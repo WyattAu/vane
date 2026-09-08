@@ -3,86 +3,136 @@
 //! Payload contract (application-defined; this binary speaks HTTP/1.1):
 //! the request payload is a full HTTP/1.1 request head (+ optional body);
 //! the response payload is the upstream's response bytes verbatim.
+//!
+//! The same bridge runs **in-process** when `[sidecar] enabled = true` in
+//! the main proxy config — co-located services then talk to the running
+//! proxy over shared memory with no extra binary.
 
+use vane_control::VaneConfig;
 use vane_shm::transport::{SidecarClient, SidecarConfig, SidecarServer};
 
-/// Runs the sidecar bridge until the channel dies.
+/// Sidecar bridge configuration resolved from the main config.
+#[derive(Debug, Clone)]
+pub struct BridgeConfig {
+    /// SHM transport base.
+    pub base: String,
+    /// Slot size.
+    pub slot_size: u32,
+    /// Slots per direction.
+    pub slots: u32,
+    /// Upstream backends (round-robin).
+    pub backends: Vec<std::net::SocketAddr>,
+}
+
+/// Resolves the bridge config: `[sidecar]` section + default cluster
+/// backends (first route's cluster, else first cluster).
+#[must_use]
+pub fn resolve_bridge(cfg: &VaneConfig) -> Option<BridgeConfig> {
+    let cluster_name = cfg
+        .routes
+        .first()
+        .map(|r| r.cluster.clone())
+        .or_else(|| cfg.clusters.keys().next().cloned())?;
+    let backends: Vec<std::net::SocketAddr> = cfg
+        .clusters
+        .get(&cluster_name)
+        .map(|c| c.backends.iter().filter_map(|b| b.parse().ok()).collect())
+        .unwrap_or_default();
+    if backends.is_empty() {
+        return None;
+    }
+    Some(BridgeConfig {
+        base: cfg.sidecar.base.clone(),
+        slot_size: cfg.sidecar.slot_size,
+        slots: cfg.sidecar.slots,
+        backends,
+    })
+}
+
+/// Opens the transport and spawns the bridge on a blocking thread.
+/// Returns immediately; the bridge runs until the process exits.
+///
+/// # Errors
+/// Transport setup failure.
+pub fn spawn_bridge(cfg: &VaneConfig) -> Result<(), String> {
+    let Some(bridge) = resolve_bridge(cfg) else {
+        return Err("no backends resolvable for the sidecar bridge".into());
+    };
+    let shm_cfg = SidecarConfig {
+        base: bridge.base.clone().into(),
+        slot_size: bridge.slot_size,
+        slots: bridge.slots,
+    };
+    let mut server = SidecarServer::open(&shm_cfg).map_err(|e| e.to_string())?;
+    tracing::info!("sidecar: serving on {}", shm_cfg.base.display());
+    let backends = bridge.backends;
+    std::thread::Builder::new()
+        .name("vane-sidecar-bridge".into())
+        .spawn(move || {
+            let mut next_backend = 0usize;
+            loop {
+                match server.recv(std::time::Duration::from_millis(500)) {
+                    Ok(Some((id, request))) => {
+                        let addr = backends[next_backend % backends.len()];
+                        next_backend += 1;
+                        let response = blocking_http_call(addr, &request);
+                        let _ = server.reply(id, &response, std::time::Duration::from_secs(5));
+                    }
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::error!("sidecar recv: {e}");
+                        return;
+                    }
+                }
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Runs the sidecar bridge until the channel dies (standalone subcommand).
 pub async fn run(config_path: Option<String>, base: String) -> i32 {
-    let cfg = match crate::server::load_config(config_path.as_deref()) {
+    let mut cfg = match crate::server::load_config(config_path.as_deref()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("vane sidecar: {e}");
             return 1;
         }
     };
-    let shm_cfg = SidecarConfig::dev_shm(base.trim_start_matches("/dev/shm/"));
-    let mut server = match SidecarServer::open(&shm_cfg) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("vane sidecar: {e}");
-            return 1;
-        }
-    };
-    println!("vane sidecar: serving on {}", shm_cfg.base.display());
-
-    // Bridge on a blocking thread; responses forwarded back through the SHM
-    // transport. Requests are plain HTTP/1.1 bytes relayed to the first
-    // healthy backend of the default cluster.
-    let default_cluster = cfg
-        .routes
-        .first()
-        .map(|r| r.cluster.clone())
-        .or_else(|| cfg.clusters.keys().next().cloned())
-        .unwrap_or_default();
-    let backends: Vec<std::net::SocketAddr> = cfg
-        .clusters
-        .get(&default_cluster)
-        .map(|c| c.backends.iter().filter_map(|b| b.parse().ok()).collect())
-        .unwrap_or_default();
-    if backends.is_empty() {
-        eprintln!("vane sidecar: no backends for cluster `{default_cluster}`");
-        return 1;
-    }
-
-    tokio::task::spawn_blocking(move || {
-        let mut next_backend = 0usize;
-        loop {
-            match server.recv(std::time::Duration::from_millis(500)) {
-                Ok(Some((id, request))) => {
-                    let addr = backends[next_backend % backends.len()];
-                    next_backend += 1;
-                    let response = blocking_http_call(addr, &request);
-                    let _ = server.reply(id, &response, std::time::Duration::from_secs(5));
-                }
-                Ok(None) => continue, // idle spin (500ms cadence)
-                Err(e) => {
-                    tracing::error!("sidecar recv: {e}");
-                    return;
-                }
+    cfg.sidecar.base = base;
+    cfg.sidecar.enabled = true;
+    match spawn_bridge(&cfg) {
+        Ok(()) => {
+            println!("vane sidecar: serving on {}", cfg.sidecar.base);
+            // Park forever; the bridge thread does the work.
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
             }
         }
-    })
-    .await
-    .ok();
-    0
+        Err(e) => {
+            eprintln!("vane sidecar: {e}");
+            1
+        }
+    }
 }
 
 /// Blocking minimal HTTP/1.1 relay to `addr`.
 fn blocking_http_call(addr: std::net::SocketAddr, request: &[u8]) -> Vec<u8> {
     use std::io::{Read, Write};
+    let bad_gw = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n".to_vec();
     let Ok(mut stream) =
         std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3))
     else {
-        return b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n".to_vec();
+        return bad_gw;
     };
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
     if stream.write_all(request).is_err() {
-        return b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n".to_vec();
+        return bad_gw;
     }
     let mut response = Vec::with_capacity(4096);
     let _ = stream.read_to_end(&mut response);
     if response.is_empty() {
-        return b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n".to_vec();
+        return bad_gw;
     }
     response
 }

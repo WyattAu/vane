@@ -40,6 +40,9 @@ pub struct ProxyConfig {
     pub pool_per_backend: usize,
     /// TLS termination config (`None` = plaintext listener).
     pub tls: Option<Arc<rustls::ServerConfig>>,
+    /// Wasm plugin module paths (feature `wasm`; applied to every request
+    /// in order, before routing).
+    pub plugins: Vec<String>,
 }
 
 /// Per-connection state.
@@ -94,6 +97,9 @@ pub struct HttpProxy {
     date: vane_proto::date::DateCache,
     /// Idle upstream connection pool (per backend, worker-local).
     pool: HashMap<SocketAddr, Vec<RawFd>>,
+    /// Loaded plugin instances (one set per worker; instances are !Sync).
+    #[cfg(feature = "wasm")]
+    plugins: Vec<vane_plugins::PluginInstance>,
     metrics: ProxyMetrics,
     worker_id: usize,
 }
@@ -129,6 +135,35 @@ impl HttpProxy {
             config.rate_limit_rps.unwrap_or(10_000),
             config.rate_limit_rps.unwrap_or(10_000),
         ));
+        // Wasm plugins (feature `wasm`): compiled per module, instantiated
+        // once per worker.
+        #[cfg(feature = "wasm")]
+        let plugins: Vec<vane_plugins::PluginInstance> = config
+            .plugins
+            .iter()
+            .filter_map(|path| {
+                match vane_plugins::PluginModule::compile(std::path::Path::new(path)) {
+                    Ok(m) => match m.instantiate() {
+                        Ok(inst) => Some(inst),
+                        Err(e) => {
+                            eprintln!("[vane:warn] plugin {path}: {e}");
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("[vane:warn] plugin {path}: {e}");
+                        None
+                    }
+                }
+            })
+            .collect();
+        #[cfg(not(feature = "wasm"))]
+        if !config.plugins.is_empty() {
+            eprintln!(
+                "[vane:warn] {} plugin(s) configured but built without the `wasm` feature",
+                config.plugins.len()
+            );
+        }
         Self {
             config,
             pipeline,
@@ -136,6 +171,8 @@ impl HttpProxy {
             conns: HashMap::new(),
             date: vane_proto::date::DateCache::new(),
             pool: HashMap::new(),
+            #[cfg(feature = "wasm")]
+            plugins,
             metrics,
             worker_id,
         }

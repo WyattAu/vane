@@ -21,6 +21,12 @@ pub struct RunOptions {
     pub config_path: Option<String>,
     /// Hot-upgrade: receive listeners from this handover socket.
     pub handover_from: Option<String>,
+    /// Hot-upgrade: on shutdown, send listeners + route state to this
+    /// socket (the standby runs with `--handover-from`). Graceful plain
+    /// drain if the peer is absent.
+    pub handover_to: Option<String>,
+    /// Test hook: trigger the shutdown path after this delay.
+    pub shutdown_after: Option<Duration>,
     /// Force the mio engine.
     pub force_mio: bool,
 }
@@ -61,7 +67,11 @@ pub fn load_config(path: Option<&str>) -> Result<VaneConfig, String> {
         std::env::var("VANE_TLS_KEY"),
     ) {
         if let Some(l) = cfg.listeners.first_mut() {
-            l.tls = Some(vane_control::ListenerTls { cert, key });
+            l.tls = Some(vane_control::ListenerTls {
+                cert,
+                key,
+                alpn_h2: false,
+            });
         }
     }
     if let Ok(addr) = std::env::var("VANE_ADMIN_ADDR") {
@@ -260,6 +270,13 @@ pub async fn run(opts: RunOptions) -> i32 {
     }
 
     // ---- Spawn workers (one per listener × core) ------------------------
+    // Keep dup'd listener fds for the hot-upgrade sender (SCM_RIGHTS needs
+    // an owned fd at shutdown; the workers get their own clones).
+    let handover_listeners: Vec<StdTcpListener> = bound
+        .iter()
+        .map(|l| l.try_clone().expect("dup listener"))
+        .collect();
+    let inherited = opts.handover_from.is_some();
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     let workers_per_listener = config
         .listeners
@@ -300,6 +317,10 @@ pub async fn run(opts: RunOptions) -> i32 {
             // kernel load-balances accepts across cores.
             let listener = if w == 0 {
                 listener.try_clone().expect("clone listener")
+            } else if inherited {
+                // Inherited sockets cannot be re-bound: dup the fd so all
+                // workers accept on the same listening socket.
+                listener.try_clone().expect("clone listener")
             } else {
                 let addr = config.listeners[li].address.parse().expect("validated");
                 match vane_core::tcp_listener(addr, true, config.runtime.backlog) {
@@ -326,6 +347,7 @@ pub async fn run(opts: RunOptions) -> i32 {
                 events,
                 tls: tls_cfg.clone(),
                 runtime: config.runtime.clone(),
+                plugins: config.plugins.iter().map(|p| p.path.clone()).collect(),
             };
             match spawn_worker(
                 li * workers_per_listener + w,
@@ -395,9 +417,85 @@ pub async fn run(opts: RunOptions) -> i32 {
         });
     }
 
+    // ---- HTTP/2 edge (feature `h2`) ---------------------------------------
+    #[cfg(feature = "h2")]
+    for (li, listener) in handover_listeners.iter().enumerate() {
+        let want_h2 = config
+            .listeners
+            .get(li)
+            .and_then(|l| l.tls.as_ref())
+            .is_some_and(|t| t.alpn_h2);
+        if !want_h2 {
+            continue;
+        }
+        match vane_tls::server_config(
+            std::path::Path::new(&config.listeners[li].tls.as_ref().expect("checked").cert),
+            std::path::Path::new(&config.listeners[li].tls.as_ref().expect("checked").key),
+        ) {
+            Ok(cfg) => {
+                let mut cfg = cfg;
+                cfg.alpn_protocols = vec![b"h2".to_vec()];
+                let dup = listener.try_clone().expect("dup for h2 edge");
+                let edge = Arc::new(crate::h2_edge::H2Edge::new(
+                    Arc::clone(&router),
+                    Arc::clone(&registry),
+                ));
+                crate::h2_edge::spawn(dup, Arc::new(cfg), edge);
+                tracing::info!("h2 edge listening (REUSEPORT) for listener {li}");
+            }
+            Err(e) => tracing::warn!("h2 edge tls: {e}"),
+        }
+    }
+
+    // ---- In-process SHM sidecar ------------------------------------------
+    if config.sidecar.enabled {
+        if let Err(e) = crate::sidecar::spawn_bridge(&config) {
+            tracing::warn!("sidecar bridge: {e}");
+        }
+    }
+
     // ---- Shutdown ---------------------------------------------------------
-    // SIGTERM/SIGINT -> drain workers with a 30 s hard deadline.
-    wait_for_signal().await;
+    // SIGTERM/SIGINT (or the test hook) -> optional hot handover, then
+    // drain workers with a 30 s hard deadline.
+    let mut shutdown = Box::pin(wait_for_signal());
+    match opts.shutdown_after {
+        Some(d) => {
+            let _ = tokio::time::timeout(d, shutdown.as_mut()).await;
+        }
+        None => shutdown.as_mut().await,
+    }
+
+    if let Some(sock) = &opts.handover_to {
+        // The standby (started earlier with --handover-from) is bound to
+        // this socket waiting to receive. Send listeners + route state so
+        // it serves the instant we start draining — zero connection resets.
+        let state = vane_shm::handover::HandoverState {
+            generation: 0,
+            routes: crate::proxy::flatten_routes(&router)
+                .into_iter()
+                .map(|r| vane_shm::handover::RouteRecord {
+                    host: r.host,
+                    pattern: r.pattern,
+                    cluster: r.cluster,
+                    backends: r.backends,
+                    strip_prefix: r.strip_prefix,
+                })
+                .collect(),
+            at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or_else(|_| "unknown".to_owned(), |d| format!("{}s", d.as_secs())),
+        };
+        let state_path = std::path::PathBuf::from("/tmp/vane-handover-state.json");
+        match vane_shm::handover::send_listeners(
+            std::path::Path::new(sock),
+            &handover_listeners,
+            &state,
+            &state_path,
+        ) {
+            Ok(()) => tracing::info!("hot upgrade: handed over to standby"),
+            Err(e) => tracing::warn!("hot upgrade handover failed (plain drain): {e}"),
+        }
+    }
 
     tracing::info!("shutting down: draining workers");
     let deadline_ms: u64 = 30_000;
@@ -433,6 +531,8 @@ struct WorkerFactory {
     tls: Option<Arc<rustls::ServerConfig>>,
     /// Runtime knobs from config.
     runtime: vane_control::RuntimeConfig,
+    /// Wasm plugin paths.
+    plugins: Vec<String>,
 }
 
 impl vane_core::HandlerFactory for WorkerFactory {
@@ -452,6 +552,7 @@ impl vane_core::HandlerFactory for WorkerFactory {
                 first_byte_timeout_ms: self.runtime.first_byte_timeout_ms,
                 pool_per_backend: self.runtime.pool_per_backend,
                 tls: self.tls.clone(),
+                plugins: self.plugins.clone(),
             },
             self.worker_id,
         ))

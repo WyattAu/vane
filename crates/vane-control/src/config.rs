@@ -38,6 +38,12 @@ pub struct VaneConfig {
     /// ACME certificate manager.
     #[serde(default)]
     pub acme: AcmeSection,
+    /// In-process SHM sidecar transport.
+    #[serde(default)]
+    pub sidecar: SidecarConfig,
+    /// Wasm plugins (feature `wasm`), applied to every request in order.
+    #[serde(default)]
+    pub plugins: Vec<PluginConfig>,
     /// Runtime tuning.
     #[serde(default)]
     pub runtime: RuntimeConfig,
@@ -66,6 +72,10 @@ pub struct ListenerTls {
     pub cert: String,
     /// PEM private key path.
     pub key: String,
+    /// Serve HTTP/2 on this listener (feature `h2`; a dedicated acceptor
+    /// handles h2 connections while engine workers keep http/1.1).
+    #[serde(default)]
+    pub alpn_h2: bool,
 }
 
 /// Listener protocol mode.
@@ -254,6 +264,38 @@ pub enum AcmeChallenge {
     Http01,
     /// TLS-ALPN-01 (planned; rejected at load time for now).
     TlsAlpn01,
+}
+
+/// In-process SHM sidecar transport configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SidecarConfig {
+    /// Enabled flag.
+    pub enabled: bool,
+    /// Transport base directory (files: `<base>/req.ring` etc.).
+    pub base: String,
+    /// Slot size (payload ceiling per message).
+    pub slot_size: u32,
+    /// Slots per direction.
+    pub slots: u32,
+}
+
+impl Default for SidecarConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base: "/dev/shm/vane-sidecar".to_owned(),
+            slot_size: 256 * 1024,
+            slots: 16,
+        }
+    }
+}
+
+/// A Wasm plugin loaded into every worker (feature `wasm`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginConfig {
+    /// Path to the `.wasm` module.
+    pub path: String,
 }
 
 /// Runtime tuning knobs.

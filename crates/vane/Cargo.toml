@@ -20,7 +20,7 @@ path = "src/main.rs"
 default = ["vane-core/io-uring"]
 file-provider = ["vane-control/file-provider"]
 docker-provider = ["vane-control/docker-provider"]
-h2 = ["dep:h2", "dep:tokio-util"]
+h2 = ["dep:h2", "dep:tokio-rustls"]
 h3 = ["dep:quinn", "dep:h3", "dep:h3-quinn"]
 wasm = ["vane-plugins/wasm"]
 k8s = ["vane-control/k8s"]
@@ -51,12 +51,15 @@ serde_json = { workspace = true }
 httparse = { workspace = true }
 rustls = { workspace = true }
 libc = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 
 # Experimental protocol features
 h2 = { workspace = true, optional = true }
-tokio-util = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+reqwest = { workspace = true }
 quinn = { workspace = true, optional = true }
 h3 = { workspace = true, optional = true }
 h3-quinn = { workspace = true, optional = true }
@@ -64,6 +67,7 @@ h3-quinn = { workspace = true, optional = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 rcgen = { workspace = true }
+libc = { workspace = true }
 
 [lints]
 workspace = true

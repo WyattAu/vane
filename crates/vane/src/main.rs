@@ -22,6 +22,10 @@ enum Cmd {
         /// Receive listeners from a previous instance (hot upgrade).
         #[arg(long)]
         handover_from: Option<String>,
+        /// On shutdown, hand listeners + routes to a standby instance
+        /// running with --handover-from (hot upgrade, zero resets).
+        #[arg(long)]
+        handover_to: Option<String>,
         /// Force the mio engine (disable io_uring).
         #[arg(long)]
         force_mio: bool,
@@ -47,6 +51,7 @@ fn main() {
         Cmd::Run {
             config,
             handover_from,
+            handover_to,
             force_mio,
         } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -57,6 +62,8 @@ fn main() {
                 vane::server::run(vane::server::RunOptions {
                     config_path: config,
                     handover_from,
+                    handover_to,
+                    shutdown_after: None,
                     force_mio,
                 })
                 .await
