@@ -1,0 +1,39 @@
+[package]
+name = "vane-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+httparse = "1.10"
+vane-proto = { path = "../crates/vane-proto" }
+vane-router = { path = "../crates/vane-router" }
+vane-shm = { path = "../crates/vane-shm" }
+
+[[bin]]
+name = "parse_request"
+path = "fuzz_targets/parse_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "route_lookup"
+path = "fuzz_targets/route_lookup.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "shm_descriptors"
+path = "fuzz_targets/shm_descriptors.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

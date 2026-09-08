@@ -1,0 +1,13 @@
+apiVersion: v2
+name: vane
+description: Deterministic, zero-copy L4/L7 reverse proxy, edge gateway, and micro sidecar
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - proxy
+  - gateway
+  - sidecar
+  - io-uring
+maintainers:
+  - name: Wyatt Au

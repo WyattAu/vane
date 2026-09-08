@@ -1,0 +1,44 @@
+replicaCount: 2
+
+image:
+  repository: ghcr.io/WyattAu/vane
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+config: {}
+#  listeners:
+#    - address: "0.0.0.0:8080"
+#      mode: http
+#  clusters:
+#    api:
+#      backends: ["web.default.svc.cluster.local:8080"]
+#  routes:
+#    - pattern: "/*rest"
+#      cluster: api
+
+admin:
+  enabled: true
+  port: 9100
+
+sidecar:
+  # Mount the SHM transport for co-located services (vane-client-sdk).
+  enabled: false
+  shmSize: 32Mi
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 16Mi
+  limits:
+    cpu: "2"
+    memory: 64Mi
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/path: /metrics
+  prometheus.io/port: "9100"
+
+# io_uring SQPOLL requires privileges; default off.
+runtime:
+  sqpoll: false
+  forceMio: false

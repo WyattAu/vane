@@ -1,0 +1,80 @@
+# WyattAu engineering standards — Tier A (concurrency/latency-critical)
+# Reuses the shared workflow: WyattAu/engineering-standards/.github/workflows/rust-kit.yml
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    uses: WyattAu/engineering-standards/.github/workflows/rust-kit.yml@main
+    with:
+      tier: a
+    secrets: inherit
+
+  e2e:
+    name: end-to-end proxy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run proxy integration tests
+        run: cargo test -p vane --test e2e -- --test-threads=1
+
+  loom:
+    name: loom model checking
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Loom (SPSC ring)
+        run: cargo test -p vane-core --features loom --test loom_spsc
+      - name: Loom (event ring)
+        run: cargo test -p vane-observe --features loom --test loom_ring
+
+  miri:
+    name: miri (pure-logic modules)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - name: Miri (session slab + token packing)
+        run: |
+          cargo +nightly miri test -p vane-core --lib slab::
+          cargo +nightly miri test -p vane-core --lib token::
+
+  feature-matrix:
+    name: feature matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: no default features (mio-only core)
+        run: cargo check --workspace --no-default-features
+      - name: all features (h2/h3/wasm/k8s/rkyv)
+        run: cargo check --workspace --all-features
+
+  fuzz-smoke:
+    name: fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-fuzz --locked
+      - name: parser smoke (30s)
+        run: cargo fuzz run parse_request -- -max_total_time=30 -max_len=4096
+      - name: router smoke (30s)
+        run: cargo fuzz run route_lookup -- -max_total_time=30

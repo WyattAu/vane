@@ -1,0 +1,76 @@
+# vane.toml — example edge-gateway configuration
+#
+# Layering: defaults -> this file -> environment (VANE_* prefix).
+
+# ─── Ingress ────────────────────────────────────────────────────────────────
+[[listeners]]
+address = "0.0.0.0:8080"
+mode = "http"          # http | tcp (L4 splice passthrough)
+workers = 0            # 0 = one worker per core (pinned thread-per-core)
+
+[[listeners]]
+address = "0.0.0.0:5432"
+mode = "tcp"           # zero-copy splice: bytes never enter user space
+
+# ─── Upstream clusters ──────────────────────────────────────────────────────
+[clusters.api]
+backends = ["127.0.0.1:9001", "127.0.0.1:9002"]
+policy = "p2c"                 # p2c | round-robin | least-conn
+health_path = "/healthz"       # active HTTP probes every 5s
+
+[clusters.db]
+backends = ["127.0.0.1:5433"]
+policy = "round-robin"
+
+# ─── Routes ─────────────────────────────────────────────────────────────────
+[[routes]]
+host = "api.example.com"
+pattern = "/v1/:resource"      # :param segments captured
+cluster = "api"
+strip_prefix = ""              # forward /v1/users -> /users when set
+priority = 10
+
+[[routes]]
+pattern = "/files/*rest"       # catch-all captures the remaining path
+cluster = "api"
+priority = 20
+
+# ─── Admin plane ────────────────────────────────────────────────────────────
+[admin]
+enabled = true
+address = "127.0.0.1:9100"     # /metrics /healthz /readyz /config
+
+# ─── Dynamic discovery ──────────────────────────────────────────────────────
+[file_provider]
+directory = "/etc/vane/routes" # *.toml files, hot-reloaded (inotify + poll)
+poll_ms = 5000
+
+[docker]
+enabled = false
+socket = "/var/run/docker.sock"
+# Containers opt in with labels:
+#   vane.enable=true  vane.host=api.example.com  vane.path=/api/*rest
+#   vane.port=8080    vane.cluster=api           vane.strip=/api
+
+[kubernetes]
+enabled = false
+namespaces = ["default"]       # Gateway API v1 HTTPRoute watches
+
+# ─── ACME (Let's Encrypt) ───────────────────────────────────────────────────
+[acme]
+directory_url = "https://acme-v02.api.letsencrypt.org/directory"
+emails = ["ops@example.com"]
+storage_dir = "/var/lib/vane/acme"
+
+[[acme.domains]]
+domain = "api.example.com"
+challenge = "http-01"
+
+# ─── Runtime tuning ─────────────────────────────────────────────────────────
+[runtime]
+pool_slots = 1024              # fixed buffer pool per worker (io_uring fixed buffers)
+ring_entries = 4096            # io_uring queue depth
+sqpoll = false                 # zero-syscall submission (needs privileges)
+force_mio = false              # force the epoll/kqueue fallback engine
+max_sessions = 16384           # per-worker session slab capacity
+backlog = 4096
