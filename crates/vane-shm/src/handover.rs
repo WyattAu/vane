@@ -108,10 +108,22 @@ pub fn receive_listeners(
             unsafe { fdpass::tcp_listener_from_fd(fd) }
         })
         .collect();
-    let bytes = std::fs::read(state_path).map_err(|e| HandoverError::State(e.to_string()))?;
-    let state: HandoverState =
-        serde_json::from_slice(&bytes).map_err(|e| HandoverError::State(e.to_string()))?;
-    Ok(Received { listeners, state })
+    // The sender writes the state before the fds arrive, but tolerate a
+    // slow/partial write with a short retry.
+    let mut state_err = None;
+    for _ in 0..25 {
+        match std::fs::read(state_path) {
+            Ok(bytes) => match serde_json::from_slice::<HandoverState>(&bytes) {
+                Ok(state) => {
+                    return Ok(Received { listeners, state });
+                }
+                Err(e) => state_err = Some(HandoverError::State(e.to_string())),
+            },
+            Err(e) => state_err = Some(HandoverError::State(e.to_string())),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
+    Err(state_err.unwrap_or_else(|| HandoverError::State("state unavailable".into())))
 }
 
 /// Prepares the handover socket path (unlinks stale sockets).
