@@ -1,0 +1,31 @@
+[package]
+name = "vane-shm"
+description = "POSIX SHM sidecar transport, zero-loss hot upgrade, and C ABI for Vane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+shm-rings = { workspace = true }
+zerocopy = { workspace = true }
+memmap2 = { workspace = true }
+libc = { workspace = true }
+vane-router = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+tempfile = { workspace = true }
+
+[[bench]]
+name = "roundtrip"
+harness = false
+
+[lints]
+workspace = true

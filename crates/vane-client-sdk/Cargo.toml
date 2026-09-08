@@ -1,0 +1,15 @@
+[package]
+name = "vane-client-sdk"
+description = "Rust SDK for Vane's shared-memory sidecar transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+vane-shm = { workspace = true }
+
+[[example]]
+name = "sidecar_roundtrip"

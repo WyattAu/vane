@@ -1,0 +1,25 @@
+[package]
+name = "vane-plugins"
+description = "Wasmtime-based plugin sandbox for Vane request pipelines"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+wasm = ["dep:wasmtime"]
+
+[dependencies]
+vane-observe = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+wasmtime = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

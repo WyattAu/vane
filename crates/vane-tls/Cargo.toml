@@ -1,0 +1,25 @@
+[package]
+name = "vane-tls"
+description = "rustls termination, ALPN, and SHM session-ticket cache for Vane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+ring = { workspace = true }
+shm-rings = { workspace = true }
+zerocopy = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
