@@ -162,7 +162,9 @@ impl K8sProvider {
                         .and_then(|p| p.value.clone())
                         .unwrap_or_else(|| "/".to_owned());
                     for br in &rule.backendRefs {
-                        let Some(name) = br.name.clone() else { continue };
+                        let Some(name) = br.name.clone() else {
+                            continue;
+                        };
                         let ns = br
                             .namespace
                             .clone()

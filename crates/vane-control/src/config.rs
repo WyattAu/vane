@@ -54,6 +54,18 @@ pub struct ListenerConfig {
     /// Worker count (0 = one per core).
     #[serde(default)]
     pub workers: usize,
+    /// TLS termination (absent = plaintext).
+    #[serde(default)]
+    pub tls: Option<ListenerTls>,
+}
+
+/// TLS material for a listener.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListenerTls {
+    /// PEM certificate chain path (or ACME-managed path).
+    pub cert: String,
+    /// PEM private key path.
+    pub key: String,
 }
 
 /// Listener protocol mode.
@@ -260,6 +272,14 @@ pub struct RuntimeConfig {
     pub max_sessions: usize,
     /// Accept backlog.
     pub backlog: i32,
+    /// Upstream connect timeout (ms).
+    pub connect_timeout_ms: u64,
+    /// Upstream first-response-byte timeout (ms).
+    pub first_byte_timeout_ms: u64,
+    /// Idle keep-alive timeout (ms).
+    pub idle_timeout_ms: u64,
+    /// Idle upstream connections retained per backend per worker.
+    pub pool_per_backend: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -271,6 +291,10 @@ impl Default for RuntimeConfig {
             force_mio: false,
             max_sessions: 16_384,
             backlog: 4096,
+            connect_timeout_ms: 5_000,
+            first_byte_timeout_ms: 30_000,
+            idle_timeout_ms: 75_000,
+            pool_per_backend: 8,
         }
     }
 }

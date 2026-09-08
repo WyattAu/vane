@@ -18,7 +18,9 @@ pub mod reconcile;
 pub mod routes;
 
 pub use acme::{AcmeConfig, AcmeManager};
-pub use config::{ClusterConfig, ListenerConfig, RouteConfig, VaneConfig};
+pub use config::{
+    ClusterConfig, ListenerConfig, ListenerTls, RouteConfig, RuntimeConfig, VaneConfig,
+};
 pub use health::{HealthChecker, HealthMap};
 pub use providers::ProviderUpdate;
 #[cfg(feature = "docker-provider")]
