@@ -1,0 +1,136 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/vane-core",
+    "crates/vane-observe",
+    "crates/vane-proto",
+    "crates/vane-router",
+    "crates/vane-filters",
+    "crates/vane-control",
+    "crates/vane-shm",
+    "crates/vane-client-sdk",
+    "crates/vane-tls",
+    "crates/vane-plugins",
+    "crates/vane",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/WyattAu/vane"
+authors = ["Wyatt Au"]
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+unwrap_used = "deny"
+# `expect` is permitted for startup-only invariants (documented at each site);
+# the Tier A deny list covers unwrap/panic/indexing.
+expect_used = "allow"
+
+[workspace.dependencies]
+# Internal
+vane-core = { path = "crates/vane-core" }
+vane-observe = { path = "crates/vane-observe" }
+vane-proto = { path = "crates/vane-proto" }
+vane-router = { path = "crates/vane-router" }
+vane-filters = { path = "crates/vane-filters" }
+vane-control = { path = "crates/vane-control" }
+vane-shm = { path = "crates/vane-shm" }
+vane-client-sdk = { path = "crates/vane-client-sdk" }
+vane-tls = { path = "crates/vane-tls" }
+vane-plugins = { path = "crates/vane-plugins" }
+
+# WyattAu kit ecosystem (reuse, do not reinvent)
+shm-rings = "0.1.1"
+slab-pool = { git = "https://github.com/WyattAu/slab-pool.git", branch = "main" }
+throttle-kit = "1.0"
+breaker = "1.0"
+healthkit = "1.0"
+axum-stack = "0.1"
+graceful = "0.1"
+otelkit = "1.0"
+envstack = "0.2"
+validkit = "1.0"
+errcode = "0.1.0-alpha.2"
+json-envelope = "0.1"
+loop-retry = "0.1"
+rustls-pki-types = "1"
+fetchkit = "0.5"
+clock = "0.4"
+
+# I/O engine
+io-uring = { version = "0.7" }
+mio = { version = "1.2", features = ["net", "os-poll", "os-ext"] }
+socket2 = { version = "0.6", features = ["all"] }
+libc = "0.2"
+core_affinity = "0.8"
+
+# Concurrency / memory
+crossbeam-epoch = "0.9"
+crossbeam-channel = "0.5"
+bytes = "1"
+zerocopy = { version = "0.8", features = ["derive"] }
+
+# Protocol / parsing
+httparse = "1.10"
+
+# Config / serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+rkyv = { version = "0.8" }
+clap = { version = "4", features = ["derive"] }
+
+# Async (control plane only)
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+futures = "0.3"
+
+# TLS / crypto
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+ring = "0.17"
+rcgen = "0.14"
+
+# Observability
+tracing = "0.1"
+
+# HTTP/2 + HTTP/3 (experimental features)
+h2 = { version = "0.4" }
+tokio-util = { version = "0.7", features = ["compat"] }
+quinn = { version = "0.11" }
+h3 = { version = "0.0.8" }
+h3-quinn = { version = "0.0.10" }
+
+# Plugins (feature-gated)
+wasmtime = { version = "48" }
+
+# Misc
+notify = "8"
+rand = "0.9"
+http = "1"
+memmap2 = "0.9"
+thiserror = "2"
+
+# Dev / test
+loom = { version = "0.7" }
+criterion = { version = "0.7", features = ["cargo_bench_support"] }
+testkit = "0.2"
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.bench]
+debug = true

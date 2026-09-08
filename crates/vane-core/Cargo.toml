@@ -1,0 +1,34 @@
+[package]
+name = "vane-core"
+description = "io_uring/mio dual-backend, thread-per-core transport engine for Vane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+vane_dbg = []
+default = ["io-uring"]
+io-uring = ["dep:io-uring"]
+loom = ["dep:loom"]
+
+[dependencies]
+io-uring = { workspace = true, optional = true }
+mio = { workspace = true }
+socket2 = { workspace = true }
+libc = { workspace = true }
+core_affinity = { workspace = true }
+bytes = { workspace = true }
+slab-pool = { workspace = true }
+vane-observe = { workspace = true }
+loom = { workspace = true, optional = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+loom = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

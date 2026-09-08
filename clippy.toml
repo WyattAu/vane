@@ -1,0 +1,3 @@
+# Match engineering-standards Tier A: warn on undocumented unsafe, deny pedantic-adjacent traps
+msrv = "1.85"
+avoid-breaking-exported-api = true

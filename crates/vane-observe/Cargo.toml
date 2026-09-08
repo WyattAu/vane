@@ -1,0 +1,22 @@
+[package]
+name = "vane-observe"
+description = "Lock-free metrics, non-blocking log ring, and W3C trace context for the Vane data plane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+tracing = { workspace = true }
+rand = { workspace = true }
+
+loom = { workspace = true, optional = true }
+
+[features]
+default = []
+loom = ["dep:loom"]
+
+[lints]
+workspace = true
