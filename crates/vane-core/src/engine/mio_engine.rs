@@ -435,6 +435,10 @@ impl Engine for MioEngine {
     }
 
     fn remove(&mut self, fd: RawFd) {
+        // Deregister so the fd can be detached (pooled) and re-attached
+        // without EEXIST, and so no stale readiness fires after close.
+        let mut src = mio::unix::SourceFd(&fd);
+        let _ = self.poller.registry().deregister(&mut src);
         self.pending.remove(&fd);
     }
 

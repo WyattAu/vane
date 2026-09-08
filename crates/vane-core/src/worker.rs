@@ -8,7 +8,7 @@
 use std::collections::BinaryHeap;
 use std::io;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -79,6 +79,8 @@ pub struct WorkerCtx {
     pub events: Arc<EventRing<LogEvent, { vane_observe::EVENT_RING_CAPACITY }>>,
     /// Effective worker config.
     pub config: WorkerConfig,
+    /// Live-session gauge (worker-maintained).
+    pub connections: vane_observe::metrics::MetricHandle,
 }
 
 /// Live handle to a running worker thread.
@@ -127,6 +129,11 @@ struct Session {
     upstream_read_inflight: bool,
     write_inflight: bool,
     upstream_write_inflight: bool,
+    /// Nonblocking connect still in progress (diagnostics).
+    #[allow(dead_code)] // consumed by CQE dispatch; kept for state clarity
+    connect_inflight: bool,
+    /// Request head already serialized to the upstream (no failover past it).
+    request_sent: bool,
     downstream_eof: bool,
     upstream_eof: bool,
     /// Half-close (FIN) requested while writes are still flushing.
@@ -141,6 +148,7 @@ struct Timer {
     at: Instant,
     slot: u32,
     generation: u16,
+    reason_aux: u16,
 }
 
 impl Ord for Timer {
@@ -391,7 +399,13 @@ impl WorkerState {
         // StreamFd Drop closes the descriptors.
     }
 
-    pub(crate) fn set_deadline(&mut self, slot: u32, generation: u16, at: Option<Instant>) {
+    pub(crate) fn set_deadline(
+        &mut self,
+        slot: u32,
+        generation: u16,
+        at: Option<Instant>,
+        reason: crate::handler::DeadlineReason,
+    ) {
         if !self.valid(slot, generation) {
             return;
         }
@@ -404,6 +418,7 @@ impl WorkerState {
                 at,
                 slot,
                 generation,
+                reason_aux: reason.aux(),
             });
         }
     }
@@ -418,6 +433,75 @@ impl WorkerState {
 
     pub(crate) fn has_upstream(&self, slot: u32, generation: u16) -> bool {
         self.valid(slot, generation) && self.slab.get(slot).is_some_and(|s| s.upstream.is_some())
+    }
+
+    /// Detaches the upstream fd (no close) for connection pooling.
+    pub(crate) fn detach_upstream(&mut self, slot: u32, generation: u16) -> Option<RawFd> {
+        if !self.valid(slot, generation) {
+            return None;
+        }
+        let fd = {
+            let s = self.slab.get_mut(slot)?;
+            let owned = s.upstream.take()?;
+            let fd = owned.fd();
+            // Ownership transfers to the caller (pool) — forget the guard
+            // so Drop does not close the descriptor.
+            std::mem::forget(owned);
+            fd
+        };
+        // Stop tracking it in the engine and return every slot it holds.
+        self.engine.remove(fd);
+        if let Some(s) = self.slab.get_mut(slot) {
+            if let Some(rs) = s.urslot.take() {
+                self.pool.release(rs);
+            }
+            s.upstream_read_inflight = false;
+            for (ws, _, _) in s.uwq.drain(..) {
+                self.pool.release(ws);
+            }
+            s.pending_up.clear();
+            s.upstream_write_inflight = false;
+            s.upstream_eof = false;
+            s.request_sent = false;
+        }
+        Some(fd)
+    }
+
+    /// Attaches a pooled fd as this session's upstream and arms its read.
+    pub(crate) fn attach_upstream(&mut self, slot: u32, generation: u16, fd: RawFd) -> bool {
+        if !self.valid(slot, generation) {
+            return false;
+        }
+        let token = Token::new(Op::UpstreamRead, slot, generation, 0);
+        if self.engine.add_stream(fd, token).is_err() {
+            return false;
+        }
+        let Some(s) = self.slab.get_mut(slot) else {
+            return false;
+        };
+        s.upstream = Some(StreamFd(fd));
+        if s.urslot.is_none() {
+            if let Some(uslot) = self.pool.take() {
+                s.urslot = Some(uslot);
+                s.upstream_read_inflight = true;
+                let _ = self.engine.read(token, fd, uslot);
+            }
+        }
+        true
+    }
+
+    /// Request-head-written flag (failover guard).
+    pub(crate) fn request_sent(&self, slot: u32, generation: u16) -> bool {
+        self.valid(slot, generation) && self.slab.get(slot).is_some_and(|s| s.request_sent)
+    }
+
+    pub(crate) fn mark_request_sent(&mut self, slot: u32, generation: u16) {
+        if !self.valid(slot, generation) {
+            return;
+        }
+        if let Some(s) = self.slab.get_mut(slot) {
+            s.request_sent = true;
+        }
     }
 
     // ----- internal event handling (called with the handler split out) -------
@@ -743,8 +827,9 @@ impl WorkerState {
                 if deadline > t.at {
                     continue; // superseded
                 }
+                let reason = crate::handler::DeadlineReason::from_aux(t.reason_aux);
                 let mut io = self.io_for(t.slot, t.generation);
-                h.on_deadline(&mut io);
+                h.on_deadline(&mut io, reason);
             }
         }
     }
@@ -806,6 +891,7 @@ impl WorkerState {
 
     fn accept_connection(&mut self, fd: i32, peer: SocketAddr, h: &mut dyn Handler) {
         let _ = set_nodelay(fd);
+        self.ctx.connections.inc(&self.ctx.registry);
         if self.draining || self.slab.live().len() >= self.ctx.config.max_sessions {
             // Overload / drain: refuse.
             // SAFETY: owned, unregistered descriptor.
@@ -834,6 +920,8 @@ impl WorkerState {
             upstream_read_inflight: false,
             write_inflight: false,
             upstream_write_inflight: false,
+            connect_inflight: false,
+            request_sent: false,
             downstream_eof: false,
             upstream_eof: false,
             fin_queued: false,
@@ -939,11 +1027,16 @@ pub fn spawn(
     events: Arc<EventRing<LogEvent, { vane_observe::EVENT_RING_CAPACITY }>>,
     factory: &dyn HandlerFactory,
 ) -> io::Result<WorkerHandle> {
+    let connections = registry.register(
+        "vane_active_connections",
+        vane_observe::metrics::MetricKind::Gauge,
+    );
     let ctx = WorkerCtx {
         id,
         registry,
         events,
         config: config.clone(),
+        connections,
     };
     let handler = factory.build(&ctx);
     let (cmd_tx, cmd_rx) = crate::spsc::channel::<WorkerCmd, 64>();

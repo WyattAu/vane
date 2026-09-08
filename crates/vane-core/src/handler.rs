@@ -6,6 +6,45 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Instant;
 
+/// Why a session deadline fired — handlers branch on this to decide
+/// between closing idle conns and failing in-flight requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DeadlineReason {
+    /// No traffic within the idle window.
+    Idle = 0,
+    /// Upstream connect did not complete in time.
+    Connect = 1,
+    /// Upstream has not produced the response head in time.
+    FirstByte = 2,
+    /// Handler-defined (aux payload rides the timer).
+    Custom(u8) = 3,
+}
+
+impl DeadlineReason {
+    /// Packs a reason into the timer's aux payload.
+    #[must_use]
+    pub fn aux(self) -> u16 {
+        match self {
+            Self::Idle => 0,
+            Self::Connect => 1,
+            Self::FirstByte => 2,
+            Self::Custom(b) => u16::from(b) | (1 << 8),
+        }
+    }
+
+    /// Unpacks from the aux payload.
+    #[must_use]
+    pub fn from_aux(aux: u16) -> Self {
+        match aux {
+            0 => Self::Idle,
+            1 => Self::Connect,
+            2 => Self::FirstByte,
+            other => Self::Custom((other & 0xff) as u8),
+        }
+    }
+}
+
 use crate::worker::WorkerCtx;
 
 /// Proxy mode a handler serves (chosen per listener).
@@ -65,8 +104,9 @@ pub trait Handler: Send + 'static {
         let _ = io;
     }
 
-    /// Session deadline expired (idle timeout / drain deadline).
-    fn on_deadline(&mut self, io: &mut SessionIo<'_>) {
+    /// Session deadline expired; `reason` says which deadline.
+    fn on_deadline(&mut self, io: &mut SessionIo<'_>, reason: DeadlineReason) {
+        let _ = reason;
         io.close();
     }
 }
@@ -153,9 +193,35 @@ impl<'a> SessionIo<'a> {
         self.worker.close_session(self.slot, self.generation);
     }
 
-    /// Arms (or clears) the session deadline.
-    pub fn set_deadline(&mut self, at: Option<Instant>) {
-        self.worker.set_deadline(self.slot, self.generation, at);
+    /// Arms (or clears) the session's single deadline slot with a reason.
+    pub fn set_deadline(&mut self, at: Option<Instant>, reason: DeadlineReason) {
+        self.worker
+            .set_deadline(self.slot, self.generation, at, reason);
+    }
+
+    /// Detaches the upstream fd without closing it (connection pooling).
+    /// Returns the raw descriptor; the caller owns it from here.
+    #[must_use]
+    pub fn detach_upstream(&mut self) -> Option<std::os::fd::RawFd> {
+        self.worker.detach_upstream(self.slot, self.generation)
+    }
+
+    /// Attaches a previously detached fd as this session's upstream
+    /// (connection pooling checkout) and arms its read.
+    pub fn attach_upstream(&mut self, fd: std::os::fd::RawFd) -> bool {
+        self.worker.attach_upstream(self.slot, self.generation, fd)
+    }
+
+    /// `true` once the request head has been written to the upstream
+    /// (failover decisions must not re-send after this point).
+    #[must_use]
+    pub fn request_sent_upstream(&self) -> bool {
+        self.worker.request_sent(self.slot, self.generation)
+    }
+
+    /// Marks the request head as written upstream.
+    pub fn mark_request_sent(&mut self) {
+        self.worker.mark_request_sent(self.slot, self.generation);
     }
 
     /// Peer address of the downstream connection.
