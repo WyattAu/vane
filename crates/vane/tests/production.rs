@@ -1,6 +1,24 @@
 //! M1 production-core e2e tests: TLS, connection pooling, failover,
 //! timeouts, and the access-log drain.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+/// Blocking cross-process test lock (flock on a temp file). Proxy suites
+/// spawn real workers and are wall-clock sensitive; serialize them.
+fn lock_serial() -> std::fs::File {
+    use std::os::unix::io::AsRawFd;
+    let path = std::env::temp_dir().join("vane-tests-serial.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .expect("open lock file");
+    // SAFETY: flock on a regular file; released when the File drops.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    assert_eq!(rc, 0, "flock");
+    file
+}
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
@@ -63,6 +81,8 @@ fn spawn_proxy(config: String) -> SocketAddr {
         let code = rt.block_on(vane::server::run(vane::server::RunOptions {
             config_path: Some(config_path),
             handover_from: None,
+            handover_to: None,
+            shutdown_after: None,
             force_mio: true,
         }));
         assert_eq!(code, 0);
@@ -87,6 +107,8 @@ fn http_get(proxy: SocketAddr, target: &str, host: &str) -> String {
 
 #[test]
 fn keep_alive_pool_reuses_upstream_connections() {
+    let _lock = lock_serial();
+
     let (upstream, conns, _h) = spawn_counting_upstream("pool-body");
     let config = format!(
         r#"
@@ -135,6 +157,8 @@ pool_per_backend = 4
 
 #[test]
 fn failover_serves_from_second_backend() {
+    let _lock = lock_serial();
+
     // Backend A: port that refuses connections.
     let dead = TcpListener::bind("127.0.0.1:0").expect("bind");
     let dead_addr = dead.local_addr().expect("addr");
@@ -145,6 +169,7 @@ fn failover_serves_from_second_backend() {
         r#"
 [[listeners]]
 address = "127.0.0.1:LISTEN_PORT"
+workers = 1
 
 [clusters.e2e]
 backends = ["{dead_addr}", "{alive}"]
@@ -172,6 +197,8 @@ connect_timeout_ms = 1000
 
 #[test]
 fn upstream_timeout_yields_504() {
+    let _lock = lock_serial();
+
     // Upstream that accepts but never responds.
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let silent = listener.local_addr().expect("addr");
@@ -188,6 +215,7 @@ fn upstream_timeout_yields_504() {
         r#"
 [[listeners]]
 address = "127.0.0.1:LISTEN_PORT"
+workers = 1
 
 [clusters.e2e]
 backends = ["{silent}"]
@@ -225,6 +253,8 @@ connect_timeout_ms = 1000
 
 #[test]
 fn tls_termination_roundtrip() {
+    let _lock = lock_serial();
+
     // Self-signed cert for the test.
     let key = rcgen::KeyPair::generate().expect("key");
     let params = rcgen::CertificateParams::new(vec!["localhost".into()]).expect("params");
@@ -240,6 +270,7 @@ fn tls_termination_roundtrip() {
         r#"
 [[listeners]]
 address = "127.0.0.1:LISTEN_PORT"
+workers = 1
 [listeners.tls]
 cert = "{}"
 key = "{}"
@@ -308,10 +339,13 @@ force_mio = true
 
 #[test]
 fn env_overrides_apply() {
+    let _lock = lock_serial();
+
     let (upstream, _c, _h) = spawn_counting_upstream("env-body");
     let config = r#"
 [[listeners]]
 address = "127.0.0.1:LISTEN_PORT"
+workers = 1
 
 [clusters.envtest]
 backends = ["127.0.0.1:1"]
