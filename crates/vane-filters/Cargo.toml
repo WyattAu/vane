@@ -1,0 +1,19 @@
+[package]
+name = "vane-filters"
+description = "Monomorphized filter pipeline and built-in filters for Vane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+throttle-kit = { workspace = true }
+breaker = { workspace = true }
+vane-observe = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,31 @@
+[package]
+name = "vane-router"
+description = "Lock-free EBR routing trie and load balancers for Vane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+rkyv = ["dep:rkyv"]
+
+[dependencies]
+crossbeam-epoch = { workspace = true }
+serde = { workspace = true }
+vane-observe = { workspace = true }
+thiserror = { workspace = true }
+rkyv = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+rand = { workspace = true }
+
+[[bench]]
+name = "lookup"
+harness = false
+
+[lints]
+workspace = true
