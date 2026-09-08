@@ -1,0 +1,67 @@
+[package]
+name = "vane"
+description = "Deterministic, zero-copy L4/L7 reverse proxy, edge gateway, and micro sidecar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "vane"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vane"
+path = "src/main.rs"
+
+[features]
+default = ["vane-core/io-uring"]
+file-provider = ["vane-control/file-provider"]
+docker-provider = ["vane-control/docker-provider"]
+h2 = ["dep:h2", "dep:tokio-util"]
+h3 = ["dep:quinn", "dep:h3", "dep:h3-quinn"]
+wasm = ["vane-plugins/wasm"]
+k8s = ["vane-control/k8s"]
+
+[dependencies]
+vane-core = { workspace = true }
+vane-proto = { workspace = true }
+vane-router = { workspace = true }
+vane-filters = { workspace = true }
+vane-control = { workspace = true }
+vane-shm = { workspace = true }
+vane-observe = { workspace = true }
+vane-tls = { workspace = true }
+vane-plugins = { workspace = true }
+
+# Kit ecosystem (control/admin plane)
+healthkit = { workspace = true }
+axum-stack = { workspace = true }
+otelkit = { workspace = true }
+envstack = { workspace = true }
+errcode = { workspace = true }
+
+tokio = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+httparse = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+# Experimental protocol features
+h2 = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+quinn = { workspace = true, optional = true }
+h3 = { workspace = true, optional = true }
+h3-quinn = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+reqwest = { workspace = true }
+
+[lints]
+workspace = true

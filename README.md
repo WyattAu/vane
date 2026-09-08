@@ -1,2 +1,145 @@
 # vane
-L4/L7 reverse proxy,edge gateway, micro sidecar monorepo
+
+**A deterministic, zero-copy L4/L7 reverse proxy, edge gateway, and micro sidecar — in Rust.**
+
+```text
+            ┌──────────────────────────────────────────────────┐
+            │  control plane (Tokio)                           │
+            │  file/docker/K8s providers · ACME · health       │
+            │  ── publishes route generations (EBR swap) ──▶   │
+            └──────────────────────────────────────────────────┘
+   ┌──────────────────────────┬──────────────────────────┐
+   ▼                          ▼                          ▼
+┌──────────────┐      ┌──────────────┐          ┌──────────────┐
+│ worker 0     │      │ worker 1     │   ...    │ worker N     │
+│ pinned core  │      │ pinned core  │          │ pinned core  │
+│ io_uring /   │      │ io_uring /   │          │ io_uring /   │
+│ mio fallback │      │ mio fallback │          │ mio fallback │
+│ slab · fixed │      │ slab · fixed │          │ slab · fixed │
+│ buffers      │      │ buffers      │          │ buffers      │
+└──────────────┘      └──────────────┘          └──────────────┘
+```
+
+- **Thread-per-core, share-nothing** — pinned workers, zero locks on the data
+  plane, cacheline-padded lock-free SPSC command paths.
+- **io_uring with fixed registered buffers** (zero per-op kernel mapping),
+  automatic **mio/epoll fallback** on older kernels.
+- **Lock-free dynamic routing** — immutable radix trie, EBR generation swap
+  across cores in well under 1 ms, ~220 ns lookups at 10k routes.
+- **Monomorphized filter pipelines** — no vtable dispatch; rate limiting
+  (GCRA) and circuit breaking reuse the [`throttle-kit`] and [`breaker`] kits.
+- **POSIX SHM sidecar transport** — co-located services call the proxy over
+  shared-memory rings: **~2.8 µs round-trip** (10× under the 30 µs target).
+- **Zero-loss hot upgrade** — listeners hand over via `SCM_RIGHTS`; route
+  state archives to disk; connections never reset.
+- **Kernel splice passthrough** for L4 — request bytes never enter user space.
+
+[`throttle-kit`]: https://crates.io/crates/throttle-kit
+[`breaker`]: https://crates.io/crates/breaker
+
+## Workspace
+
+| Crate | Role |
+|---|---|
+| `vane-core` | io_uring/mio engines, pinned workers, session slab, SPSC, splice |
+| `vane-proto` | zero-copy HTTP/1.1 (httparse), date cache, response writer |
+| `vane-router` | EBR-published radix trie, P2C/RR/least-conn balancers |
+| `vane-filters` | compile-time pipelines + GCRA/breaker/forwarded built-ins |
+| `vane-control` | config, file/docker/K8s providers, ACME, health checks |
+| `vane-shm` | sidecar ring transport, hot-upgrade handover, C ABI |
+| `vane-tls` | rustls termination, ALPN, ChaCha20 session-ticket cache |
+| `vane-plugins` | wasmtime sandbox (feature `wasm`) |
+| `vane-client-sdk` | Rust SDK + `include/vane_sidecar.h` for C/C++ |
+| `vane` | the binary: CLI, proxy handler, admin plane |
+
+## Quick start
+
+```bash
+# 1. upstream
+python3 -m http.server 9001 &
+
+# 2. config
+cat > vane.toml <<'EOF'
+[[listeners]]
+address = "0.0.0.0:8080"
+
+[clusters.demo]
+backends = ["127.0.0.1:9001"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "demo"
+
+[admin]
+enabled = true
+address = "127.0.0.1:9100"
+EOF
+
+# 3. run
+cargo run -p vane -- run -c vane.toml
+
+# 4. verify
+curl -v localhost:8080/anything
+curl localhost:9100/metrics
+```
+
+### Sidecar mode
+
+```bash
+# in the proxy process (or `vane sidecar`)
+curl localhost:9100/config            # route table
+
+# from a co-located service (Rust):
+Sidecar::connect("/dev/shm/vane-sidecar")?.send(b"GET /health", 1s)?;
+# from C/C++: see crates/vane-client-sdk/include/vane_sidecar.h
+```
+
+### Hot upgrade
+
+```bash
+# new binary takes over listening sockets + routes with zero dropped packets:
+./vane-new run -c vane.toml --handover-from /tmp/vane-handover.sock
+# old binary: sends fds (SCM_RIGHTS) + route archive, then drains and exits
+```
+
+## Performance
+
+Measured on the repository's criterion benches (dev profile — release builds
+are faster):
+
+| Bench | Result | Requirement |
+|---|---|---|
+| HTTP/1.1 head parse (5 headers) | ~266 ns incl. storage reset | `PR-01` |
+| Route lookup @ 10k routes | ~223 ns | `CP-01` |
+| SHM sidecar RTT (512 B) | ~2.8 µs | `IP-01` < 30 µs |
+| Config generation swap | one `Release` store + epoch retire | `CP-02` < 1 ms |
+
+## Engineering gates (Tier A)
+
+`cargo clippy -D warnings` (pedantic) · `llvm-cov ≥ 90%` · **loom**
+model-checking of the SPSC/event rings · **miri** on pure-logic modules ·
+**cargo-fuzz** smoke runs on the parser/router/descriptor · criterion
+baseline regressions. CI mirrors [`WyattAu/engineering-standards`].
+
+[`WyattAu/engineering-standards`]: https://github.com/WyattAu/engineering-standards
+
+## Feature flags
+
+| Flag | Effect |
+|---|---|
+| `io-uring` (default) | io_uring engine; off ⇒ mio fallback |
+| `h2` / `h3` | experimental HTTP/2 & HTTP/3 bridges |
+| `wasm` | wasmtime plugin sandbox |
+| `k8s` | Gateway API provider |
+| `rkyv` | zero-copy route snapshots for handover |
+
+## Deploy
+
+- `Dockerfile` — distroless image
+- `deploy/docker-compose.yml` — local two-service demo
+- `deploy/helm/vane/` — chart with probes, SHM mount, scrape annotations
+- `deploy/vane.example.toml` — full configuration reference
+
+## License
+
+Apache-2.0
