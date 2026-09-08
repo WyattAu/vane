@@ -1,0 +1,42 @@
+[package]
+name = "vane-control"
+description = "Configuration, discovery providers, ACME, and health checks for Vane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = ["file-provider", "docker-provider"]
+file-provider = []
+docker-provider = []
+k8s = []
+
+[dependencies]
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+envstack = { workspace = true }
+validkit = { workspace = true }
+loop-retry = { workspace = true }
+rustls-pki-types = { workspace = true }
+rcgen = { workspace = true }
+ring = { workspace = true }
+base64 = "0.22"
+rand = { workspace = true }
+notify = { workspace = true }
+vane-router = { workspace = true }
+vane-observe = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
