@@ -94,6 +94,31 @@ Sidecar::connect("/dev/shm/vane-sidecar")?.send(b"GET /health", 1s)?;
 # from C/C++: see crates/vane-client-sdk/include/vane_sidecar.h
 ```
 
+### TLS termination
+
+```toml
+[[listeners]]
+address = "0.0.0.0:8443"
+[listeners.tls]
+cert = "/etc/vane/cert.pem"
+key  = "/etc/vane/key.pem"
+```
+
+rustls with ALPN (`h2`, `http/1.1`) and a shared ChaCha20 session-ticket
+cache; pair with the ACME manager for automated certificates.
+
+### Production features
+
+- **Upstream keep-alive pools** per worker/backend with idle eviction and
+  stale-connection retry
+- **Failover**: a dead backend is skipped (up to 2 attempts) while the
+  request is still unsent
+- **Enforced timeouts**: connect / first-byte / idle — 504 on expiry,
+  breaker-recorded
+- **Env overrides** (container-friendly layering over TOML):
+  `VANE_LISTEN`, `VANE_TLS_CERT`/`VANE_TLS_KEY`, `VANE_ADMIN_ADDR`,
+  `VANE_CLUSTER_<NAME>` (comma-separated backends), `VANE_WORKERS`
+
 ### Hot upgrade
 
 ```bash
@@ -112,6 +137,7 @@ are faster):
 | HTTP/1.1 head parse (5 headers) | ~266 ns incl. storage reset | `PR-01` |
 | Route lookup @ 10k routes | ~223 ns | `CP-01` |
 | SHM sidecar RTT (512 B) | ~2.8 µs | `IP-01` < 30 µs |
+| Keep-alive pool | 1 upstream conn across 5 sequential requests | new |
 | Config generation swap | one `Release` store + epoch retire | `CP-02` < 1 ms |
 
 ## Engineering gates (Tier A)

@@ -25,7 +25,14 @@ pub struct RunOptions {
     pub force_mio: bool,
 }
 
-/// Loads config from the given path or the default locations.
+/// Loads config from the given path or the default locations, then applies
+/// `VANE_*` environment overrides (container-friendly layering):
+///
+/// - `VANE_LISTEN` — replaces the first listener's address
+/// - `VANE_TLS_CERT` / `VANE_TLS_KEY` — TLS material for the first listener
+/// - `VANE_ADMIN_ADDR` — admin bind address
+/// - `VANE_CLUSTER_<NAME>` — comma-separated backends for cluster `<NAME>`
+/// - `VANE_WORKERS` — workers per listener (0 = per core)
 ///
 /// # Errors
 /// Missing file or invalid TOML.
@@ -35,7 +42,51 @@ pub fn load_config(path: Option<&str>) -> Result<VaneConfig, String> {
         .or_else(|| std::env::var("VANE_CONFIG").ok())
         .unwrap_or_else(|| "vane.toml".to_owned());
     let text = std::fs::read_to_string(&path).map_err(|e| format!("read {path}: {e}"))?;
-    let cfg = VaneConfig::parse_toml(&text).map_err(|e| e.to_string())?;
+    let mut cfg = VaneConfig::parse_toml(&text).map_err(|e| e.to_string())?;
+
+    if let Ok(addr) = std::env::var("VANE_LISTEN") {
+        if let Some(l) = cfg.listeners.first_mut() {
+            l.address = addr;
+        } else {
+            cfg.listeners.push(vane_control::ListenerConfig {
+                address: addr,
+                mode: vane_control::config::ListenerMode::Http,
+                workers: 0,
+                tls: None,
+            });
+        }
+    }
+    if let (Ok(cert), Ok(key)) = (
+        std::env::var("VANE_TLS_CERT"),
+        std::env::var("VANE_TLS_KEY"),
+    ) {
+        if let Some(l) = cfg.listeners.first_mut() {
+            l.tls = Some(vane_control::ListenerTls { cert, key });
+        }
+    }
+    if let Ok(addr) = std::env::var("VANE_ADMIN_ADDR") {
+        cfg.admin.address = addr;
+        cfg.admin.enabled = true;
+    }
+    for (name, cluster) in cfg.clusters.iter_mut() {
+        let key = format!("VANE_CLUSTER_{}", name.to_uppercase());
+        if let Ok(backends) = std::env::var(key) {
+            cluster.backends = backends
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+        }
+    }
+    if let Ok(w) = std::env::var("VANE_WORKERS") {
+        if let Ok(n) = w.parse::<usize>() {
+            for l in &mut cfg.listeners {
+                l.workers = n;
+            }
+        }
+    }
+
     cfg.validate().map_err(|e| e.to_string())?;
     Ok(cfg)
 }
@@ -67,10 +118,14 @@ pub async fn run(opts: RunOptions) -> i32 {
 
     // ---- Control plane (tokio) ------------------------------------------
     #[cfg_attr(
-    not(any(feature = "file-provider", feature = "docker-provider", feature = "k8s")),
-    allow(unused_variables)
-)]
-let (update_tx, update_rx) = tokio::sync::mpsc::channel(64);
+        not(any(
+            feature = "file-provider",
+            feature = "docker-provider",
+            feature = "k8s"
+        )),
+        allow(unused_variables)
+    )]
+    let (update_tx, update_rx) = tokio::sync::mpsc::channel(64);
     let mut reconciler = Reconciler::new(
         Arc::clone(&router),
         Arc::clone(&health),
@@ -211,6 +266,9 @@ let (update_tx, update_rx) = tokio::sync::mpsc::channel(64);
         .first()
         .map_or(1, |l| if l.workers == 0 { cores } else { l.workers });
     let mut handles = Vec::new();
+    let mut event_rings: Vec<
+        Arc<EventRing<vane_observe::LogEvent, { vane_observe::EVENT_RING_CAPACITY }>>,
+    > = Vec::new();
     for (li, listener) in bound.into_iter().enumerate() {
         let mode = match config
             .listeners
@@ -220,6 +278,23 @@ let (update_tx, update_rx) = tokio::sync::mpsc::channel(64);
             ListenerMode::Http => CoreMode::Http,
             ListenerMode::Tcp => CoreMode::L4,
         };
+        // TLS termination material for this listener (built once, shared).
+        let tls_cfg: Option<Arc<rustls::ServerConfig>> =
+            match config.listeners.get(li).and_then(|l| l.tls.as_ref()) {
+                Some(t) if mode == CoreMode::Http => {
+                    match vane_tls::server_config(
+                        std::path::Path::new(&t.cert),
+                        std::path::Path::new(&t.key),
+                    ) {
+                        Ok(cfg) => Some(Arc::new(cfg)),
+                        Err(e) => {
+                            eprintln!("vane: listener {}: tls: {e}", config.listeners[li].address);
+                            return 1;
+                        }
+                    }
+                }
+                _ => None,
+            };
         for w in 0..workers_per_listener {
             // SO_REUSEPORT lets each worker own a duplicate bind; the
             // kernel load-balances accepts across cores.
@@ -241,20 +316,23 @@ let (update_tx, update_rx) = tokio::sync::mpsc::channel(64);
                 max_sessions: config.runtime.max_sessions,
                 backlog: config.runtime.backlog,
             };
+            let events = Arc::new(EventRing::new());
+            event_rings.push(Arc::clone(&events));
             let factory = WorkerFactory {
                 mode,
                 router: Arc::clone(&router),
                 registry: Arc::clone(&registry),
                 worker_id: li * workers_per_listener + w,
-                events: Arc::new(EventRing::new()),
+                events,
+                tls: tls_cfg.clone(),
+                runtime: config.runtime.clone(),
             };
-            let events = Arc::new(EventRing::new());
             match spawn_worker(
                 li * workers_per_listener + w,
                 worker_cfg,
                 listener,
                 Arc::clone(&registry),
-                events,
+                Arc::clone(&factory.events),
                 &factory,
             ) {
                 Ok(h) => handles.push(h),
@@ -264,6 +342,45 @@ let (update_tx, update_rx) = tokio::sync::mpsc::channel(64);
                 }
             }
         }
+    }
+
+    // ---- Access-log drain: workers push fixed-size events into their
+    // rings; this task bridges them into `tracing` (never blocks workers).
+    {
+        let rings = event_rings.clone();
+        tokio::spawn(async move {
+            loop {
+                let mut any = false;
+                for (worker, ring) in rings.iter().enumerate() {
+                    while let Some(ev) = ring.try_pop() {
+                        any = true;
+                        let msg = String::from_utf8_lossy(ev.msg()).into_owned();
+                        match vane_observe::LogLevel::from_u8(ev.level) {
+                            vane_observe::LogLevel::Error => {
+                                tracing::error!(worker, "{}", msg);
+                            }
+                            vane_observe::LogLevel::Warn => {
+                                tracing::warn!(worker, "{}", msg);
+                            }
+                            vane_observe::LogLevel::Debug => {
+                                tracing::debug!(worker, "{}", msg);
+                            }
+                            vane_observe::LogLevel::Trace => {
+                                tracing::trace!(worker, "{}", msg);
+                            }
+                            vane_observe::LogLevel::Info => {
+                                tracing::info!(worker, "{}", msg);
+                            }
+                        }
+                    }
+                }
+                if !any {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                } else {
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
     }
 
     // ---- Admin server ----------------------------------------------------
@@ -312,6 +429,10 @@ struct WorkerFactory {
     registry: Arc<Registry>,
     worker_id: usize,
     events: Arc<EventRing<vane_observe::LogEvent, { vane_observe::EVENT_RING_CAPACITY }>>,
+    /// TLS termination config for this worker's listener (`None` = plain).
+    tls: Option<Arc<rustls::ServerConfig>>,
+    /// Runtime knobs from config.
+    runtime: vane_control::RuntimeConfig,
 }
 
 impl vane_core::HandlerFactory for WorkerFactory {
@@ -326,8 +447,11 @@ impl vane_core::HandlerFactory for WorkerFactory {
                 registry: Arc::clone(&self.registry),
                 events: Arc::clone(&self.events),
                 rate_limit_rps: None,
-                connect_timeout_ms: 5_000,
-                idle_timeout_ms: 75_000,
+                connect_timeout_ms: self.runtime.connect_timeout_ms,
+                idle_timeout_ms: self.runtime.idle_timeout_ms,
+                first_byte_timeout_ms: self.runtime.first_byte_timeout_ms,
+                pool_per_backend: self.runtime.pool_per_backend,
+                tls: self.tls.clone(),
             },
             self.worker_id,
         ))

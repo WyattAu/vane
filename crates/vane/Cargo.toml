@@ -49,6 +49,8 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 httparse = { workspace = true }
+rustls = { workspace = true }
+libc = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 
@@ -61,7 +63,7 @@ h3-quinn = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-reqwest = { workspace = true }
+rcgen = { workspace = true }
 
 [lints]
 workspace = true
