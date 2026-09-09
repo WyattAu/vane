@@ -169,15 +169,6 @@ impl AcmeManager {
         }
     }
 
-    /// The stored account URL (kid), if the account was created this run.
-    fn account_kid(&self) -> Result<String, AcmeError> {
-        self.account_url
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            .ok_or_else(|| AcmeError::new("account URL not yet known"))
-    }
-
     /// HTTP-01 challenge responses: `token -> key authorization`.
     ///
     /// The proxy's HTTP handler consults this for
@@ -273,12 +264,13 @@ impl AcmeManager {
     ///
     /// Note: the parsed-JSON variant (`jws_post`) cannot return PEM; this
     /// is only used for the certificate chain download.
+    #[allow(clippy::unused_async)]
     async fn jws_post_raw_text(
         &self,
         key: &EcdsaKeyPair,
         dir: &Directory,
         url: &str,
-        payload: serde_json::Value,
+        _payload: serde_json::Value,
         kid: Option<&str>,
     ) -> Result<(String, Option<String>), AcmeError> {
         let nonce = self.nonce(dir).await?;
@@ -441,7 +433,7 @@ impl AcmeManager {
             "contact": self.config.emails.iter().map(|e| format!("mailto:{e}")).collect::<Vec<_>>(),
             "onlyReturnExisting": false
         });
-        let (account, account_location, _): (
+        let (_account, account_location, _): (
             Option<serde_json::Value>,
             Option<String>,
             Option<String>,
@@ -618,13 +610,6 @@ impl AcmeManager {
             .await?;
         self.persist_certs(&cert_text)?;
         Ok(self.config.domains.clone())
-    }
-
-    fn account_pkcs8(&self, key: &EcdsaKeyPair) -> Result<Vec<u8>, AcmeError> {
-        // We generated from rcgen's PKCS#8; re-read from disk.
-        let _ = key;
-        let path = self.config.storage.join("account.key");
-        std::fs::read(&path).map_err(|e| AcmeError::new(e.to_string()))
     }
 
     /// Builds the full key authorization for a token (JWK thumbprint).

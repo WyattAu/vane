@@ -98,6 +98,8 @@ pub struct HttpProxy {
     date: vane_proto::date::DateCache,
     /// Idle upstream connection pool (per backend, worker-local).
     pool: HashMap<SocketAddr, Vec<RawFd>>,
+    /// Per-cluster request counters (lazily registered, one per cluster).
+    cluster_metrics: HashMap<String, ClusterMetric>,
     /// Loaded plugin instances (one set per worker; instances are !Sync).
     #[cfg(feature = "wasm")]
     plugins: Vec<vane_plugins::PluginInstance>,
@@ -112,6 +114,35 @@ struct ProxyMetrics {
     bytes_in: MetricHandle,
     bytes_out: MetricHandle,
     latency: MetricHandle,
+}
+
+/// Lazily-registered per-cluster counters. Registration takes a brief
+/// control-plane lock on first sight of a cluster; every subsequent
+/// request is lock-free.
+#[derive(Clone)]
+struct ClusterMetric {
+    requests: MetricHandle,
+    errors: MetricHandle,
+}
+
+impl ClusterMetric {
+    fn register(registry: &Registry, cluster: &str) -> Self {
+        // Prometheus label sanitation: [a-zA-Z0-9_].
+        let safe: String = cluster
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        Self {
+            requests: registry.register(
+                &format!("vane_cluster_{safe}_requests_total"),
+                MetricKind::Counter,
+            ),
+            errors: registry.register(
+                &format!("vane_cluster_{safe}_upstream_errors_total"),
+                MetricKind::Counter,
+            ),
+        }
+    }
 }
 
 impl HttpProxy {
@@ -173,6 +204,7 @@ impl HttpProxy {
             conns: HashMap::new(),
             date: vane_proto::date::DateCache::new(),
             pool: HashMap::new(),
+            cluster_metrics: HashMap::new(),
             #[cfg(feature = "wasm")]
             plugins,
             metrics,
@@ -332,6 +364,18 @@ impl HttpProxy {
 
     fn conn(&mut self, slot: u32) -> &mut Conn {
         self.conns.entry(slot).or_default()
+    }
+
+    /// Lazily registers and returns a cluster's metric handles. First sight
+    /// of a cluster takes the registry's control-plane lock once; later
+    /// requests are lock-free handle lookups.
+    fn cluster_metric(&mut self, cluster: &str) -> ClusterMetric {
+        if let Some(m) = self.cluster_metrics.get(cluster) {
+            return m.clone();
+        }
+        let m = ClusterMetric::register(&self.config.registry, cluster);
+        self.cluster_metrics.insert(cluster.to_owned(), m.clone());
+        m
     }
 
     fn respond_full(&mut self, io: &mut SessionIo<'_>, status: Status, body: &str) {
@@ -619,8 +663,16 @@ impl Handler for HttpProxy {
     fn on_upstream_error(&mut self, io: &mut SessionIo<'_>, err: io::Error) {
         self.metrics.upstream_errors.inc(&self.config.registry);
         let slot = io.slot_index();
-        if let Some(route) = &self.conns.get(&slot).expect("conn exists").route {
-            self.breaker.record_failure(&route.cluster);
+        if let Some(cluster) = self
+            .conns
+            .get(&slot)
+            .and_then(|c| c.route.as_ref())
+            .map(|r| r.cluster.clone())
+        {
+            self.breaker.record_failure(&cluster);
+            self.cluster_metric(&cluster)
+                .errors
+                .inc(&self.config.registry);
         }
         self.log(LogLevel::Warn, &format!("upstream error: {err}"));
         self.upstream_failed(io);
@@ -745,6 +797,10 @@ impl HttpProxy {
             self.respond_full(io, Status::ServiceUnavailable, "no healthy upstream\n");
             return;
         };
+        // Per-cluster request counter.
+        let cluster_requests = self.cluster_metric(&route.cluster).requests;
+        cluster_requests.inc(&self.config.registry);
+
         // Stash transaction state.
         {
             let conn = self.conn(slot);

@@ -16,7 +16,7 @@
 //! certificate download.
 
 use std::sync::Arc;
-use std::time::Duration;
+
 use vane_control::acme::{AcmeConfig, AcmeManager};
 
 #[tokio::test]
@@ -37,39 +37,7 @@ async fn acme_issues_certificate_against_pebble() {
     let worker = Arc::clone(&mgr);
     let issuance = tokio::spawn(async move { worker.obtain_certificate().await });
 
-    let challenge_relay = tokio::spawn(async move {
-        let http = reqwest::Client::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        let mut pushed: std::collections::HashSet<String> = Default::default();
-        while std::time::Instant::now() < deadline {
-            let Some(token) = mgr
-                .http01_tokens()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .keys()
-                .next()
-                .cloned()
-            else {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            };
-            if pushed.insert(token.clone()) {
-                let Ok(key_auth) = mgr.http01_key_auth(&token) else {
-                    continue;
-                };
-                let body = format!(r#"{{"token": "{token}", "content": "{key_auth}"}}"#);
-                let _ = http
-                    .post("http://127.0.0.1:8055/add-http01")
-                    .header("Content-Type", "application/json")
-                    .body(body)
-                    .send()
-                    .await;
-            }
-        }
-    });
-
     let result = issuance.await.expect("issuance task");
-    let _ = challenge_relay;
     assert!(result.is_ok(), "acme issuance failed: {result:?}");
 
     let cert = std::fs::read_to_string(storage.path().join("cert.pem")).expect("cert.pem written");
