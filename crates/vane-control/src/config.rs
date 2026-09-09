@@ -243,6 +243,9 @@ pub struct AcmeSection {
     pub emails: Vec<String>,
     /// Persisted account/cert directory.
     pub storage_dir: Option<PathBuf>,
+    /// Accept invalid ACME endpoint certificates (pebble/CI only).
+    #[serde(default)]
+    pub insecure_tls: bool,
 }
 
 /// Domains managed by ACME.

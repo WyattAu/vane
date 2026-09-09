@@ -41,6 +41,8 @@ pub struct ProxyConfig {
     /// TLS termination config (`None` = plaintext listener). Shared slot:
     /// hot reload swaps the inner Arc without touching workers.
     pub tls: Option<Arc<std::sync::RwLock<Arc<rustls::ServerConfig>>>>,
+    /// Shared HTTP-01 token map (Some when ACME is configured).
+    pub http01_tokens: Option<Arc<std::sync::Mutex<HashMap<String, String>>>>,
     /// Wasm plugin module paths (feature `wasm`; applied to every request
     /// in order, before routing).
     pub plugins: Vec<String>,
@@ -104,6 +106,8 @@ pub struct HttpProxy {
     pool: HashMap<SocketAddr, Vec<RawFd>>,
     /// Per-cluster request counters (lazily registered, one per cluster).
     cluster_metrics: HashMap<String, ClusterMetric>,
+    /// Shared ACME HTTP-01 token map.
+    http01_tokens: Option<Arc<std::sync::Mutex<HashMap<String, String>>>>,
     /// Loaded plugin instances (one set per worker; instances are !Sync).
     #[cfg(feature = "wasm")]
     plugins: Vec<vane_plugins::PluginInstance>,
@@ -201,6 +205,7 @@ impl HttpProxy {
                 config.plugins.len()
             );
         }
+        let http01_tokens = config.http01_tokens.clone();
         Self {
             config,
             pipeline,
@@ -209,6 +214,7 @@ impl HttpProxy {
             date: vane_proto::date::DateCache::new(),
             pool: HashMap::new(),
             cluster_metrics: HashMap::new(),
+            http01_tokens,
             #[cfg(feature = "wasm")]
             plugins,
             metrics,
@@ -751,6 +757,55 @@ impl HttpProxy {
     fn handle_request(&mut self, io: &mut SessionIo<'_>, view: &RequestView<'_>, _head_len: usize) {
         let started = Instant::now();
         let slot = io.slot_index();
+
+        // ACME HTTP-01 challenges bypass routing entirely (RFC 8555 §8.3):
+        // answered from the shared token map before any route lookup.
+        if self.config.http01_tokens.is_some()
+            && view.path.starts_with("/.well-known/acme-challenge/")
+        {
+            let token = &view.path["/.well-known/acme-challenge/".len()..];
+            let answer = self
+                .config
+                .http01_tokens
+                .as_ref()
+                .expect("checked")
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(token)
+                .cloned();
+            match answer {
+                Some(key_auth) => {
+                    eprintln!("[acme-dbg] SERVED token={token} ka={key_auth}");
+                    self.respond_full(io, Status::Ok, &key_auth);
+                }
+                None => {
+                    let map = self.config.http01_tokens.as_ref().expect("checked");
+                    let m = map.lock().unwrap_or_else(|e| e.into_inner());
+                    eprintln!(
+                        "[acme-dbg] MISS token={token} map_len={} keys={:?}",
+                        m.len(),
+                        m.keys().collect::<Vec<_>>()
+                    );
+                    drop(m);
+                    self.respond_full(io, Status::NotFound, "unknown token\n");
+                }
+                None => {
+                    let len = self
+                        .config
+                        .http01_tokens
+                        .as_ref()
+                        .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()).len())
+                        .unwrap_or(0);
+                    eprintln!("[acme-dbg] serve miss: token={token} map_len={len}");
+                }
+                None => {
+                    self.respond_full(io, Status::NotFound, "unknown token\n");
+                }
+            }
+            io.close();
+            return;
+        }
+
         let host = view
             .header("host")
             .and_then(|h| std::str::from_utf8(h).ok());

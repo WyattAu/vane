@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::collections::HashMap;
+use vane_control::acme::AcmeManager;
 use vane_control::config::ListenerMode;
 use vane_control::{Reconciler, VaneConfig};
 use vane_core::handler::Mode as CoreMode;
@@ -118,6 +120,7 @@ pub async fn run(opts: RunOptions) -> i32 {
             return 1;
         }
     };
+    eprintln!("[run-dbg] config loaded");
     if config.listeners.is_empty() {
         eprintln!("vane: no listeners configured");
         return 1;
@@ -144,6 +147,50 @@ pub async fn run(opts: RunOptions) -> i32 {
         update_rx,
     );
 
+    // ---- ACME manager (certificate renewal + HTTP-01 answers) ----------
+    let http01_tokens: Option<Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>> =
+        if !config.acme.domains.is_empty() {
+            let storage = config
+                .acme
+                .storage_dir
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from("/var/lib/vane/acme"));
+            let acme_cfg = vane_control::acme::AcmeConfig {
+                directory_url: config
+                    .acme
+                    .directory_url
+                    .clone()
+                    .unwrap_or_else(|| "https://acme-v02.api.letsencrypt.org/directory".into()),
+                emails: config.acme.emails.clone(),
+                domains: config
+                    .acme
+                    .domains
+                    .iter()
+                    .map(|d| d.domain.clone())
+                    .collect(),
+                storage: storage.clone(),
+                renew_at_fraction: 2.0 / 3.0,
+                insecure_tls: config.acme.insecure_tls,
+                challenge_answer_url: None,
+            };
+            let mgr = Arc::new(AcmeManager::new(acme_cfg));
+            mgr.clone().spawn_renewal();
+            tracing::info!(
+                "acme: managing {:?} (storage {})",
+                config
+                    .acme
+                    .domains
+                    .iter()
+                    .map(|d| &d.domain)
+                    .collect::<Vec<_>>(),
+                storage.display()
+            );
+            Some(mgr.http01_tokens())
+        } else {
+            None
+        };
+
+    eprintln!("[run-dbg] acme wired");
     // Static routes + health probe paths.
     reconciler.publish_static(&config);
     let mut checker = vane_control::HealthChecker::new(Arc::clone(&health), Duration::from_secs(5));
@@ -270,6 +317,7 @@ pub async fn run(opts: RunOptions) -> i32 {
         }
     }
 
+    eprintln!("[run-dbg] listeners bound: {}", bound.len());
     // ---- Spawn workers (one per listener × core) ------------------------
     // Keep dup'd listener fds for the hot-upgrade sender (SCM_RIGHTS needs
     // an owned fd at shutdown; the workers get their own clones).
@@ -364,6 +412,7 @@ pub async fn run(opts: RunOptions) -> i32 {
                 tls: tls_cfg.clone(),
                 runtime: config.runtime.clone(),
                 plugins: config.plugins.iter().map(|p| p.path.clone()).collect(),
+                http01_tokens: http01_tokens.clone(),
             };
             match spawn_worker(
                 li * workers_per_listener + w,
@@ -570,6 +619,8 @@ struct WorkerFactory {
     runtime: vane_control::RuntimeConfig,
     /// Wasm plugin paths.
     plugins: Vec<String>,
+    /// Shared HTTP-01 token map (Some when ACME is configured).
+    http01_tokens: Option<Arc<std::sync::Mutex<HashMap<String, String>>>>,
 }
 
 impl vane_core::HandlerFactory for WorkerFactory {
@@ -590,6 +641,7 @@ impl vane_core::HandlerFactory for WorkerFactory {
                 pool_per_backend: self.runtime.pool_per_backend,
                 tls: self.tls.clone(),
                 plugins: self.plugins.clone(),
+                http01_tokens: self.http01_tokens.clone(),
             },
             self.worker_id,
         ))

@@ -41,11 +41,14 @@ impl std::error::Error for AcmeError {}
 
 impl loop_retry::IsRetryable for AcmeError {
     fn is_retryable(&self) -> bool {
-        // 4xx protocol errors (bad CSR, unauthorized) never recover; any
-        // other failure is treated as transient infrastructure trouble.
-        !(self.message.contains("400")
-            || self.message.contains("403")
-            || self.message.contains("404"))
+        // Nonce rejections are retried with a fresh nonce; transport and
+        // 5xx failures are transient. Explicit 4xx protocol rejections
+        // (malformed, unauthorized) are terminal.
+        if self.retryable_nonce {
+            return true;
+        }
+        let m = &self.message;
+        !(m.contains(" 400 ") || m.contains(" 403 ") || m.contains(" 404 "))
     }
 }
 use ring::rand::SystemRandom;
@@ -410,6 +413,10 @@ impl AcmeManager {
     /// Obtains a certificate for the configured domains (blocking flow,
     /// called from the renewal loop).
     pub async fn obtain_certificate(&self) -> Result<Vec<String>, AcmeError> {
+        eprintln!(
+            "[acme-dbg] obtain_certificate start: {:?}",
+            self.config.domains
+        );
         if self.config.domains.is_empty() {
             return Ok(Vec::new());
         }
@@ -422,6 +429,7 @@ impl AcmeManager {
             .text()
             .await
             .map_err(|e| AcmeError::new(e.to_string()))?;
+        eprintln!("[acme-dbg] dir fetched");
         eprintln!("[acme-dbg] dir: {dir_text}");
         let dir: Directory =
             serde_json::from_str(&dir_text).map_err(|e| AcmeError::new(e.to_string()))?;
@@ -533,8 +541,14 @@ impl AcmeManager {
                             valid = true;
                             break;
                         }
-                        "pending" => tokio::time::sleep(Duration::from_secs(2)).await,
-                        _ => return Err(AcmeError::new("authorization failed")),
+                        "pending" => {
+                            eprintln!("[acme-dbg] authz pending: {auth_url}");
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        }
+                        other => {
+                            eprintln!("[acme-dbg] authz {other:?}: {auth_url}");
+                            return Err(AcmeError::new("authorization failed"));
+                        }
                     },
                     Ok(_) => break,
                     Err(e) if e.retryable_nonce => {
@@ -551,6 +565,13 @@ impl AcmeManager {
         // Finalize with a CSR (fresh cert keypair, NOT the account key —
         // pebble rejects CSRs reusing the account public key).
         let cert_key = rcgen::KeyPair::generate().map_err(|e| AcmeError::new(e.to_string()))?;
+        // Persist the cert key NOW: TLS listeners watch privkey.pem and the
+        // reload must be able to load both files on the change event.
+        std::fs::write(
+            self.config.storage.join("privkey.pem"),
+            cert_key.serialize_pem(),
+        )
+        .map_err(|e| AcmeError::new(e.to_string()))?;
         let key_pair = cert_key;
         let mut params = rcgen::CertificateParams::new(self.config.domains.clone())
             .map_err(|e| AcmeError::new(e.to_string()))?;
@@ -627,6 +648,10 @@ impl AcmeManager {
             jwk["y"].as_str().unwrap_or("")
         );
         let digest = ring::digest::digest(&ring::digest::SHA256, canonical.as_bytes());
+        eprintln!(
+            "[acme-dbg] key_auth token={token} thumb={} canonical={canonical}",
+            Self::b64(digest.as_ref())
+        );
         Ok(format!("{token}.{}", Self::b64(digest.as_ref())))
     }
 
