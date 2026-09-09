@@ -107,7 +107,8 @@ impl K8sProvider {
             #[serde(default)]
             matches: Vec<PathMatch>,
             #[serde(default)]
-            backendRefs: Vec<BackendRef>,
+            #[serde(rename = "backendRefs")]
+            backend_refs: Vec<BackendRef>,
         }
         #[derive(Deserialize)]
         struct PathMatch {
@@ -161,7 +162,7 @@ impl K8sProvider {
                         .and_then(|m| m.path.as_ref())
                         .and_then(|p| p.value.clone())
                         .unwrap_or_else(|| "/".to_owned());
-                    for br in &rule.backendRefs {
+                    for br in &rule.backend_refs {
                         let Some(name) = br.name.clone() else {
                             continue;
                         };

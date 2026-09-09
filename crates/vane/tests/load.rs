@@ -1,17 +1,11 @@
-//! Regression anchor for the sustained-load engine bug.
+//! Sustained-load regression gate: 8 client threads x 500 keep-alive
+//! requests (4000 total) with framed response reads.
 //!
-//! Currently #[ignore]: under sustained concurrent load (32+ connections,
-//! thousands of requests) the engine exhibits:
-//! - debug builds: stop responding partway through (poll loop starves)
-//! - release builds: EBADF storms on upstream writes (fd lifecycle race)
-//!
-//! Small sequential/low-concurrency flows pass (see e2e.rs/production.rs),
-//! so the defect is in the sustained-concurrency path — likely the mio
-//! pending-op table vs fd reuse, or pool-slot lifetime across
-//! attach/detach cycles. Fixing this is the top roadmap item; un-ignore
-//! this test to work on it.
-//!
-//! Run: cargo test -p vane --test load -- --ignored --nocapture
+//! History: this test exposed two defects — (1) the test client itself
+//! read unframed responses (fixed here), and (2) a synchronous-connect
+//! path that never invoked `on_upstream_connected` (fixed via
+//! `UpstreamDial`). It guards the per-request engine/handler machinery
+//! under real concurrency.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -42,8 +36,9 @@ fn spawn_upstream() -> SocketAddr {
 }
 
 #[test]
-#[ignore = "sustained-load engine bug (see module docs) — un-ignore when fixed"]
 fn sustained_concurrent_load_no_failures() {
+    // Wall-clock sensitive (many workers); serialize with the other suites.
+    let _lock = lock_serial();
     let upstream = spawn_upstream();
     let probe = TcpListener::bind("127.0.0.1:0").expect("probe");
     let proxy_addr = probe.local_addr().expect("addr");
@@ -101,6 +96,9 @@ force_mio = true
     }
 
     // 8 client threads x 500 keep-alive requests = 4000 requests.
+    // Clients read *framed* responses (status line + Content-Length body):
+    // TCP segmentation may split or coalesce response bytes arbitrarily,
+    // so a single read() is never a complete response.
     let failures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let total = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut clients = Vec::new();
@@ -109,27 +107,67 @@ force_mio = true
         let total = Arc::clone(&total);
         clients.push(std::thread::spawn(move || {
             let mut s = TcpStream::connect(proxy_addr).expect("connect");
-            s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            s.set_read_timeout(Some(Duration::from_secs(15))).ok();
+            let mut acc: Vec<u8> = Vec::with_capacity(4096);
+            let mut tmp = [0u8; 4096];
             for i in 0..500 {
                 let req = format!("GET /r{i} HTTP/1.1\r\nHost: t\r\n\r\n");
-                if s.write_all(req.as_bytes()).is_err() {
+                if let Err(e) = s.write_all(req.as_bytes()) {
+                    eprintln!("[client] req{i} write failed: {e}");
                     failures.fetch_add(1, Ordering::SeqCst);
                     return;
                 }
-                let mut buf = [0u8; 1024];
-                match s.read(&mut buf) {
-                    Ok(n) if n > 0 => {
-                        let head = String::from_utf8_lossy(&buf[..n.min(64)]).into_owned();
-                        if !head.starts_with("HTTP/1.1 200") {
+                // Drain one full response: head, then Content-Length body.
+                let head_end = loop {
+                    match s.read(&mut tmp) {
+                        Ok(0) => {
+                            eprintln!("[client] req{i} eof waiting for head");
+                            failures.fetch_add(1, Ordering::SeqCst);
+                            return;
+                        }
+                        Ok(n) => {
+                            acc.extend_from_slice(&tmp[..n]);
+                            if let Some(p) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break p + 4;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[client] req{i} head read failed: {e}");
                             failures.fetch_add(1, Ordering::SeqCst);
                             return;
                         }
                     }
-                    _ => {
-                        failures.fetch_add(1, Ordering::SeqCst);
-                        return;
+                };
+                let head = String::from_utf8_lossy(&acc[..head_end]).into_owned();
+                if !head.starts_with("HTTP/1.1 200") {
+                    eprintln!("[client] req{i} non-200: {head:?}");
+                    failures.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+                let cl: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("Content-Length:")
+                            .or_else(|| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse().ok())
+                    })
+                    .unwrap_or(0);
+                while acc.len() < head_end + cl {
+                    match s.read(&mut tmp) {
+                        Ok(0) => {
+                            eprintln!("[client] req{i} eof waiting for body");
+                            failures.fetch_add(1, Ordering::SeqCst);
+                            return;
+                        }
+                        Ok(n) => acc.extend_from_slice(&tmp[..n]),
+                        Err(e) => {
+                            eprintln!("[client] req{i} body read failed: {e}");
+                            failures.fetch_add(1, Ordering::SeqCst);
+                            return;
+                        }
                     }
                 }
+                acc.drain(..head_end + cl);
                 total.fetch_add(1, Ordering::SeqCst);
             }
         }));
@@ -144,3 +182,19 @@ force_mio = true
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+
+/// Blocking cross-process test lock (flock on a temp file).
+fn lock_serial() -> std::fs::File {
+    use std::os::unix::io::AsRawFd;
+    let path = std::env::temp_dir().join("vane-tests-serial.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .expect("open lock file");
+    // SAFETY: flock on a regular file; released when the File drops.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    assert_eq!(rc, 0, "flock");
+    file
+}

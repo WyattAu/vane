@@ -334,8 +334,6 @@ impl HttpProxy {
     }
 
     fn respond_full(&mut self, io: &mut SessionIo<'_>, status: Status, body: &str) {
-        #[cfg(feature = "vane_dbg")]
-        eprintln!("[resp] {} {}", status.code(), body.trim());
         let _ = io.slot_index();
         let mut buf = [0u8; 1024];
         if let Ok(n) = write_full(&mut buf, status, body.as_bytes(), &[], &self.date) {
@@ -624,6 +622,11 @@ impl Handler for HttpProxy {
         self.upstream_failed(io);
     }
 
+    fn on_downstream_error(&mut self, io: &mut SessionIo<'_>, err: io::Error) {
+        let _ = err;
+        io.close();
+    }
+
     fn on_shutdown_hint(&mut self, io: &mut SessionIo<'_>) {
         // Drain: finish the current transaction, then close. The idle
         // deadline still applies; keep-alive ends after this response.
@@ -669,7 +672,6 @@ impl HttpProxy {
             .header("host")
             .and_then(|h| std::str::from_utf8(h).ok());
         let host_only = host.map(|h| h.split(':').next().unwrap_or(h));
-
         // Route lookup on the live snapshot.
         let table = self.config.router.load();
         let matched = table.table().lookup(host_only, view.path).map(|m| {
@@ -739,7 +741,6 @@ impl HttpProxy {
             self.respond_full(io, Status::ServiceUnavailable, "no healthy upstream\n");
             return;
         };
-
         // Stash transaction state.
         {
             let conn = self.conn(slot);

@@ -9,8 +9,10 @@
 set -euo pipefail
 
 DURATION="${1:-10}"
-PORT_UP=19999
-PORT_PROXY=18080
+# Random free ports per run: fixed ports invite stale proxies (SO_REUSEPORT
+# silently load-balances into them).
+PORT_UP=$(python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1])")
+PORT_PROXY=$(python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1])")
 
 echo "== building (release) =="
 cargo build --release -p vane
@@ -27,10 +29,14 @@ def serve():
         c, _ = s.accept()
         threading.Thread(target=handle, args=(c,), daemon=True).start()
 def handle(c):
+    # Keep-alive loop: same connection serves many requests, so ab measures
+    # the PROXY (connection setup + routing + relay), not thread spawning.
     try:
-        c.recv(4096)
-        body = b"hello-vane"
-        c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n" + body)
+        while True:
+            d = c.recv(4096)
+            if not d:
+                break
+            c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: keep-alive\r\n\r\nhello-vane")
     finally:
         c.close()
 serve()
@@ -39,10 +45,11 @@ PY
 UP_PID=$!
 sleep 0.5
 
+WORKERS="${WORKERS:-1}"
 cat > /tmp/vane-bench.toml <<TOML
 [[listeners]]
 address = "127.0.0.1:$PORT_PROXY"
-workers = 1
+workers = $WORKERS
 
 [clusters.bench]
 backends = ["127.0.0.1:$PORT_UP"]
@@ -55,7 +62,7 @@ cluster = "bench"
 enabled = false
 TOML
 
-echo "== vane (release, 1 worker) on :$PORT_PROXY =="
+echo "== vane (release, $WORKERS worker(s)) on :$PORT_PROXY =="
 ./target/release/vane run -c /tmp/vane-bench.toml &
 VANE_PID=$!
 sleep 1

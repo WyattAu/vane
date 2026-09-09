@@ -408,8 +408,11 @@ pub async fn run(opts: RunOptions) -> i32 {
     // ---- Admin server ----------------------------------------------------
     if config.admin.enabled {
         let admin_addr: std::net::SocketAddr = config.admin.address.parse().expect("validated");
-        let admin_router =
-            crate::admin::build_admin_router(Arc::clone(&router), Arc::clone(&registry));
+        let admin_router = crate::admin::build_admin_router(
+            Arc::clone(&router),
+            Arc::clone(&registry),
+            Arc::clone(&health),
+        );
         tokio::spawn(async move {
             if let Err(e) = crate::admin::serve(admin_addr, admin_router).await {
                 tracing::error!("admin server: {e}");

@@ -111,31 +111,56 @@ impl MioEngine {
         self.pending.entry(fd).or_default().push(op);
     }
 
-    fn finish_read(&mut self, fd: RawFd, slot: u32, token: Token) {
+    /// Performs one read attempt: full/EOF/error results queue a CQE
+    /// (true); WouldBlock parks the op for the readiness edge (false).
+    fn try_read_now(&mut self, fd: RawFd, slot: u32, token: &Token) -> bool {
         let ptr = self.slot_ptr(slot);
         // SAFETY: slot exclusively ours while its read is in flight; the
         // worker does not touch it until the CQE lands.
         let res = unsafe { libc::read(fd, ptr.cast(), self.buf_size) };
         if res >= 0 {
             self.cqes.push(Cqe {
-                token,
+                token: *token,
                 result: Ok(res as u32),
             });
+            true
         } else {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::WouldBlock {
-                // Keep armed: requeue.
-                self.push(fd, Pending::Read { slot, token });
+                self.push(
+                    fd,
+                    Pending::Read {
+                        slot,
+                        token: *token,
+                    },
+                );
+                false
             } else {
                 self.cqes.push(Cqe {
-                    token,
+                    token: *token,
                     result: Err(err),
                 });
+                true
             }
         }
     }
 
-    fn finish_write(&mut self, fd: RawFd, slot: u32, len: usize, offset: usize, token: Token) {
+    fn finish_read(&mut self, fd: RawFd, slot: u32, token: Token) {
+        // Readiness-driven retry: same semantics as the inline attempt.
+        let _ = self.try_read_now(fd, slot, &token);
+    }
+
+    /// Performs one write attempt: full success queues a CQE (true);
+    /// partial/WouldBlock parks the remainder for the edge (false); fatal
+    /// errors queue an error CQE (true).
+    fn try_write_now(
+        &mut self,
+        fd: RawFd,
+        slot: u32,
+        len: usize,
+        offset: usize,
+        token: &Token,
+    ) -> bool {
         let ptr = self.slot_ptr(slot);
         // SAFETY: slot bytes serialized by the session pre-submit.
         let res = unsafe { libc::write(fd, ptr.add(offset).cast(), len - offset) };
@@ -143,9 +168,10 @@ impl MioEngine {
             let n = res as usize;
             if offset + n >= len {
                 self.cqes.push(Cqe {
-                    token,
+                    token: *token,
                     result: Ok(len as u32),
                 });
+                true
             } else {
                 self.push(
                     fd,
@@ -153,9 +179,10 @@ impl MioEngine {
                         slot,
                         len,
                         offset: offset + n,
-                        token,
+                        token: *token,
                     },
                 );
+                false
             }
         } else {
             let err = io::Error::last_os_error();
@@ -166,16 +193,24 @@ impl MioEngine {
                         slot,
                         len,
                         offset,
-                        token,
+                        token: *token,
                     },
                 );
+                false
             } else {
                 self.cqes.push(Cqe {
-                    token,
+                    token: *token,
                     result: Err(err),
                 });
+                true
             }
         }
+    }
+
+    fn finish_write(&mut self, fd: RawFd, slot: u32, len: usize, offset: usize, token: Token) {
+        // Readiness-driven retry: same semantics as the inline attempt.
+        let _ = self.try_write_now(fd, slot, len, offset, &token);
+        let _ = fd;
     }
 
     fn pump_splice(&mut self, from: RawFd, to: RawFd, token: Token) {
@@ -311,10 +346,14 @@ impl Engine for MioEngine {
     }
 
     fn read(&mut self, token: Token, fd: RawFd, slot: u32) -> io::Result<Poll> {
-        // Edge-triggered: attempt inline; only park on WouldBlock (a data
-        // edge will re-fire readiness).
-        self.finish_read(fd, slot, token);
-        Ok(Poll::Pending)
+        // Edge-triggered: attempt inline. On WouldBlock (nothing ready) park
+        // for the data edge; on immediate success report Done so callers do
+        // not await a CQE that will never come.
+        if self.try_read_now(fd, slot, &token) {
+            Ok(Poll::Done(0)) // length rides the read CQE below
+        } else {
+            Ok(Poll::Pending)
+        }
     }
 
     fn write(
@@ -325,9 +364,13 @@ impl Engine for MioEngine {
         len: usize,
         offset: usize,
     ) -> io::Result<Poll> {
-        // Edge-triggered: attempt inline; park the remainder on WouldBlock.
-        self.finish_write(fd, slot, len, offset, token);
-        Ok(Poll::Pending)
+        // Edge-triggered: attempt inline. Full synchronous success reports
+        // Done; anything else (WouldBlock/partial) parks for the edge.
+        if self.try_write_now(fd, slot, len, offset, &token) {
+            Ok(Poll::Done(len as u32))
+        } else {
+            Ok(Poll::Pending)
+        }
     }
 
     fn connect(&mut self, token: Token, addr: SocketAddr) -> io::Result<(RawFd, Poll)> {

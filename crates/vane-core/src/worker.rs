@@ -227,7 +227,7 @@ impl WorkerState {
             .get(slot)
             .is_some_and(|s| s.pending_down.len() + bytes.len() > 4 * self.pool.buf_size());
         if overflow {
-            self.close_session(slot, generation); // runaway guard
+            self.close_session(slot, generation, "runaway-write-queue");
             return;
         }
         if let Some(s) = self.slab.get_mut(slot) {
@@ -266,7 +266,7 @@ impl WorkerState {
             .get(slot)
             .is_some_and(|s| s.pending_up.len() + bytes.len() > 4 * self.pool.buf_size());
         if overflow {
-            self.close_session(slot, generation);
+            self.close_session(slot, generation, "generic");
             return;
         }
         if let Some(s) = self.slab.get_mut(slot) {
@@ -376,7 +376,10 @@ impl WorkerState {
         }
     }
 
-    pub(crate) fn close_session(&mut self, slot: u32, generation: u16) {
+    /// Closes and drops a session. `reason` documents the call site for
+    /// crash triage (compiled out in release... kept as a parameter so the
+    /// next debug session can re-enable the trace in one line).
+    pub(crate) fn close_session(&mut self, slot: u32, generation: u16, _reason: &str) {
         if !self.valid(slot, generation) {
             return;
         }
@@ -478,8 +481,7 @@ impl WorkerState {
             // Ownership transfers to the caller (pool) — forget the guard
             // so Drop does not close the descriptor.
             std::mem::forget(owned);
-            #[cfg(feature = "vane_dbg")]
-            eprintln!("[pool] detach fd={fd} slot={slot}");
+
             fd
         };
         // Stop tracking it in the engine and return every slot it holds.
@@ -523,6 +525,18 @@ impl WorkerState {
             }
         }
         true
+    }
+
+    /// Raw upstream descriptor (diagnostics).
+    pub(crate) fn upstream_fd(&self, slot: u32, generation: u16) -> Option<RawFd> {
+        if self.valid(slot, generation) {
+            self.slab
+                .get(slot)
+                .and_then(|s| s.upstream.as_ref())
+                .map(StreamFd::fd)
+        } else {
+            None
+        }
     }
 
     /// Request-head-written flag (failover guard).
@@ -581,6 +595,13 @@ impl WorkerState {
         let Some(s) = self.slab.get_mut(slot) else {
             return;
         };
+        // The handler may have detached (parked) or discarded the upstream
+        // during its callback — there is nothing to read anymore. Re-arming
+        // here would submit a read on fd -1 / a closed descriptor whose
+        // EBADF completion then kills the idle keep-alive session.
+        if s.upstream.is_none() {
+            return;
+        }
         if s.upstream_read_inflight || s.splice {
             return;
         }
@@ -708,7 +729,7 @@ impl WorkerState {
                 && !s.upstream_write_inflight
         });
         if done {
-            self.close_session(slot, generation);
+            self.close_session(slot, generation, "both-eof-flushed");
         }
     }
 
@@ -813,7 +834,7 @@ impl WorkerState {
                     self.maybe_finish(slot, generation);
                 }
                 Ok(_) => { /* bytes moved; multishot readiness continues */ }
-                Err(_) => self.close_session(slot, generation),
+                Err(_) => self.close_session(slot, generation, "splice-err"),
             },
         }
     }
@@ -925,7 +946,7 @@ impl WorkerState {
         if let Some(deadline) = self.drain_deadline {
             if Instant::now() >= deadline {
                 for (slot, generation) in self.slab.live() {
-                    self.close_session(slot, generation);
+                    self.close_session(slot, generation, "generic");
                 }
                 return true;
             }
@@ -1011,7 +1032,7 @@ impl WorkerState {
         std::mem::forget(guard); // ownership moved into the session
         let token = Token::new(Op::DownstreamRead, slot, generation, 0);
         if self.engine.add_stream(fd, token).is_err() {
-            self.close_session(slot, generation);
+            self.close_session(slot, generation, "add-stream-failed");
             return;
         }
         {

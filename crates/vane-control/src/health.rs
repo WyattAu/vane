@@ -58,9 +58,26 @@ impl HealthMap {
             .copied()
             .collect()
     }
+
+    /// Snapshot of every tracked (address, healthy) pair (admin dump).
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<(SocketAddr, bool)> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(a, f)| (*a, f.load(Ordering::Relaxed) != 0))
+            .collect()
+    }
 }
 
 /// Probes backends on an interval and flips [`HealthMap`] flags.
+///
+/// Flap-proofing: a backend is marked unhealthy only after
+/// [`HealthChecker::DOWN_AFTER`] consecutive failed probes, and recovers
+/// on the first success. This keeps container/K8s startup ordering (slow
+/// backends, late endpoint propagation) from taking freshly-started
+/// backends out of rotation on the first tick.
 pub struct HealthChecker {
     map: std::sync::Arc<HealthMap>,
     /// Per-address HTTP probe path (None => TCP connect only).
@@ -69,9 +86,14 @@ pub struct HealthChecker {
     pub interval: Duration,
     /// HTTP client (connection pooled, rustls).
     client: reqwest::Client,
+    /// Consecutive failures per address.
+    failures: Mutex<HashMap<SocketAddr, u32>>,
 }
 
 impl HealthChecker {
+    /// Consecutive failed probes before a backend is marked down.
+    pub const DOWN_AFTER: u32 = 3;
+
     /// Creates a checker; call [`Self::spawn`] to start the loop.
     ///
     /// # Panics
@@ -88,6 +110,7 @@ impl HealthChecker {
             http_paths: HashMap::new(),
             interval,
             client,
+            failures: Mutex::new(HashMap::new()),
         }
     }
 
@@ -108,8 +131,24 @@ impl HealthChecker {
             } else {
                 tcp_probe(addr).await
             };
-            tracing::debug!(%addr, healthy, "health probe");
-            self.map.set(addr, healthy);
+            if healthy {
+                self.failures
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&addr);
+                if !self.map.is_healthy(addr) {
+                    tracing::info!(%addr, "health probe: backend recovered");
+                }
+                self.map.set(addr, true);
+            } else {
+                let mut failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+                let count = failures.entry(addr).or_insert(0);
+                *count += 1;
+                if *count >= Self::DOWN_AFTER && self.map.is_healthy(addr) {
+                    tracing::warn!(%addr, failures = *count, "health probe: backend down");
+                    self.map.set(addr, false);
+                }
+            }
         }
     }
 

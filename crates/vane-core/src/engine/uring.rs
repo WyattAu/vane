@@ -43,6 +43,57 @@ pub struct UringEngine {
     splice_dirs: HashMap<u64, (RawFd, RawFd)>,
     /// Completed accepts awaiting pickup: fd -> peer.
     accepted: HashMap<RawFd, SocketAddr>,
+    /// Owned sockaddr storage per in-flight connect (token bits -> (addr, len)).
+    /// io_uring copies the sockaddr at SUBMISSION time, not at SQE build
+    /// time — a stack-local sockaddr would dangle between `push` and
+    /// `submit` (use-after-free manifesting as EAFNOSUPPORT under load).
+    connect_addrs: HashMap<u64, Box<ConnectAddr>>,
+}
+
+/// Owned connect address for one in-flight `Connect` SQE.
+struct ConnectAddr {
+    storage: libc::sockaddr_storage,
+    len: libc::socklen_t,
+}
+
+/// Serializes a `SocketAddr` into owned storage, returning the box plus a
+/// pointer/len pair valid for as long as the box lives.
+///
+/// # Safety
+/// The caller must keep the returned box alive (in `connect_addrs`) until
+/// the op completes. The heap address is stable across moves.
+unsafe fn connect_addr_boxed(
+    addr: SocketAddr,
+) -> (Box<ConnectAddr>, *const libc::sockaddr, libc::socklen_t) {
+    // SAFETY: fully initialized for the active family below.
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let len = match addr {
+        SocketAddr::V4(v4) => {
+            // SAFETY: family matches the written layout.
+            let sa: &mut libc::sockaddr_in =
+                unsafe { &mut *std::ptr::addr_of_mut!(storage).cast::<libc::sockaddr_in>() };
+            sa.sin_family = libc::AF_INET as _;
+            sa.sin_port = v4.port().to_be();
+            sa.sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
+        }
+        SocketAddr::V6(v6) => {
+            // SAFETY: family matches the written layout.
+            let sa: &mut libc::sockaddr_in6 =
+                unsafe { &mut *std::ptr::addr_of_mut!(storage).cast::<libc::sockaddr_in6>() };
+            sa.sin6_family = libc::AF_INET6 as _;
+            sa.sin6_port = v6.port().to_be();
+            sa.sin6_addr.s6_addr = v6.ip().octets();
+            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
+        }
+    };
+    let boxed = Box::new(ConnectAddr { storage, len });
+    // The heap address is stable for the box's lifetime (per the function
+    // contract the caller stores it in `connect_addrs`); `addr_of!` on a
+    // place expression needs no unsafe block.
+    let ptr = std::ptr::addr_of!(boxed.storage).cast::<libc::sockaddr>();
+    let out_len = boxed.len;
+    (boxed, ptr, out_len)
 }
 
 // SAFETY: slot pointers live in the worker-owned pool; single-thread use.
@@ -91,6 +142,7 @@ impl UringEngine {
             listeners: HashMap::new(),
             splice_dirs: HashMap::new(),
             accepted: HashMap::new(),
+            connect_addrs: HashMap::new(),
         })
     }
 
@@ -218,10 +270,12 @@ impl Engine for UringEngine {
         sock.set_nonblocking(true)?;
         sock.set_tcp_nodelay(true)?;
         let fd = sock.into_raw_fd();
-        let sa: socket2::SockAddr = addr.into();
-        // SAFETY contract for `push`: sockaddr bytes are copied at
-        // submission time by the kernel.
-        let entry = io_uring::opcode::Connect::new(Fd(fd), sa.as_ptr().cast(), sa.len()).build();
+        // The sockaddr must live in owned storage until the op completes:
+        // io_uring copies it at submit time, not when the SQE is built.
+        // SAFETY: the box is stored in `connect_addrs` for the op lifetime.
+        let (owned, ptr, len) = unsafe { connect_addr_boxed(addr) };
+        let entry = io_uring::opcode::Connect::new(Fd(fd), ptr, len).build();
+        self.connect_addrs.insert(token.bits(), owned);
         self.push(entry, token);
         Ok((fd, Poll::Pending))
     }
@@ -231,20 +285,37 @@ impl Engine for UringEngine {
         sock.set_nonblocking(true)?;
         let fd = sock.into_raw_fd();
         let sa = socket2::SockAddr::unix(path)?;
-        // SAFETY contract for `push`: as above.
-        let entry = io_uring::opcode::Connect::new(Fd(fd), sa.as_ptr().cast(), sa.len()).build();
+        // SAFETY: raw sockaddr bytes are copied into owned storage, kept in
+        // `connect_addrs` for the op lifetime.
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let bytes = sa.as_ptr().cast::<u8>();
+        let copy_len = (sa.len() as usize).min(std::mem::size_of::<libc::sockaddr_storage>());
+        // SAFETY: sa is a valid sockaddr of `sa.len()` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes, std::ptr::addr_of_mut!(storage).cast(), copy_len)
+        };
+        let len = sa.len();
+        let owned = Box::new(ConnectAddr { storage, len });
+        // Heap address is stable while `owned` lives in `connect_addrs`.
+        let ptr = std::ptr::addr_of!(owned.storage).cast::<libc::sockaddr>();
+        let entry = io_uring::opcode::Connect::new(Fd(fd), ptr, len).build();
+        self.connect_addrs.insert(token.bits(), owned);
         self.push(entry, token);
         Ok((fd, Poll::Pending))
     }
 
     fn accept(&mut self, _lfd: RawFd, ltoken: Token) -> io::Result<Option<(RawFd, SocketAddr)>> {
         // Return one completed accept if the poll loop queued it.
-        if let Some((&fd, &addr)) = self.accepted.iter().next() {
-            self.accepted.remove(&fd);
+        let keys: Vec<RawFd> = self.accepted.keys().copied().collect();
+        if let Some(fd) = keys.into_iter().next() {
+            let addr = self.accepted.remove(&fd).expect("just listed");
             return Ok(Some((fd, addr)));
         }
-        // Not ready yet — (re)arm the accept SQE.
-        self.arm_accept(ltoken.bits());
+        // Not ready yet. Do NOT re-arm here: exactly one accept SQE is
+        // outstanding per listener at all times (armed in `add_listener`,
+        // re-armed on every completion in `poll`). Re-arming per call would
+        // accumulate unbounded SQEs and exhaust the submission queue.
+        let _ = ltoken;
         Ok(None)
     }
 
@@ -299,6 +370,11 @@ impl Engine for UringEngine {
             } else {
                 Err(io::Error::from_raw_os_error(-raw))
             };
+            // In-flight connect storage is safe to release once its CQE
+            // has been observed.
+            if token.op() == crate::token::Op::Connect {
+                self.connect_addrs.remove(&token.bits());
+            }
             match token.op() {
                 crate::token::Op::Accept => {
                     if raw >= 0 {

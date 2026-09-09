@@ -8,8 +8,28 @@ use vane_observe::metrics::Registry;
 use vane_router::Router as RouteRouter;
 
 /// Builds the admin router: `/metrics`, `/healthz`, `/readyz`, `/config`.
-pub fn build_admin_router(router: Arc<RouteRouter>, registry: Arc<Registry>) -> Router {
+pub fn build_admin_router(
+    router: Arc<RouteRouter>,
+    registry: Arc<Registry>,
+    health: Arc<vane_control::HealthMap>,
+) -> Router {
+    let health2 = Arc::clone(&health);
     Router::new()
+        .route(
+            "/health",
+            get(move || {
+                let health = Arc::clone(&health2);
+                async move {
+                    axum::Json(
+                        health
+                            .snapshot()
+                            .iter()
+                            .map(|(a, h)| (a.to_string(), *h))
+                            .collect::<Vec<_>>(),
+                    )
+                }
+            }),
+        )
         .route(
             "/metrics",
             get(move || {

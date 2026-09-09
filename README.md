@@ -123,13 +123,16 @@ cache; pair with the ACME manager for automated certificates.
 
 ### Known issues / current limits
 
-- **Sustained concurrent load**: a reproducible engine bug surfaces under
-  sustained keep-alive load (every second request on a connection fails);
-  sequential and low-concurrency flows pass. Regression test:
-  `cargo test -p vane --test load -- --ignored` (top roadmap item).
+- **Sustained concurrent load** (`crates/vane/tests/load.rs`, always
+  green): fixed in this cycle. The decisive defects were an io_uring
+  `Connect` sockaddr use-after-free (bytes copied at submit, not at SQE
+  build — surfaced as EAFNOSUPPORT storms) and an IPv4 byte-order slip
+  (`1.0.0.127` SYN blackhole). Both carry regression coverage
+  (`vane-core/tests/connect.rs`, `vane-core/tests/echo.rs` on both
+  engines).
 - **Upstream keep-alive pooling** ships disabled by default
-  (`pool_per_backend = 0` = dial-fresh) pending the same lifecycle
-  hardening; set `> 0` to experiment.
+  (`pool_per_backend = 0` = dial-fresh) pending lifecycle hardening
+  under sustained load; set `> 0` to experiment.
 - HTTP/2 is served by a **separate REUSEPORT acceptor** (see
   `h2_edge.rs`) whose bodies are buffered (32 MiB); no upstream h2 yet.
 

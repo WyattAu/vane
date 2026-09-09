@@ -56,6 +56,15 @@ pub enum Mode {
     L4,
 }
 
+/// Outcome of an upstream dial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamDial {
+    /// Connect queued; completion arrives asynchronously.
+    Initiated,
+    /// Connected synchronously — the handler may proceed immediately.
+    Established,
+}
+
 /// Per-connection handler. One instance is shared by all sessions of a
 /// worker (single-threaded dispatch; per-connection state lives in the
 /// session, reached through [`SessionIo`]).
@@ -190,7 +199,8 @@ impl<'a> SessionIo<'a> {
 
     /// Closes the whole session.
     pub fn close(&mut self) {
-        self.worker.close_session(self.slot, self.generation);
+        self.worker
+            .close_session(self.slot, self.generation, "handler");
     }
 
     /// Arms (or clears) the session's single deadline slot with a reason.
@@ -216,6 +226,12 @@ impl<'a> SessionIo<'a> {
     /// (connection pooling checkout) and arms its read.
     pub fn attach_upstream(&mut self, fd: std::os::fd::RawFd) -> bool {
         self.worker.attach_upstream(self.slot, self.generation, fd)
+    }
+
+    /// Raw upstream descriptor (diagnostics).
+    #[must_use]
+    pub fn upstream_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.worker.upstream_fd(self.slot, self.generation)
     }
 
     /// `true` once the request head has been written to the upstream

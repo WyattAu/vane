@@ -37,8 +37,7 @@ impl HandlerFactory for EchoFactory {
     }
 }
 
-#[test]
-fn echo_through_worker() {
+fn run_echo(force_mio: bool) {
     let listener =
         vane_core::tcp_listener("127.0.0.1:0".parse().expect("addr"), true, 64).expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -46,7 +45,7 @@ fn echo_through_worker() {
     let registry = Arc::new(Registry::new());
     let events = Arc::new(vane_observe::ring::EventRing::new());
     let cfg = WorkerConfig {
-        force_mio: true,
+        force_mio,
         ..WorkerConfig::default()
     };
     let factory = EchoFactory;
@@ -66,4 +65,14 @@ fn echo_through_worker() {
         .cmd
         .send(vane_core::WorkerCmd::Shutdown { deadline_ms: 100 });
     handle.join();
+}
+
+#[test]
+fn echo_through_worker_mio() {
+    run_echo(true);
+}
+
+#[test]
+fn echo_through_worker_uring() {
+    run_echo(false);
 }
