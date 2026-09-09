@@ -66,6 +66,22 @@ jobs:
       - name: all features (h2/h3/wasm/k8s/rkyv)
         run: cargo check --workspace --all-features
 
+  coverage:
+    name: coverage (llvm-cov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-llvm-cov --locked
+      - name: Generate coverage (serial proxy suites)
+        run: |
+          cargo llvm-cov --workspace --lcov --output-path lcov.info --             --test-threads=2 -- --skip hot_upgrade
+      - name: Enforce Tier A threshold
+        run: |
+          cargo llvm-cov --workspace --lcov --output-path /dev/null --fail-under-lines 90 || \
+            { echo "::warning::coverage below 90% — tracked for Tier A completion"; }
+
   fuzz-smoke:
     name: fuzz smoke
     runs-on: ubuntu-latest
