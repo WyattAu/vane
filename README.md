@@ -134,6 +134,8 @@ cache; pair with the ACME manager for automated certificates.
   backend per worker); `pool_per_backend = 0` for dial-fresh.
 - HTTP/2 is served by a **separate REUSEPORT acceptor** (see
   `h2_edge.rs`) whose bodies are buffered (32 MiB); no upstream h2 yet.
+- Upstream HTTP/2 and HTTP/3 (frontend h2/h3 terminate to HTTP/1.1) —
+  tracked on the roadmap.
 
 ### Hot upgrade
 
