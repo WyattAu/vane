@@ -13,7 +13,21 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 #[test]
-fn pooled_sustained_load_no_failures() {
+fn pooled_sustained_load_no_failures_mio() {
+    run_pooled(true, 1);
+}
+
+#[test]
+fn pooled_sustained_load_no_failures_uring() {
+    run_pooled(false, 1);
+}
+
+#[test]
+fn pooled_sustained_load_no_failures_uring_4w() {
+    run_pooled(false, 4);
+}
+
+fn run_pooled(force_mio: bool, workers: usize) {
     let _lock = lock_serial();
 
     // Keep-alive upstream: thread per connection, persistent response loop.
@@ -54,7 +68,7 @@ fn pooled_sustained_load_no_failures() {
             r#"
 [[listeners]]
 address = "{proxy_addr}"
-workers = 1
+workers = {workers}
 
 [clusters.e2e]
 backends = ["{upstream}"]
@@ -67,7 +81,7 @@ cluster = "e2e"
 enabled = false
 
 [runtime]
-force_mio = true
+force_mio = {force_mio}
 pool_per_backend = 4
 "#
         ),
@@ -85,7 +99,7 @@ pool_per_backend = 4
             handover_from: None,
             handover_to: None,
             shutdown_after: Some(Duration::from_secs(20)),
-            force_mio: true,
+            force_mio,
         }));
         assert_eq!(code, 0);
     });
