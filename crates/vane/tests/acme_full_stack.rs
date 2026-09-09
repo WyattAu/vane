@@ -17,6 +17,11 @@ use std::time::Duration;
 #[tokio::test]
 async fn acme_full_stack_issue_and_serve() {
     let _lock = lock_serial();
+    // Kill leaked vane children from prior failed runs — they squat the
+    // ACME ports and break fresh runs.
+    let _ = Command::new("pkill")
+        .args(["-9", "-f", "target/debug/vane"])
+        .output();
 
     // Clean slate: no stale pebble/challtestsrv containers or orphan vanes
     // squatting the fixed ACME port.

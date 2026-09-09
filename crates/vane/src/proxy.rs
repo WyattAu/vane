@@ -106,8 +106,6 @@ pub struct HttpProxy {
     pool: HashMap<SocketAddr, Vec<RawFd>>,
     /// Per-cluster request counters (lazily registered, one per cluster).
     cluster_metrics: HashMap<String, ClusterMetric>,
-    /// Shared ACME HTTP-01 token map.
-    http01_tokens: Option<Arc<std::sync::Mutex<HashMap<String, String>>>>,
     /// Loaded plugin instances (one set per worker; instances are !Sync).
     #[cfg(feature = "wasm")]
     plugins: Vec<vane_plugins::PluginInstance>,
@@ -205,7 +203,6 @@ impl HttpProxy {
                 config.plugins.len()
             );
         }
-        let http01_tokens = config.http01_tokens.clone();
         Self {
             config,
             pipeline,
@@ -214,7 +211,6 @@ impl HttpProxy {
             date: vane_proto::date::DateCache::new(),
             pool: HashMap::new(),
             cluster_metrics: HashMap::new(),
-            http01_tokens,
             #[cfg(feature = "wasm")]
             plugins,
             metrics,
@@ -787,18 +783,6 @@ impl HttpProxy {
                         m.keys().collect::<Vec<_>>()
                     );
                     drop(m);
-                    self.respond_full(io, Status::NotFound, "unknown token\n");
-                }
-                None => {
-                    let len = self
-                        .config
-                        .http01_tokens
-                        .as_ref()
-                        .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()).len())
-                        .unwrap_or(0);
-                    eprintln!("[acme-dbg] serve miss: token={token} map_len={len}");
-                }
-                None => {
                     self.respond_full(io, Status::NotFound, "unknown token\n");
                 }
             }

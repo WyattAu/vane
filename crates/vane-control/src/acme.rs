@@ -494,21 +494,30 @@ impl AcmeManager {
             let Some(token) = &ch.token else { continue };
             // Full key authorization (RFC 8555 §8.1): token.thumbprint.
             let key_auth = self.http01_key_auth(token)?;
+            eprintln!("[acme-dbg] http01 token={token} key_auth={key_auth}");
             self.http01
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(token.clone(), key_auth.clone());
             // CI environments (pebble): push the answer to the challenge
-            // server's admin API BEFORE triggering validation.
+            // server's admin API BEFORE triggering validation. The push
+            // retries until the challenge server accepts it (the server
+            // may still be booting).
             if let Some(url) = &self.config.challenge_answer_url {
                 let body = format!(r#"{{"token": "{token}", "content": "{key_auth}"}}"#);
-                let _ = self
-                    .http
-                    .post(url)
-                    .header("Content-Type", "application/json")
-                    .body(body)
-                    .send()
-                    .await;
+                for _ in 0..10 {
+                    match self
+                        .http
+                        .post(url)
+                        .header("Content-Type", "application/json")
+                        .body(body.clone())
+                        .send()
+                        .await
+                    {
+                        Ok(r) if r.status().is_success() => break,
+                        _ => tokio::time::sleep(Duration::from_millis(300)).await,
+                    }
+                }
             }
             let (_ack, _, _): (Option<serde_json::Value>, Option<String>, Option<String>) = self
                 .jws_post(
