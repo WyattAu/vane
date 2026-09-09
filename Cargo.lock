@@ -3621,6 +3621,8 @@ dependencies = [
  "http",
  "httparse",
  "libc",
+ "loop-retry",
+ "notify",
  "otelkit",
  "quinn",
  "rcgen",

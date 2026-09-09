@@ -38,8 +38,9 @@ pub struct ProxyConfig {
     pub first_byte_timeout_ms: u64,
     /// Idle upstream connections kept per backend (per worker).
     pub pool_per_backend: usize,
-    /// TLS termination config (`None` = plaintext listener).
-    pub tls: Option<Arc<rustls::ServerConfig>>,
+    /// TLS termination config (`None` = plaintext listener). Shared slot:
+    /// hot reload swaps the inner Arc without touching workers.
+    pub tls: Option<Arc<std::sync::RwLock<Arc<rustls::ServerConfig>>>>,
     /// Wasm plugin module paths (feature `wasm`; applied to every request
     /// in order, before routing).
     pub plugins: Vec<String>,
@@ -459,8 +460,11 @@ impl HttpProxy {
 impl Handler for HttpProxy {
     fn on_connected(&mut self, io: &mut SessionIo<'_>) {
         let slot = io.slot_index();
-        if let Some(tls_cfg) = &self.config.tls {
-            match rustls::ServerConnection::new(Arc::clone(tls_cfg)) {
+        if let Some(tls_slot) = &self.config.tls {
+            // Hot-reload point: read the current generation through the
+            // shared slot (uncontended read lock, once per connection).
+            let tls_cfg = tls_slot.read().expect("tls slot").clone();
+            match rustls::ServerConnection::new(tls_cfg) {
                 Ok(conn) => self.conn(slot).tls = Some(conn),
                 Err(e) => {
                     self.log(LogLevel::Error, &format!("tls setup: {e}"));

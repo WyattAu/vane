@@ -25,6 +25,7 @@ h2 = ["dep:h2", "dep:tokio-rustls"]
 h3 = ["dep:quinn", "dep:h3", "dep:h3-quinn"]
 wasm = ["vane-plugins/wasm"]
 k8s = ["vane-control/k8s"]
+acme-pebble = []
 
 [dependencies]
 vane-core = { workspace = true }
@@ -54,6 +55,7 @@ rustls = { workspace = true }
 libc = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }
+notify = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 
@@ -69,6 +71,7 @@ h3-quinn = { workspace = true, optional = true }
 tempfile = { workspace = true }
 rcgen = { workspace = true }
 libc = { workspace = true }
+loop-retry = { workspace = true }
 
 [lints]
 workspace = true

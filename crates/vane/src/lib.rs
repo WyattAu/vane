@@ -9,3 +9,4 @@ pub mod h2_edge;
 pub mod proxy;
 pub mod server;
 pub mod sidecar;
+pub mod tls_reload;

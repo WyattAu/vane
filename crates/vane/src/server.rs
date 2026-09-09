@@ -2,6 +2,7 @@
 //! server, and graceful shutdown.
 
 use std::net::TcpListener as StdTcpListener;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -283,6 +284,7 @@ pub async fn run(opts: RunOptions) -> i32 {
         .first()
         .map_or(1, |l| if l.workers == 0 { cores } else { l.workers });
     let mut handles = Vec::new();
+    let mut tls_cfg_slots: Vec<Option<crate::tls_reload::TlsSlot>> = Vec::new();
     let mut event_rings: Vec<
         Arc<EventRing<vane_observe::LogEvent, { vane_observe::EVENT_RING_CAPACITY }>>,
     > = Vec::new();
@@ -295,15 +297,28 @@ pub async fn run(opts: RunOptions) -> i32 {
             ListenerMode::Http => CoreMode::Http,
             ListenerMode::Tcp => CoreMode::L4,
         };
-        // TLS termination material for this listener (built once, shared).
-        let tls_cfg: Option<Arc<rustls::ServerConfig>> =
+        let want_h2 = cfg!(feature = "h2")
+            && config
+                .listeners
+                .get(li)
+                .and_then(|l| l.tls.as_ref())
+                .is_some_and(|t| t.alpn_h2);
+        // TLS termination material for this listener: shared, swappable
+        // slot (hot reload replaces the inner Arc; workers read it once per
+        // connection).
+        let tls_cfg: Option<Arc<std::sync::RwLock<Arc<rustls::ServerConfig>>>> =
             match config.listeners.get(li).and_then(|l| l.tls.as_ref()) {
                 Some(t) if mode == CoreMode::Http => {
                     match vane_tls::server_config(
                         std::path::Path::new(&t.cert),
                         std::path::Path::new(&t.key),
                     ) {
-                        Ok(cfg) => Some(Arc::new(cfg)),
+                        Ok(mut cfg) => {
+                            if want_h2 {
+                                cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+                            }
+                            Some(Arc::new(std::sync::RwLock::new(Arc::new(cfg))))
+                        }
                         Err(e) => {
                             eprintln!("vane: listener {}: tls: {e}", config.listeners[li].address);
                             return 1;
@@ -339,6 +354,7 @@ pub async fn run(opts: RunOptions) -> i32 {
             };
             let events = Arc::new(EventRing::new());
             event_rings.push(Arc::clone(&events));
+            tls_cfg_slots.push(tls_cfg.clone());
             let factory = WorkerFactory {
                 mode,
                 router: Arc::clone(&router),
@@ -450,6 +466,23 @@ pub async fn run(opts: RunOptions) -> i32 {
         }
     }
 
+    // ---- TLS certificate hot reload --------------------------------------
+    for (li, slot) in tls_cfg_slots.iter().enumerate() {
+        if let (Some(t), Some(slot)) = (config.listeners.get(li).and_then(|l| l.tls.as_ref()), slot)
+        {
+            crate::tls_reload::spawn_reloader(
+                PathBuf::from(&t.cert),
+                PathBuf::from(&t.key),
+                if cfg!(feature = "h2") && t.alpn_h2 {
+                    vec![b"h2".to_vec()]
+                } else {
+                    vec![b"http/1.1".to_vec()]
+                },
+                Arc::clone(slot),
+            );
+        }
+    }
+
     // ---- In-process SHM sidecar ------------------------------------------
     if config.sidecar.enabled {
         if let Err(e) = crate::sidecar::spawn_bridge(&config) {
@@ -530,8 +563,9 @@ struct WorkerFactory {
     registry: Arc<Registry>,
     worker_id: usize,
     events: Arc<EventRing<vane_observe::LogEvent, { vane_observe::EVENT_RING_CAPACITY }>>,
-    /// TLS termination config for this worker's listener (`None` = plain).
-    tls: Option<Arc<rustls::ServerConfig>>,
+    /// TLS termination slot for this worker's listener (`None` = plain).
+    /// Shared + swappable: hot reload replaces the inner Arc.
+    tls: Option<Arc<std::sync::RwLock<Arc<rustls::ServerConfig>>>>,
     /// Runtime knobs from config.
     runtime: vane_control::RuntimeConfig,
     /// Wasm plugin paths.

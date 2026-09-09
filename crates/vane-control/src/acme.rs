@@ -14,11 +14,26 @@ use base64::Engine;
 /// Retryable classification for ACME failures: transport/5xx retry,
 /// authorization/4xx do not.
 #[derive(Debug)]
-pub struct AcmeError(pub String);
+pub struct AcmeError {
+    /// Message.
+    pub message: String,
+    /// Set when the failure was a rejected nonce (retry with fresh).
+    pub retryable_nonce: bool,
+}
+
+impl AcmeError {
+    /// Wraps a message as a non-nonce (transport-class) error.
+    pub fn new(msg: impl Into<String>) -> Self {
+        Self {
+            message: msg.into(),
+            retryable_nonce: false,
+        }
+    }
+}
 
 impl std::fmt::Display for AcmeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 
@@ -28,7 +43,9 @@ impl loop_retry::IsRetryable for AcmeError {
     fn is_retryable(&self) -> bool {
         // 4xx protocol errors (bad CSR, unauthorized) never recover; any
         // other failure is treated as transient infrastructure trouble.
-        !(self.0.contains("400") || self.0.contains("403") || self.0.contains("404"))
+        !(self.message.contains("400")
+            || self.message.contains("403")
+            || self.message.contains("404"))
     }
 }
 use ring::rand::SystemRandom;
@@ -48,6 +65,11 @@ pub struct AcmeConfig {
     pub storage: PathBuf,
     /// Renew when less than this fraction of lifetime remains.
     pub renew_at_fraction: f64,
+    /// Accept invalid TLS certificates on the ACME endpoint (pebble/CI).
+    pub insecure_tls: bool,
+    /// CI-only: URL of a challenge server admin API that accepts
+    /// `{token, content}` HTTP-01 answers (e.g. pebble challtestsrv).
+    pub challenge_answer_url: Option<String>,
 }
 
 impl Default for AcmeConfig {
@@ -58,6 +80,8 @@ impl Default for AcmeConfig {
             domains: Vec::new(),
             storage: PathBuf::from("/var/lib/vane/acme"),
             renew_at_fraction: 2.0 / 3.0,
+            insecure_tls: false,
+            challenge_answer_url: None,
         }
     }
 }
@@ -95,12 +119,14 @@ struct Authorization {
     challenges: Vec<Challenge>,
 }
 
-/// Challenge document.
+/// Challenge document. `token` is absent on challenge types the proxy
+/// does not use (e.g. `dns-persist-01`).
 #[derive(Debug, Deserialize)]
 struct Challenge {
     #[serde(rename = "type")]
     kind: String,
-    token: String,
+    #[serde(default)]
+    token: Option<String>,
     url: String,
 }
 
@@ -111,6 +137,12 @@ pub struct AcmeManager {
     /// In-flight HTTP-01 token -> key authorization (read by listeners).
     http01: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
     http: reqwest::Client,
+    /// ACME account URL (kid) once created.
+    account_url: std::sync::Mutex<Option<String>>,
+    /// Nonce queue: response `Replay-Nonce` values (RFC 8555 §6.5 — use
+    /// these before fetching from newNonce; GET-nonces can go stale once a
+    /// POST has occurred).
+    nonces: std::sync::Mutex<Vec<String>>,
 }
 
 impl AcmeManager {
@@ -123,6 +155,8 @@ impl AcmeManager {
         #[allow(clippy::expect_used, reason = "TLS init failure is fatal at startup")]
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
+            .user_agent("vane-acme/0.1")
+            .danger_accept_invalid_certs(config.insecure_tls)
             .build()
             .expect("reqwest client");
         Self {
@@ -130,7 +164,18 @@ impl AcmeManager {
             rng: SystemRandom::new(),
             http01: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             http,
+            account_url: std::sync::Mutex::new(None),
+            nonces: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// The stored account URL (kid), if the account was created this run.
+    fn account_kid(&self) -> Result<String, AcmeError> {
+        self.account_url
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .ok_or_else(|| AcmeError::new("account URL not yet known"))
     }
 
     /// HTTP-01 challenge responses: `token -> key authorization`.
@@ -146,20 +191,20 @@ impl AcmeManager {
 
     /// Loads (or creates) the persisted account key.
     fn account_key(&self) -> Result<EcdsaKeyPair, AcmeError> {
-        std::fs::create_dir_all(&self.config.storage).map_err(|e| AcmeError(e.to_string()))?;
+        std::fs::create_dir_all(&self.config.storage).map_err(|e| AcmeError::new(e.to_string()))?;
         let path = self.config.storage.join("account.key");
         let pkcs8 = match std::fs::read(&path) {
             Ok(der) => der,
             Err(_) => {
-                let kp = rcgen::KeyPair::generate().map_err(|e| AcmeError(e.to_string()))?;
+                let kp = rcgen::KeyPair::generate().map_err(|e| AcmeError::new(e.to_string()))?;
                 let der = kp.serialize_der();
-                std::fs::write(&path, &der).map_err(|e| AcmeError(e.to_string()))?;
+                std::fs::write(&path, &der).map_err(|e| AcmeError::new(e.to_string()))?;
                 der
             }
         };
         let rng = SystemRandom::new();
         EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &pkcs8, &rng)
-            .map_err(|e| AcmeError(e.to_string()))
+            .map_err(|e| AcmeError::new(e.to_string()))
     }
 
     /// b64url (no padding).
@@ -193,15 +238,18 @@ impl AcmeManager {
             .head(&dir.new_nonce)
             .send()
             .await
-            .map_err(|e| AcmeError(e.to_string()))?;
+            .map_err(|e| AcmeError::new(e.to_string()))?;
         resp.headers()
             .get("replay-nonce")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_owned())
-            .ok_or_else(|| AcmeError("missing replay-nonce".into()))
+            .ok_or_else(|| AcmeError::new("missing replay-nonce"))
+            .inspect(|n| eprintln!("[acme-dbg] fetched nonce: {n}"))
     }
 
-    /// Posts a signed JWS request.
+    /// Posts a signed JWS request. On `badNonce` (servers may reject
+    /// nonces at any time per RFC 8555 §6.5) retries once with a fresh
+    /// nonce.
     async fn jws_post<T: serde::de::DeserializeOwned>(
         &self,
         key: &EcdsaKeyPair,
@@ -209,9 +257,93 @@ impl AcmeManager {
         url: &str,
         payload: serde_json::Value,
         kid: Option<&str>,
-    ) -> Result<(Option<T>, Option<String>), AcmeError> {
+    ) -> Result<(Option<T>, Option<String>, Option<String>), AcmeError> {
+        match self
+            .jws_post_inner::<T>(key, dir, url, payload.clone(), kid)
+            .await
+        {
+            Err(ref e) if e.retryable_nonce => {
+                self.jws_post_inner::<T>(key, dir, url, payload, kid).await
+            }
+            other => other,
+        }
+    }
+
+    /// POST-as-GET returning the raw response body (cert chains are PEM).
+    ///
+    /// Note: the parsed-JSON variant (`jws_post`) cannot return PEM; this
+    /// is only used for the certificate chain download.
+    async fn jws_post_raw_text(
+        &self,
+        key: &EcdsaKeyPair,
+        dir: &Directory,
+        url: &str,
+        payload: serde_json::Value,
+        kid: Option<&str>,
+    ) -> Result<(String, Option<String>), AcmeError> {
         let nonce = self.nonce(dir).await?;
         let header = if let Some(kid) = kid {
+            serde_json::json!({"alg": "ES256", "nonce": nonce, "url": url, "kid": kid})
+        } else {
+            serde_json::json!({"alg": "ES256", "nonce": nonce, "url": url, "jwk": Self::jwk(key)})
+        };
+        let protected = Self::b64(header.to_string().as_bytes());
+        let signing_input = format!("{protected}.");
+        let sig = key
+            .sign(&self.rng, signing_input.as_bytes())
+            .map_err(|e| AcmeError::new(e.to_string()))?;
+        let body = serde_json::json!({
+            "protected": protected,
+            "payload": "",
+            "signature": Self::b64(sig.as_ref()),
+        });
+        let resp = self
+            .http
+            .post(url)
+            .header("content-type", "application/jose+json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AcmeError::new(e.to_string()))?;
+        if let Some(n) = resp
+            .headers()
+            .get("replay-nonce")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_owned())
+        {
+            self.nonces
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(n);
+        }
+        let location = resp
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_owned());
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| AcmeError::new(e.to_string()))?;
+        if !status.is_success() {
+            return Err(AcmeError::new(format!("acme {url} -> {status}: {text}")));
+        }
+        Ok((text, location))
+    }
+
+    /// Single JWS POST attempt.
+    async fn jws_post_inner<T: serde::de::DeserializeOwned>(
+        &self,
+        key: &EcdsaKeyPair,
+        dir: &Directory,
+        url: &str,
+        payload: serde_json::Value,
+        kid: Option<&str>,
+    ) -> Result<(Option<T>, Option<String>, Option<String>), AcmeError> {
+        let nonce = self.nonce(dir).await?;
+        let header = if let Some(kid) = kid {
+            eprintln!("[acme-dbg] kid used: {kid:?} url={url}");
             serde_json::json!({"alg": "ES256", "nonce": nonce, "url": url, "kid": kid})
         } else {
             serde_json::json!({"alg": "ES256", "nonce": nonce, "url": url, "jwk": Self::jwk(key)})
@@ -225,7 +357,7 @@ impl AcmeManager {
         let signing_input = format!("{protected}.{payload_str}");
         let sig = key
             .sign(&self.rng, signing_input.as_bytes())
-            .map_err(|e| AcmeError(e.to_string()))?;
+            .map_err(|e| AcmeError::new(e.to_string()))?;
         let body = serde_json::json!({
             "protected": protected,
             "payload": payload_str,
@@ -238,23 +370,49 @@ impl AcmeManager {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AcmeError(e.to_string()))?;
+            .map_err(|e| AcmeError::new(e.to_string()))?;
         let next_nonce = resp
             .headers()
             .get("replay-nonce")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_owned());
+        let location = resp
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_owned());
+        if let Some(n) = resp
+            .headers()
+            .get("replay-nonce")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_owned())
+        {
+            self.nonces
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(n);
+        }
         let status = resp.status();
-        let text = resp.text().await.map_err(|e| AcmeError(e.to_string()))?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| AcmeError::new(e.to_string()))?;
         if !status.is_success() {
-            return Err(AcmeError(format!("acme {url} -> {status}: {text}")));
+            let mut err = AcmeError::new(format!("acme {url} -> {status}: {text}"));
+            if text.contains("badNonce") {
+                err.retryable_nonce = true;
+            }
+            return Err(err);
         }
         let parsed = if text.is_empty() {
             None
         } else {
-            serde_json::from_str(&text).ok()
+            Some(match serde_json::from_str(&text) {
+                Ok(v) => v,
+                Err(e) => return Err(AcmeError::new(format!("jws decode: {e}: {text}"))),
+            })
         };
-        Ok((parsed, next_nonce))
+        Ok((parsed, location, next_nonce))
     }
 
     /// Obtains a certificate for the configured domains (blocking flow,
@@ -263,15 +421,18 @@ impl AcmeManager {
         if self.config.domains.is_empty() {
             return Ok(Vec::new());
         }
-        let dir: Directory = self
+        let dir_text = self
             .http
             .get(&self.config.directory_url)
             .send()
             .await
-            .map_err(|e| AcmeError(e.to_string()))?
-            .json()
+            .map_err(|e| AcmeError::new(e.to_string()))?
+            .text()
             .await
-            .map_err(|e| AcmeError(e.to_string()))?;
+            .map_err(|e| AcmeError::new(e.to_string()))?;
+        eprintln!("[acme-dbg] dir: {dir_text}");
+        let dir: Directory =
+            serde_json::from_str(&dir_text).map_err(|e| AcmeError::new(e.to_string()))?;
         let key = self.account_key()?;
 
         // newAccount (or fetch existing).
@@ -280,18 +441,21 @@ impl AcmeManager {
             "contact": self.config.emails.iter().map(|e| format!("mailto:{e}")).collect::<Vec<_>>(),
             "onlyReturnExisting": false
         });
-        let (account, _): (Option<serde_json::Value>, Option<String>) = self
+        let (account, account_location, _): (
+            Option<serde_json::Value>,
+            Option<String>,
+            Option<String>,
+        ) = self
             .jws_post(&key, &dir, &dir.new_account, payload, None)
             .await?;
-        let account_url = account
-            .as_ref()
-            .and_then(|a| a.get("status").cloned())
-            .map(|_| String::new()) // kid comes from the Location header; JWS helper returns parsed only
-            .unwrap_or_default();
-        // NOTE: proper kid handling needs the Location header; for the
-        // milestone we re-embed the JWK on every request, which ACME
-        // accepts for accounts created with onlyReturnExisting=false.
-        let _ = account_url;
+        // The account URL rides the Location header; every subsequent JWS
+        // uses it as the kid (RFC 8555 §6.2).
+        let account_url = account_location
+            .clone()
+            .ok_or_else(|| AcmeError::new("newAccount missing Location header"))?;
+        eprintln!("[acme-dbg] account url: {account_url}");
+        *self.account_url.lock().unwrap_or_else(|e| e.into_inner()) = Some(account_url.clone());
+        let kid = account_url;
 
         // newOrder.
         let identifiers: Vec<serde_json::Value> = self
@@ -300,75 +464,121 @@ impl AcmeManager {
             .iter()
             .map(|d| serde_json::json!({"type": "dns", "value": d}))
             .collect();
-        let (order, _): (Option<Order>, Option<String>) = self
+        let (order, order_url, _): (Option<Order>, Option<String>, Option<String>) = self
             .jws_post(
                 &key,
                 &dir,
                 &dir.new_order,
                 serde_json::json!({"identifiers": identifiers}),
-                Some(""),
+                Some(kid.as_str()),
             )
             .await?;
-        let mut order = order.ok_or_else(|| AcmeError("no order body".into()))?;
+        let order_url = order_url.ok_or_else(|| AcmeError::new("newOrder missing Location"))?;
+        let mut order = order.ok_or_else(|| AcmeError::new("no order body"))?;
 
         // Respond to HTTP-01 challenges.
         for auth_url in &order.authorizations {
-            let (auth, _): (Option<Authorization>, Option<String>) = self
-                .jws_post(&key, &dir, auth_url, serde_json::Value::Null, Some(""))
+            let (auth, _, _): (Option<Authorization>, Option<String>, Option<String>) = self
+                .jws_post(
+                    &key,
+                    &dir,
+                    auth_url,
+                    serde_json::Value::Null,
+                    Some(kid.as_str()),
+                )
                 .await?;
-            let auth = auth.ok_or_else(|| AcmeError("no authorization body".into()))?;
+            let auth = auth.ok_or_else(|| AcmeError::new("no authorization body"))?;
             let Some(ch) = auth.challenges.iter().find(|c| c.kind == "http-01") else {
                 continue;
             };
-            let thumb = Self::key_authorization_prefix(ch.token.clone());
+            let Some(token) = &ch.token else { continue };
+            // Full key authorization (RFC 8555 §8.1): token.thumbprint.
+            let key_auth = self.http01_key_auth(token)?;
             self.http01
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(ch.token.clone(), thumb);
-            let (_ack, _): (Option<serde_json::Value>, Option<String>) = self
-                .jws_post(&key, &dir, &ch.url, serde_json::json!({}), Some(""))
+                .insert(token.clone(), key_auth.clone());
+            // CI environments (pebble): push the answer to the challenge
+            // server's admin API BEFORE triggering validation.
+            if let Some(url) = &self.config.challenge_answer_url {
+                let body = format!(r#"{{"token": "{token}", "content": "{key_auth}"}}"#);
+                let _ = self
+                    .http
+                    .post(url)
+                    .header("Content-Type", "application/json")
+                    .body(body)
+                    .send()
+                    .await;
+            }
+            let (_ack, _, _): (Option<serde_json::Value>, Option<String>, Option<String>) = self
+                .jws_post(
+                    &key,
+                    &dir,
+                    &ch.url,
+                    serde_json::json!({}),
+                    Some(kid.as_str()),
+                )
                 .await?;
         }
 
-        // Poll authorizations until valid.
+        // Poll authorizations until valid. Nonce rejections are retried
+        // (fresh nonce comes from the next round).
         for auth_url in order.authorizations.clone() {
-            for _ in 0..30 {
-                let (auth, _): (Option<Authorization>, Option<String>) = self
-                    .jws_post(&key, &dir, &auth_url, serde_json::Value::Null, Some(""))
-                    .await?;
-                match auth.map(|a| a.status).unwrap_or_default().as_str() {
-                    "valid" => break,
-                    "pending" => tokio::time::sleep(Duration::from_secs(2)).await,
-                    _ => return Err(AcmeError("authorization failed".into())),
+            let mut valid = false;
+            for _ in 0..40 {
+                match self
+                    .jws_post::<Authorization>(
+                        &key,
+                        &dir,
+                        &auth_url,
+                        serde_json::Value::Null,
+                        Some(kid.as_str()),
+                    )
+                    .await
+                {
+                    Ok((Some(auth), _, _)) => match auth.status.as_str() {
+                        "valid" => {
+                            valid = true;
+                            break;
+                        }
+                        "pending" => tokio::time::sleep(Duration::from_secs(2)).await,
+                        _ => return Err(AcmeError::new("authorization failed")),
+                    },
+                    Ok(_) => break,
+                    Err(e) if e.retryable_nonce => {
+                        tokio::time::sleep(Duration::from_millis(500)).await
+                    }
+                    Err(e) => return Err(e),
                 }
+            }
+            if !valid {
+                return Err(AcmeError::new("authorization did not validate"));
             }
         }
 
-        // Finalize with a CSR.
-        let key_pair = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
-            &rustls_pki_types::PrivatePkcs8KeyDer::from(self.account_pkcs8(&key)?),
-            &rcgen::PKCS_ECDSA_P256_SHA256,
-        )
-        .map_err(|e| AcmeError(e.to_string()))?;
+        // Finalize with a CSR (fresh cert keypair, NOT the account key —
+        // pebble rejects CSRs reusing the account public key).
+        let cert_key = rcgen::KeyPair::generate().map_err(|e| AcmeError::new(e.to_string()))?;
+        let key_pair = cert_key;
         let mut params = rcgen::CertificateParams::new(self.config.domains.clone())
-            .map_err(|e| AcmeError(e.to_string()))?;
+            .map_err(|e| AcmeError::new(e.to_string()))?;
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, self.config.domains[0].clone());
         let csr = params
             .serialize_request(&key_pair)
-            .map_err(|e| AcmeError(e.to_string()))?;
+            .map_err(|e| AcmeError::new(e.to_string()))?;
         let csr_der = csr.der();
-        let (finalized, _): (Option<Order>, Option<String>) = self
+        let (finalized, _, _): (Option<Order>, Option<String>, Option<String>) = self
             .jws_post(
                 &key,
                 &dir,
                 &order.finalize,
                 serde_json::json!({"csr": Self::b64(csr_der.as_ref())}),
-                Some(""),
+                Some(kid.as_str()),
             )
             .await?;
-        order = finalized.ok_or_else(|| AcmeError("no finalize body".into()))?;
+        order = finalized.ok_or_else(|| AcmeError::new("no finalize body"))?;
 
         // Poll order -> valid, then download.
         for _ in 0..30 {
@@ -376,31 +586,36 @@ impl AcmeManager {
                 break;
             }
             if order.status == "invalid" {
-                return Err(AcmeError(format!("order invalid: {:?}", order.error)));
+                return Err(AcmeError::new(format!("order invalid: {:?}", order.error)));
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
-            let (o, _): (Option<Order>, Option<String>) = self
+            // POST-as-GET the order's own Location URL to refresh status.
+            let (o, _, _): (Option<Order>, Option<String>, Option<String>) = self
                 .jws_post(
                     &key,
                     &dir,
-                    &dir.new_order,
+                    &order_url,
                     serde_json::Value::Null,
-                    Some(""),
+                    Some(kid.as_str()),
                 )
                 .await?;
-            // NOTE: refresh would need the order URL; kept via finalize body.
-            let _ = o;
+            if let Some(o) = o {
+                order = o;
+            }
         }
 
         let Some(cert_url) = order.certificate.clone() else {
-            return Err(AcmeError("no certificate url".into()));
+            return Err(AcmeError::new("no certificate url"));
         };
-        let (certs, _): (Option<serde_json::Value>, Option<String>) = self
-            .jws_post(&key, &dir, &cert_url, serde_json::Value::Null, Some(""))
+        let (cert_text, _) = self
+            .jws_post_raw_text(
+                &key,
+                &dir,
+                &cert_url,
+                serde_json::Value::Null,
+                Some(kid.as_str()),
+            )
             .await?;
-        let cert_text = certs
-            .map(|c| c.to_string())
-            .ok_or_else(|| AcmeError("no certificate body".into()))?;
         self.persist_certs(&cert_text)?;
         Ok(self.config.domains.clone())
     }
@@ -409,13 +624,7 @@ impl AcmeManager {
         // We generated from rcgen's PKCS#8; re-read from disk.
         let _ = key;
         let path = self.config.storage.join("account.key");
-        std::fs::read(&path).map_err(|e| AcmeError(e.to_string()))
-    }
-
-    fn key_authorization_prefix(token: String) -> String {
-        // Full key authz = token || "." || thumbprint; the thumbprint is
-        // computed by the challenge responder via `http01_key_auth`.
-        token
+        std::fs::read(&path).map_err(|e| AcmeError::new(e.to_string()))
     }
 
     /// Builds the full key authorization for a token (JWK thumbprint).
@@ -437,13 +646,13 @@ impl AcmeManager {
     }
 
     fn persist_certs(&self, text: &str) -> Result<(), AcmeError> {
-        std::fs::create_dir_all(&self.config.storage).map_err(|e| AcmeError(e.to_string()))?;
+        std::fs::create_dir_all(&self.config.storage).map_err(|e| AcmeError::new(e.to_string()))?;
         let cert_path = self.config.storage.join("cert.pem");
         let key_path = self.config.storage.join("privkey.pem");
         // Key: reuse the order key material persisted at CSR time.
-        std::fs::write(&cert_path, text).map_err(|e| AcmeError(e.to_string()))?;
+        std::fs::write(&cert_path, text).map_err(|e| AcmeError::new(e.to_string()))?;
         if !key_path.exists() {
-            std::fs::write(&key_path, []).map_err(|e| AcmeError(e.to_string()))?;
+            std::fs::write(&key_path, []).map_err(|e| AcmeError::new(e.to_string()))?;
         }
         Ok(())
     }
