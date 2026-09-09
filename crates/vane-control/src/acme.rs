@@ -257,6 +257,12 @@ impl AcmeManager {
             .await
         {
             Err(ref e) if e.retryable_nonce => {
+                // Purge the queue: a stale queued nonce caused the first
+                // rejection. Fetch a fresh one from newNonce directly.
+                self.nonces
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
                 self.jws_post_inner::<T>(key, dir, url, payload, kid).await
             }
             other => other,

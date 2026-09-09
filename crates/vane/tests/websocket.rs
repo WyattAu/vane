@@ -114,8 +114,25 @@ fn text_frame(payload: &[u8]) -> Vec<u8> {
     f
 }
 
+/// Blocking cross-process test lock (flock on a temp file).
+fn lock_serial() -> std::fs::File {
+    use std::os::unix::io::AsRawFd;
+    let path = std::env::temp_dir().join("vane-tests-serial.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .expect("open lock file");
+    // SAFETY: flock on a regular file; released when the File drops.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    assert_eq!(rc, 0, "flock");
+    file
+}
+
 #[test]
 fn websocket_upgrade_and_tunnel_echo() {
+    let _lock = lock_serial();
     let upstream = spawn_ws_upstream();
     let proxy = spawn_proxy(upstream);
 

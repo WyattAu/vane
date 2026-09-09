@@ -1,7 +1,6 @@
 //! Proxy handler unit tests: error paths, tunnel mode, ACME challenge
 //! serving, and per-cluster metrics — all without real sockets.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -64,7 +63,7 @@ fn proxy_constructs_with_all_options() {
     let registry = Arc::new(Registry::new());
     let router = make_router(&[("/*rest", "c")]);
     let events = Arc::new(EventRing::new());
-    let p = make_proxy(router, registry, events);
+    let _p = make_proxy(router, registry, events);
     // Construction succeeds — the handler is ready to serve.
 }
 

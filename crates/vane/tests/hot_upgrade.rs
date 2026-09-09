@@ -14,8 +14,25 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
+/// Blocking cross-process test lock (flock on a temp file).
+fn lock_serial() -> std::fs::File {
+    use std::os::unix::io::AsRawFd;
+    let path = std::env::temp_dir().join("vane-tests-serial.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .expect("open lock file");
+    // SAFETY: flock on a regular file; released when the File drops.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    assert_eq!(rc, 0, "flock");
+    file
+}
+
 #[test]
 fn hot_upgrade_zero_connection_refusals() {
+    let _lock = lock_serial();
     // Upstream: keep-alive 200 responder.
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind upstream");
     let upstream = listener.local_addr().expect("addr");
