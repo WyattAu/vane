@@ -109,15 +109,29 @@ cache; pair with the ACME manager for automated certificates.
 
 ### Production features
 
-- **Upstream keep-alive pools** per worker/backend with idle eviction and
-  stale-connection retry
+- **TLS termination** (rustls, ALPN, ticket cache) with per-listener
+  cert/key or `VANE_TLS_CERT`/`VANE_TLS_KEY`
 - **Failover**: a dead backend is skipped (up to 2 attempts) while the
-  request is still unsent
-- **Enforced timeouts**: connect / first-byte / idle — 504 on expiry,
-  breaker-recorded
+  request is still unsent; breaker-recorded
+- **Enforced timeouts**: connect / first-byte / idle — 504 on expiry
+- **Opt-in rate limiting** (GCRA per client IP via `rate_limit_rps`)
 - **Env overrides** (container-friendly layering over TOML):
-  `VANE_LISTEN`, `VANE_TLS_CERT`/`VANE_TLS_KEY`, `VANE_ADMIN_ADDR`,
-  `VANE_CLUSTER_<NAME>` (comma-separated backends), `VANE_WORKERS`
+  `VANE_LISTEN`, `VANE_ADMIN_ADDR`, `VANE_CLUSTER_<NAME>`
+  (comma-separated backends), `VANE_WORKERS`
+- **In-process SHM sidecar** (`[sidecar] enabled = true`) and **wasm
+  plugins** (`[[plugins]] path = "..."`, feature `wasm`)
+
+### Known issues / current limits
+
+- **Sustained concurrent load**: a reproducible engine bug surfaces under
+  sustained keep-alive load (every second request on a connection fails);
+  sequential and low-concurrency flows pass. Regression test:
+  `cargo test -p vane --test load -- --ignored` (top roadmap item).
+- **Upstream keep-alive pooling** ships disabled by default
+  (`pool_per_backend = 0` = dial-fresh) pending the same lifecycle
+  hardening; set `> 0` to experiment.
+- HTTP/2 is served by a **separate REUSEPORT acceptor** (see
+  `h2_edge.rs`) whose bodies are buffered (32 MiB); no upstream h2 yet.
 
 ### Hot upgrade
 
@@ -137,7 +151,7 @@ are faster):
 | HTTP/1.1 head parse (5 headers) | ~266 ns incl. storage reset | `PR-01` |
 | Route lookup @ 10k routes | ~223 ns | `CP-01` |
 | SHM sidecar RTT (512 B) | ~2.8 µs | `IP-01` < 30 µs |
-| Keep-alive pool | 1 upstream conn across 5 sequential requests | new |
+| Keep-alive pool (opt-in) | 1 upstream conn across 5 sequential requests | — |
 | Config generation swap | one `Release` store + epoch retire | `CP-02` < 1 ms |
 
 ## Engineering gates (Tier A)

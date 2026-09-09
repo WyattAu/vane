@@ -130,11 +130,12 @@ impl HttpProxy {
             latency: registry.register_histogram("vane_request_duration_us"),
         };
         let breaker = Arc::new(BreakerGate::new(Arc::clone(&registry)));
-        let pipeline = Pipeline::new().then(RateLimit::new(
-            Arc::clone(&registry),
-            config.rate_limit_rps.unwrap_or(10_000),
-            config.rate_limit_rps.unwrap_or(10_000),
-        ));
+        // None = unlimited in practice (1M rps burst; GCRA stays O(1) and
+        // rate limiting remains opt-in via config).
+        let (rps, burst) = config
+            .rate_limit_rps
+            .map_or((1_000_000, 1_000_000), |r| (r, r));
+        let pipeline = Pipeline::new().then(RateLimit::new(Arc::clone(&registry), rps, burst));
         // Wasm plugins (feature `wasm`): compiled per module, instantiated
         // once per worker.
         #[cfg(feature = "wasm")]
@@ -333,6 +334,9 @@ impl HttpProxy {
     }
 
     fn respond_full(&mut self, io: &mut SessionIo<'_>, status: Status, body: &str) {
+        #[cfg(feature = "vane_dbg")]
+        eprintln!("[resp] {} {}", status.code(), body.trim());
+        let _ = io.slot_index();
         let mut buf = [0u8; 1024];
         if let Ok(n) = write_full(&mut buf, status, body.as_bytes(), &[], &self.date) {
             self.write_downstream(io, &buf[..n]);
@@ -761,15 +765,17 @@ impl HttpProxy {
         }
 
         // Checkout a pooled keep-alive connection, else dial fresh.
-        let pooled = self.pool.get_mut(&addr).and_then(Vec::pop);
-        if let Some(fd) = pooled {
-            if io.attach_upstream(fd) {
-                // Pooled conn is already connected: drive the head now.
-                self.on_upstream_connected(io);
-                return;
+        if self.config.pool_per_backend > 0 {
+            let pooled = self.pool.get_mut(&addr).and_then(Vec::pop);
+            if let Some(fd) = pooled {
+                if io.attach_upstream(fd) {
+                    // Pooled conn is already connected: drive the head now.
+                    self.on_upstream_connected(io);
+                    return;
+                }
+                // Stale pooled fd: discard, fall through to a fresh dial.
+                self.close_fd(fd);
             }
-            // Stale pooled fd: discard, fall through to a fresh dial.
-            self.close_fd(fd);
         }
         if !io.connect_upstream(addr) {
             self.metrics.upstream_errors.inc(&self.config.registry);
@@ -902,6 +908,7 @@ impl HttpProxy {
             conn.body = BodyFraming::AwaitingHead;
             conn.remaining = 0;
         }
+        io.discard_upstream(); // the dead pooled fd must not linger
         if !io.connect_upstream(addr) {
             self.metrics.upstream_errors.inc(&self.config.registry);
             self.respond_full(io, Status::BadGateway, "connect failed\n");
@@ -916,6 +923,14 @@ impl HttpProxy {
 
     /// Returns an idle keep-alive connection to the pool (or closes it).
     fn park_upstream(&mut self, io: &mut SessionIo<'_>) {
+        if self.config.pool_per_backend == 0 {
+            // Pooling disabled: close the upstream, keep the downstream
+            // session alive for the next keep-alive request.
+            if let Some(fd) = io.detach_upstream() {
+                self.close_fd(fd);
+            }
+            return;
+        }
         let slot = io.slot_index();
         let Some(addr) = self.conn(slot).upstream_addr else {
             return;

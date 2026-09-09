@@ -206,6 +206,12 @@ impl<'a> SessionIo<'a> {
         self.worker.detach_upstream(self.slot, self.generation)
     }
 
+    /// Discards a dead upstream (close + epoch bump) so stale completions
+    /// for its descriptor can never touch the session again.
+    pub fn discard_upstream(&mut self) {
+        self.worker.discard_upstream(self.slot, self.generation);
+    }
+
     /// Attaches a previously detached fd as this session's upstream
     /// (connection pooling checkout) and arms its read.
     pub fn attach_upstream(&mut self, fd: std::os::fd::RawFd) -> bool {

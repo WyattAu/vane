@@ -18,6 +18,7 @@ path = "src/main.rs"
 
 [features]
 default = ["vane-core/io-uring"]
+vane_dbg = ["vane-core/vane_dbg"]
 file-provider = ["vane-control/file-provider"]
 docker-provider = ["vane-control/docker-provider"]
 h2 = ["dep:h2", "dep:tokio-rustls"]

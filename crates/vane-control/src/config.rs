@@ -336,7 +336,10 @@ impl Default for RuntimeConfig {
             connect_timeout_ms: 5_000,
             first_byte_timeout_ms: 30_000,
             idle_timeout_ms: 75_000,
-            pool_per_backend: 8,
+            // Upstream keep-alive pooling is disabled by default: the
+            // pooled-fd lifecycle has a known EBADF race under sustained
+            // load (tracked for the next hardening pass). Set > 0 to enable.
+            pool_per_backend: 0,
         }
     }
 }

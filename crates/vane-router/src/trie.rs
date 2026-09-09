@@ -272,13 +272,25 @@ fn match_node<'r, T>(
     if pos > bytes.len() {
         return None;
     }
-    // Terminal check at end of path.
+    // Terminal check at end of path: exact terminal first, then a
+    // catch-all child matching the empty remainder (`/*rest` matches "/").
     if pos == bytes.len() {
-        return node.terminal.as_ref().map(|t| Matched {
-            terminal: t,
-            params,
-            wildcard: None,
-        });
+        if let Some(t) = &node.terminal {
+            return Some(Matched {
+                terminal: t,
+                params,
+                wildcard: None,
+            });
+        }
+        if let Some((_, c)) = &node.catch_all {
+            let t = c.terminal.as_ref()?;
+            return Some(Matched {
+                terminal: t,
+                params,
+                wildcard: Some((pos as u32, pos as u32)),
+            });
+        }
+        return None;
     }
     let end = bytes[pos..]
         .iter()

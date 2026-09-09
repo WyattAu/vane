@@ -132,6 +132,9 @@ struct Session {
     /// Nonblocking connect still in progress (diagnostics).
     #[allow(dead_code)] // consumed by CQE dispatch; kept for state clarity
     connect_inflight: bool,
+    /// Bumped whenever the upstream fd is replaced; rides the token aux so
+    /// stale completions for a discarded fd are dropped.
+    upstream_epoch: u8,
     /// Request head already serialized to the upstream (no failover past it).
     request_sent: bool,
     downstream_eof: bool,
@@ -435,6 +438,34 @@ impl WorkerState {
         self.valid(slot, generation) && self.slab.get(slot).is_some_and(|s| s.upstream.is_some())
     }
 
+    /// Discards a dead upstream: removes it from the engine, closes the fd,
+    /// releases its slots, and bumps the epoch so stale CQEs are dropped.
+    pub(crate) fn discard_upstream(&mut self, slot: u32, generation: u16) {
+        if !self.valid(slot, generation) {
+            return;
+        }
+        let Some(s) = self.slab.get_mut(slot) else {
+            return;
+        };
+        let Some(old) = s.upstream.take() else { return };
+        let fd = old.fd();
+        // StreamFd Drop closes it — ownership is simply dropped.
+        drop(old);
+        self.engine.remove(fd);
+        if let Some(rs) = s.urslot.take() {
+            self.pool.release(rs);
+        }
+        for (ws, _, _) in s.uwq.drain(..) {
+            self.pool.release(ws);
+        }
+        s.pending_up.clear();
+        s.upstream_read_inflight = false;
+        s.upstream_write_inflight = false;
+        s.upstream_eof = false;
+        s.request_sent = false;
+        s.upstream_epoch = s.upstream_epoch.wrapping_add(1);
+    }
+
     /// Detaches the upstream fd (no close) for connection pooling.
     pub(crate) fn detach_upstream(&mut self, slot: u32, generation: u16) -> Option<RawFd> {
         if !self.valid(slot, generation) {
@@ -447,6 +478,8 @@ impl WorkerState {
             // Ownership transfers to the caller (pool) — forget the guard
             // so Drop does not close the descriptor.
             std::mem::forget(owned);
+            #[cfg(feature = "vane_dbg")]
+            eprintln!("[pool] detach fd={fd} slot={slot}");
             fd
         };
         // Stop tracking it in the engine and return every slot it holds.
@@ -482,8 +515,10 @@ impl WorkerState {
         s.upstream = Some(StreamFd(fd));
         if s.urslot.is_none() {
             if let Some(uslot) = self.pool.take() {
+                let epoch = u16::from(s.upstream_epoch);
                 s.urslot = Some(uslot);
                 s.upstream_read_inflight = true;
+                let token = Token::new(Op::UpstreamRead, slot, generation, epoch);
                 let _ = self.engine.read(token, fd, uslot);
             }
         }
@@ -513,10 +548,11 @@ impl WorkerState {
             };
             if s.urslot.is_none() && !s.splice {
                 if let Some(uslot) = self.pool.take() {
+                    let epoch = u16::from(s.upstream_epoch);
                     let fd = s.upstream.as_ref().map_or(-1, StreamFd::fd);
                     s.urslot = Some(uslot);
                     s.upstream_read_inflight = true;
-                    let token = Token::new(Op::UpstreamRead, slot, generation, 0);
+                    let token = Token::new(Op::UpstreamRead, slot, generation, epoch);
                     let _ = self.engine.read(token, fd, uslot);
                 }
             }
@@ -554,8 +590,9 @@ impl WorkerState {
         }
         let Some(rs) = s.urslot else { return };
         s.upstream_read_inflight = true;
+        let epoch = u16::from(s.upstream_epoch);
         let fd = s.upstream.as_ref().map_or(-1, StreamFd::fd);
-        let token = Token::new(Op::UpstreamRead, slot, generation, 0);
+        let token = Token::new(Op::UpstreamRead, slot, generation, epoch);
         let _ = self.engine.read(token, fd, rs);
     }
 
@@ -741,54 +778,23 @@ impl WorkerState {
                     h.on_downstream_error(&mut io, e);
                 }
             },
-            Op::UpstreamRead => {
-                {
-                    let Some(s) = self.slab.get_mut(slot) else {
-                        return;
-                    };
-                    s.upstream_read_inflight = false;
+            Op::UpstreamRead | Op::UpstreamWrite => {
+                // Stale completions for a discarded upstream fd (failover
+                // replaced it) must not touch the session: the epoch rides
+                // the token aux and must match.
+                let epoch = u8::try_from(cqe.token.aux()).unwrap_or(u8::MAX);
+                let epoch_ok = self
+                    .slab
+                    .get(slot)
+                    .is_some_and(|s| s.upstream_epoch == epoch);
+                if !epoch_ok {
+                    return;
                 }
-                match cqe.result {
-                    Ok(n) if n > 0 => {
-                        let data = {
-                            let Some(s) = self.slab.get_mut(slot) else {
-                                return;
-                            };
-                            let Some(rs) = s.urslot.take() else { return };
-                            let v = self.pool.slot(rs)[..n as usize].to_vec();
-                            self.pool.release(rs);
-                            v
-                        };
-                        let mut io = self.io_for(slot, generation);
-                        h.on_upstream_data(&mut io, &data);
-                        self.arm_upstream_read(slot, generation);
-                    }
-                    Ok(0) => {
-                        let Some(s) = self.slab.get_mut(slot) else {
-                            return;
-                        };
-                        if let Some(rs) = s.urslot.take() {
-                            self.pool.release(rs);
-                        }
-                        let mut io = self.io_for(slot, generation);
-                        h.on_upstream_eof(&mut io);
-                        self.maybe_finish(slot, generation);
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        let mut io = self.io_for(slot, generation);
-                        h.on_upstream_error(&mut io, e);
-                    }
+                match cqe.token.op() {
+                    Op::UpstreamRead => self.dispatch_upstream_read(cqe, slot, generation, h),
+                    _ => self.dispatch_upstream_write(cqe, slot, generation, h),
                 }
             }
-            Op::UpstreamWrite => match cqe.result {
-                Ok(n) if n > 0 => self.continue_upstream_write(slot, generation, h),
-                Ok(_) => {}
-                Err(e) => {
-                    let mut io = self.io_for(slot, generation);
-                    h.on_upstream_error(&mut io, e);
-                }
-            },
             Op::Splice => match cqe.result {
                 Ok(0) => {
                     let aux = cqe.token.aux();
@@ -809,6 +815,70 @@ impl WorkerState {
                 Ok(_) => { /* bytes moved; multishot readiness continues */ }
                 Err(_) => self.close_session(slot, generation),
             },
+        }
+    }
+
+    fn dispatch_upstream_read(
+        &mut self,
+        cqe: crate::engine::Cqe,
+        slot: u32,
+        generation: u16,
+        h: &mut dyn Handler,
+    ) {
+        {
+            let Some(s) = self.slab.get_mut(slot) else {
+                return;
+            };
+            s.upstream_read_inflight = false;
+        }
+        match cqe.result {
+            Ok(n) if n > 0 => {
+                let data = {
+                    let Some(s) = self.slab.get_mut(slot) else {
+                        return;
+                    };
+                    let Some(rs) = s.urslot.take() else { return };
+                    let v = self.pool.slot(rs)[..n as usize].to_vec();
+                    self.pool.release(rs);
+                    v
+                };
+                let mut io = self.io_for(slot, generation);
+                h.on_upstream_data(&mut io, &data);
+                self.arm_upstream_read(slot, generation);
+            }
+            Ok(0) => {
+                let Some(s) = self.slab.get_mut(slot) else {
+                    return;
+                };
+                if let Some(rs) = s.urslot.take() {
+                    self.pool.release(rs);
+                }
+                let mut io = self.io_for(slot, generation);
+                h.on_upstream_eof(&mut io);
+                self.maybe_finish(slot, generation);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                let mut io = self.io_for(slot, generation);
+                h.on_upstream_error(&mut io, e);
+            }
+        }
+    }
+
+    fn dispatch_upstream_write(
+        &mut self,
+        cqe: crate::engine::Cqe,
+        slot: u32,
+        generation: u16,
+        h: &mut dyn Handler,
+    ) {
+        match cqe.result {
+            Ok(n) if n > 0 => self.continue_upstream_write(slot, generation, h),
+            Ok(_) => {}
+            Err(e) => {
+                let mut io = self.io_for(slot, generation);
+                h.on_upstream_error(&mut io, e);
+            }
         }
     }
 
@@ -921,6 +991,7 @@ impl WorkerState {
             write_inflight: false,
             upstream_write_inflight: false,
             connect_inflight: false,
+            upstream_epoch: 0,
             request_sent: false,
             downstream_eof: false,
             upstream_eof: false,

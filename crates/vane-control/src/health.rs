@@ -108,6 +108,7 @@ impl HealthChecker {
             } else {
                 tcp_probe(addr).await
             };
+            tracing::debug!(%addr, healthy, "health probe");
             self.map.set(addr, healthy);
         }
     }
