@@ -60,6 +60,8 @@ struct Conn {
     close_after: bool,
     /// Response body framing decided from the upstream head.
     body: BodyFraming,
+    /// WebSocket tunnel active (101 switched): raw bidirectional pump.
+    tunnel: bool,
     remaining: u64,
     started: Option<Instant>,
     trace: Option<vane_observe::trace::TraceContext>,
@@ -81,6 +83,8 @@ enum BodyFraming {
     ContentLength,
     /// Pass chunked bytes until terminal 0-chunk observed (len tracking).
     Chunked { last_was_lf: bool, seen_zero: bool },
+    /// WebSocket/protocol tunnel: raw bidirectional pump.
+    Tunnel,
     /// Response complete.
     Done,
 }
@@ -476,7 +480,13 @@ impl HttpProxy {
                         upstream_close = true;
                     }
                 }
-                let framing = if code == 204 || code == 304 {
+                let framing = if code == 101 {
+                    // WebSocket / protocol switch: everything after the
+                    // head is a raw bidirectional pump until either side
+                    // closes.
+                    self.conn(slot).tunnel = true;
+                    BodyFraming::Tunnel
+                } else if code == 204 || code == 304 {
                     BodyFraming::Done
                 } else if chunked {
                     BodyFraming::Chunked {
@@ -524,13 +534,18 @@ impl Handler for HttpProxy {
     }
 
     fn on_downstream_data(&mut self, io: &mut SessionIo<'_>, data: &[u8]) {
+        let slot = io.slot_index();
+        // WebSocket tunnel: raw bidirectional relay, no parsing.
+        if self.conns.get(&slot).is_some_and(|c| c.tunnel) {
+            self.metrics
+                .bytes_in
+                .add(&self.config.registry, data.len() as u64);
+            io.write_upstream(data);
+            return;
+        }
         // Every downstream byte on a TLS listener is ciphertext: route
         // through the TLS pump (which handles handshake and app data).
-        let tls = self
-            .conns
-            .get(&io.slot_index())
-            .and_then(|c| c.tls.as_ref())
-            .is_some();
+        let tls = self.conns.get(&slot).and_then(|c| c.tls.as_ref()).is_some();
         if tls {
             self.tls_read(io, data);
         } else {
@@ -592,6 +607,13 @@ impl Handler for HttpProxy {
             // First upstream byte: clear the FirstByte deadline.
             io.set_deadline(None, vane_core::handler::DeadlineReason::FirstByte);
         }
+        if self.conn(slot).tunnel {
+            // Tunnel: relay raw both ways, no deadlines (long-lived).
+            io.set_deadline(None, vane_core::handler::DeadlineReason::Idle);
+            let data = data.to_vec();
+            self.write_downstream(io, &data);
+            return;
+        }
         let framing = self.conn(slot).body;
         match framing {
             BodyFraming::AwaitingHead => {
@@ -614,6 +636,11 @@ impl Handler for HttpProxy {
             BodyFraming::ContentLength | BodyFraming::Chunked { .. } => {
                 self.relay_body(io, data);
                 self.check_done(io);
+            }
+            BodyFraming::Tunnel => {
+                // Tunnel: relay raw both directions.
+                let data = data.to_vec();
+                self.write_downstream(io, &data);
             }
             BodyFraming::Done => { /* trailing bytes after done: ignore */ }
         }

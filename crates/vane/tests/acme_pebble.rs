@@ -15,12 +15,32 @@
 //! challtestsrv from the client's key authorizations) → finalize →
 //! certificate download.
 
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 
 use vane_control::acme::{AcmeConfig, AcmeManager};
 
+/// Blocking cross-process test lock (flock on a temp file).
+fn lock_serial() -> std::fs::File {
+    let path = std::env::temp_dir().join("vane-tests-serial.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .expect("open lock file");
+    // SAFETY: flock on a regular file; released when the File drops.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    assert_eq!(rc, 0, "flock");
+    file
+}
+
 #[tokio::test]
 async fn acme_issues_certificate_against_pebble() {
+    // Serialize with the other proxy suites (shared pebble state + wall-
+    // clock sensitive challenge window).
+    let _lock = lock_serial();
+
     let storage = tempfile::tempdir().expect("dir");
     let mgr = Arc::new(AcmeManager::new(AcmeConfig {
         directory_url: "https://127.0.0.1:14000/dir".into(),
