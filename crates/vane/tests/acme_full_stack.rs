@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[tokio::test]
+#[ignore = "requires docker (pebble container)"]
 async fn acme_full_stack_issue_and_serve() {
     let _lock = lock_serial();
     // Kill leaked vane children from prior failed runs — they squat the

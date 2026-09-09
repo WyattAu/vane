@@ -1,5 +1,8 @@
 //! ACME e2e against a dedicated pebble instance (`acme-pebble` feature).
 //!
+//! Marked `#[ignore]` in the default run: requires Docker. Run with
+//! `cargo test --features acme-pebble --test acme_pebble -- --ignored`.
+//!
 //! Starts its own pebble + challtestsrv containers (host network), drives
 //! the real ACME client through a full issuance cycle, and cleans up.
 
@@ -26,6 +29,7 @@ fn lock_serial() -> std::fs::File {
 }
 
 #[tokio::test]
+#[ignore = "requires docker (pebble + challtestsrv containers)"]
 async fn acme_issues_certificate_against_pebble() {
     let _lock = lock_serial();
 
