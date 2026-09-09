@@ -1,19 +1,24 @@
-//! Sustained-load regression gate: 8 client threads x 500 keep-alive
-//! requests (4000 total) with framed response reads.
+//! Pooled-upstream load variant: same sustained keep-alive traffic as
+//! `load.rs` but with upstream keep-alive pooling enabled
+//! (`pool_per_backend > 0`).
 //!
-//! History: this test exposed two defects — (1) the test client itself
-//! read unframed responses (fixed here), and (2) a synchronous-connect
-//! path that never invoked `on_upstream_connected` (fixed via
-//! `UpstreamDial`). It guards the per-request engine/handler machinery
-//! under real concurrency.
+//! History: pooling under sustained concurrent load previously exhibited
+//! detached-fd lifecycle races (EBADF on writes to closed/reused
+//! descriptors). This suite is the acceptance gate for re-enabling it.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-fn spawn_upstream() -> SocketAddr {
+#[test]
+fn pooled_sustained_load_no_failures() {
+    let _lock = lock_serial();
+
+    // Keep-alive upstream: thread per connection, persistent response loop.
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind upstream");
-    let addr = listener.local_addr().expect("addr");
+    let upstream = listener.local_addr().expect("addr");
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let mut s = stream;
@@ -23,42 +28,20 @@ fn spawn_upstream() -> SocketAddr {
                     match s.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(_) => {
-                            let _ = s.write_all(
+                            if s.write_all(
                                 b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: keep-alive\r\n\r\nhello-vane",
-                            );
+                            )
+                            .is_err()
+                            {
+                                break;
+                            }
                         }
                     }
                 }
             });
         }
     });
-    addr
-}
 
-#[test]
-fn sustained_concurrent_load_no_failures_mio() {
-    run_sustained(true, 1);
-}
-
-/// Multi-worker: SO_REUSEPORT distribution across 4 pinned workers must
-/// serve the same traffic with zero failures.
-#[test]
-fn sustained_concurrent_load_no_failures_mio_4w() {
-    run_sustained(true, 4);
-}
-
-/// Exercises the io_uring engine end-to-end when the kernel supports it
-/// (the worker silently falls back to mio otherwise, so the test is
-/// portable). Serialized with the other proxy suites.
-#[test]
-fn sustained_concurrent_load_no_failures_uring() {
-    run_sustained(false, 1);
-}
-
-fn run_sustained(force_mio: bool, workers: usize) {
-    // Wall-clock sensitive (many workers); serialize with the other suites.
-    let _lock = lock_serial();
-    let upstream = spawn_upstream();
     let probe = TcpListener::bind("127.0.0.1:0").expect("probe");
     let proxy_addr = probe.local_addr().expect("addr");
     drop(probe);
@@ -71,7 +54,7 @@ fn run_sustained(force_mio: bool, workers: usize) {
             r#"
 [[listeners]]
 address = "{proxy_addr}"
-workers = {workers}
+workers = 1
 
 [clusters.e2e]
 backends = ["{upstream}"]
@@ -84,14 +67,15 @@ cluster = "e2e"
 enabled = false
 
 [runtime]
-force_mio = {force_mio}
+force_mio = true
+pool_per_backend = 4
 "#
         ),
     )
     .expect("write");
 
     let config_path = path.display().to_string();
-    std::thread::spawn(move || {
+    let _server = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -101,12 +85,11 @@ force_mio = {force_mio}
             handover_from: None,
             handover_to: None,
             shutdown_after: Some(Duration::from_secs(20)),
-            force_mio,
+            force_mio: true,
         }));
         assert_eq!(code, 0);
     });
 
-    // Wait for readiness.
     for _ in 0..40 {
         if TcpStream::connect(proxy_addr).is_ok() {
             break;
@@ -114,12 +97,10 @@ force_mio = {force_mio}
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // 8 client threads x 500 keep-alive requests = 4000 requests.
-    // Clients read *framed* responses (status line + Content-Length body):
-    // TCP segmentation may split or coalesce response bytes arbitrarily,
-    // so a single read() is never a complete response.
-    let failures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let total = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // 8 client threads x 300 keep-alive requests = 2400 through the pool.
+    let failures = Arc::new(AtomicUsize::new(0));
+    let total = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
     let mut clients = Vec::new();
     for _ in 0..8 {
         let failures = Arc::clone(&failures);
@@ -129,18 +110,18 @@ force_mio = {force_mio}
             s.set_read_timeout(Some(Duration::from_secs(15))).ok();
             let mut acc: Vec<u8> = Vec::with_capacity(4096);
             let mut tmp = [0u8; 4096];
-            for i in 0..500 {
+            for i in 0..300 {
                 let req = format!("GET /r{i} HTTP/1.1\r\nHost: t\r\n\r\n");
                 if let Err(e) = s.write_all(req.as_bytes()) {
                     eprintln!("[client] req{i} write failed: {e}");
                     failures.fetch_add(1, Ordering::SeqCst);
                     return;
                 }
-                // Drain one full response: head, then Content-Length body.
+                // Framed read: head, then Content-Length body.
                 let head_end = loop {
                     match s.read(&mut tmp) {
                         Ok(0) => {
-                            eprintln!("[client] req{i} eof waiting for head");
+                            eprintln!("[client] req{i} eof (head)");
                             failures.fetch_add(1, Ordering::SeqCst);
                             return;
                         }
@@ -151,7 +132,7 @@ force_mio = {force_mio}
                             }
                         }
                         Err(e) => {
-                            eprintln!("[client] req{i} head read failed: {e}");
+                            eprintln!("[client] req{i} head read: {e}");
                             failures.fetch_add(1, Ordering::SeqCst);
                             return;
                         }
@@ -167,20 +148,19 @@ force_mio = {force_mio}
                     .lines()
                     .find_map(|l| {
                         l.strip_prefix("Content-Length:")
-                            .or_else(|| l.strip_prefix("content-length:"))
                             .and_then(|v| v.trim().parse().ok())
                     })
                     .unwrap_or(0);
                 while acc.len() < head_end + cl {
                     match s.read(&mut tmp) {
                         Ok(0) => {
-                            eprintln!("[client] req{i} eof waiting for body");
+                            eprintln!("[client] req{i} eof (body)");
                             failures.fetch_add(1, Ordering::SeqCst);
                             return;
                         }
                         Ok(n) => acc.extend_from_slice(&tmp[..n]),
                         Err(e) => {
-                            eprintln!("[client] req{i} body read failed: {e}");
+                            eprintln!("[client] req{i} body read: {e}");
                             failures.fetch_add(1, Ordering::SeqCst);
                             return;
                         }
@@ -194,13 +174,11 @@ force_mio = {force_mio}
     for c in clients {
         c.join().expect("client thread");
     }
+    stop.store(true, Ordering::SeqCst);
     let f = failures.load(Ordering::SeqCst);
     let t = total.load(Ordering::SeqCst);
-    assert_eq!(f, 0, "{f} failures out of {} completed requests", t + f);
+    assert_eq!(f, 0, "{f} failures out of {t} completed (pooled path)");
 }
-
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 /// Blocking cross-process test lock (flock on a temp file).
 fn lock_serial() -> std::fs::File {

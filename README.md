@@ -130,9 +130,8 @@ cache; pair with the ACME manager for automated certificates.
   (`1.0.0.127` SYN blackhole). Both carry regression coverage
   (`vane-core/tests/connect.rs`, `vane-core/tests/echo.rs` on both
   engines).
-- **Upstream keep-alive pooling** ships disabled by default
-  (`pool_per_backend = 0` = dial-fresh) pending lifecycle hardening
-  under sustained load; set `> 0` to experiment.
+- **Upstream keep-alive pooling** on by default (4 idle conns per
+  backend per worker); `pool_per_backend = 0` for dial-fresh.
 - HTTP/2 is served by a **separate REUSEPORT acceptor** (see
   `h2_edge.rs`) whose bodies are buffered (32 MiB); no upstream h2 yet.
 
