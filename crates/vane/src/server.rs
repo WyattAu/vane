@@ -284,6 +284,7 @@ pub async fn run(opts: RunOptions) -> i32 {
                             strip_prefix: r.strip_prefix,
                             timeout_ms: None,
                             backends,
+                            upstream_h2: false,
                             policy: vane_router::Policy::P2C,
                             priority: 20,
                         };

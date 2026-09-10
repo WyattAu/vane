@@ -20,6 +20,8 @@ use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
+use crate::providers::ProviderRouteSpec;
+
 use crate::health::HealthMap;
 use crate::providers::{ProviderUpdate, build_route};
 
@@ -134,13 +136,16 @@ impl DockerProvider {
                         // duplicates for labeled hosts.
                         for r in &routes {
                             builders.push(build_route(
-                                r.host.clone(),
-                                r.pattern.clone(),
-                                r.cluster.clone(),
-                                vec![r.addr],
+                                ProviderRouteSpec {
+                                    host: r.host.clone(),
+                                    pattern: r.pattern.clone(),
+                                    cluster: r.cluster.clone(),
+                                    addrs: vec![r.addr],
+                                    strip_prefix: r.strip.clone(),
+                                    priority: 50,
+                                    upstream_h2: false,
+                                },
                                 &health,
-                                r.strip.clone(),
-                                50,
                             ));
                         }
                         let _ = grouped;

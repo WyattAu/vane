@@ -34,6 +34,18 @@ impl RateLimit {
             registry,
         }
     }
+
+    /// Async check — for callers already inside a runtime (the h2 edge).
+    /// `check_sync` would panic there ("runtime within a runtime").
+    pub async fn check_async(&self, key: &str) -> Outcome {
+        match self.limiter.check(key).await.allowed {
+            true => Outcome::Continue,
+            false => {
+                self.rejected.inc(&self.registry);
+                Outcome::Reject(429, "rate limited")
+            }
+        }
+    }
 }
 
 impl Filter for RateLimit {

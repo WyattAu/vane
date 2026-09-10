@@ -13,7 +13,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use crate::health::HealthMap;
-use crate::providers::{ProviderUpdate, build_route};
+use crate::providers::{ProviderRouteSpec, ProviderUpdate, build_route};
 
 const SA_TOKEN: &str = "/var/run/secrets/kubernetes.io/serviceaccount/token";
 const SA_CA: &str = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
@@ -56,6 +56,9 @@ impl K8sProvider {
         };
         let ca = std::fs::read(SA_CA).map_err(|e| format!("read ca: {e}"))?;
         let cert = reqwest::Certificate::from_pem(&ca).map_err(|e| e.to_string())?;
+        // Idempotent provider install (workspace pins rustls without a
+        // default provider; reqwest needs one).
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::builder()
             .add_root_certificate(cert)
             .timeout(std::time::Duration::from_secs(10))
@@ -154,13 +157,19 @@ impl K8sProvider {
                             for host in hosts {
                                 for (prefix, cluster, _) in &r.matches {
                                     builders.push(build_route(
-                                        host.clone(),
-                                        format!("{}*rest", prefix.trim_end_matches('/')),
-                                        cluster.clone(),
-                                        r.backends.clone(),
+                                        ProviderRouteSpec {
+                                            host: host.clone(),
+                                            pattern: format!(
+                                                "{}*rest",
+                                                prefix.trim_end_matches('/')
+                                            ),
+                                            cluster: cluster.clone(),
+                                            addrs: r.backends.clone(),
+                                            strip_prefix: None,
+                                            priority: 30,
+                                            upstream_h2: false,
+                                        },
                                         &health,
-                                        None,
-                                        30,
                                     ));
                                 }
                             }

@@ -94,19 +94,27 @@ clap = { version = "4", features = ["derive"] }
 
 # Async (control plane only)
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 futures = "0.3"
 
 # TLS / crypto
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
-tokio-rustls = "0.26"
+# Pin ring: the tokio-rustls default pulls `rustls/aws_lc_rs`, which —
+# combined with our direct rustls `ring` pin — makes the process-level
+# CryptoProvider ambiguous (rustls refuses to auto-select, reqwest panics).
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "logging",
+    "tls12",
+    "ring",
+] }
 ring = "0.17"
 rcgen = "0.14"
 
 # Observability
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std"] }
 
 # HTTP/2 + HTTP/3 (experimental features)
 h2 = { version = "0.4" }

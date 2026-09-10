@@ -158,10 +158,15 @@ impl AcmeManager {
     /// If the TLS-capable reqwest client cannot be built.
     #[must_use]
     pub fn new(config: AcmeConfig) -> Self {
+        // The workspace pins rustls without a default provider; install
+        // ours (idempotent — no-ops if already set) so the process-level
+        // default exists even in SDK-embedded use.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         #[allow(clippy::expect_used, reason = "TLS init failure is fatal at startup")]
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
             .user_agent("vane-acme/0.1")
+            // Pebble/CI servers use self-signed certificates.
             .danger_accept_invalid_certs(config.insecure_tls)
             .build()
             .expect("reqwest client");
@@ -235,7 +240,7 @@ impl AcmeManager {
             .head(&dir.new_nonce)
             .send()
             .await
-            .map_err(|e| AcmeError::new(e.to_string()))?;
+            .map_err(|e| AcmeError::new(reqwest_chain(&e)))?;
         resp.headers()
             .get("replay-nonce")
             .and_then(|v| v.to_str().ok())
@@ -307,7 +312,7 @@ impl AcmeManager {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AcmeError::new(e.to_string()))?;
+            .map_err(|e| AcmeError::new(reqwest_chain(&e)))?;
         if let Some(n) = resp
             .headers()
             .get("replay-nonce")
@@ -372,7 +377,7 @@ impl AcmeManager {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AcmeError::new(e.to_string()))?;
+            .map_err(|e| AcmeError::new(reqwest_chain(&e)))?;
         let next_nonce = resp
             .headers()
             .get("replay-nonce")
@@ -432,7 +437,7 @@ impl AcmeManager {
             .get(&self.config.directory_url)
             .send()
             .await
-            .map_err(|e| AcmeError::new(e.to_string()))?
+            .map_err(|e| AcmeError::new(reqwest_chain(&e)))?
             .text()
             .await
             .map_err(|e| AcmeError::new(e.to_string()))?;
@@ -727,6 +732,20 @@ impl AcmeManager {
             }
         })
     }
+}
+
+/// Flattens a reqwest error's source chain into one string — the default
+/// `Display` hides the root cause ("error sending request" says nothing
+/// about DNS vs TLS vs connection refused).
+fn reqwest_chain(e: &reqwest::Error) -> String {
+    let mut msg = e.to_string();
+    let mut src: Option<&dyn std::error::Error> = std::error::Error::source(&e);
+    while let Some(s) = src {
+        msg.push_str(": ");
+        msg.push_str(&s.to_string());
+        src = s.source();
+    }
+    msg
 }
 
 #[cfg(test)]

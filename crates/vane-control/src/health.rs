@@ -101,6 +101,9 @@ impl HealthChecker {
     #[must_use]
     pub fn new(map: std::sync::Arc<HealthMap>, interval: Duration) -> Self {
         #[allow(clippy::expect_used, reason = "TLS init failure is fatal at startup")]
+        // Idempotent provider install (workspace pins rustls without a
+        // default provider; reqwest needs one).
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(3))
             .build()

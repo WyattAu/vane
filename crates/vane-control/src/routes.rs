@@ -27,6 +27,7 @@ pub fn static_routes(cfg: &VaneConfig, health: &HealthMap) -> Vec<RouteBuilder> 
             strip_prefix: r.strip_prefix.clone(),
             timeout_ms: r.timeout_ms,
             backends,
+            upstream_h2: cluster.http2,
             policy: cluster.policy.into(),
             priority: r.priority,
         });

@@ -42,7 +42,12 @@ pub struct H2Edge {
     router: Arc<Router>,
     breaker: Arc<vane_filters::BreakerGate>,
     rate: Option<Arc<vane_filters::RateLimit>>,
+    /// HTTP/1.1 upstream client (default).
     http: reqwest::Client,
+    /// HTTP/2 prior-knowledge upstream client (clusters with
+    /// `http2 = true`). Shares the connection pool: one h2 connection
+    /// multiplexes all streams to a backend.
+    http2: reqwest::Client,
 }
 
 impl H2Edge {
@@ -52,6 +57,9 @@ impl H2Edge {
     /// Metric registration failure (startup-only).
     #[must_use]
     pub fn new(router: Arc<Router>, registry: Arc<Registry>) -> Self {
+        // Idempotent: vane's binaries install this in main, but the edge
+        // is also constructed by embedders/tests without that guarantee.
+        vane_tls::install_crypto_provider();
         let breaker = Arc::new(vane_filters::BreakerGate::new(Arc::clone(&registry)));
         let rate = Some(Arc::new(vane_filters::RateLimit::new(
             Arc::clone(&registry),
@@ -66,6 +74,11 @@ impl H2Edge {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("reqwest client"),
+            http2: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .http2_prior_knowledge()
+                .build()
+                .expect("reqwest h2 client"),
         }
     }
 
@@ -164,7 +177,12 @@ impl H2Edge {
             ctx.inject("X-Forwarded-Proto", "https");
             let mut rejected = false;
             if let Some(rate) = &self.rate {
-                if matches!(rate.run(&mut ctx), vane_filters::Outcome::Reject(..)) {
+                // Async check: `run`/`check_sync` would panic inside the
+                // tokio runtime.
+                if matches!(
+                    rate.check_async(ctx.client.ip().to_string().as_str()).await,
+                    vane_filters::Outcome::Reject(..)
+                ) {
                     rejected = true;
                 }
             }
@@ -200,8 +218,13 @@ impl H2Edge {
             }
         };
 
+        let client = if route.upstream_h2 {
+            &self.http2
+        } else {
+            &self.http
+        };
         let url = format!("http://{addr}{upstream_path}");
-        let mut upstream = self.http.request(method, &url);
+        let mut upstream = client.request(method, &url);
         for (name, value) in &inject {
             upstream = upstream.header(name.as_str(), value.as_str());
         }

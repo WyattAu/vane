@@ -35,6 +35,15 @@ pub enum TlsError {
     Ticket(String),
 }
 
+/// Installs the process-global rustls crypto provider (ring). Idempotent:
+/// safe to call from every binary and test harness; no-ops if another
+/// provider is already installed. Required because the workspace pins
+/// rustls without a default provider — client stacks (reqwest) would
+/// otherwise panic with "No provider set".
+pub fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// Loads PEM cert chain + key from disk.
 ///
 /// # Errors

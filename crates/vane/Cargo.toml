@@ -57,6 +57,7 @@ http = { workspace = true }
 bytes = { workspace = true }
 notify = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 
 # Experimental protocol features
@@ -70,6 +71,8 @@ h3-quinn = { workspace = true, optional = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
+h2 = { workspace = true }
+http = { workspace = true }
 rcgen = { workspace = true }
 libc = { workspace = true }
 loop-retry = { workspace = true }

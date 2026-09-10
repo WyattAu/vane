@@ -47,6 +47,7 @@ fn make_router(routes: &[(&str, &str)]) -> Arc<Router> {
                     strip_prefix: None,
                     timeout_ms: None,
                     backends: vec![Backend::new(SocketAddr::from(([127, 0, 0, 1], 9999)), 1)],
+                    upstream_h2: false,
                     policy: Policy::P2C,
                     priority: 0,
                 }

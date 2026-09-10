@@ -24,6 +24,7 @@ envstack = { workspace = true }
 validkit = { workspace = true }
 loop-retry = { workspace = true }
 rustls-pki-types = { workspace = true }
+rustls = { workspace = true }
 rcgen = { workspace = true }
 ring = { workspace = true }
 base64 = "0.22"

@@ -31,6 +31,7 @@ fn lock_serial() -> std::fs::File {
 #[tokio::test]
 #[ignore = "requires docker (pebble + challtestsrv containers)"]
 async fn acme_issues_certificate_against_pebble() {
+    vane_tls::install_crypto_provider();
     let _lock = lock_serial();
 
     // Kill leaked vane children from prior failed runs.

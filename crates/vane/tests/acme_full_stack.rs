@@ -17,6 +17,7 @@ use std::time::Duration;
 #[tokio::test]
 #[ignore = "requires docker (pebble container)"]
 async fn acme_full_stack_issue_and_serve() {
+    vane_tls::install_crypto_provider();
     let _lock = lock_serial();
     // Kill leaked vane children from prior failed runs — they squat the
     // ACME ports and break fresh runs.
@@ -177,6 +178,7 @@ force_mio = true
         .args(["run", "-c", &p1s])
         .stdout(Stdio::null())
         .stderr(err_log)
+        .env("RUST_LOG", "debug")
         .spawn()
         .expect("spawn phase-1 vane");
 
@@ -210,11 +212,13 @@ force_mio = true
     }
 
     // Wait for the certificate to be issued and installed. Ceiling is
-    // generous: pebble injects multi-second validation delays and the
-    // chain download may need retries (worst observed ~45s).
+    // generous: pebble injects multi-second validation delays, the chain
+    // download may need retries, and under a loaded host the renewal
+    // loop's 30s between-attempt backoff can stack (worst observed ~45s
+    // quiet, >75s under parallel load).
     let cert_path = acme_storage.join("cert.pem");
     let mut issued = false;
-    for _ in 0..150 {
+    for _ in 0..300 {
         if let Ok(text) = std::fs::read_to_string(&cert_path) {
             if text.contains("BEGIN CERTIFICATE") {
                 issued = true;

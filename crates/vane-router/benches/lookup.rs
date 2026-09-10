@@ -21,6 +21,7 @@ fn entry(host: Option<String>, pattern: String) -> RouteEntry {
             SocketAddr::from(([127, 0, 0, 1], 9000)),
             1,
         )],
+        upstream_h2: false,
         policy: Policy::P2C,
         priority: 0,
     }
