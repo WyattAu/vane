@@ -75,6 +75,17 @@ fn cmd_run(
     handover_to: Option<String>,
     force_mio: bool,
 ) -> i32 {
+    cmd_run_with_shutdown(config, handover_from, handover_to, force_mio, None)
+}
+
+/// `vane run` with an optional shutdown delay (tests bound the run).
+fn cmd_run_with_shutdown(
+    config: Option<String>,
+    handover_from: Option<String>,
+    handover_to: Option<String>,
+    force_mio: bool,
+    shutdown_after: Option<std::time::Duration>,
+) -> i32 {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -84,7 +95,7 @@ fn cmd_run(
             config_path: config,
             handover_from,
             handover_to,
-            shutdown_after: None,
+            shutdown_after,
             force_mio,
         })
         .await
@@ -239,5 +250,52 @@ enabled = false
     #[test]
     fn validate_missing_file_exits_one() {
         assert_eq!(super::cmd_validate("/nonexistent/vane/config.toml"), 1);
+    }
+
+    #[test]
+    fn cmd_run_starts_and_shuts_down() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("run.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[listeners]]
+address = "127.0.0.1:0"
+
+[clusters.up]
+backends = ["127.0.0.1:9"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = true
+"#,
+        )
+        .expect("write");
+        let code = super::cmd_run_with_shutdown(
+            Some(path.to_str().expect("utf8").to_owned()),
+            None,
+            None,
+            true,
+            Some(std::time::Duration::from_millis(200)),
+        );
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn cmd_run_bad_config_exits_one() {
+        let code = super::cmd_run_with_shutdown(
+            Some("/nonexistent/vane.toml".into()),
+            None,
+            None,
+            true,
+            Some(std::time::Duration::from_millis(100)),
+        );
+        assert_eq!(code, 1);
     }
 }

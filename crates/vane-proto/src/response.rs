@@ -207,3 +207,48 @@ mod tests {
         assert!(write_full(&mut buf, Status::Ok, b"", &[], &date).is_err());
     }
 }
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    #[test]
+    fn status_roundtrips_all_codes() {
+        for code in [
+            200, 201, 204, 301, 304, 400, 401, 403, 404, 405, 413, 500, 502, 503, 504,
+        ] {
+            let s = Status::from_code(code);
+            assert_eq!(s.code(), code, "code {code}");
+            assert!(!s.reason().is_empty());
+        }
+    }
+
+    #[test]
+    fn unknown_codes_map_to_500() {
+        assert_eq!(Status::from_code(599).code(), 500);
+        assert_eq!(Status::from_code(99).code(), 500);
+        assert_eq!(Status::from_code(418).code(), 500);
+    }
+
+    #[test]
+    fn write_head_with_extra_headers() {
+        let date = DateCache::new();
+        let mut buf = [0u8; 512];
+        let n = write_head(
+            &mut buf,
+            Status::Ok,
+            &[
+                ("x-test", b"yes".as_slice()),
+                ("connection", b"close".as_slice()),
+            ],
+            &date,
+            Some(5),
+        )
+        .expect("fits");
+        let s = std::str::from_utf8(&buf[..n]).expect("utf8");
+        assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(s.contains("Content-Length: 5\r\n"));
+        assert!(s.contains("x-test: yes\r\n"));
+        assert!(s.ends_with("\r\n"));
+    }
+}

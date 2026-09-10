@@ -205,4 +205,47 @@ cluster = "web"
         let routes = provider.scan(&HealthMap::new()).expect("scan");
         assert_eq!(routes.len(), 1);
     }
+
+    #[tokio::test]
+    async fn scan_missing_directory_errors() {
+        let provider = FileProvider::new(std::path::PathBuf::from("/nonexistent/vane/routes"), 100);
+        assert!(provider.scan(&HealthMap::new()).is_err());
+    }
+
+    #[tokio::test]
+    async fn scan_ignores_non_toml_and_empty() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("notes.txt"), "hello").expect("write");
+        std::fs::write(dir.path().join("empty.toml"), "").expect("write");
+        let provider = FileProvider::new(dir.path().to_path_buf(), 100);
+        let routes = provider.scan(&HealthMap::new()).expect("scan");
+        assert!(routes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn spawn_watches_and_pushes_updates() {
+        let dir = tempfile::tempdir().expect("dir");
+        let provider = FileProvider::new(dir.path().to_path_buf(), 50);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let _handle = provider
+            .spawn(Arc::new(HealthMap::new()), tx)
+            .expect("spawn");
+        // Initial snapshot arrives without any files.
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("initial update")
+            .expect("some");
+        assert!(first.routes.is_empty());
+        // Adding a file triggers an update.
+        std::fs::write(
+            dir.path().join("live.toml"),
+            "[clusters.w]\nbackends = [\"127.0.0.1:1\"]\n\n[[routes]]\npattern = \"/w\"\ncluster = \"w\"\n",
+        )
+        .expect("write");
+        let second = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("second update")
+            .expect("some");
+        assert_eq!(second.routes.len(), 1);
+    }
 }
