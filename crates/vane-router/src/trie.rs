@@ -395,3 +395,39 @@ mod tests {
         assert_eq!(t.lookup("/a").expect("hit").terminal.value, 2);
     }
 }
+
+#[cfg(test)]
+mod parts_tests {
+    use super::*;
+
+    #[test]
+    fn clone_parts_roundtrip() {
+        let t = PathTrie::new().insert("/a/*rest", 1).insert("/a/b", 2);
+        let parts = t.clone_parts();
+        let rebuilt = PathTrie::from_parts(parts);
+        assert_eq!(rebuilt.lookup("/a/b").map(|m| m.terminal.value), Some(2));
+        assert_eq!(rebuilt.lookup("/a/z").map(|m| m.terminal.value), Some(1));
+    }
+
+    #[test]
+    fn is_empty_reflects_inserts() {
+        let t: PathTrie<u8> = PathTrie::new();
+        assert!(t.is_empty());
+        assert_eq!(t.len(), 0);
+        let t = t.insert("/x", 1);
+        assert!(!t.is_empty());
+        assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn double_slash_in_request_path_fails_match() {
+        let t = PathTrie::new().insert("/a/b", 1);
+        assert!(t.lookup("/a//b").is_none(), "// must not match literals");
+    }
+
+    #[test]
+    fn catch_all_matches_root_slash() {
+        let t = PathTrie::new().insert("/*rest", 7);
+        assert_eq!(t.lookup("/").map(|m| m.terminal.value), Some(7));
+    }
+}

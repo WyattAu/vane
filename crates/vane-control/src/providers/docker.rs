@@ -389,3 +389,44 @@ mod mock_socket_tests {
         assert!(provider.list_routes().await.is_err());
     }
 }
+
+#[cfg(test)]
+mod spawn_tests {
+    use super::*;
+
+    /// spawn(): the poll loop groups routes and pushes ProviderUpdates.
+    #[tokio::test]
+    async fn spawn_pushes_updates() {
+        let dir = tempfile::tempdir().expect("dir");
+        let sock = dir.path().join("d.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in listener.incoming().flatten() {
+                let mut s = stream;
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let body = serde_json::json!([
+                    {"Labels": {"vane.enable": "true", "vane.cluster": "web"},
+                     "Ports": [{"PrivatePort": 80}]}
+                ])
+                .to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        let provider = DockerProvider::new(sock, std::time::Duration::from_millis(50));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let _handle = provider.spawn(Arc::new(HealthMap::new()), tx);
+        let update = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("update")
+            .expect("some");
+        assert_eq!(update.source, "docker");
+        assert_eq!(update.routes.len(), 1);
+    }
+}

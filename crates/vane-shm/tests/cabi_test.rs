@@ -206,3 +206,72 @@ fn cabi_recv_buffer_too_small() {
     // SAFETY: valid handle.
     unsafe { cabi::vane_sc_close(client) };
 }
+
+/// Null path → null handle + error; null payload with len>0 rejected.
+#[test]
+fn cabi_open_null_path_and_send_null_payload() {
+    // SAFETY: deliberately invalid args; the ABI must reject cleanly.
+    let null_handle = unsafe { cabi::vane_sc_open(std::ptr::null()) };
+    assert!(null_handle.is_null());
+    assert!(!cabi::vane_sc_last_err().is_null());
+
+    let dir = tempfile::tempdir().expect("dir");
+    let base = dir.path().join("null-payload");
+    let cfg = vane_shm::transport::SidecarConfig {
+        base: base.clone(),
+        slot_size: 64 * 1024,
+        slots: 2,
+    };
+    let _server = vane_shm::transport::SidecarServer::open(&cfg).expect("server");
+    let path = CString::new(base.to_str().expect("utf8")).expect("cstring");
+    // SAFETY: valid C string.
+    let client = unsafe { cabi::vane_sc_open(path.as_ptr()) };
+    assert!(!client.is_null());
+    // SAFETY: null payload with nonzero len must be rejected (-1 style).
+    let id = unsafe { cabi::vane_sc_send(client, std::ptr::null(), 5, 100) };
+    assert_eq!(id, u64::MAX, "null payload must fail");
+    // SAFETY: valid handle.
+    unsafe { cabi::vane_sc_close(client) };
+}
+
+/// Zero-length payload is legal (empty message).
+#[test]
+fn cabi_send_zero_length_ok() {
+    let dir = tempfile::tempdir().expect("dir");
+    let base = dir.path().join("zero-len");
+    let cfg = vane_shm::transport::SidecarConfig {
+        base: base.clone(),
+        slot_size: 64 * 1024,
+        slots: 2,
+    };
+    let mut server = vane_shm::transport::SidecarServer::open(&cfg).expect("server");
+    let path = CString::new(base.to_str().expect("utf8")).expect("cstring");
+    // SAFETY: valid C string.
+    let client = unsafe { cabi::vane_sc_open(path.as_ptr()) };
+    assert!(!client.is_null());
+
+    std::thread::spawn(move || {
+        loop {
+            match server.recv(Duration::from_secs(1)) {
+                Ok(Some((id, data))) => {
+                    let _ = server.reply(id, &data, Duration::from_secs(5));
+                }
+                Ok(None) => continue,
+                Err(_) => return,
+            }
+        }
+    });
+
+    // SAFETY: valid handle; zero-length payload pointer may be null-ish —
+    // we pass a valid pointer with len 0.
+    let id = unsafe { cabi::vane_sc_send(client, b"x".as_ptr(), 0, 2000) };
+    assert_ne!(id, u64::MAX, "zero-length send must succeed");
+
+    let mut out = [0u8; 8];
+    let mut rid = 0u64;
+    // SAFETY: valid handle; out writable.
+    let rc = unsafe { cabi::vane_sc_recv(client, out.as_mut_ptr(), out.len(), &mut rid, 5000) };
+    assert_eq!(rc, 0, "empty reply length");
+    // SAFETY: valid handle.
+    unsafe { cabi::vane_sc_close(client) };
+}

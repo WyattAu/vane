@@ -364,6 +364,29 @@ mod tests {
         assert_eq!(verdict, GuestVerdict::Continue);
     }
 
+    /// Invalid status return surfaces as an ABI error.
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn abi_invalid_status_is_error() {
+        const GUEST: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "alloc") (param i32) (result i32) i32.const 0)
+  (func (export "on_request") (param i32 i32 i32) (result i32)
+    (i32.const 999))
+)
+"#;
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("bad.wasm");
+        std::fs::write(&path, GUEST).expect("write wat");
+        let module = PluginModule::compile(&path).expect("compile");
+        let mut inst = module.instantiate().expect("instantiate");
+        match inst.on_request("/x") {
+            Err(PluginError::Abi(msg)) => assert!(msg.contains("999"), "{msg}"),
+            other => panic!("expected Abi error, got {other:?}"),
+        }
+    }
+
     /// ABI v1 compatibility: a guest with no `vane` imports still runs.
     #[cfg(feature = "wasm")]
     #[test]

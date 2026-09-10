@@ -398,17 +398,21 @@ struct Splicer;
 
 impl Handler for Splicer {
     fn on_connected(&mut self, io: &mut SessionIo<'_>) {
-        eprintln!("DBG splicer on_connected");
-        // Engine-level socketpair is created by the test via a fixed path
-        // marker; here we use a TCP upstream dialed from the handler.
-        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("addr");
-        let _ = addr;
-        // The upstream fd is supplied by the test through CONNECT: dial a
-        // pre-arranged listener.
-        if !io.connect_upstream(std::net::SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            SPLICE_UPSTREAM_PORT.load(std::sync::atomic::Ordering::Relaxed),
-        )) {
+        let Some(addr) = *SPLICE_UPSTREAM_ADDR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        else {
+            // Legacy port-only mode (v4 loopback).
+            let addr = std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                SPLICE_UPSTREAM_PORT.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            if !io.connect_upstream(addr) {
+                io.close();
+            }
+            return;
+        };
+        if !io.connect_upstream(addr) {
             io.close();
         }
     }
@@ -448,6 +452,8 @@ impl HandlerFactory for SplicerFactory {
 }
 
 static SPLICE_UPSTREAM_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+static SPLICE_UPSTREAM_ADDR: std::sync::Mutex<Option<std::net::SocketAddr>> =
+    std::sync::Mutex::new(None);
 
 /// Worker-level splice: downstream bytes cross to the upstream through
 /// the kernel pipe (handler only sets the pump up).
@@ -455,8 +461,14 @@ static SPLICE_UPSTREAM_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::A
 fn worker_splice_pumps_raw_bytes() {
     // Upstream echo on a known port.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let upstream_port = listener.local_addr().expect("addr").port();
-    SPLICE_UPSTREAM_PORT.store(upstream_port, std::sync::atomic::Ordering::Relaxed);
+    let upstream_addr = listener.local_addr().expect("addr");
+    SPLICE_UPSTREAM_PORT.store(upstream_addr.port(), std::sync::atomic::Ordering::Relaxed);
+    *SPLICE_UPSTREAM_ADDR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(upstream_addr);
+    *SPLICE_UPSTREAM_ADDR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(upstream_addr);
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let mut s = stream;
@@ -508,4 +520,60 @@ fn worker_splice_pumps_raw_bytes() {
 /// Naive substring search over accumulated echo bytes.
 fn twoway_contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// IPv6 upstream dial through the engine (v6 sockaddr path).
+#[test]
+fn connect_ipv6_upstream() {
+    // v6 loopback listener.
+    let listener = match std::net::TcpListener::bind("[::1]:0") {
+        Ok(l) => l,
+        Err(_) => return, // no v6 in this environment
+    };
+    let upstream_addr = listener.local_addr().expect("addr");
+    let port = upstream_addr.port();
+    *SPLICE_UPSTREAM_ADDR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(upstream_addr);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut s = stream;
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 64];
+                if let Ok(n) = s.read(&mut buf) {
+                    let _ = s.write_all(&buf[..n]);
+                }
+            });
+        }
+    });
+
+    let tcp_listener =
+        vane_core::tcp_listener("127.0.0.1:0".parse().expect("addr"), true, 64).expect("bind");
+    let addr = tcp_listener.local_addr().expect("addr");
+
+    let registry = Arc::new(Registry::new());
+    let events = Arc::new(vane_observe::ring::EventRing::new());
+    let cfg = WorkerConfig {
+        force_mio: true,
+        ..WorkerConfig::default()
+    };
+    let factory = SplicerFactory;
+    // Reuse Splicer: it dials the atomic port; store the v6 port.
+    SPLICE_UPSTREAM_PORT.store(port, std::sync::atomic::Ordering::Relaxed);
+    let mut handle = spawn_worker(1, cfg, tcp_listener, registry, events, &factory).expect("spawn");
+
+    let mut client = TcpStream::connect(addr).expect("connect");
+    client
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .ok();
+    client.write_all(b"v6").expect("write");
+    let mut buf = [0u8; 2];
+    client.read_exact(&mut buf).expect("v6 echo");
+    assert_eq!(&buf, b"v6");
+
+    let _ = handle
+        .cmd
+        .send(vane_core::WorkerCmd::Shutdown { deadline_ms: 100 });
+    handle.join();
 }
