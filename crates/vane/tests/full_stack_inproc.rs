@@ -149,7 +149,7 @@ workers = 1
     spawn_proxy(cfg);
 
     // Wait for the listener.
-    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     wait_bound(proxy);
 
     // Routed success.
@@ -195,7 +195,7 @@ workers = 1
     drop(s);
 
     // Admin endpoints answer while running.
-    let admin_addr: std::net::SocketAddr = format!("127.0.0.1:{admin}").parse().unwrap();
+    let admin_addr: std::net::SocketAddr = format!("127.0.0.1:{admin}").parse().expect("addr");
     let resp = request(
         admin_addr,
         b"GET /healthz HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
@@ -232,7 +232,7 @@ workers = 1
 
     spawn_proxy(cfg);
 
-    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     wait_bound(proxy);
     // L4: raw bytes cross to the upstream (it answers HTTP but splice
     // just moves bytes; any response proves the pipe works).
@@ -292,7 +292,7 @@ workers = 1
 
     spawn_proxy(cfg);
 
-    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     wait_bound(proxy);
 
     // TLS client: trust the generated cert directly.

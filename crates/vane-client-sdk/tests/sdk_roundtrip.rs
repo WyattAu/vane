@@ -82,5 +82,5 @@ fn sdk_call_times_out() {
     let _server = SidecarServer::open(&cfg).expect("server");
     let mut client = Sidecar::connect(cfg.base.as_path()).expect("client");
     let res = Sidecar::call(&mut client, b"quiet", Duration::from_millis(200));
-    assert!(matches!(res, Err(_)), "expected timeout error, got {res:?}");
+    assert!(res.is_err(), "expected timeout error, got {res:?}");
 }

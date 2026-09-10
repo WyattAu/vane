@@ -161,7 +161,7 @@ fn client_half_close_is_handled() {
     client
         .set_read_timeout(Some(std::time::Duration::from_secs(3)))
         .ok();
-    let mut buf = [0u8; 3];
+    let _buf = [0u8; 3];
     // The echo handler may or may not reply after EOF — either way the
     // session must be reaped: shutdown of our read side too, then verify
     // the worker stays alive with a new connection.

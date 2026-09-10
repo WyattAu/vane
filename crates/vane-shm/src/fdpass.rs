@@ -200,7 +200,7 @@ mod tests {
 
         // SAFETY: the fd was a listening TCP socket when sent; ownership
         // moved with the send (original dropped below).
-        let mut transferred = unsafe { tcp_listener_from_fd(fds[0]) };
+        let transferred = unsafe { tcp_listener_from_fd(fds[0]) };
         // The transferred listener still accepts connections.
         let probe = std::net::TcpStream::connect(addr).expect("connect");
         let (accepted, _) = transferred.accept().expect("accept");

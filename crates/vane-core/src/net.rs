@@ -163,7 +163,7 @@ mod net_tests {
         use std::io::Read as _;
         let a = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = a.local_addr().expect("addr");
-        let mut client = std::net::TcpStream::connect(addr).expect("connect");
+        let client = std::net::TcpStream::connect(addr).expect("connect");
         let mut server = a.incoming().next().unwrap().expect("accept");
         shutdown_write(client.as_raw_fd());
         // Peer sees EOF.

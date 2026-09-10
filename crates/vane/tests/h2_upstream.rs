@@ -225,7 +225,7 @@ async fn no_route_yields_404() {
 async fn disallowed_method_yields_405() {
     let upstream = spawn_h1_upstream().await;
     let r = Router::new();
-    r.update(|mut editor| {
+    r.update(|editor| {
         editor.insert(RouteEntry {
             host: None,
             pattern: "/*rest".into(),
@@ -329,7 +329,7 @@ async fn post_body_roundtrip() {
     });
 
     let r = Router::new();
-    r.update(|mut editor| {
+    r.update(|editor| {
         editor.insert(RouteEntry {
             host: None,
             pattern: "/*rest".into(),

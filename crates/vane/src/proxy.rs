@@ -449,11 +449,13 @@ impl HttpProxy {
             .unwrap_or(([0u8; 16], 0));
         let upstream = conn.upstream_addr.map(|a| (ip16(a.ip()), a.port()));
         let mut trace_hex = [0u8; 32];
+        let mut trace_len = 0;
         if let Some(t) = &conn.trace {
             for (i, b) in t.trace_id.iter().enumerate() {
                 trace_hex[i * 2] = HEX[usize::from(b >> 4)];
                 trace_hex[i * 2 + 1] = HEX[usize::from(b & 0x0F)];
             }
+            trace_len = t.trace_id.len() * 2;
         }
         let rec = vane_observe::access::AccessRecord::now(
             u16::try_from(self.worker_id).unwrap_or(u16::MAX),
@@ -465,7 +467,7 @@ impl HttpProxy {
             conn.req_method.as_bytes(),
             conn.req_host.as_deref().unwrap_or_default().as_bytes(),
             conn.req_path.as_bytes(),
-            &trace_hex,
+            &trace_hex[..trace_len],
         );
         access.emit(rec);
         if let Some(c) = self.conns.get_mut(&slot) {
