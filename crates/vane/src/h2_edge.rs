@@ -63,10 +63,26 @@ impl H2Edge {
         registry: Arc<Registry>,
         access: Option<std::sync::Arc<vane_observe::access::AccessLog>>,
     ) -> Self {
-        // Idempotent: vane's binaries install this in main, but the edge
-        // is also constructed by embedders/tests without that guarantee.
+        Self::with_parts(router, registry, access, None)
+    }
+
+    /// Sets a pre-built breaker gate (tests inject an opened breaker).
+    #[must_use]
+    pub fn with_breaker(mut self, breaker: Arc<vane_filters::BreakerGate>) -> Self {
+        self.breaker = breaker;
+        self
+    }
+
+    /// Shared constructor.
+    fn with_parts(
+        router: Arc<Router>,
+        registry: Arc<Registry>,
+        access: Option<std::sync::Arc<vane_observe::access::AccessLog>>,
+        breaker: Option<Arc<vane_filters::BreakerGate>>,
+    ) -> Self {
         vane_tls::install_crypto_provider();
-        let breaker = Arc::new(vane_filters::BreakerGate::new(Arc::clone(&registry)));
+        let breaker = breaker
+            .unwrap_or_else(|| Arc::new(vane_filters::BreakerGate::new(Arc::clone(&registry))));
         let rate = Some(Arc::new(vane_filters::RateLimit::new(
             Arc::clone(&registry),
             10_000,

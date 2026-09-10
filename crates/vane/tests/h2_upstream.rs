@@ -592,3 +592,69 @@ async fn no_healthy_backend_yields_503() {
     let (status, _, _) = request_via_edge(Arc::new(r), "/x").await;
     assert_eq!(status, 503);
 }
+
+/// Open breaker on the route's cluster: the edge short-circuits 503.
+#[tokio::test]
+async fn breaker_open_yields_503() {
+    let upstream = spawn_h1_upstream().await;
+    let r = Router::new();
+    let breaker = std::sync::Arc::new(vane_filters::BreakerGate::new(Arc::new(Registry::new())));
+    for _ in 0..20 {
+        breaker.record_failure("up");
+    }
+    r.update(|editor| {
+        editor.insert(RouteEntry {
+            host: None,
+            pattern: "/*rest".into(),
+            methods: Vec::new(),
+            cluster: "up".into(),
+            strip_prefix: None,
+            timeout_ms: None,
+            backends: vec![vane_router::Backend::new(upstream, 1)],
+            upstream_h2: false,
+            policy: vane_router::Policy::P2C,
+            gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
+            priority: 0,
+        });
+    });
+    // Construct the edge with the SAME breaker instance so it is open.
+    let edge = Arc::new(
+        tokio::task::spawn_blocking(move || {
+            vane::h2_edge::H2Edge::new(Arc::new(r), Arc::new(Registry::new()), None)
+                .with_breaker(breaker)
+        })
+        .await
+        .expect("edge build"),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let edge_addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let e = Arc::clone(&edge);
+            tokio::spawn(async move {
+                let _ = e.serve_connection(stream).await;
+            });
+        }
+    });
+
+    let io = tokio::net::TcpStream::connect(edge_addr)
+        .await
+        .expect("connect");
+    let (mut send_request, connection) = h2::client::handshake(io).await.expect("h2");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = http::Request::builder()
+        .method("GET")
+        .uri("http://edge/open")
+        .body(())
+        .expect("request");
+    let (response, _) = send_request.send_request(request, true).expect("send");
+    let (parts, _) = response.await.expect("response").into_parts();
+    assert_eq!(parts.status.as_u16(), 503, "open breaker must 503");
+}

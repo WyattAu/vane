@@ -261,3 +261,131 @@ mod tests {
         assert!(p.list_routes().await.is_err());
     }
 }
+
+#[cfg(test)]
+mod mock_socket_tests {
+    use super::*;
+
+    /// Mock Docker Engine API over a UDS: serves /containers/json.
+    fn start_mock_docker() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("dir");
+        let sock = dir.path().join("docker.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in listener.incoming().flatten() {
+                let mut s = stream;
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf);
+                    let body = serde_json::json!([
+                        {
+                            "Labels": {
+                                "vane.enable": "true",
+                                "vane.host": "app.example.com",
+                                "vane.path": "/api/*rest",
+                                "vane.port": "9000",
+                                "vane.cluster": "apps",
+                                "vane.strip": "/api"
+                            },
+                            "Ports": [
+                                {"PrivatePort": 9000, "IP": "172.17.0.5"}
+                            ]
+                        },
+                        {
+                            "Labels": {"vane.enable": "false"},
+                            "Ports": []
+                        },
+                        {
+                            "Labels": {},
+                            "Ports": []
+                        }
+                    ])
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = s.write_all(resp.as_bytes());
+                });
+            }
+        });
+        (dir, sock)
+    }
+
+    #[tokio::test]
+    async fn list_routes_parses_labels_and_ports() {
+        let (_dir, sock) = start_mock_docker();
+        let provider = DockerProvider::new(sock, std::time::Duration::from_secs(1));
+        let routes = provider.list_routes().await.expect("list");
+        // Only the enabled container becomes a route.
+        assert_eq!(routes.len(), 1);
+        let r = &routes[0];
+        assert_eq!(r.host.as_deref(), Some("app.example.com"));
+        assert_eq!(r.pattern, "/api/*rest");
+        assert_eq!(r.cluster, "apps");
+        assert_eq!(r.strip.as_deref(), Some("/api"));
+        // Mapped bridge IP preferred over loopback fallback.
+        assert_eq!(r.addr.to_string(), "172.17.0.5:9000");
+    }
+
+    #[tokio::test]
+    async fn list_routes_defaults_without_labels() {
+        let dir = tempfile::tempdir().expect("dir");
+        let sock = dir.path().join("d.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in listener.incoming().flatten() {
+                let mut s = stream;
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let body = serde_json::json!([
+                    {"Labels": {"vane.enable": "true"}, "Ports": [{"PrivatePort": 8080}]}
+                ])
+                .to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        let provider = DockerProvider::new(sock, std::time::Duration::from_secs(1));
+        let routes = provider.list_routes().await.expect("list");
+        assert_eq!(routes.len(), 1);
+        // Defaults: loopback + port 8080, /*rest, cluster "docker", no host.
+        // Port label absent → default 80.
+        assert_eq!(routes[0].addr.to_string(), "127.0.0.1:80");
+        assert_eq!(routes[0].pattern, "/*rest");
+        assert_eq!(routes[0].cluster, "docker");
+        assert_eq!(routes[0].host, None);
+        assert_eq!(routes[0].strip, None);
+    }
+
+    #[tokio::test]
+    async fn malformed_json_is_error() {
+        let dir = tempfile::tempdir().expect("dir");
+        let sock = dir.path().join("d.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in listener.incoming().flatten() {
+                let mut s = stream;
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let body = "not json at all";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        let provider = DockerProvider::new(sock, std::time::Duration::from_secs(1));
+        assert!(provider.list_routes().await.is_err());
+    }
+}
