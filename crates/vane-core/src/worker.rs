@@ -178,6 +178,10 @@ pub(crate) struct WorkerState {
     drain_deadline: Option<Instant>,
     #[allow(dead_code)] // kept for per-mode logging in follow-ups
     mode: Mode,
+    /// Connects that completed inline (UDS always; TCP rarely) and need
+    /// their `on_upstream_connected` callback delivered on the next loop
+    /// pass — the handler is not reachable from the connect call site.
+    inline_connected: Vec<(u32, u16)>,
 }
 
 impl WorkerState {
@@ -292,6 +296,7 @@ impl WorkerState {
                 s.upstream = Some(StreamFd(fd));
                 if poll == crate::engine::Poll::Done(0) {
                     self.do_upstream_connected(slot, generation);
+                    self.inline_connected.push((slot, generation));
                 }
                 true
             }
@@ -317,6 +322,7 @@ impl WorkerState {
                 s.upstream = Some(StreamFd(fd));
                 if poll == crate::engine::Poll::Done(0) {
                     self.do_upstream_connected(slot, generation);
+                    self.inline_connected.push((slot, generation));
                 }
                 true
             }
@@ -1092,6 +1098,19 @@ impl WorkerInner {
                     state.dispatch_cqe(cqe, handler.as_mut());
                 }
             }
+            // Inline-completed connects: deliver the deferred callback.
+            if !self.state.inline_connected.is_empty() {
+                let queued = std::mem::take(&mut self.state.inline_connected);
+                for (slot, generation) in queued {
+                    if !self.state.valid(slot, generation) {
+                        continue;
+                    }
+                    let WorkerInner { state, handler } = &mut self;
+                    state.do_upstream_connected(slot, generation);
+                    let mut io = state.io_for(slot, generation);
+                    handler.on_upstream_connected(&mut io);
+                }
+            }
             let now = Instant::now();
             let WorkerInner { state, handler } = &mut self;
             state.run_timers(now, handler.as_mut());
@@ -1174,6 +1193,7 @@ pub fn spawn(
                 draining: false,
                 drain_deadline: None,
                 mode,
+                inline_connected: Vec::new(),
             },
             handler,
         };
