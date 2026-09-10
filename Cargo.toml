@@ -48,6 +48,8 @@ vane-plugins = { version = "0.1.0", path = "crates/vane-plugins" }
 
 # WyattAu kit ecosystem (reuse, do not reinvent)
 shm-rings = "0.1.1"
+# NOTE: publish blocker — slab-pool must be on crates.io first (currently git).
+# Once published, switch to: slab-pool = "0.1"
 slab-pool = { git = "https://github.com/WyattAu/slab-pool.git", branch = "main" }
 throttle-kit = "1.0"
 breaker = "1.0"
