@@ -144,6 +144,9 @@ pub trait Engine {
 ///
 /// Prefers io_uring (when compiled in and permitted — `SQPOLL` needs a
 /// privileged or unbounded user); falls back to mio otherwise.
+/// # Errors
+/// Returns the platform error when no engine can be created (io_uring
+/// syscall probe fails and mio fallback setup fails).
 pub fn create_engine(
     entries: u32,
     buffers: Option<&BufferPool>,

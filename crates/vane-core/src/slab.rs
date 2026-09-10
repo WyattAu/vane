@@ -35,6 +35,9 @@ pub struct SessionSlab<T> {
 
 impl<T> SessionSlab<T> {
     /// Pre-allocates `capacity` slots (no `T` constructed yet).
+    ///
+    /// # Errors
+    /// [`SlabError::Capacity`] when `capacity` is 0 or exceeds `MAX_SLOTS`.
     pub fn new(capacity: usize) -> Result<Self, SlabError> {
         if capacity == 0 || capacity > MAX_SLOTS {
             return Err(SlabError::Capacity(capacity));
@@ -56,6 +59,9 @@ impl<T> SessionSlab<T> {
     }
 
     /// Inserts a value, returning `(slot, generation)`.
+    ///
+    /// # Errors
+    /// [`SlabError::Exhausted`] when every slot is live.
     pub fn insert(&mut self, value: T) -> Result<(u32, u16), SlabError> {
         if self.free_count == 0 {
             return Err(SlabError::Exhausted);

@@ -419,6 +419,10 @@ impl AcmeManager {
 
     /// Obtains a certificate for the configured domains (blocking flow,
     /// called from the renewal loop).
+    ///
+    /// # Errors
+    /// Any ACME protocol failure (directory, account, order, authorization,
+    /// finalization, or chain download).
     pub async fn obtain_certificate(&self) -> Result<Vec<String>, AcmeError> {
         if self.config.domains.is_empty() {
             return Ok(Vec::new());

@@ -131,6 +131,9 @@ pub struct SpscSender<T, const CAP: usize> {
 
 impl<T, const CAP: usize> SpscSender<T, CAP> {
     /// Enqueues without blocking; `Err(value)` when full.
+    ///
+    /// # Errors
+    /// Returns the value back when the ring is full (lock-free bound).
     #[inline]
     pub fn send(&self, value: T) -> Result<(), T> {
         match self.ring.try_push(value) {

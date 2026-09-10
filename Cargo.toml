@@ -29,6 +29,9 @@ missing_docs = "warn"
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "warn"
 unwrap_used = "deny"
+# High-value pedantic subset: documentation quality (casts are pervasive
+# and deliberate in fd/buffer arithmetic — tracked, not enforced).
+missing_errors_doc = "warn"
 # `expect` is permitted for startup-only invariants (documented at each site);
 # the Tier A deny list covers unwrap/panic/indexing.
 expect_used = "allow"
