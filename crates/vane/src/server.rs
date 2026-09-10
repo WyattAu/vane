@@ -34,6 +34,20 @@ pub struct RunOptions {
     pub force_mio: bool,
 }
 
+impl RunOptions {
+    /// Test/coverage helper: minimal options with just a config path.
+    #[must_use]
+    pub fn for_test(config_path: Option<&str>) -> Self {
+        Self {
+            config_path: config_path.map(str::to_owned),
+            handover_from: None,
+            handover_to: None,
+            shutdown_after: None,
+            force_mio: true,
+        }
+    }
+}
+
 /// Loads config from the given path or the default locations, then applies
 /// `VANE_*` environment overrides (container-friendly layering):
 ///

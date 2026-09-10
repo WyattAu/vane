@@ -3660,6 +3660,7 @@ name = "vane-filters"
 version = "0.1.0"
 dependencies = [
  "breaker",
+ "tempfile",
  "throttle-kit",
  "vane-observe",
 ]

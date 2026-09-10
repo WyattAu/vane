@@ -232,3 +232,81 @@ impl Filter for AccessLog {
         Outcome::Continue
     }
 }
+
+#[cfg(test)]
+mod builtin_tests {
+    use super::*;
+    use crate::pipeline::{Filter, Outcome};
+
+    fn ctx<'a>(method: &'a str, path: &'a mut str, host: Option<&'a str>) -> RequestCtx<'a> {
+        RequestCtx::new(method, path, "10.0.0.7:1234".parse().expect("addr"), host)
+    }
+
+    #[test]
+    fn rate_limit_blocks_after_burst() {
+        let registry = std::sync::Arc::new(Registry::new());
+        let rl = RateLimit::new(registry, 1, 2);
+        let mut path = String::from("/x");
+        // Burst of 2 allowed, 3rd within the window rejected.
+        assert!(matches!(
+            rl.run(&mut ctx("GET", &mut path, None)),
+            Outcome::Continue
+        ));
+        assert!(matches!(
+            rl.run(&mut ctx("GET", &mut path, None)),
+            Outcome::Continue
+        ));
+        match rl.run(&mut ctx("GET", &mut path, None)) {
+            Outcome::Reject(code, reason) => {
+                assert_eq!(code, 429);
+                assert!(!reason.is_empty());
+            }
+            other => panic!("expected reject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn breaker_opens_after_failures_and_halfopens() {
+        let registry = std::sync::Arc::new(Registry::new());
+        let gate = BreakerGate::new(registry);
+        let mut path = String::from("/x");
+        for _ in 0..20 {
+            gate.record_failure("c1");
+        }
+        // Open breaker short-circuits (ctx.cluster must be set — the gate
+        // is post-route).
+        let mut c = ctx("GET", &mut path, None);
+        c.cluster = Some("c1");
+        match gate.run(&mut c) {
+            Outcome::Reject(code, _) => assert_eq!(code, 503),
+            other => panic!("expected 503, got {other:?}"),
+        }
+        // Different cluster unaffected.
+        let mut other_cluster = ctx("GET", &mut path, None);
+        other_cluster.cluster = Some("c2");
+        assert!(matches!(gate.run(&mut other_cluster), Outcome::Continue));
+        // Successes don't fix an OPEN breaker (probe-gated).
+        gate.record_success("c1");
+        let mut again = ctx("GET", &mut path, None);
+        again.cluster = Some("c1");
+        assert!(matches!(gate.run(&mut again), Outcome::Reject(..)));
+    }
+
+    #[test]
+    fn request_id_and_forwarded_inject_headers() {
+        let rid = RequestId::default();
+        let mut path = String::from("/y");
+        let mut c = ctx("POST", &mut path, Some("h.example"));
+        assert!(matches!(rid.run(&mut c), Outcome::Continue));
+        assert!(c.inject_headers.iter().any(|(k, _)| k == "X-Request-Id"));
+
+        let fwd = ForwardedHeaders::default();
+        assert!(matches!(fwd.run(&mut c), Outcome::Continue));
+        assert!(c.inject_headers.iter().any(|(k, _)| k == "X-Forwarded-For"));
+        assert!(
+            c.inject_headers
+                .iter()
+                .any(|(k, _)| k == "X-Forwarded-Host")
+        );
+    }
+}

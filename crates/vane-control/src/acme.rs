@@ -758,4 +758,95 @@ mod tests {
         let s = AcmeManager::b64(&[0xfb, 0xff]);
         assert!(!s.contains('+') && !s.contains('/') && !s.contains('='));
     }
+
+    #[test]
+    fn directory_parses_acme_fields() {
+        let text = r#"{
+            "newNonce": "https://acme/nounce-plz",
+            "newAccount": "https://acme/sign-me-up",
+            "newOrder": "https://acme/order-plz",
+            "revokeCert": "https://acme/revoke"
+        }"#;
+        let dir: Directory = serde_json::from_str(text).expect("parse");
+        assert_eq!(dir.new_nonce, "https://acme/nounce-plz");
+        assert_eq!(dir.new_account, "https://acme/sign-me-up");
+        assert_eq!(dir.new_order, "https://acme/order-plz");
+    }
+
+    #[test]
+    fn order_parses_status_and_authz_urls() {
+        let text = r#"{
+            "status": "pending",
+            "authorizations": ["https://acme/authZ/1", "https://acme/authZ/2"],
+            "finalize": "https://acme/finalize",
+            "identifiers": []
+        }"#;
+        let order: Order = serde_json::from_str(text).expect("parse");
+        assert_eq!(order.status, "pending");
+        assert_eq!(order.authorizations.len(), 2);
+    }
+
+    #[test]
+    fn authorization_parses_challenges() {
+        let text = r#"{
+            "status": "pending",
+            "challenges": [
+                {"type": "http-01", "url": "https://acme/chalZ/abc", "token": "tok"},
+                {"type": "dns-01", "url": "https://acme/chalZ/def"}
+            ],
+            "identifier": {"type": "dns", "value": "x.example"}
+        }"#;
+        let auth: Authorization = serde_json::from_str(text).expect("parse");
+        assert_eq!(auth.status, "pending");
+        assert_eq!(auth.challenges.len(), 2);
+        assert_eq!(auth.challenges[0].kind, "http-01");
+        assert_eq!(auth.challenges[0].token.as_deref(), Some("tok"));
+        // dns-01 has no token in vane's model.
+        assert!(auth.challenges[1].token.is_none());
+    }
+
+    #[test]
+    fn jwk_point_is_coordinate_pair() {
+        // Uncompressed point: 0x04 || X(32) || Y(32).
+        let mut point = vec![4u8];
+        point.extend(std::iter::repeat_n(0xA5, 32));
+        point.extend(std::iter::repeat_n(0x5A, 32));
+        let jwk = AcmeManager::jwk_point(&point);
+        assert_eq!(jwk["kty"], "EC");
+        assert_eq!(jwk["crv"], "P-256");
+        let x = jwk["x"].as_str().expect("x");
+        let y = jwk["y"].as_str().expect("y");
+        // 0xA5 repeated: base64url of 32 × 0xA5 bytes.
+        assert_eq!(x, "paWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaU");
+        assert_eq!(y, "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo");
+    }
+
+    #[test]
+    fn jwk_from_keypair_matches_rfc7638_shape() {
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            &rng,
+        )
+        .expect("key");
+        let key = ring::signature::EcdsaKeyPair::from_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            pkcs8.as_ref(),
+            &rng,
+        )
+        .expect("from pkcs8");
+        let jwk = AcmeManager::jwk(&key);
+        // RFC 7638 required members, lexically ordered upstream.
+        assert!(jwk["crv"].as_str().is_some());
+        assert!(jwk["kty"].as_str().is_some());
+        assert!(jwk["x"].as_str().is_some());
+        assert!(jwk["y"].as_str().is_some());
+    }
+
+    #[test]
+    fn directory_missing_fields_error() {
+        let text = r#"{"newNonce": "https://x"}"#;
+        let res: Result<Directory, _> = serde_json::from_str(text);
+        assert!(res.is_err(), "missing fields must reject");
+    }
 }

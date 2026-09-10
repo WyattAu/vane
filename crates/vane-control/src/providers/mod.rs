@@ -72,3 +72,75 @@ pub fn build_route(spec: ProviderRouteSpec, health: &crate::health::HealthMap) -
         priority: spec.priority,
     }
 }
+
+#[cfg(test)]
+mod build_route_tests {
+    use super::*;
+
+    #[test]
+    fn build_route_shares_health_and_compiles() {
+        let health = crate::HealthMap::new();
+        let addr: SocketAddr = "127.0.0.1:9001".parse().expect("addr");
+        health.set(addr, true);
+
+        let builder = build_route(
+            ProviderRouteSpec {
+                host: Some("api.example".into()),
+                pattern: "/v1/*rest".into(),
+                cluster: "c".into(),
+                addrs: vec![addr],
+                strip_prefix: Some("/v1".into()),
+                priority: 9,
+                upstream_h2: true,
+            },
+            &health,
+        );
+        let entry = builder.compile().expect("compile");
+        assert_eq!(entry.host.as_deref(), Some("api.example"));
+        assert_eq!(entry.strip_prefix.as_deref(), Some("/v1"));
+        assert!(entry.upstream_h2);
+        assert_eq!(entry.priority, 9);
+        assert_eq!(entry.backends.len(), 1);
+        assert!(entry.backends[0].is_healthy(), "healthy flag shared");
+    }
+
+    #[test]
+    fn build_route_unhealthy_backend_reflected() {
+        let health = crate::HealthMap::new();
+        let addr: SocketAddr = "127.0.0.1:9002".parse().expect("addr");
+        health.set(addr, false);
+        let entry = build_route(
+            ProviderRouteSpec {
+                host: None,
+                pattern: "/*rest".into(),
+                cluster: "down".into(),
+                addrs: vec![addr],
+                strip_prefix: None,
+                priority: 0,
+                upstream_h2: false,
+            },
+            &health,
+        )
+        .compile()
+        .expect("compile");
+        assert!(!entry.backends[0].is_healthy());
+    }
+
+    #[test]
+    fn build_route_empty_backends_fails_compile() {
+        let health = crate::HealthMap::new();
+        let entry = build_route(
+            ProviderRouteSpec {
+                host: None,
+                pattern: "/*rest".into(),
+                cluster: "empty".into(),
+                addrs: Vec::new(),
+                strip_prefix: None,
+                priority: 0,
+                upstream_h2: false,
+            },
+            &health,
+        );
+        assert!(entry.compile().is_err(), "zero backends must not compile");
+    }
+}

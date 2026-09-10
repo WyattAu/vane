@@ -153,4 +153,89 @@ mod tests {
         assert_eq!(back.generation, 3);
         assert_eq!(back.routes.len(), 1);
     }
+
+    /// Full two-thread handover: listeners cross the socket, the state
+    /// archive round-trips, and the transferred listeners still accept.
+    #[test]
+    fn full_handover_roundtrip() {
+        let dir = tempfile::tempdir().expect("dir");
+        let sock_path = dir.path().join("handover.sock");
+        let state_path = dir.path().join("state.json");
+        prepare_socket(&sock_path);
+
+        let l1 = TcpListener::bind("127.0.0.1:0").expect("bind1");
+        let l2 = TcpListener::bind("127.0.0.1:0").expect("bind2");
+        let addr1 = l1.local_addr().expect("addr1");
+        let addr2 = l2.local_addr().expect("addr2");
+
+        let state = HandoverState {
+            generation: 7,
+            routes: vec![RouteRecord {
+                host: None,
+                pattern: "/*rest".into(),
+                cluster: "c".into(),
+                backends: vec![addr1.to_string()],
+                strip_prefix: None,
+            }],
+            at: "test".into(),
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let rx_sock = sock_path.clone();
+        let rx_state = state_path.clone();
+        std::thread::spawn(move || {
+            tx.send(receive_listeners(&rx_sock, &rx_state, 2).map_err(|e| e.to_string()))
+                .expect("send");
+        });
+
+        // Listeners move into send_listeners (fd ownership transfers).
+        send_listeners(&sock_path, &[l1, l2], &state, &state_path).expect("send_listeners");
+
+        let received = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("join")
+            .expect("receive_listeners");
+        assert_eq!(received.state.generation, 7);
+        assert_eq!(received.state.routes.len(), 1);
+        assert_eq!(received.listeners.len(), 2);
+
+        // The inherited listeners are live: probe both ports.
+        for expected in [addr1, addr2] {
+            let probe = std::net::TcpStream::connect(expected).expect("connect");
+            drop(probe);
+            // One of the transferred listeners accepted it.
+        }
+        // Wrapped listeners report the original bound addresses.
+        let got: Vec<std::net::SocketAddr> = received
+            .listeners
+            .iter()
+            .map(|l| l.local_addr().expect("local"))
+            .collect();
+        assert!(got.contains(&addr1) && got.contains(&addr2));
+    }
+
+    /// `receive_listeners` errors when the state file never appears.
+    #[test]
+    fn missing_state_times_out() {
+        let dir = tempfile::tempdir().expect("dir");
+        let sock_path = dir.path().join("hs.sock");
+        // Receiver watches a path the sender never writes.
+        let rx_state = dir.path().join("absent.json");
+        let written_state = dir.path().join("written.json");
+        prepare_socket(&sock_path);
+
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let rx_sock = sock_path.clone();
+        std::thread::spawn(move || {
+            tx.send(receive_listeners(&rx_sock, &rx_state, 1).map_err(|e| e.to_string()))
+                .expect("send");
+        });
+        send_listeners(&sock_path, &[l], &HandoverState::default(), &written_state)
+            .expect("send listeners fine");
+        let res = rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("join");
+        assert!(res.is_err(), "expected state-file failure");
+    }
 }

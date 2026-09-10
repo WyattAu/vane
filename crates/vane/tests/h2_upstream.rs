@@ -206,3 +206,194 @@ async fn h2_flag_on_h1_upstream_yields_502() {
     let (status, _, _) = request_via_edge(router, "/nope").await;
     assert_eq!(status, 502, "expected 502, got {status}");
 }
+
+fn router_empty() -> Arc<Router> {
+    Arc::new(Router::new())
+}
+
+#[tokio::test]
+async fn no_route_yields_404() {
+    let upstream = spawn_h2_upstream().await;
+    // Router with NO routes: every path 404s before reaching upstream.
+    let router = router_empty();
+    let (status, _, _) = request_via_edge(router, "/anything").await;
+    assert_eq!(status, 404);
+    let _ = upstream;
+}
+
+#[tokio::test]
+async fn disallowed_method_yields_405() {
+    let upstream = spawn_h1_upstream().await;
+    let r = Router::new();
+    r.update(|mut editor| {
+        editor.insert(RouteEntry {
+            host: None,
+            pattern: "/*rest".into(),
+            methods: vec!["GET".into()],
+            cluster: "up".into(),
+            strip_prefix: None,
+            timeout_ms: None,
+            backends: vec![vane_router::Backend::new(upstream, 1)],
+            upstream_h2: false,
+            policy: vane_router::Policy::P2C,
+            gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
+            priority: 0,
+        });
+    });
+    // POST on a GET-only route.
+    let edge = Arc::new(
+        tokio::task::spawn_blocking(move || {
+            vane::h2_edge::H2Edge::new(Arc::new(r), Arc::new(Registry::new()), None)
+        })
+        .await
+        .expect("edge build"),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let edge_addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let e = Arc::clone(&edge);
+            tokio::spawn(async move {
+                let _ = e.serve_connection(stream).await;
+            });
+        }
+    });
+    let io = tokio::net::TcpStream::connect(edge_addr)
+        .await
+        .expect("connect");
+    let (mut send_request, connection) = h2::client::handshake(io).await.expect("h2");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("http://edge/x")
+        .body(())
+        .expect("request");
+    let (response, _) = send_request.send_request(request, true).expect("send");
+    let (parts, _) = response.await.expect("response").into_parts();
+    assert_eq!(parts.status.as_u16(), 405);
+}
+
+/// POST with a request body: the edge relays the body upstream and the
+/// upstream's response body streams back through h2 flow control.
+#[tokio::test]
+async fn post_body_roundtrip() {
+    // h2 upstream that echoes the request body back.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut conn = match h2::server::handshake(stream).await {
+                    Ok(c) => c,
+                    Err(_) => return,
+                };
+                while let Some(request) = conn.accept().await {
+                    let Ok((request, mut respond)) = request else {
+                        break;
+                    };
+                    let mut body = request.into_body();
+                    let mut collected = Vec::new();
+                    while let Some(chunk) = body.data().await {
+                        match chunk {
+                            Ok(b) => {
+                                let len = b.len();
+                                collected.extend_from_slice(&b);
+                                let _ = body.flow_control().release_capacity(len);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let response = http::Response::builder()
+                        .status(200)
+                        .body(())
+                        .expect("static");
+                    let Ok(mut send) = respond.send_response(response, false) else {
+                        break;
+                    };
+                    let _ = send.send_data(bytes::Bytes::from(collected), true);
+                }
+            });
+        }
+    });
+
+    let r = Router::new();
+    r.update(|mut editor| {
+        editor.insert(RouteEntry {
+            host: None,
+            pattern: "/*rest".into(),
+            methods: Vec::new(),
+            cluster: "up".into(),
+            strip_prefix: None,
+            timeout_ms: None,
+            backends: vec![vane_router::Backend::new(addr, 1)],
+            upstream_h2: true,
+            policy: vane_router::Policy::P2C,
+            gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
+            priority: 0,
+        });
+    });
+    let edge = Arc::new(
+        tokio::task::spawn_blocking(move || {
+            vane::h2_edge::H2Edge::new(Arc::new(r), Arc::new(Registry::new()), None)
+        })
+        .await
+        .expect("edge build"),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let edge_addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let e = Arc::clone(&edge);
+            tokio::spawn(async move {
+                let _ = e.serve_connection(stream).await;
+            });
+        }
+    });
+
+    let io = tokio::net::TcpStream::connect(edge_addr)
+        .await
+        .expect("connect");
+    let (mut send_request, connection) = h2::client::handshake(io).await.expect("h2");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("http://edge/echo")
+        .body(())
+        .expect("request");
+    let (response, mut flow) = send_request.send_request(request, false).expect("send");
+    flow.send_data(bytes::Bytes::from_static(b"post-body-123"), true)
+        .expect("body");
+    let (parts, mut body) = response.await.expect("response").into_parts();
+    assert_eq!(parts.status.as_u16(), 200);
+    let mut buf = Vec::new();
+    while let Some(chunk) = body.data().await {
+        match chunk {
+            Ok(b) => {
+                let len = b.len();
+                buf.extend_from_slice(&b);
+                let _ = body.flow_control().release_capacity(len);
+            }
+            Err(_) => break,
+        }
+    }
+    assert_eq!(buf, b"post-body-123");
+}

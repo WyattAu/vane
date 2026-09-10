@@ -155,3 +155,128 @@ pub fn default_socket_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/tmp/vane-handover.sock"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_sock(name: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join(name);
+        (dir, path)
+    }
+
+    /// Full round-trip: a listening TCP socket's fd crosses the socket
+    /// and comes back usable on the receiving side.
+    #[test]
+    fn roundtrip_listening_socket() {
+        let (_dir, sock) = temp_sock("rt.sock");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let fd = listener.as_raw_fd();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sock_for_recv = sock.clone();
+        std::thread::spawn(move || {
+            let res = recv_fds(&sock_for_recv, 4);
+            tx.send(res.map_err(|e| e.to_string()))
+                .expect("send result");
+        });
+
+        for _ in 0..100 {
+            if sock.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        send_fds(&sock, &[fd]).expect("send_fds");
+        let (fds, byte) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("recv result")
+            .expect("recv_fds");
+        assert_eq!(byte, 0, "handshake byte");
+        assert_eq!(fds.len(), 1);
+
+        // SAFETY: the fd was a listening TCP socket when sent; ownership
+        // moved with the send (original dropped below).
+        let mut transferred = unsafe { tcp_listener_from_fd(fds[0]) };
+        // The transferred listener still accepts connections.
+        let probe = std::net::TcpStream::connect(addr).expect("connect");
+        let (accepted, _) = transferred.accept().expect("accept");
+        drop((probe, accepted));
+        std::mem::forget(listener); // fd ownership moved with the send
+    }
+
+    /// Multiple fds in one message, order preserved.
+    #[test]
+    fn roundtrip_multiple_fds() {
+        let (_dir, sock) = temp_sock("multi.sock");
+        let a = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a");
+        let b = std::net::TcpListener::bind("127.0.0.1:0").expect("bind b");
+        let fa = a.as_raw_fd();
+        let fb = b.as_raw_fd();
+        // Distinct fds (kernel guarantees within a process).
+        assert_ne!(fa, fb);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sock_for_recv = sock.clone();
+        std::thread::spawn(move || {
+            let res = recv_fds(&sock_for_recv, 8);
+            tx.send(res.map_err(|e| e.to_string()))
+                .expect("send result");
+        });
+
+        for _ in 0..100 {
+            if sock.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        send_fds(&sock, &[fa, fb]).expect("send_fds");
+        let (fds, _) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("recv")
+            .expect("recv_fds");
+        // The kernel renumbers installed fds — verify identity by the
+        // bound addresses instead.
+        assert_eq!(fds.len(), 2);
+        // SAFETY: transferred listening sockets, wrapped exactly once.
+        let ta = unsafe { tcp_listener_from_fd(fds[0]) };
+        // SAFETY: same.
+        let tb = unsafe { tcp_listener_from_fd(fds[1]) };
+        assert_eq!(ta.local_addr().expect("ta"), a.local_addr().expect("a"));
+        assert_eq!(tb.local_addr().expect("tb"), b.local_addr().expect("b"));
+        std::mem::forget((a, b));
+    }
+
+    /// Connecting to a path nobody listens on is a clean error.
+    #[test]
+    fn send_to_missing_socket_errors() {
+        let (_dir, sock) = temp_sock("missing.sock");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let fd = listener.as_raw_fd();
+        assert!(send_fds(&sock, &[fd]).is_err());
+    }
+
+    /// `default_socket_path` honors the env override.
+    #[test]
+    fn default_socket_path_env() {
+        // SAFETY: tests run single-threaded per process for env mutation
+        // is not guaranteed — use a unique value and restore after.
+        let orig = std::env::var("VANE_HANDOVER_SOCK").ok();
+        // SAFETY: no other thread reads this env concurrently in this test.
+        unsafe { std::env::set_var("VANE_HANDOVER_SOCK", "/tmp/custom-sock") };
+        assert_eq!(default_socket_path(), PathBuf::from("/tmp/custom-sock"));
+        // SAFETY: same as above; restore prior state.
+        unsafe { std::env::remove_var("VANE_HANDOVER_SOCK") };
+        assert_eq!(
+            default_socket_path(),
+            PathBuf::from("/tmp/vane-handover.sock")
+        );
+        if let Some(o) = orig {
+            // SAFETY: restore.
+            unsafe { std::env::set_var("VANE_HANDOVER_SOCK", o) };
+        }
+    }
+}

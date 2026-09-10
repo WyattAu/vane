@@ -63,3 +63,55 @@ fn cabi_open_missing_returns_null() {
     let err = cabi::vane_sc_last_err();
     assert!(!err.is_null(), "expected error message");
 }
+
+/// Recv timeout returns 0 (no data) without touching out buffers.
+#[test]
+fn cabi_recv_timeout_returns_zero() {
+    let dir = tempfile::tempdir().expect("dir");
+    let base = dir.path().join("recv-timeout");
+    let cfg = vane_shm::transport::SidecarConfig {
+        base: base.clone(),
+        slot_size: 64 * 1024,
+        slots: 2,
+    };
+    let _server = vane_shm::transport::SidecarServer::open(&cfg).expect("server");
+    let path = CString::new(base.to_str().expect("utf8")).expect("cstring");
+    // SAFETY: path outlives the call, valid C string.
+    let client = unsafe { cabi::vane_sc_open(path.as_ptr()) };
+    assert!(!client.is_null());
+
+    let mut out = [0u8; 64];
+    let mut id = 0u64;
+    // SAFETY: valid handle; out/id are writable for the given sizes.
+    let rc = unsafe { cabi::vane_sc_recv(client, out.as_mut_ptr(), out.len(), &mut id, 50) };
+    assert_eq!(rc, 0, "timeout must be 0, got {rc}");
+
+    // SAFETY: valid handle.
+    unsafe { cabi::vane_sc_close(client) };
+}
+
+/// Recv null/invalid args are rejected with -1 and an error string.
+#[test]
+fn cabi_recv_bad_args() {
+    let mut out = [0u8; 8];
+    let mut id = 0u64;
+    // SAFETY: deliberately invalid args; the ABI must reject, not crash.
+    let rc = unsafe {
+        cabi::vane_sc_recv(
+            std::ptr::null_mut(),
+            out.as_mut_ptr(),
+            out.len(),
+            &mut id,
+            10,
+        )
+    };
+    assert_eq!(rc, -1);
+    assert!(!cabi::vane_sc_last_err().is_null());
+}
+
+/// Closing null is a no-op (no crash).
+#[test]
+fn cabi_close_null_is_noop() {
+    // SAFETY: null is explicitly tolerated.
+    unsafe { cabi::vane_sc_close(std::ptr::null_mut()) };
+}

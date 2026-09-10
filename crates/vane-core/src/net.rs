@@ -131,3 +131,43 @@ pub fn shutdown_write(fd: RawFd) {
         let _ = libc::shutdown(fd, libc::SHUT_WR);
     }
 }
+
+#[cfg(test)]
+mod net_tests {
+    use super::*;
+
+    #[test]
+    fn tcp_listener_reuseport_binds() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr");
+        let l = tcp_listener(addr, true, 64).expect("bind");
+        assert!(l.local_addr().is_ok());
+    }
+
+    #[test]
+    fn set_nodelay_and_keepalive_on_socket() {
+        let a = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = a.local_addr().expect("addr");
+        let client = std::net::TcpStream::connect(addr).expect("connect");
+        let fd = client.as_raw_fd();
+        set_nodelay(fd).expect("nodelay");
+        set_keepalive(fd, 30).expect("keepalive");
+    }
+
+    #[test]
+    fn set_nodelay_rejects_bad_fd() {
+        assert!(set_nodelay(-1).is_err());
+    }
+
+    #[test]
+    fn shutdown_write_sends_fin() {
+        use std::io::Read as _;
+        let a = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = a.local_addr().expect("addr");
+        let mut client = std::net::TcpStream::connect(addr).expect("connect");
+        let mut server = a.incoming().next().unwrap().expect("accept");
+        shutdown_write(client.as_raw_fd());
+        // Peer sees EOF.
+        let mut buf = [0u8; 1];
+        assert_eq!(server.read(&mut buf).expect("read"), 0);
+    }
+}

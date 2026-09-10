@@ -170,3 +170,39 @@ pub fn create_engine(
     })?;
     Ok(Box::new(mio_engine::MioEngine::new(fallback)?))
 }
+
+#[cfg(test)]
+mod create_tests {
+    use super::*;
+
+    #[test]
+    fn creates_engine_with_pool() {
+        let pool = BufferPool::new(64, crate::buffer::DEFAULT_BUF_SIZE).expect("pool");
+        let engine = create_engine(64, Some(&pool), false).expect("engine");
+        // The engine constructs and is a valid trait object.
+        let _dyn: Box<dyn Engine> = engine;
+    }
+
+    #[test]
+    fn mio_fallback_requires_pool() {
+        // Without a pool the mio fallback cannot be constructed; on hosts
+        // where io_uring is unavailable this is an error, where available
+        // the uring engine succeeds (assert only the invariant we own).
+        let res = create_engine(8, None, false);
+        if let Err(e) = res {
+            assert_eq!(
+                e.kind(),
+                io::ErrorKind::InvalidInput,
+                "fallback error must be InvalidInput"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_entries_still_builds_mio() {
+        // entries only affect the uring path; mio ignores them.
+        let pool = BufferPool::new(64, crate::buffer::DEFAULT_BUF_SIZE).expect("pool");
+        // Env-dependent path choice — the invariant is "no panic".
+        let _ = create_engine(0, Some(&pool), false);
+    }
+}
