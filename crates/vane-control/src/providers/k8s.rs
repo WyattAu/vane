@@ -78,57 +78,6 @@ impl K8sProvider {
     /// API request failure.
     pub async fn list_routes(&self) -> Result<Vec<HttpRouteCompiled>, String> {
         let token = self.token()?;
-        #[derive(Deserialize)]
-        struct Items {
-            #[serde(default)]
-            items: Vec<RouteItem>,
-        }
-        #[derive(Deserialize)]
-        struct RouteItem {
-            #[serde(default)]
-            metadata: Meta,
-            #[serde(default)]
-            spec: RouteSpec,
-        }
-        #[derive(Deserialize, Default)]
-        struct Meta {
-            #[serde(default)]
-            namespace: String,
-        }
-        #[derive(Deserialize, Default)]
-        struct RouteSpec {
-            #[serde(default)]
-            hostnames: Vec<String>,
-            #[serde(default)]
-            rules: Vec<Rule>,
-        }
-        #[derive(Deserialize)]
-        struct Rule {
-            #[serde(default)]
-            matches: Vec<PathMatch>,
-            #[serde(default)]
-            #[serde(rename = "backendRefs")]
-            backend_refs: Vec<BackendRef>,
-        }
-        #[derive(Deserialize)]
-        struct PathMatch {
-            #[serde(default)]
-            path: Option<PathValue>,
-        }
-        #[derive(Deserialize)]
-        struct PathValue {
-            #[serde(default)]
-            value: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct BackendRef {
-            #[serde(default)]
-            name: Option<String>,
-            #[serde(default)]
-            namespace: Option<String>,
-            #[serde(default)]
-            port: Option<u16>,
-        }
 
         let mut all = Vec::new();
         let namespaces = if self.namespaces.is_empty() {
@@ -152,39 +101,8 @@ impl K8sProvider {
                 .send()
                 .await
                 .map_err(|e| e.to_string())?;
-            let items: Items = resp.json().await.map_err(|e| e.to_string())?;
-            for it in items.items {
-                let mut matches = Vec::new();
-                for rule in &it.spec.rules {
-                    let prefix = rule
-                        .matches
-                        .first()
-                        .and_then(|m| m.path.as_ref())
-                        .and_then(|p| p.value.clone())
-                        .unwrap_or_else(|| "/".to_owned());
-                    for br in &rule.backend_refs {
-                        let Some(name) = br.name.clone() else {
-                            continue;
-                        };
-                        let ns = br
-                            .namespace
-                            .clone()
-                            .unwrap_or_else(|| it.metadata.namespace.clone());
-                        matches.push((
-                            prefix.clone(),
-                            format!("{}/{}", ns, name),
-                            br.port.unwrap_or(80),
-                        ));
-                    }
-                }
-                if !matches.is_empty() {
-                    all.push(HttpRouteCompiled {
-                        hosts: it.spec.hostnames,
-                        matches,
-                        backends: Vec::new(),
-                    });
-                }
-            }
+            let items: RouteItems = resp.json().await.map_err(|e| e.to_string())?;
+            all.extend(compile_httproutes(items.items));
         }
         // Resolve Services to endpoints (subset: first page, IP family v4).
         let mut resolved = Vec::new();
@@ -268,6 +186,112 @@ impl K8sProvider {
     }
 }
 
+/// Kubernetes `HTTPRouteList` envelope.
+#[derive(Deserialize)]
+pub(crate) struct RouteItems {
+    #[serde(default)]
+    pub items: Vec<RouteItem>,
+}
+
+/// One `HTTPRoute` resource (subset of fields vane consumes).
+#[derive(Deserialize)]
+pub(crate) struct RouteItem {
+    #[serde(default)]
+    pub metadata: Meta,
+    #[serde(default)]
+    pub spec: RouteSpec,
+}
+
+/// Object metadata (namespace only).
+#[derive(Deserialize, Default)]
+pub(crate) struct Meta {
+    #[serde(default)]
+    pub namespace: String,
+}
+
+/// HTTPRoute spec (hostnames + rules).
+#[derive(Deserialize, Default)]
+pub(crate) struct RouteSpec {
+    #[serde(default)]
+    pub hostnames: Vec<String>,
+    #[serde(default)]
+    pub rules: Vec<Rule>,
+}
+
+/// One routing rule: path matches + backend references.
+#[derive(Deserialize, Default)]
+pub(crate) struct Rule {
+    #[serde(default)]
+    pub matches: Vec<PathMatch>,
+    #[serde(default, rename = "backendRefs")]
+    pub backend_refs: Vec<BackendRef>,
+}
+
+/// Path match wrapper.
+#[derive(Deserialize, Default)]
+pub(crate) struct PathMatch {
+    #[serde(default)]
+    pub path: Option<PathValue>,
+}
+
+/// Path value (`type: PathPrefix` assumed; value defaults to `/`).
+#[derive(Deserialize, Default)]
+pub(crate) struct PathValue {
+    #[serde(default)]
+    pub value: Option<String>,
+}
+
+/// Backend reference (Service name, optional namespace/port).
+#[derive(Deserialize, Default)]
+pub(crate) struct BackendRef {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub namespace: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+}
+
+/// Compiles HTTPRoute items into vane's route form. Rules without
+/// backend refs are skipped; path defaults to `/`, port to 80, and the
+/// backend namespace to the HTTPRoute's own namespace.
+fn compile_httproutes(items: Vec<RouteItem>) -> Vec<HttpRouteCompiled> {
+    let mut all = Vec::new();
+    for it in items {
+        let mut matches = Vec::new();
+        for rule in &it.spec.rules {
+            let prefix = rule
+                .matches
+                .first()
+                .and_then(|m| m.path.as_ref())
+                .and_then(|p| p.value.clone())
+                .unwrap_or_else(|| "/".to_owned());
+            for br in &rule.backend_refs {
+                let Some(name) = br.name.clone() else {
+                    continue;
+                };
+                let ns = br
+                    .namespace
+                    .clone()
+                    .unwrap_or_else(|| it.metadata.namespace.clone());
+                matches.push((
+                    prefix.clone(),
+                    format!("{ns}/{name}"),
+                    br.port.unwrap_or(80),
+                ));
+            }
+        }
+        if !matches.is_empty() {
+            all.push(HttpRouteCompiled {
+                hosts: it.spec.hostnames,
+                matches,
+                backends: Vec::new(),
+            });
+        }
+    }
+    all
+}
+
 /// Extracts ready v4 endpoint addresses from an Endpoints JSON document.
 fn parse_endpoints(json: &str, port: u16) -> Vec<std::net::SocketAddr> {
     #[derive(Deserialize)]
@@ -322,6 +346,57 @@ mod tests {
         let addrs = parse_endpoints(doc, 80);
         assert_eq!(addrs.len(), 2);
         assert_eq!(addrs[0].to_string(), "10.1.2.3:8080");
+    }
+
+    /// Compiles a realistic HTTPRoute list into cluster matches.
+    #[test]
+    fn compiles_httproute_list() {
+        let items_json = r#"[
+            {
+                "metadata": {"namespace": "shop"},
+                "spec": {
+                    "hostnames": ["api.example.com"],
+                    "rules": [
+                        {
+                            "matches": [{"path": {"value": "/v1"}}],
+                            "backendRefs": [
+                                {"name": "orders", "port": 8080},
+                                {"name": "legacy", "namespace": "other", "port": 9090}
+                            ]
+                        },
+                        {
+                            "backendRefs": [{"name": "default-svc"}]
+                        }
+                    ]
+                }
+            },
+            {
+                "metadata": {"namespace": "misc"},
+                "spec": {"rules": [{"backendRefs": []}]}
+            }
+        ]"#;
+        let items: Vec<RouteItem> = serde_json::from_str(items_json).expect("valid items");
+        let routes = compile_httproutes(items);
+        // Second HTTPRoute has no backends → skipped entirely.
+        assert_eq!(routes.len(), 1);
+        let r = &routes[0];
+        assert_eq!(r.hosts, vec!["api.example.com".to_string()]);
+        assert_eq!(r.matches.len(), 3);
+        // Same-namespace default resolution.
+        assert_eq!(
+            r.matches[0],
+            ("/v1".to_string(), "shop/orders".to_string(), 8080)
+        );
+        // Cross-namespace ref honored.
+        assert_eq!(
+            r.matches[1],
+            ("/v1".to_string(), "other/legacy".to_string(), 9090)
+        );
+        // Path defaults to "/" and port to 80.
+        assert_eq!(
+            r.matches[2],
+            ("/".to_string(), "shop/default-svc".to_string(), 80)
+        );
     }
 }
 
