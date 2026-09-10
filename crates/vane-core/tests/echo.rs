@@ -217,8 +217,6 @@ impl HandlerFactory for FloodFactory {
 /// reaped (client sees EOF) and the worker keeps serving.
 #[test]
 fn upstream_buffer_overflow_reaps_session() {
-    use vane_core::HandlerFactory as _;
-
     let listener =
         vane_core::tcp_listener("127.0.0.1:0".parse().expect("addr"), true, 64).expect("bind");
     let addr = listener.local_addr().expect("addr");
