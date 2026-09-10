@@ -73,6 +73,7 @@ tempfile = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 h2 = { workspace = true }
 http = { workspace = true }
+tokio-rustls = { workspace = true }
 rcgen = { workspace = true }
 libc = { workspace = true }
 loop-retry = { workspace = true }

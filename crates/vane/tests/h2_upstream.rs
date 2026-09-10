@@ -397,3 +397,172 @@ async fn post_body_roundtrip() {
     }
     assert_eq!(buf, b"post-body-123");
 }
+
+/// Cross-process serial lock shared with the proxy-spawning suites.
+fn lock_serial() -> std::fs::File {
+    use std::os::unix::io::AsRawFd as _;
+    let path = std::env::temp_dir().join("vane-tests-serial.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .expect("open lock file");
+    // SAFETY: flock on a regular file; released when the File drops.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    assert_eq!(rc, 0, "flock");
+    file
+}
+
+/// h2 edge through real server startup: TLS listener with alpn_h2 spawns
+/// the dedicated acceptor; an h2-over-TLS client round-trips.
+#[cfg(feature = "h2")]
+#[tokio::test]
+async fn h2_edge_via_server_startup() {
+    let _serial = lock_serial();
+    // Self-signed cert for the edge listener.
+    let dir = tempfile::tempdir().expect("dir");
+    let cert_path = dir.path().join("cert.pem");
+    let key_path = dir.path().join("key.pem");
+    let certs = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
+    std::fs::write(&cert_path, certs.cert.pem()).expect("cert");
+    std::fs::write(&key_path, certs.signing_key.serialize_pem()).expect("key");
+
+    let upstream = spawn_h1_upstream().await;
+    let port: u16 = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("probe");
+        l.local_addr().expect("addr").port()
+    };
+    let cfg_path = dir.path().join("vane.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[listeners.tls]
+cert = "{}"
+key = "{}"
+alpn_h2 = true
+
+[clusters.up]
+backends = ["{upstream}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = true
+workers = 1
+"#,
+            cert_path.display(),
+            key_path.display()
+        ),
+    )
+    .expect("write");
+
+    let cfg = cfg_path.to_str().expect("utf8").to_owned();
+    // Keep the tempdir alive for the server lifetime.
+    let _dir_guard = dir;
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let _ = rt.block_on(vane::server::run(vane::server::RunOptions {
+            config_path: Some(cfg),
+            handover_from: None,
+            handover_to: None,
+            shutdown_after: None,
+            force_mio: true,
+        }));
+    });
+
+    // Wait for the TLS port. The probe connection may land on an engine
+    // worker (REUSEPORT) — that is fine; it just proves the port is up.
+    let edge: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    for _ in 0..60 {
+        if std::net::TcpStream::connect(edge).is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // TLS client trusting the generated cert, ALPN h2.
+    use rustls::pki_types::pem::PemObject as _;
+    let der = rustls::pki_types::CertificateDer::from_pem_file(&cert_path).expect("der");
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(der).expect("root");
+    let mut client_cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    client_cfg.alpn_protocols = vec![b"h2".to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_cfg));
+    let server_name = rustls::pki_types::ServerName::try_from("localhost".to_owned()).expect("sni");
+    // REUSEPORT: connections land on either the engine's h1-TLS worker
+    // (which aborts h2-only ALPN) or the dedicated h2 acceptor. Retry
+    // with backoff until the h2 acceptor wins the coin flip.
+    let mut tls = None;
+    for attempt in 0..80u32 {
+        let tcp = tokio::net::TcpStream::connect(edge)
+            .await
+            .expect("tcp connect");
+        let attempt_result = tokio::time::timeout(
+            Duration::from_secs(3),
+            connector.clone().connect(server_name.clone(), tcp),
+        )
+        .await;
+        match attempt_result {
+            Ok(Ok(t)) => {
+                if t.get_ref().1.alpn_protocol() == Some(&b"h2"[..]) {
+                    tls = Some(t);
+                    break;
+                }
+                // Landed on the engine worker (no h2 ALPN): backoff.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Ok(Err(_)) | Err(_) => {
+                // Aborted handshake or timeout: backoff and retry.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        if attempt == 79 {
+            panic!("h2 acceptor never answered with ALPN h2");
+        }
+    }
+    let tls = tls.expect("tls");
+
+    let (mut send, connection) = h2::client::handshake(tls).await.expect("h2");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = http::Request::builder()
+        .method("GET")
+        .uri("https://edge/via-server")
+        .body(())
+        .expect("request");
+    let (response, _) = send.send_request(request, true).expect("send");
+    let (parts, mut body) = tokio::time::timeout(Duration::from_secs(10), response)
+        .await
+        .expect("in time")
+        .expect("response")
+        .into_parts();
+    assert_eq!(parts.status.as_u16(), 200);
+    let mut buf = Vec::new();
+    while let Some(chunk) = body.data().await {
+        match chunk {
+            Ok(b) => {
+                let len = b.len();
+                buf.extend_from_slice(&b);
+                let _ = body.flow_control().release_capacity(len);
+            }
+            Err(_) => break,
+        }
+    }
+    assert_eq!(buf, b"h1-upstream");
+}

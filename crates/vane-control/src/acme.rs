@@ -847,6 +847,16 @@ mod tests {
     }
 
     #[test]
+    fn config_defaults_are_sane() {
+        let cfg = AcmeConfig::default();
+        assert!(cfg.directory_url.contains("letsencrypt"));
+        assert!(cfg.domains.is_empty());
+        assert!(!cfg.insecure_tls);
+        assert!(cfg.challenge_answer_url.is_none());
+        assert!((cfg.renew_at_fraction - 2.0 / 3.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn directory_missing_fields_error() {
         let text = r#"{"newNonce": "https://x"}"#;
         let res: Result<Directory, _> = serde_json::from_str(text);

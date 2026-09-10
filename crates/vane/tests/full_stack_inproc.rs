@@ -799,3 +799,92 @@ workers = 1
     assert!(resp.contains("200 OK"), "chunked must complete: {resp:?}");
     assert!(resp.contains("hello"), "chunked body: {resp:?}");
 }
+
+/// Unroutable upstream + short connect timeout: dial deadline fires,
+/// proxy answers without hanging.
+#[test]
+fn connect_timeout_fires() {
+    let _serial = lock_serial();
+    let port = free_port();
+    let (_dir, cfg) = temp_config(format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.up]
+backends = ["10.255.255.1:81"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = true
+workers = 1
+connect_timeout_ms = 400
+"#
+    ));
+    spawn_proxy(cfg);
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    let start = std::time::Instant::now();
+    let resp = request(
+        proxy,
+        b"GET /dark HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+    );
+    // Either fast refusal routing or timeout failover — both terminate.
+    assert!(
+        resp.contains("502") || resp.contains("503") || resp.contains("504"),
+        "unroutable must terminate: {resp:?}"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(25),
+        "must not hang on unroutable upstream"
+    );
+}
+
+/// Access log with an unwritable path: the drain falls back to stderr
+/// (warns once) and the proxy keeps serving.
+#[test]
+fn access_log_bad_path_falls_back() {
+    let _serial = lock_serial();
+    let upstream = spawn_upstream();
+    let port = free_port();
+    let (_dir, cfg) = temp_config(format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.up]
+backends = ["{upstream}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[access_log]
+enabled = true
+path = "/nonexistent-dir-vane/access.jsonl"
+
+[runtime]
+force_mio = true
+workers = 1
+"#
+    ));
+    spawn_proxy(cfg);
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    let resp = request(
+        proxy,
+        b"GET /fb HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+    );
+    assert!(resp.contains("200 OK"), "fallback must serve: {resp:?}");
+}
