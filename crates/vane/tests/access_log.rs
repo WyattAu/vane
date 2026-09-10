@@ -109,8 +109,25 @@ workers = 1
     (child, proxy_addr, rx, dir)
 }
 
+/// Cross-process serial lock shared with the proxy-spawning suites.
+fn lock_serial() -> std::fs::File {
+    use std::os::unix::io::AsRawFd;
+    let path = std::env::temp_dir().join("vane-tests-serial.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .expect("open lock file");
+    // SAFETY: flock on a regular file; released when the File drops.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    assert_eq!(rc, 0, "flock");
+    file
+}
+
 #[test]
 fn access_log_records_routed_request() {
+    let _serial = lock_serial();
     let (mut child, proxy_addr, rx, _dir) = run_proxy_with_access_log();
 
     // One request through the proxy.

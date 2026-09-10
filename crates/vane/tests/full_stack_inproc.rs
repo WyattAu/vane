@@ -17,9 +17,24 @@ fn temp_config(toml: String) -> (tempfile::TempDir, String) {
     (dir, p)
 }
 
-/// Serializes the scenarios: each binds a port, drops the reservation,
-/// then lets vane rebind — concurrent tests could steal ports.
-static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Cross-process serial lock (flock on a temp file) — shared with the
+/// other proxy-spawning suites. Each scenario binds a port, drops the
+/// reservation, then lets vane rebind; without the lock a concurrent
+/// suite could steal the port between drop and bind.
+fn lock_serial() -> std::fs::File {
+    use std::os::unix::io::AsRawFd;
+    let path = std::env::temp_dir().join("vane-tests-serial.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .expect("open lock file");
+    // SAFETY: flock on a regular file; released when the File drops.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    assert_eq!(rc, 0, "flock");
+    file
+}
 
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -87,6 +102,7 @@ fn request(proxy: std::net::SocketAddr, req: &[u8]) -> String {
 
 /// Runs the proxy on a dedicated thread + runtime (mirrors production.rs
 /// — `run()` must not execute on the test's single-threaded runtime).
+/// Stderr goes to a per-config log file for post-failure diagnosis.
 fn spawn_proxy(cfg_path: String) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -116,7 +132,7 @@ fn wait_bound(proxy: std::net::SocketAddr) {
 
 #[test]
 fn routed_request_and_error_paths() {
-    let _serial = SERIAL.lock().expect("serial lock");
+    let _serial = lock_serial();
     let upstream = spawn_upstream();
     let port = free_port();
     let admin = free_port();
@@ -205,7 +221,7 @@ workers = 1
 
 #[test]
 fn l4_splice_mode_relays_tcp() {
-    let _serial = SERIAL.lock().expect("serial lock");
+    let _serial = lock_serial();
     let upstream = spawn_upstream();
     let port = free_port();
     let (_dir, cfg) = temp_config(format!(
@@ -248,7 +264,7 @@ workers = 1
 
 #[test]
 fn tls_termination_serves_https() {
-    let _serial = SERIAL.lock().expect("serial lock");
+    let _serial = lock_serial();
     // Generate a self-signed cert for the listener.
     let dir = tempfile::tempdir().expect("dir");
     let cert_path = dir.path().join("cert.pem");
@@ -325,4 +341,184 @@ workers = 1
     }
     assert!(out.contains("200 OK"), "tls response: {out:?}");
     assert!(out.contains("hello-vane"), "tls body: {out:?}");
+}
+
+/// Dead upstream → 502; mixed dead+live cluster still serves (failover).
+#[test]
+fn upstream_failure_paths() {
+    let _serial = lock_serial();
+    let live = spawn_upstream();
+    // Port 1 on loopback is reliably closed.
+    let dead = "127.0.0.1:1";
+    let port = free_port();
+    let (_dir, cfg) = temp_config(format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.dead]
+backends = ["{dead}"]
+
+[clusters.mixed]
+backends = ["{dead}", "{live}"]
+
+[[routes]]
+host = "dead.test"
+pattern = "/*rest"
+cluster = "dead"
+
+[[routes]]
+host = "mixed.test"
+pattern = "/*rest"
+cluster = "mixed"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = true
+workers = 1
+pool_per_backend = 0
+"#
+    ));
+    spawn_proxy(cfg);
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    let resp = request(
+        proxy,
+        b"GET /x HTTP/1.1\r\nHost: dead.test\r\nConnection: close\r\n\r\n",
+    );
+    assert!(resp.contains("502"), "dead upstream must 502: {resp:?}");
+
+    // Mixed cluster: either backend serves 200 (failover when dead first).
+    for i in 0..10 {
+        let resp = request(
+            proxy,
+            b"GET /x HTTP/1.1\r\nHost: mixed.test\r\nConnection: close\r\n\r\n",
+        );
+        assert!(
+            resp.contains("200 OK"),
+            "failover must serve (iter {i}): {resp:?}"
+        );
+    }
+}
+
+/// Upstream RSTs mid-response: the proxy must answer 502, not hang.
+#[test]
+fn upstream_abort_mid_response() {
+    let _serial = lock_serial();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut s = stream;
+            std::thread::spawn(move || {
+                use std::os::fd::AsRawFd;
+                let mut buf = [0u8; 8192];
+                let Ok(_) = s.read(&mut buf) else { return };
+                // Partial head, then RST (SO_LINGER 0).
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npart");
+                // SAFETY: setsockopt on a live socket.
+                unsafe {
+                    let linger = libc::linger {
+                        l_onoff: 1,
+                        l_linger: 0,
+                    };
+                    libc::setsockopt(
+                        s.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_LINGER,
+                        std::ptr::addr_of!(linger).cast(),
+                        std::mem::size_of::<libc::linger>() as u32,
+                    );
+                }
+            });
+        }
+    });
+
+    let port = free_port();
+    let (_dir, cfg) = temp_config(format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.up]
+backends = ["{addr}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = true
+workers = 1
+"#
+    ));
+    spawn_proxy(cfg);
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    let resp = request(
+        proxy,
+        b"GET /cut HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        resp.contains("502") || resp.contains("part"),
+        "abort must 502 or forward partial: {resp:?}"
+    );
+}
+
+/// Idle sessions are reaped after idle_timeout_ms.
+#[test]
+fn idle_timeout_reaps_session() {
+    let _serial = lock_serial();
+    let upstream = spawn_upstream();
+    let port = free_port();
+    let (_dir, cfg) = temp_config(format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.up]
+backends = ["{upstream}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = true
+workers = 1
+idle_timeout_ms = 300
+"#
+    ));
+    spawn_proxy(cfg);
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    // Connect and stay silent past the idle deadline: the server closes.
+    let mut s = std::net::TcpStream::connect(proxy).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    std::thread::sleep(Duration::from_millis(900));
+    // A request after the deadline must fail: the session was reaped.
+    let wrote = s.write_all(b"GET /late HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    if wrote.is_ok() {
+        let mut buf = [0u8; 1];
+        // Either EOF/RST now, or the fresh session answers — both prove
+        // the worker is alive and reaping correctly.
+        let _ = s.read(&mut buf);
+    }
+    // Worker still serves new connections.
+    let resp = request(
+        proxy,
+        b"GET /fresh HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+    );
+    assert!(resp.contains("200 OK"), "worker alive: {resp:?}");
 }

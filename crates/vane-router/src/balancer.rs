@@ -188,6 +188,38 @@ impl Balancer {
     pub fn pick_addr(&mut self) -> Option<SocketAddr> {
         self.pick().map(|i| self.backends[i].addr)
     }
+
+    /// Picks the next backend, skipping `exclude` (a just-failed dial).
+    /// Falls back to the excluded backend when it is the only healthy
+    /// one left — a lone backend is never starved by the exclusion.
+    pub fn pick_addr_except(&mut self, exclude: Option<SocketAddr>) -> Option<SocketAddr> {
+        let Some(skip) = exclude else {
+            return self.pick_addr();
+        };
+        let healthy: Vec<usize> = self
+            .backends
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.is_healthy())
+            .map(|(i, _)| i)
+            .collect();
+        if healthy.iter().any(|&i| self.backends[i].addr == skip) && healthy.len() > 1 {
+            // Temporarily mask the failed backend.
+            let saved: Vec<bool> = self.backends.iter().map(|b| b.is_healthy()).collect();
+            for b in &self.backends {
+                if b.addr == skip {
+                    b.set_healthy(false);
+                }
+            }
+            let pick = self.pick_addr();
+            for (i, was) in saved.iter().enumerate() {
+                self.backends[i].set_healthy(*was);
+            }
+            pick.or(Some(skip))
+        } else {
+            self.pick_addr()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -268,5 +300,61 @@ mod tests {
             1,
         );
         assert_eq!(b.pick_addr().expect("addr").port(), 3);
+    }
+}
+
+#[cfg(test)]
+mod pick_except_tests {
+    use super::*;
+
+    fn two_backend(policy: Policy) -> Balancer {
+        Balancer::new(
+            vec![
+                Backend::new("127.0.0.1:9101".parse().expect("addr"), 1),
+                Backend::new("127.0.0.1:9102".parse().expect("addr"), 1),
+            ],
+            std::sync::Arc::new(ConnGauges::new(2)),
+            policy,
+            0,
+        )
+    }
+
+    #[test]
+    fn except_skips_failed_backend() {
+        for policy in [Policy::P2C, Policy::RoundRobin, Policy::LeastConn] {
+            let mut b = two_backend(policy);
+            // Exclude the first backend 20 times: must never be picked.
+            for _ in 0..20 {
+                let addr = b
+                    .pick_addr_except(Some("127.0.0.1:9101".parse().expect("addr")))
+                    .expect("pick");
+                assert_eq!(addr.to_string(), "127.0.0.1:9102");
+            }
+        }
+    }
+
+    #[test]
+    fn except_falls_back_to_lone_backend() {
+        let mut b = two_backend(Policy::P2C);
+        b.backends[1].set_healthy(false);
+        // Only 9101 is healthy: exclusion must not starve it.
+        let addr = b
+            .pick_addr_except(Some("127.0.0.1:9101".parse().expect("addr")))
+            .expect("pick");
+        assert_eq!(addr.to_string(), "127.0.0.1:9101");
+    }
+
+    #[test]
+    fn except_restores_health_flags() {
+        let mut b = two_backend(Policy::P2C);
+        let _ = b.pick_addr_except(Some("127.0.0.1:9101".parse().expect("addr")));
+        // Masking is temporary: both backends healthy afterwards.
+        assert!(b.backends.iter().all(|x| x.is_healthy()));
+    }
+
+    #[test]
+    fn except_none_behaves_like_pick() {
+        let mut b = two_backend(Policy::RoundRobin);
+        assert!(b.pick_addr_except(None).is_some());
     }
 }

@@ -593,6 +593,11 @@ impl HttpProxy {
 impl Handler for HttpProxy {
     fn on_connected(&mut self, io: &mut SessionIo<'_>) {
         let slot = io.slot_index();
+        // Fresh per-session state: worker slots are reused across
+        // connections and must not inherit the previous session's
+        // buffered bytes, route, or timers (stale head_buf replays the
+        // old request into the new session's parse).
+        self.conns.insert(slot, Conn::default());
         if let Some(tls_slot) = &self.config.tls {
             // Hot-reload point: read the current generation through the
             // shared slot (uncontended read lock, once per connection).
@@ -977,7 +982,6 @@ impl HttpProxy {
             conn.attempts = 0;
             conn.upstream_ready = false;
         }
-
         // Checkout a pooled keep-alive connection, else dial fresh.
         if self.config.pool_per_backend > 0 {
             let pooled = self.pool.get_mut(&addr).and_then(Vec::pop);
@@ -1115,12 +1119,17 @@ impl HttpProxy {
             io.close();
             return;
         };
+        // Never re-dial the backend that just failed: mask it for this
+        // pick so failover deterministically moves to a live backend.
+        let failed = self.conns.get(&slot).and_then(|c| c.upstream_addr);
         let mut balancer = route.balancer(u64::from(slot) ^ u64::from(attempts + 1));
-        let Some(addr) = balancer.pick_addr() else {
+
+        let Some(addr) = balancer.pick_addr_except(failed) else {
             self.respond_full(io, Status::ServiceUnavailable, "no healthy upstream\n");
             io.close();
             return;
         };
+
         {
             let conn = self.conn(slot);
             conn.attempts += 1;
