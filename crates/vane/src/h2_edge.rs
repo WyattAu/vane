@@ -297,15 +297,18 @@ impl H2Edge {
         match respond.send_response(head, false) {
             Ok(mut send) => {
                 let mut body = response;
+                let mut bytes_out: u64 = 0;
                 while let Some(chunk) = body.chunk().await.transpose() {
                     match chunk {
                         Ok(bytes) => {
+                            bytes_out += bytes.len() as u64;
                             let _ = send.send_data(bytes, false);
                         }
                         Err(_) => break,
                     }
                 }
                 let _ = send.send_data(bytes::Bytes::new(), true);
+                emit(status.as_u16(), bytes_out);
             }
             Err(_) => { /* client gone mid-response */ }
         }

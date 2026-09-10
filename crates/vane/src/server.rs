@@ -800,6 +800,33 @@ cluster = "up"
     }
 
     #[test]
+    fn env_tls_override_attaches_to_first_listener() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let dir = tempfile::tempdir().expect("dir");
+        let certs = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
+        let cert = dir.path().join("c.pem");
+        let key = dir.path().join("k.pem");
+        std::fs::write(&cert, certs.cert.pem()).expect("cert");
+        std::fs::write(&key, certs.signing_key.serialize_pem()).expect("key");
+
+        // SAFETY: env mutation serialized by ENV_LOCK within this binary.
+        unsafe {
+            std::env::set_var("VANE_TLS_CERT", cert.to_str().expect("utf8"));
+            std::env::set_var("VANE_TLS_KEY", key.to_str().expect("utf8"));
+        }
+        let path = write_cfg(dir.path(), "tls.toml", BASE);
+        let cfg = load_config(Some(&path)).expect("load");
+        // SAFETY: restore.
+        unsafe {
+            std::env::remove_var("VANE_TLS_CERT");
+            std::env::remove_var("VANE_TLS_KEY");
+        }
+        let tls = cfg.listeners[0].tls.as_ref().expect("tls attached");
+        assert_eq!(tls.cert, cert.to_str().expect("utf8"));
+        assert!(!tls.alpn_h2);
+    }
+
+    #[test]
     fn flatten_routes_mirrors_table() {
         let router = Arc::new(Router::new());
         router.update(|editor| {

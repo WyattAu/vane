@@ -658,3 +658,68 @@ async fn breaker_open_yields_503() {
     let (parts, _) = response.await.expect("response").into_parts();
     assert_eq!(parts.status.as_u16(), 503, "open breaker must 503");
 }
+
+/// Edge with access logging enabled: every reply emits an AccessRecord.
+#[tokio::test]
+async fn access_log_records_edge_replies() {
+    let upstream = spawn_h1_upstream().await;
+    let router = router_with(upstream, false);
+    let edge = Arc::new(
+        tokio::task::spawn_blocking(move || {
+            let log = std::sync::Arc::new(vane_observe::access::AccessLog::new());
+            (
+                vane::h2_edge::H2Edge::new(
+                    router,
+                    Arc::new(Registry::new()),
+                    Some(std::sync::Arc::clone(&log)),
+                ),
+                log,
+            )
+        })
+        .await
+        .expect("edge build"),
+    );
+    // Destructure: run the edge with the SAME log we inspect.
+    let (edge_inner, log) = match std::sync::Arc::try_unwrap(edge) {
+        Ok((e, l)) => (e, l),
+        Err(_) => panic!("sole owner expected"),
+    };
+    let edge = Arc::new(edge_inner);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let edge_addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let e = Arc::clone(&edge);
+            tokio::spawn(async move {
+                let _ = e.serve_connection(stream).await;
+            });
+        }
+    });
+
+    let io = tokio::net::TcpStream::connect(edge_addr)
+        .await
+        .expect("connect");
+    let (mut send_request, connection) = h2::client::handshake(io).await.expect("h2");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = http::Request::builder()
+        .method("GET")
+        .uri("http://edge/logged")
+        .body(())
+        .expect("request");
+    let (response, _) = send_request.send_request(request, true).expect("send");
+    let (parts, _) = response.await.expect("response").into_parts();
+    assert_eq!(parts.status.as_u16(), 200);
+
+    let rec = log.pop().expect("access record emitted");
+    assert_eq!(rec.status, 200);
+    assert_eq!(rec.method.as_bytes(), b"GET");
+    assert_eq!(rec.path.as_bytes(), b"/logged");
+    assert_eq!(rec.bytes_out, 11);
+}

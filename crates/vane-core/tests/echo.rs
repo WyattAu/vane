@@ -273,6 +273,9 @@ struct UnixDialer {
 
 impl Handler for UnixDialer {
     fn on_connected(&mut self, io: &mut SessionIo<'_>) {
+        // Write BEFORE dialing: exercises the pre-connect pending_up
+        // buffer and the post-connect flush kick.
+        io.write_upstream(b"early-bytes");
         if !io.connect_upstream_unix(self.path.clone()) {
             io.close();
         }
@@ -354,22 +357,34 @@ fn unix_upstream_roundtrip() {
     client
         .set_read_timeout(Some(std::time::Duration::from_secs(3)))
         .ok();
-    let mut buf = [0u8; 8];
-    // UDS connect completes async: poll for the echoed bytes.
-    let mut got = false;
-    for _ in 0..40 {
+    // Two round-trips: the pre-connect "early-bytes" flush (kick path)
+    // and the post-connect "uds-ping". The UDS echo may coalesce both
+    // writes into one read, so match on accumulated content.
+    let mut seen_early = false;
+    let mut seen_ping = false;
+    let mut acc = Vec::new();
+    let mut buf = [0u8; 64];
+    for _ in 0..60 {
         match client.read(&mut buf) {
-            Ok(8) => {
-                got = true;
-                break;
-            }
-            Ok(_) | Err(_) => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
+            Ok(0) | Err(_) => {}
+            Ok(n) => acc.extend_from_slice(&buf[..n]),
         }
+        if !seen_early {
+            seen_early = twoway_contains(&acc, b"early-bytes");
+        }
+        if !seen_ping {
+            seen_ping = twoway_contains(&acc, b"uds-ping");
+        }
+        if seen_early && seen_ping {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    assert!(got, "uds round-trip: {:?}", buf);
-    assert_eq!(&buf, b"uds-ping");
+    assert!(
+        seen_early,
+        "pre-connect flush kick must deliver early bytes"
+    );
+    assert!(seen_ping, "uds-ping must round-trip");
 
     let _ = handle
         .cmd
@@ -405,9 +420,8 @@ impl Handler for Splicer {
     }
 
     fn on_upstream_connected(&mut self, io: &mut SessionIo<'_>) {
-        eprintln!("DBG splicer upstream connected, splicing");
+        assert!(io.upstream_fd().is_some(), "upstream fd must be visible");
         if !io.start_splice() {
-            eprintln!("DBG start_splice failed");
             io.close();
         }
     }
@@ -489,4 +503,9 @@ fn worker_splice_pumps_raw_bytes() {
         .cmd
         .send(vane_core::WorkerCmd::Shutdown { deadline_ms: 100 });
     handle.join();
+}
+
+/// Naive substring search over accumulated echo bytes.
+fn twoway_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
