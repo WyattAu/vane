@@ -802,7 +802,7 @@ cluster = "up"
     #[test]
     fn flatten_routes_mirrors_table() {
         let router = Arc::new(Router::new());
-        router.update(|mut editor| {
+        router.update(|editor| {
             editor.insert(vane_router::RouteEntry {
                 host: Some("h.example".into()),
                 pattern: "/a/*rest".into(),
