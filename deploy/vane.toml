@@ -1,0 +1,24 @@
+# Demo config for `docker-compose.yml`.
+#
+# Single listener on :8080, everything through route `/*rest` to the
+# `upstream` service above, admin on :9090.
+
+[[listeners]]
+address = "0.0.0.0:8080"
+
+[clusters.up]
+backends = ["upstream:18082"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = true
+address = "0.0.0.0:9090"
+
+[access_log]
+enabled = true
+
+[runtime]
+workers = 2

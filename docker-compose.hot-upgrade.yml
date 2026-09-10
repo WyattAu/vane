@@ -1,0 +1,64 @@
+# Zero-downtime binary hot upgrade, containerized.
+#
+# Topology: two vane containers share the handover socket directory;
+# vane-a serves, then vane-b takes over the SAME listening socket
+# (SCM_RIGHTS fd passing) with zero dropped connections.
+#
+#   docker compose -f docker-compose.hot-upgrade.yml up
+#   curl http://127.0.0.1:8080/     # served by vane-a
+#   docker compose -f docker-compose.hot-upgrade.yml exec vane-a \
+#     sh -c 'kill -TERM 1'          # watch vane-b take over live
+#
+# For a scripted demo (no manual kill), run ./deploy/demo-hot-upgrade.sh
+# which keeps one client in a tight loop and asserts zero failures.
+
+services:
+  upstream:
+    image: hashicorp/http-echo:1.0
+    command: ["-listen=:18082", "-text=hello-hot-upgrade"]
+    expose:
+      - "18082"
+    networks:
+      - vanenet
+
+  # Generation 1: owns the listener on :8080, hands it off on SIGTERM.
+  vane-a:
+    image: ${VANE_IMAGE:-ghcr.io/wyattau/vane:0.2.0}
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./deploy/vane.hot.toml:/etc/vane/vane.toml:ro
+      - handover:/run/vane
+    environment:
+      VANE_HANDOVER_SOCK: /run/vane/handover.sock
+    command:
+      [
+        "run",
+        "-c", "/etc/vane/vane.toml",
+        "--handover-to", "/run/vane/handover.sock",
+      ]
+    networks:
+      - vanenet
+
+  # Generation 2 (standby): takes the listener when vane-a drains.
+  vane-b:
+    image: ${VANE_IMAGE:-ghcr.io/wyattau/vane:0.2.0}
+    volumes:
+      - ./deploy/vane.hot.toml:/etc/vane/vane.toml:ro
+      - handover:/run/vane
+    environment:
+      VANE_HANDOVER_SOCK: /run/vane/handover.sock
+    command:
+      [
+        "run",
+        "-c", "/etc/vane/vane.toml",
+        "--handover-from", "/run/vane/handover.sock",
+      ]
+    networks:
+      - vanenet
+
+volumes:
+  handover: {}
+
+networks:
+  vanenet: {}
