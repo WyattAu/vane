@@ -158,6 +158,30 @@ are faster):
 | Keep-alive pool (opt-in) | 1 upstream conn across 5 sequential requests | — |
 | Config generation swap | one `Release` store + epoch retire | `CP-02` < 1 ms |
 
+### Comparison against nginx (same box, same upstream)
+
+`ab -k -c 64/-c 256` against an identical upstream (threaded Rust stub,
+~76–78k rps direct), vane release build (2 workers) vs nginx:alpine in
+Docker with host networking (1 worker, stock `proxy_pass` config):
+
+| Scenario | vane | nginx (stock) |
+|---|---|---|
+| keep-alive, c=64 | 37.4–39.1k rps | 9.1–9.3k rps |
+| keep-alive, c=256 | 37.8k rps | 8.5k rps |
+| short connections, c=64 | 7.0k rps | 7.7k rps |
+
+Caveats, honestly stated:
+
+- nginx's stock `proxy_pass` speaks HTTP/1.0 upstream **without
+  keep-alive** — it opens a fresh upstream connection per request. That
+  is the default most deployments run, but `upstream` keep-alive pools
+  narrow the gap.
+- vane pools upstream connections by default (epoch-invalidated), which
+  is where the keep-alive advantage comes from.
+- Short-connection rate is accept-bound and effectively at parity.
+- Measurements are single-run means on a shared multi-tenant host; treat
+  ratios (≈4× keep-alive, ≈1× short) as indicative, not absolute.
+
 ## Engineering gates (Tier A)
 
 `cargo clippy -D warnings` (pedantic) · `llvm-cov ≥ 90%` · **loom**
