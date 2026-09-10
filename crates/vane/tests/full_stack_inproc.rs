@@ -472,6 +472,165 @@ workers = 1
     );
 }
 
+/// Malformed bytes → 400; oversized head → 413.
+#[test]
+fn malformed_and_oversized_requests() {
+    let _serial = lock_serial();
+    let upstream = spawn_upstream();
+    let port = free_port();
+    let (_dir, cfg) = temp_config(format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.up]
+backends = ["{upstream}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = true
+workers = 1
+"#
+    ));
+    spawn_proxy(cfg);
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    // Garbage bytes are not HTTP.
+    let resp = request(proxy, b"\x00\xff\xfe garbage \r\n\r\n");
+    assert!(resp.contains("400"), "malformed must 400: {resp:?}");
+
+    // Head larger than the parse limit.
+    let big = format!("GET /{} HTTP/1.1\r\nHost: t\r\n\r\n", "a".repeat(1 << 20));
+    let resp = request(proxy, big.as_bytes());
+    assert!(
+        resp.contains("413") || resp.contains("400"),
+        "oversized must 413/400: {resp:?}"
+    );
+}
+
+/// Upstream closes cleanly mid-body (FIN, no RST): truncated body.
+#[test]
+fn upstream_clean_truncation() {
+    let _serial = lock_serial();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut s = stream;
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                let Ok(_) = s.read(&mut buf) else { return };
+                // Promise 100 bytes, deliver 4, then clean FIN.
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npart");
+                drop(s);
+            });
+        }
+    });
+
+    let port = free_port();
+    let (_dir, cfg) = temp_config(format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.up]
+backends = ["{addr}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = true
+workers = 1
+"#
+    ));
+    spawn_proxy(cfg);
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    // The proxy must not hang: it closes (possibly after partial body).
+    let mut s = std::net::TcpStream::connect(proxy).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    s.write_all(b"GET /trunc HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+        .expect("write");
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(
+        text.contains("200 OK") || text.contains("502"),
+        "truncation must terminate: {text:?}"
+    );
+}
+
+/// Blackhole upstream (accepts, never responds) + short first-byte
+/// timeout: the proxy must fail over/502, not hang.
+#[test]
+fn blackhole_upstream_times_out() {
+    let _serial = lock_serial();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                // Hold the connection open, never respond.
+                std::thread::sleep(Duration::from_secs(30));
+                drop(stream);
+            });
+        }
+    });
+
+    let port = free_port();
+    let (_dir, cfg) = temp_config(format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.up]
+backends = ["{addr}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = true
+workers = 1
+first_byte_timeout_ms = 400
+"#
+    ));
+    spawn_proxy(cfg);
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    let start = std::time::Instant::now();
+    let resp = request(
+        proxy,
+        b"GET /hole HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        resp.contains("504") || resp.contains("502"),
+        "blackhole must time out: {resp:?}"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(20),
+        "must not hang on blackhole"
+    );
+}
+
 /// Idle sessions are reaped after idle_timeout_ms.
 #[test]
 fn idle_timeout_reaps_session() {
@@ -521,4 +680,65 @@ idle_timeout_ms = 300
         b"GET /fresh HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
     );
     assert!(resp.contains("200 OK"), "worker alive: {resp:?}");
+}
+
+/// ACME hook live with an empty token map: unknown tokens 404.
+/// (The background issuance fails without a directory; the hook itself
+/// answers synchronously.)
+#[test]
+fn acme_unknown_token_404() {
+    let _serial = lock_serial();
+    let upstream = spawn_upstream();
+    let port = free_port();
+    let dir = tempfile::tempdir().expect("dir");
+    let storage = dir.path().join("acme");
+    let (_cfgdir, cfg) = temp_config(format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.up]
+backends = ["{upstream}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[acme]
+directory_url = "https://127.0.0.1:1/dir"
+emails = ["ci@example.com"]
+storage_dir = "{}"
+insecure_tls = true
+
+[[acme.domains]]
+domain = "probe.test"
+
+[runtime]
+force_mio = true
+workers = 1
+"#,
+        storage.display()
+    ));
+    // Keep the storage dir alive for the proxy lifetime.
+    let _storage_guard = dir;
+    spawn_proxy(cfg);
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    let resp = request(
+        proxy,
+        b"GET /.well-known/acme-challenge/nope HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+    );
+    assert!(resp.contains("404"), "unknown token must 404: {resp:?}");
+    assert!(resp.contains("unknown token"), "body: {resp:?}");
+
+    // Normal routing unaffected by the ACME section.
+    let resp = request(
+        proxy,
+        b"GET /plain HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+    );
+    assert!(resp.contains("200 OK"), "routed: {resp:?}");
 }

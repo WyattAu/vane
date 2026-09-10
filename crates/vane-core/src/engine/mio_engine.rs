@@ -871,3 +871,58 @@ mod fault_tests {
         crate::tcp_listener("127.0.0.1:0".parse().expect("addr"), true, 64).expect("bind")
     }
 }
+
+#[cfg(test)]
+mod unix_tests {
+    use super::*;
+    use crate::buffer::DEFAULT_BUF_SIZE;
+    use crate::token::Op;
+
+    #[test]
+    fn connect_unix_to_live_socket() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("test.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        // Nonblocking accept loop.
+        listener.set_nonblocking(true).ok();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                drop(stream);
+            }
+        });
+
+        let pool = BufferPool::new(4, DEFAULT_BUF_SIZE).expect("pool");
+        let mut engine = MioEngine::new(&pool).expect("engine");
+        let t = Token::new(Op::Connect, 0, 0, 0);
+        let (fd, poll) = engine.connect_unix(t, &path).expect("connect_unix");
+        match poll {
+            Poll::Done(_) => {}
+            Poll::Pending => {
+                let mut out = Vec::new();
+                engine
+                    .poll(Some(std::time::Duration::from_secs(2)), &mut out)
+                    .expect("poll");
+                assert!(
+                    out.iter().any(|c| c.token == t && c.result.is_ok()),
+                    "unix connect must complete: {out:?}"
+                );
+            }
+        }
+        // SAFETY: test owns the fd.
+        unsafe { libc::close(fd) };
+    }
+
+    #[test]
+    fn connect_unix_missing_path_errors() {
+        let pool = BufferPool::new(4, DEFAULT_BUF_SIZE).expect("pool");
+        let mut engine = MioEngine::new(&pool).expect("engine");
+        let t = Token::new(Op::Connect, 0, 0, 0);
+        let missing = std::path::PathBuf::from("/nonexistent/vane-test/no.sock");
+        let res = engine.connect_unix(t, &missing);
+        assert!(res.is_err() || matches!(res, Ok((_, Poll::Pending))));
+        if let Ok((fd, _)) = res {
+            // SAFETY: test owns the fd on success path.
+            unsafe { libc::close(fd) };
+        }
+    }
+}

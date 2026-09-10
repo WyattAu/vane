@@ -181,3 +181,88 @@ fn client_half_close_is_handled() {
         .send(vane_core::WorkerCmd::Shutdown { deadline_ms: 100 });
     handle.join();
 }
+
+/// Handler that buffers upstream-bound bytes without ever connecting:
+/// exercises the pending_up overflow guard.
+struct Flood;
+
+impl Handler for Flood {
+    fn on_downstream_data(&mut self, io: &mut SessionIo<'_>, data: &[u8]) {
+        let _ = data;
+        io.write_upstream(&[0xABu8; 8192]);
+    }
+
+    fn on_upstream_connected(&mut self, _io: &mut SessionIo<'_>) {}
+    fn on_upstream_data(&mut self, _io: &mut SessionIo<'_>, _data: &[u8]) {}
+    fn on_downstream_eof(&mut self, _io: &mut SessionIo<'_>) {}
+    fn on_upstream_eof(&mut self, _io: &mut SessionIo<'_>) {}
+    fn on_upstream_error(&mut self, io: &mut SessionIo<'_>, _e: std::io::Error) {
+        io.close();
+    }
+}
+
+struct FloodFactory;
+
+impl HandlerFactory for FloodFactory {
+    fn mode(&self) -> Mode {
+        Mode::Http
+    }
+
+    fn build(&self, _ctx: &vane_core::WorkerCtx) -> Box<dyn Handler> {
+        Box::new(Flood)
+    }
+}
+
+/// Unbounded upstream buffering trips the overflow guard: the session is
+/// reaped (client sees EOF) and the worker keeps serving.
+#[test]
+fn upstream_buffer_overflow_reaps_session() {
+    use vane_core::HandlerFactory as _;
+
+    let listener =
+        vane_core::tcp_listener("127.0.0.1:0".parse().expect("addr"), true, 64).expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    let registry = Arc::new(Registry::new());
+    let events = Arc::new(vane_observe::ring::EventRing::new());
+    let cfg = WorkerConfig {
+        force_mio: true,
+        ..WorkerConfig::default()
+    };
+    let factory = FloodFactory;
+    let mut handle = spawn_worker(0, cfg, listener, registry, events, &factory).expect("spawn");
+
+    // Three 8 KiB writes exceed 4 x 4 KiB pool slots → guard fires.
+    // Each client write is one downstream event buffering 8 KiB.
+    let mut client = TcpStream::connect(addr).expect("connect");
+    for _ in 0..4 {
+        client.write_all(b"go").expect("write");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    client
+        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+        .ok();
+    // The session dies: reads return EOF (possibly after WouldBlock spins).
+    let mut buf = [0u8; 8];
+    let mut eof = false;
+    for _ in 0..50 {
+        match client.read(&mut buf) {
+            Ok(0) => {
+                eof = true;
+                break;
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    assert!(eof, "overflowed session must be reaped");
+
+    // Worker still accepts new sessions.
+    let probe = TcpStream::connect(addr);
+    assert!(probe.is_ok(), "worker must stay alive");
+
+    let _ = handle
+        .cmd
+        .send(vane_core::WorkerCmd::Shutdown { deadline_ms: 100 });
+    handle.join();
+}
