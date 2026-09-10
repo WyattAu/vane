@@ -310,3 +310,36 @@ mod builtin_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod async_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn check_async_blocks_after_burst() {
+        let registry = std::sync::Arc::new(Registry::new());
+        let rl = RateLimit::new(registry, 1, 1);
+        assert!(matches!(
+            rl.check_async("k").await,
+            crate::pipeline::Outcome::Continue
+        ));
+        match rl.check_async("k").await {
+            crate::pipeline::Outcome::Reject(code, _) => assert_eq!(code, 429),
+            other => panic!("expected reject, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn check_async_independent_keys() {
+        let registry = std::sync::Arc::new(Registry::new());
+        let rl = RateLimit::new(registry, 1, 1);
+        assert!(matches!(
+            rl.check_async("a").await,
+            crate::pipeline::Outcome::Continue
+        ));
+        assert!(matches!(
+            rl.check_async("b").await,
+            crate::pipeline::Outcome::Continue
+        ));
+    }
+}

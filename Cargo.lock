@@ -3662,6 +3662,7 @@ dependencies = [
  "breaker",
  "tempfile",
  "throttle-kit",
+ "tokio",
  "vane-observe",
 ]
 

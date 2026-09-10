@@ -170,3 +170,44 @@ impl<T, const CAP: usize> Default for EventRing<T, CAP> {
 
 // Keep the padding constant referenced (silences dead-code in odd configs).
 const _: () = assert!(CACHE_LINE == 64);
+
+#[cfg(test)]
+mod ring_tests {
+    use super::*;
+
+    #[test]
+    fn full_ring_returns_value() {
+        let ring = EventRing::<u64, 4>::new();
+        for i in 0..4 {
+            assert!(ring.try_push(i).is_none(), "slot {i} must accept");
+        }
+        // Full: the value comes back.
+        assert_eq!(ring.try_push(99), Some(99));
+        assert_eq!(ring.len(), 4);
+    }
+
+    #[test]
+    fn fifo_order_across_wraparound() {
+        let ring = EventRing::<u64, 4>::new();
+        for i in 0..4 {
+            assert!(ring.try_push(i).is_none());
+        }
+        assert_eq!(ring.try_pop(), Some(0));
+        assert_eq!(ring.try_pop(), Some(1));
+        assert!(ring.try_push(4).is_none());
+        assert!(ring.try_push(5).is_none());
+        assert_eq!(ring.try_pop(), Some(2));
+        assert_eq!(ring.try_pop(), Some(3));
+        assert_eq!(ring.try_pop(), Some(4));
+        assert_eq!(ring.try_pop(), Some(5));
+        assert_eq!(ring.try_pop(), None);
+        assert!(ring.is_empty());
+    }
+
+    #[test]
+    fn empty_pop_is_none() {
+        let ring = EventRing::<u64, 8>::new();
+        assert!(ring.is_empty());
+        assert_eq!(ring.try_pop(), None);
+    }
+}

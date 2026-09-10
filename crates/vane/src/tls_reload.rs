@@ -99,3 +99,61 @@ pub fn spawn_reloader(
         }
     })
 }
+
+#[cfg(test)]
+mod reload_tests {
+    use super::*;
+
+    fn test_certpair(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+        let certs = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        std::fs::write(&cert, certs.cert.pem()).expect("cert");
+        std::fs::write(&key, certs.signing_key.serialize_pem()).expect("key");
+        (cert, key)
+    }
+
+    #[test]
+    fn load_config_reads_pair() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (cert, key) = test_certpair(dir.path());
+        let cfg = load_config(&cert, &key, &[b"h2".to_vec()]).expect("load");
+        assert_eq!(cfg.alpn_protocols, vec![b"h2".to_vec()]);
+    }
+
+    #[test]
+    fn load_config_rejects_missing() {
+        let dir = tempfile::tempdir().expect("dir");
+        let missing = dir.path().join("nope.pem");
+        assert!(load_config(&missing, &missing, &[]).is_err());
+    }
+
+    #[tokio::test]
+    async fn reloader_swaps_slot_on_change() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (cert, key) = test_certpair(dir.path());
+        let initial = load_config(&cert, &key, &[]).expect("load");
+        let slot: TlsSlot = Arc::new(std::sync::RwLock::new(Arc::new(initial)));
+        let _handle = spawn_reloader(cert.clone(), key.clone(), vec![], Arc::clone(&slot));
+
+        // Rewrite the cert with a fresh keypair: the watcher must swap.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (cert2, key2) = test_certpair(dir.path());
+        // Atomic replace via rename (editor-style).
+        std::fs::rename(&cert2, &cert).expect("rename cert");
+        std::fs::rename(&key2, &key).expect("rename key");
+
+        let before = Arc::as_ptr(&slot.read().expect("read"));
+        let mut swapped = false;
+        for _ in 0..60 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // A swap replaces the inner Arc: pointer inequality proves it.
+            let current = slot.read().expect("read");
+            if Arc::as_ptr(&current) != before {
+                swapped = true;
+                break;
+            }
+        }
+        assert!(swapped, "slot was not swapped after cert change");
+    }
+}
