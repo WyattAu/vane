@@ -63,6 +63,10 @@ pub struct ProxyConfig {
     pub plugins: Vec<String>,
     /// Structured access log (`None` = disabled — no per-request work).
     pub access: Option<std::sync::Arc<vane_observe::access::AccessLog>>,
+    /// L4 splice mode (`mode = "tcp"` listeners): kernel zero-copy
+    /// passthrough to the first matching route's cluster — no HTTP
+    /// parsing on the data path.
+    pub l4_splice: bool,
 }
 
 /// Per-connection state.
@@ -100,6 +104,8 @@ struct Conn {
     bytes_out: u64,
     /// Set once the transaction's access record was emitted.
     access_logged: bool,
+    /// L4 splice mode session (no HTTP parsing).
+    l4: bool,
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -598,6 +604,42 @@ impl Handler for HttpProxy {
         // buffered bytes, route, or timers (stale head_buf replays the
         // old request into the new session's parse).
         self.conns.insert(slot, Conn::default());
+        if self.config.l4_splice {
+            // L4: route by catch-all (no SNI parsing), dial, and splice
+            // once the upstream is live. Early client bytes are written
+            // upstream; the worker buffers them until the dial lands.
+            let table = self.config.router.load();
+            let matched = table.table().lookup(None, "/");
+            let Some(m) = matched else {
+                io.close();
+                return;
+            };
+            let route = Arc::clone(&m.terminal.value);
+            drop(table);
+            let mut balancer = route.balancer(0);
+            let Some(addr) = balancer.pick_addr() else {
+                io.close();
+                return;
+            };
+            {
+                let conn = self.conn(slot);
+                conn.l4 = true;
+                conn.route = Some(route);
+                conn.upstream_addr = Some(addr);
+                conn.attempts = 0;
+                conn.upstream_ready = false;
+            }
+            if !io.connect_upstream(addr) {
+                self.metrics.upstream_errors.inc(&self.config.registry);
+                io.close();
+                return;
+            }
+            io.set_deadline(
+                Some(self.deadline(self.config.connect_timeout_ms)),
+                vane_core::handler::DeadlineReason::Connect,
+            );
+            return;
+        }
         if let Some(tls_slot) = &self.config.tls {
             // Hot-reload point: read the current generation through the
             // shared slot (uncontended read lock, once per connection).
@@ -619,6 +661,12 @@ impl Handler for HttpProxy {
 
     fn on_downstream_data(&mut self, io: &mut SessionIo<'_>, data: &[u8]) {
         let slot = io.slot_index();
+        // L4 splice: raw bytes toward the upstream (pre-splice only —
+        // once spliced the kernel pumps without the handler).
+        if self.conns.get(&slot).is_some_and(|c| c.l4) {
+            io.write_upstream(data);
+            return;
+        }
         // WebSocket tunnel: raw bidirectional relay, no parsing.
         if self.conns.get(&slot).is_some_and(|c| c.tunnel) {
             self.metrics
@@ -649,6 +697,14 @@ impl Handler for HttpProxy {
 
     fn on_upstream_connected(&mut self, io: &mut SessionIo<'_>) {
         let slot = io.slot_index();
+        if self.conns.get(&slot).is_some_and(|c| c.l4) {
+            // Kernel zero-copy pump takes over; the handler is done.
+            if io.start_splice() {
+                return;
+            }
+            io.close();
+            return;
+        }
         self.conn(slot).upstream_ready = true;
         let (route, upstream_path, inject) = {
             let conn = self.conn(slot);

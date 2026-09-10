@@ -715,6 +715,7 @@ impl vane_core::HandlerFactory for WorkerFactory {
                 plugins: self.plugins.clone(),
                 http01_tokens: self.http01_tokens.clone(),
                 access: self.access.clone(),
+                l4_splice: self.mode == CoreMode::L4,
             },
             self.worker_id,
         ))

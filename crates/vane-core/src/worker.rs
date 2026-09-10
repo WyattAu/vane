@@ -339,14 +339,19 @@ impl WorkerState {
         };
         let Some(up) = &s.upstream else { return false };
         let (a, b) = (s.downstream.fd(), up.fd());
-        // Splice bypasses the buffer pool entirely — release held slots.
-        if let Some(rs) = s.rslot.take() {
-            s.read_inflight = false;
-            self.pool.release(rs);
+        // Splice bypasses the buffer pool. Slots with in-flight reads are
+        // KEPT: their CQEs will land after the pump starts and must be
+        // forwarded raw (see the splice branch in the read dispatchers) —
+        // releasing them now would drop the bytes they hold.
+        if !s.read_inflight {
+            if let Some(rs) = s.rslot.take() {
+                self.pool.release(rs);
+            }
         }
-        if let Some(rs) = s.urslot.take() {
-            s.upstream_read_inflight = false;
-            self.pool.release(rs);
+        if !s.upstream_read_inflight {
+            if let Some(rs) = s.urslot.take() {
+                self.pool.release(rs);
+            }
         }
         s.splice = true;
         let ta = Token::new(Op::Splice, slot, generation, 1);
@@ -577,6 +582,17 @@ impl WorkerState {
                 }
             }
         }
+        // Bytes buffered before the dial completed (early client data):
+        // kick the write queue now that the upstream exists, or they
+        // would sit until the next write-completion event (which may
+        // never come — nothing was in flight).
+        let needs_kick = self
+            .slab
+            .get(slot)
+            .is_some_and(|s| !s.pending_up.is_empty() && !s.upstream_write_inflight);
+        if needs_kick {
+            self.kick_pending_upstream(slot, generation);
+        }
     }
 
     fn arm_downstream_read(&mut self, slot: u32, generation: u16) {
@@ -680,6 +696,38 @@ impl WorkerState {
         }
     }
 
+    /// Kicks pending_up bytes into the upstream write queue (used after
+    /// a dial completes with buffered early data). Public within the
+    /// worker for `do_upstream_connected`.
+    fn kick_pending_upstream(&mut self, slot: u32, generation: u16) {
+        let next = {
+            let Some(s) = self.slab.get_mut(slot) else {
+                return;
+            };
+            if s.uwq.front().is_some() || s.pending_up.is_empty() || s.upstream_write_inflight {
+                return;
+            }
+            let Some(ws) = self.pool.take() else {
+                return; // backpressure: flushed on the next completion
+            };
+            let n = s.pending_up.len().min(self.pool.buf_size());
+            self.pool.slot_mut(ws)[..n].copy_from_slice(&s.pending_up[..n]);
+            s.pending_up.drain(..n);
+            s.uwq.push_back((ws, n as u32, 0));
+            s.upstream_write_inflight = true;
+            Some((ws, n as u32, 0))
+        };
+        if let Some((ws, len, off)) = next {
+            let Some(s) = self.slab.get_mut(slot) else {
+                return;
+            };
+            let Some(up) = &s.upstream else { return };
+            let fd = up.fd();
+            let token = Token::new(Op::UpstreamWrite, slot, generation, 0);
+            let _ = self.engine.write(token, fd, ws, len as usize, off as usize);
+        }
+    }
+
     fn continue_upstream_write(&mut self, slot: u32, generation: u16, h: &mut dyn Handler) {
         let next = {
             let Some(s) = self.slab.get_mut(slot) else {
@@ -763,6 +811,17 @@ impl WorkerState {
                         return;
                     };
                     s.read_inflight = false;
+                    // Splice takeover: forward the in-flight bytes raw to
+                    // the upstream (the kernel pump handles everything
+                    // after) and do not re-arm.
+                    let res = match &cqe.result {
+                        Ok(n) => Ok(*n),
+                        Err(e) => Err(io::Error::from_raw_os_error(e.raw_os_error().unwrap_or(0))),
+                    };
+                    if s.splice {
+                        self.splice_forward_inflight(slot, generation, true, res);
+                        return;
+                    }
                 }
                 match cqe.result {
                     Ok(n) if n > 0 => {
@@ -845,6 +904,70 @@ impl WorkerState {
         }
     }
 
+    /// Forwards the bytes held by an in-flight read slot to the opposite
+    /// side after splice takeover. `from_downstream` selects direction.
+    /// `result` is the read CQE: Ok(n) forwards, Ok(0) half-closes,
+    /// Err kills the session. The slot rides the write queue so it is
+    /// released on write completion (zero copy).
+    fn splice_forward_inflight(
+        &mut self,
+        slot: u32,
+        generation: u16,
+        from_downstream: bool,
+        result: io::Result<u32>,
+    ) {
+        let held = if from_downstream {
+            self.slab.get_mut(slot).and_then(|s| s.rslot.take())
+        } else {
+            self.slab.get_mut(slot).and_then(|s| s.urslot.take())
+        };
+        let Some(rs) = held else { return }; // no in-flight slot: pump owns it
+        let Some(s) = self.slab.get_mut(slot) else {
+            return;
+        };
+        match result {
+            Ok(n) if n > 0 => {
+                // Queue the held slot toward the opposite fd (zero copy).
+                if from_downstream {
+                    let Some(up) = &s.upstream else {
+                        self.pool.release(rs);
+                        return;
+                    };
+                    let fd = up.fd();
+                    s.uwq.push_back((rs, n, 0));
+                    s.upstream_write_inflight = true;
+                    let token = Token::new(Op::UpstreamWrite, slot, generation, 0);
+                    let _ = self.engine.write(token, fd, rs, n as usize, 0);
+                } else {
+                    let fd = s.downstream.fd();
+                    s.wq.push_back((rs, n, 0));
+                    s.write_inflight = true;
+                    let token = Token::new(Op::DownstreamWrite, slot, generation, 0);
+                    let _ = self.engine.write(token, fd, rs, n as usize, 0);
+                }
+            }
+            // Only Ok(0) reaches here (n > 0 matched above): EOF —
+            // half-close the opposite write side.
+            Ok(_) => {
+                if from_downstream {
+                    if let Some(up) = &s.upstream {
+                        shutdown_write(up.fd());
+                    }
+                    s.downstream_eof = true;
+                } else {
+                    shutdown_write(s.downstream.fd());
+                    s.upstream_eof = true;
+                }
+                self.pool.release(rs);
+                self.maybe_finish(slot, generation);
+            }
+            Err(_) => {
+                self.pool.release(rs);
+                self.close_session(slot, generation, "splice-forward-err");
+            }
+        }
+    }
+
     fn dispatch_upstream_read(
         &mut self,
         cqe: crate::engine::Cqe,
@@ -857,6 +980,15 @@ impl WorkerState {
                 return;
             };
             s.upstream_read_inflight = false;
+            // Splice takeover: forward in-flight bytes raw to the client.
+            let res = match &cqe.result {
+                Ok(n) => Ok(*n),
+                Err(e) => Err(io::Error::from_raw_os_error(e.raw_os_error().unwrap_or(0))),
+            };
+            if s.splice {
+                self.splice_forward_inflight(slot, generation, false, res);
+                return;
+            }
         }
         match cqe.result {
             Ok(n) if n > 0 => {

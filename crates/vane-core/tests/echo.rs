@@ -376,3 +376,117 @@ fn unix_upstream_roundtrip() {
         .send(vane_core::WorkerCmd::Shutdown { deadline_ms: 100 });
     handle.join();
 }
+
+/// Handler exercising SessionIo::start_splice: dials a socketpair upstream
+/// on connect, splices, and the kernel pumps raw bytes both directions.
+struct Splicer;
+
+impl Handler for Splicer {
+    fn on_connected(&mut self, io: &mut SessionIo<'_>) {
+        eprintln!("DBG splicer on_connected");
+        // Engine-level socketpair is created by the test via a fixed path
+        // marker; here we use a TCP upstream dialed from the handler.
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("addr");
+        let _ = addr;
+        // The upstream fd is supplied by the test through CONNECT: dial a
+        // pre-arranged listener.
+        if !io.connect_upstream(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            SPLICE_UPSTREAM_PORT.load(std::sync::atomic::Ordering::Relaxed),
+        )) {
+            io.close();
+        }
+    }
+
+    fn on_downstream_data(&mut self, io: &mut SessionIo<'_>, data: &[u8]) {
+        // Mirror the proxy L4 branch: forward pre-splice bytes upstream
+        // (the worker buffers them until the dial completes).
+        io.write_upstream(data);
+    }
+
+    fn on_upstream_connected(&mut self, io: &mut SessionIo<'_>) {
+        eprintln!("DBG splicer upstream connected, splicing");
+        if !io.start_splice() {
+            eprintln!("DBG start_splice failed");
+            io.close();
+        }
+    }
+    fn on_upstream_data(&mut self, _io: &mut SessionIo<'_>, _data: &[u8]) {
+        eprintln!("DBG splicer upstream data (post-splice leak)");
+    }
+    fn on_downstream_eof(&mut self, _io: &mut SessionIo<'_>) {}
+    fn on_upstream_eof(&mut self, _io: &mut SessionIo<'_>) {}
+    fn on_upstream_error(&mut self, io: &mut SessionIo<'_>, _e: std::io::Error) {
+        io.close();
+    }
+}
+
+struct SplicerFactory;
+
+impl HandlerFactory for SplicerFactory {
+    fn mode(&self) -> Mode {
+        Mode::Http
+    }
+
+    fn build(&self, _ctx: &vane_core::WorkerCtx) -> Box<dyn Handler> {
+        Box::new(Splicer)
+    }
+}
+
+static SPLICE_UPSTREAM_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// Worker-level splice: downstream bytes cross to the upstream through
+/// the kernel pipe (handler only sets the pump up).
+#[test]
+fn worker_splice_pumps_raw_bytes() {
+    // Upstream echo on a known port.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let upstream_port = listener.local_addr().expect("addr").port();
+    SPLICE_UPSTREAM_PORT.store(upstream_port, std::sync::atomic::Ordering::Relaxed);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut s = stream;
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 4096];
+                loop {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if s.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let tcp_listener =
+        vane_core::tcp_listener("127.0.0.1:0".parse().expect("addr"), true, 64).expect("bind");
+    let addr = tcp_listener.local_addr().expect("addr");
+
+    let registry = Arc::new(Registry::new());
+    let events = Arc::new(vane_observe::ring::EventRing::new());
+    let cfg = WorkerConfig {
+        force_mio: true,
+        ..WorkerConfig::default()
+    };
+    let factory = SplicerFactory;
+    let mut handle = spawn_worker(0, cfg, tcp_listener, registry, events, &factory).expect("spawn");
+
+    let mut client = TcpStream::connect(addr).expect("connect");
+    client
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .ok();
+    client.write_all(b"splice-me").expect("write");
+    let mut buf = [0u8; 9];
+    client.read_exact(&mut buf).expect("splice echo");
+    assert_eq!(&buf, b"splice-me");
+
+    let _ = handle
+        .cmd
+        .send(vane_core::WorkerCmd::Shutdown { deadline_ms: 100 });
+    handle.join();
+}
