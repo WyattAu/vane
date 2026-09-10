@@ -26,6 +26,15 @@ detects this and falls back to the mio engine automatically (you'll see
 `io_uring unavailable …, falling back to mio`). To run io_uring in a
 container, use a permissive seccomp profile or `--privileged`.
 
+The compose files also set two container knobs vane depends on:
+
+- `shm_size: "256mb"` — `/dev/shm` defaults to 64 MB, too small for
+  the default sidecar slot config; enlarge it whenever `[sidecar]` is
+  enabled (see `[sidecar] slot_size × slots` in [config.md](config.md)).
+- `cap_add: [IPC_LOCK]` — io_uring fixed buffers are page-locked
+  (`IORING_REGISTER_BUFFERS`); without it, buffer registration fails
+  and the engine falls back to heap buffers.
+
 ## 2. Docker Compose
 
 A proxy + upstream demo (Compose files at the repo root):

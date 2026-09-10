@@ -39,6 +39,11 @@ services:
       ]
     networks:
       - vanenet
+    # Sidecar SHM arenas live in /dev/shm; io_uring fixed buffers are
+    # page-locked (see docker-compose.yml).
+    shm_size: "256mb"
+    cap_add:
+      - IPC_LOCK
 
   # Generation 2 (standby): takes the listener when vane-a drains.
   vane-b:
@@ -56,6 +61,9 @@ services:
       ]
     networks:
       - vanenet
+    shm_size: "256mb"
+    cap_add:
+      - IPC_LOCK
 
 volumes:
   handover: {}

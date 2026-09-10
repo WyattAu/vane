@@ -26,6 +26,11 @@ services:
     command: ["run", "-c", "/etc/vane/vane.toml"]
     networks:
       - vanenet
+    # Sidecar SHM arenas live in /dev/shm (default 64MB is too small for
+    # the default slot config); io_uring fixed buffers are page-locked.
+    shm_size: "256mb"
+    cap_add:
+      - IPC_LOCK
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1:9090/healthz"]
       interval: 5s

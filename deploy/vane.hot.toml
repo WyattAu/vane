@@ -1,0 +1,21 @@
+# Demo config for `docker-compose.hot-upgrade.yml`.
+#
+# Same proxy as deploy/vane.toml but WITHOUT the admin listener (only
+# vane-a publishes :8080; vane-b is a pure standby until handover).
+# The two generations coordinate through VANE_HANDOVER_SOCK.
+
+[[listeners]]
+address = "0.0.0.0:8080"
+
+[clusters.up]
+backends = ["upstream:18082"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+workers = 2
