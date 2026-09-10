@@ -14,6 +14,21 @@ use vane_filters::pipeline::Filter as _;
 use vane_filters::{BreakerGate, Outcome, Pipeline, RateLimit, RequestCtx};
 use vane_observe::metrics::{MetricHandle, MetricKind, Registry};
 use vane_observe::ring::EventRing;
+
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+/// Packs an IP into the v4-mapped 16-byte form used by access records.
+fn ip16(ip: std::net::IpAddr) -> [u8; 16] {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            [
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, o[0], o[1], o[2], o[3],
+            ]
+        }
+        std::net::IpAddr::V6(v6) => v6.octets(),
+    }
+}
 use vane_observe::{LogEvent, LogLevel};
 use vane_proto::request::{MAX_HEADERS, Parsed, RequestView};
 use vane_proto::response::{Status, write_full};
@@ -46,6 +61,8 @@ pub struct ProxyConfig {
     /// Wasm plugin module paths (feature `wasm`; applied to every request
     /// in order, before routing).
     pub plugins: Vec<String>,
+    /// Structured access log (`None` = disabled — no per-request work).
+    pub access: Option<std::sync::Arc<vane_observe::access::AccessLog>>,
 }
 
 /// Per-connection state.
@@ -75,6 +92,14 @@ struct Conn {
     upstream_addr: Option<SocketAddr>,
     /// Connect attempts for the current transaction (failover cap).
     attempts: u8,
+    /// Access-log fields for the in-flight transaction.
+    req_method: String,
+    req_host: Option<String>,
+    req_path: String,
+    resp_status: u16,
+    bytes_out: u64,
+    /// Set once the transaction's access record was emitted.
+    access_logged: bool,
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,6 +254,7 @@ impl HttpProxy {
         let Some(conn) = self.conns.get_mut(&slot) else {
             return;
         };
+        conn.bytes_out += bytes.len() as u64;
         let Some(tls) = &mut conn.tls else {
             io.respond(bytes);
             return;
@@ -385,16 +411,66 @@ impl HttpProxy {
     }
 
     fn respond_full(&mut self, io: &mut SessionIo<'_>, status: Status, body: &str) {
-        let _ = io.slot_index();
+        let slot = io.slot_index();
+        self.conn(slot).resp_status = status.code();
+        let started = self.conns.get(&slot).and_then(|c| c.started);
         let mut buf = [0u8; 1024];
         if let Ok(n) = write_full(&mut buf, status, body.as_bytes(), &[], &self.date) {
             self.write_downstream(io, &buf[..n]);
             self.metrics.responses.inc(&self.config.registry);
         }
+        self.access_emit(io, started);
         io.set_deadline(
             Some(self.deadline(self.config.idle_timeout_ms)),
             vane_core::handler::DeadlineReason::Idle,
         );
+    }
+
+    /// Emits the transaction's access record (once). No-op when the
+    /// access log is disabled or the record was already written.
+    fn access_emit(&mut self, io: &SessionIo<'_>, started: Option<Instant>) {
+        let Some(access) = self.config.access.as_ref() else {
+            return;
+        };
+        let slot = io.slot_index();
+        let Some(conn) = self.conns.get(&slot) else {
+            return;
+        };
+        if conn.access_logged {
+            return;
+        }
+        let duration_us = started
+            .map(|s| s.elapsed().as_micros())
+            .unwrap_or(0)
+            .min(u128::from(u32::MAX)) as u32;
+        let client = io
+            .peer()
+            .map(|a| (ip16(a.ip()), a.port()))
+            .unwrap_or(([0u8; 16], 0));
+        let upstream = conn.upstream_addr.map(|a| (ip16(a.ip()), a.port()));
+        let mut trace_hex = [0u8; 32];
+        if let Some(t) = &conn.trace {
+            for (i, b) in t.trace_id.iter().enumerate() {
+                trace_hex[i * 2] = HEX[usize::from(b >> 4)];
+                trace_hex[i * 2 + 1] = HEX[usize::from(b & 0x0F)];
+            }
+        }
+        let rec = vane_observe::access::AccessRecord::now(
+            u16::try_from(self.worker_id).unwrap_or(u16::MAX),
+            conn.resp_status,
+            duration_us,
+            conn.bytes_out,
+            client,
+            upstream,
+            conn.req_method.as_bytes(),
+            conn.req_host.as_deref().unwrap_or_default().as_bytes(),
+            conn.req_path.as_bytes(),
+            &trace_hex,
+        );
+        access.emit(rec);
+        if let Some(c) = self.conns.get_mut(&slot) {
+            c.access_logged = true;
+        }
     }
 
     /// Serializes the upstream request head from the parsed view + pipeline
@@ -457,6 +533,7 @@ impl HttpProxy {
             Ok(httparse::Status::Complete(head_len)) => {
                 let code = resp.code.unwrap_or(500);
                 let status = Status::from_code(code);
+                self.conn(slot).resp_status = code;
                 let mut content_length: Option<u64> = None;
                 let mut chunked = false;
                 let mut upstream_close = false;
@@ -488,8 +565,6 @@ impl HttpProxy {
                     // closes.
                     self.conn(slot).tunnel = true;
                     BodyFraming::Tunnel
-                } else if code == 204 || code == 304 {
-                    BodyFraming::Done
                 } else if chunked {
                     BodyFraming::Chunked {
                         last_was_lf: false,
@@ -629,6 +704,12 @@ impl Handler for HttpProxy {
                 // Relay the head verbatim (hop-by-hop cleanup minimal).
                 let head = data[..head_len].to_vec();
                 self.write_downstream(io, &head);
+                if self.conns.get(&slot).is_some_and(|c| c.tunnel) {
+                    // 101 switch: the transaction is complete at upgrade;
+                    // tunnel bytes belong to the stream, not this record.
+                    let started = self.conns.get(&slot).and_then(|c| c.started);
+                    self.access_emit(io, started);
+                }
                 let rest = &data[head_len..];
                 if !rest.is_empty() {
                     self.relay_body(io, rest);
@@ -753,6 +834,19 @@ impl HttpProxy {
     fn handle_request(&mut self, io: &mut SessionIo<'_>, view: &RequestView<'_>, _head_len: usize) {
         let started = Instant::now();
         let slot = io.slot_index();
+        {
+            let conn = self.conn(slot);
+            conn.req_method.clear();
+            conn.req_method.push_str(view.method);
+            conn.req_host = view
+                .header("host")
+                .and_then(|h| std::str::from_utf8(h).ok())
+                .map(|h| h.split(':').next().unwrap_or(h).to_owned());
+            conn.req_path = view.path.to_owned();
+            conn.resp_status = 0;
+            conn.bytes_out = 0;
+            conn.access_logged = false;
+        }
 
         // ACME HTTP-01 challenges bypass routing entirely (RFC 8555 §8.3):
         // answered from the shared token map before any route lookup.
@@ -956,6 +1050,7 @@ impl HttpProxy {
                 u64::try_from(started.map(|s| s.elapsed().as_micros()).unwrap_or(0))
                     .unwrap_or(u64::MAX),
             );
+            self.access_emit(io, started);
             if let Some(route) = &self.conns.get(&slot).expect("conn").route {
                 self.breaker.record_success(&route.cluster);
             }
@@ -974,6 +1069,12 @@ impl HttpProxy {
                 conn.close_after = false;
                 conn.attempts = 0;
                 conn.upstream_ready = false;
+                conn.req_method.clear();
+                conn.req_host = None;
+                conn.req_path.clear();
+                conn.resp_status = 0;
+                conn.bytes_out = 0;
+                conn.access_logged = false;
                 io.set_deadline(
                     Some(self.deadline(self.config.idle_timeout_ms)),
                     vane_core::handler::DeadlineReason::Idle,

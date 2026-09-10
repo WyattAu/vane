@@ -13,6 +13,7 @@
 //! - [`trace`] — W3C `traceparent` generation and propagation (`OB-02`).
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+pub mod access;
 pub mod metrics;
 pub mod ring;
 pub mod trace;

@@ -334,6 +334,7 @@ pub async fn run(opts: RunOptions) -> i32 {
     let mut event_rings: Vec<
         Arc<EventRing<vane_observe::LogEvent, { vane_observe::EVENT_RING_CAPACITY }>>,
     > = Vec::new();
+    let mut access_logs: Vec<Arc<vane_observe::access::AccessLog>> = Vec::new();
     for (li, listener) in bound.into_iter().enumerate() {
         let mode = match config
             .listeners
@@ -400,6 +401,14 @@ pub async fn run(opts: RunOptions) -> i32 {
             };
             let events = Arc::new(EventRing::new());
             event_rings.push(Arc::clone(&events));
+            let access = if config.access_log.enabled {
+                Some(Arc::new(vane_observe::access::AccessLog::new()))
+            } else {
+                None
+            };
+            if let Some(a) = &access {
+                access_logs.push(Arc::clone(a));
+            }
             tls_cfg_slots.push(tls_cfg.clone());
             let factory = WorkerFactory {
                 mode,
@@ -411,6 +420,7 @@ pub async fn run(opts: RunOptions) -> i32 {
                 runtime: config.runtime.clone(),
                 plugins: config.plugins.iter().map(|p| p.path.clone()).collect(),
                 http01_tokens: http01_tokens.clone(),
+                access,
             };
             match spawn_worker(
                 li * workers_per_listener + w,
@@ -502,15 +512,64 @@ pub async fn run(opts: RunOptions) -> i32 {
                 let mut cfg = cfg;
                 cfg.alpn_protocols = vec![b"h2".to_vec()];
                 let dup = listener.try_clone().expect("dup for h2 edge");
+                let access = if config.access_log.enabled {
+                    let a = Arc::new(vane_observe::access::AccessLog::new());
+                    access_logs.push(Arc::clone(&a));
+                    Some(a)
+                } else {
+                    None
+                };
                 let edge = Arc::new(crate::h2_edge::H2Edge::new(
                     Arc::clone(&router),
                     Arc::clone(&registry),
+                    access,
                 ));
                 crate::h2_edge::spawn(dup, Arc::new(cfg), edge);
                 tracing::info!("h2 edge listening (REUSEPORT) for listener {li}");
             }
-            Err(e) => tracing::warn!("h2 edge tls: {e}"),
+            Err(e) => {
+                tracing::warn!("h2 edge tls config: {e}");
+            }
         }
+    }
+
+    // ---- Access-log drain: render one JSON line per transaction into
+    // the configured sink (stderr by default). Dropping on a full ring
+    // is preferable to ever blocking a worker.
+    if config.access_log.enabled {
+        let logs = access_logs.clone();
+        let path = config.access_log.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut file = path.and_then(|p| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&p)
+                    .map_err(|e| tracing::warn!("access log open {p}: {e}"))
+                    .ok()
+            });
+            use std::io::Write as _;
+            let mut out = String::with_capacity(512);
+            loop {
+                let mut any = false;
+                for log in &logs {
+                    while let Some(rec) = log.pop() {
+                        any = true;
+                        out.clear();
+                        rec.render_json(&mut out);
+                        out.push('\n');
+                        if let Some(f) = file.as_mut() {
+                            let _ = f.write_all(out.as_bytes());
+                        } else {
+                            let _ = std::io::stderr().write_all(out.as_bytes());
+                        }
+                    }
+                }
+                if !any {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        });
     }
 
     // ---- TLS certificate hot reload --------------------------------------
@@ -619,6 +678,8 @@ struct WorkerFactory {
     plugins: Vec<String>,
     /// Shared HTTP-01 token map (Some when ACME is configured).
     http01_tokens: Option<Arc<std::sync::Mutex<HashMap<String, String>>>>,
+    /// Per-worker access log (`None` = disabled).
+    access: Option<Arc<vane_observe::access::AccessLog>>,
 }
 
 impl vane_core::HandlerFactory for WorkerFactory {
@@ -640,6 +701,7 @@ impl vane_core::HandlerFactory for WorkerFactory {
                 tls: self.tls.clone(),
                 plugins: self.plugins.clone(),
                 http01_tokens: self.http01_tokens.clone(),
+                access: self.access.clone(),
             },
             self.worker_id,
         ))

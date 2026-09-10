@@ -48,6 +48,8 @@ pub struct H2Edge {
     /// `http2 = true`). Shares the connection pool: one h2 connection
     /// multiplexes all streams to a backend.
     http2: reqwest::Client,
+    /// Structured access log (`None` = disabled).
+    access: Option<std::sync::Arc<vane_observe::access::AccessLog>>,
 }
 
 impl H2Edge {
@@ -56,7 +58,11 @@ impl H2Edge {
     /// # Panics
     /// Metric registration failure (startup-only).
     #[must_use]
-    pub fn new(router: Arc<Router>, registry: Arc<Registry>) -> Self {
+    pub fn new(
+        router: Arc<Router>,
+        registry: Arc<Registry>,
+        access: Option<std::sync::Arc<vane_observe::access::AccessLog>>,
+    ) -> Self {
         // Idempotent: vane's binaries install this in main, but the edge
         // is also constructed by embedders/tests without that guarantee.
         vane_tls::install_crypto_provider();
@@ -79,6 +85,7 @@ impl H2Edge {
                 .http2_prior_knowledge()
                 .build()
                 .expect("reqwest h2 client"),
+            access,
         }
     }
 
@@ -106,15 +113,7 @@ impl H2Edge {
         request: http::Request<h2::RecvStream>,
         respond: &mut h2::server::SendResponse<bytes::Bytes>,
     ) {
-        let mut reply = |status: u16, reason: &'static str| {
-            let response = http::Response::builder()
-                .status(status)
-                .header("server", "vane")
-                .body(())
-                .expect("static response");
-            let _ = respond.send_response(response, true);
-            let _ = reason;
-        };
+        let started = std::time::Instant::now();
 
         let path = request
             .uri()
@@ -127,6 +126,39 @@ impl H2Edge {
             .and_then(|h| h.to_str().ok())
             .map(|h| h.split(':').next().unwrap_or(h).to_owned());
         let method = request.method().clone();
+
+        let (method_l, host_l, path_l) = (
+            method.as_str().to_owned(),
+            host.clone().unwrap_or_default(),
+            path.clone(),
+        );
+        let emit = move |status: u16, bytes_out: u64| {
+            if let Some(access) = &self.access {
+                let rec = vane_observe::access::AccessRecord::now(
+                    u16::MAX,
+                    status,
+                    u32::try_from(started.elapsed().as_micros()).unwrap_or(u32::MAX),
+                    bytes_out,
+                    ([0u8; 16], 0),
+                    None,
+                    method_l.as_bytes(),
+                    host_l.as_bytes(),
+                    path_l.as_bytes(),
+                    &[],
+                );
+                access.emit(rec);
+            }
+        };
+        let mut reply = |status: u16, reason: &'static str| {
+            let response = http::Response::builder()
+                .status(status)
+                .header("server", "vane")
+                .body(())
+                .expect("static response");
+            let _ = respond.send_response(response, true);
+            emit(status, 0);
+            let _ = reason;
+        };
 
         // Route on the live snapshot. The epoch guard is scoped: only the
         // 'static Arc escapes (TableGuard is !Send and must not cross an

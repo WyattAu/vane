@@ -47,6 +47,9 @@ pub struct VaneConfig {
     /// Runtime tuning.
     #[serde(default)]
     pub runtime: RuntimeConfig,
+    /// Structured access logging.
+    #[serde(default)]
+    pub access_log: AccessLogConfig,
 }
 
 /// An ingress listener.
@@ -271,6 +274,17 @@ pub enum AcmeChallenge {
     Http01,
     /// TLS-ALPN-01 (planned; rejected at load time for now).
     TlsAlpn01,
+}
+
+/// Access-log configuration (`Default` = disabled, stderr sink).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AccessLogConfig {
+    /// Emit one JSON line per completed request.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Output file (append). `None` = stderr.
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 /// In-process SHM sidecar transport configuration.

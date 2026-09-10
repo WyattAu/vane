@@ -29,6 +29,7 @@ fn make_proxy(
             tls: None,
             plugins: Vec::new(),
             http01_tokens: None,
+            access: None,
         },
         0,
     )

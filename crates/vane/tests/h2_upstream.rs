@@ -110,6 +110,7 @@ async fn request_via_edge(router: Arc<Router>, path: &str) -> (u16, String, Stri
     let edge = Arc::new(vane::h2_edge::H2Edge::new(
         router,
         Arc::new(Registry::new()),
+        None,
     ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
