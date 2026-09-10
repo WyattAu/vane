@@ -182,6 +182,26 @@ Caveats, honestly stated:
 - Measurements are single-run means on a shared multi-tenant host; treat
   ratios (≈4× keep-alive, ≈1× short) as indicative, not absolute.
 
+## Admin plane & metrics
+
+The admin listener (`[admin]`, default `127.0.0.1:9100`) serves:
+
+| Endpoint | Content |
+|---|---|
+| `/healthz`, `/readyz` | Kubernetes probes (`ok` / `ready`) |
+| `/health` | per-backend health states (JSON) |
+| `/metrics` | Prometheus exposition |
+| `/config` | live route-table records (JSON) |
+
+Core metric families (`vane_*`): `http_requests_total`,
+`http_responses_total`, `bytes_in_total`, `bytes_out_total`,
+`upstream_errors_total`, `breaker_rejected_total`,
+`ratelimit_rejected_total`, `config_generation`,
+`request_duration_us` (histogram).
+
+Access logging (`[access_log]`, default off) emits one JSON object per
+completed request — see [docs/config.md](docs/config.md).
+
 ## Engineering gates (Tier A)
 
 `cargo clippy -D warnings` (pedantic) · `llvm-cov ≥ 90%` · **loom**
