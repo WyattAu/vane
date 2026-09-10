@@ -1,0 +1,74 @@
+# Default values for vane.
+#
+# A minimal install exposes one data-plane listener and serves a static
+# config. See values-k8s-provider.yaml for the Gateway API variant.
+
+image:
+  repository: ghcr.io/wyattau/vane
+  pullPolicy: IfNotPresent
+  tag: "0.2.0"
+
+replicaCount: 2
+
+# Listener ports (data plane on `service.port`, admin on `service.adminPort`).
+service:
+  type: ClusterIP
+  port: 8080
+  adminPort: 9090
+  annotations: {}
+
+admin:
+  enabled: true
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 64Mi
+  limits:
+    cpu: "2"
+    memory: 256Mi
+
+# securityContext for the pod (non-root; image runs as uid 999/gid 999).
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 999
+  runAsGroup: 999
+  fsGroup: 999
+
+# Static proxy config rendered into a ConfigMap. Keep clusters' backends
+# as Service DNS names — vane resolves them at control-plane cadence.
+config:
+  listeners:
+    - address: "0.0.0.0:8080"
+  clusters:
+    example:
+      backends:
+        - "example-svc:80"
+  routes:
+    - pattern: "/*rest"
+      cluster: example
+  admin:
+    enabled: true
+    address: "0.0.0.0:9090"
+  access_log:
+    enabled: true
+
+# Prometheus scraping via annotations (set prometheus.enabled to emit a
+# PodMonitor when prometheus-operator is installed).
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # create is implied by k8sProvider.enabled; name defaults to the release
+  name: ""
+
+prometheus:
+  enabled: false
+  interval: 30s
+
+# Kubernetes Gateway API provider: watches HTTPRoutes + Endpoints and
+# rebuilds the route table live. Needs RBAC (rbac.create=true) and the
+# gateway-api CRDs installed in the cluster.
+k8sProvider:
+  enabled: false
+  namespaces: []

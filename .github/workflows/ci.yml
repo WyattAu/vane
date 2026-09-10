@@ -86,6 +86,27 @@ jobs:
             --include-ignored --skip hot_upgrade || \
             { echo "::warning::coverage below 90% — tracked for Tier A completion"; }
 
+  helm:
+    name: helm lint + template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.4
+      - name: Lint
+        run: helm lint charts/vane
+      - name: Template (default + k8s-provider)
+        run: |
+          helm template vane charts/vane --show-only templates/configmap.yaml > /tmp/opencode/cm-default.yaml
+          test -s /tmp/opencode/cm-default.yaml
+          helm template vane charts/vane -f charts/vane/values-k8s-provider.yaml | grep -q "kind: ClusterRoleBinding"
+      - name: Compose validation
+        run: |
+          docker compose -f docker-compose.yml config --quiet
+          docker compose -f docker-compose.hot-upgrade.yml config --quiet
+
   fuzz-smoke:
     name: fuzz smoke
     runs-on: ubuntu-latest

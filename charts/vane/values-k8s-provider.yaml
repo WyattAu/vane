@@ -1,0 +1,29 @@
+# Values for the Kubernetes Gateway API deployment: vane watches HTTPRoutes
+# (+ Endpoints) and rebuilds its route table live. Requires the gateway-api
+# CRDs installed in the cluster.
+#
+#   helm install vane ./charts/vane -f charts/vane/values-k8s-provider.yaml
+
+image:
+  repository: ghcr.io/wyattau/vane
+  tag: "0.2.0"
+
+replicaCount: 2
+
+config:
+  listeners:
+    - address: "0.0.0.0:8080"
+  clusters: {}
+  routes: []
+  admin:
+    enabled: true
+    address: "0.0.0.0:9090"
+  access_log:
+    enabled: true
+
+k8sProvider:
+  enabled: true
+  namespaces: ["*"]
+
+prometheus:
+  enabled: true

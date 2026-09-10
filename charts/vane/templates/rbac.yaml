@@ -1,0 +1,42 @@
+{{- if .Values.k8sProvider.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "vane.serviceAccountName" . }}
+  labels:
+    {{- include "vane.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "vane.fullname" . }}-reader
+  labels:
+    {{- include "vane.labels" . | nindent 4 }}
+rules:
+  # Gateway API route discovery (list + watch).
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["httproutes"]
+    verbs: ["get", "list", "watch"]
+  # Endpoint resolution for backend_refs → ready pod IPs.
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "vane.fullname" . }}-reader
+  labels:
+    {{- include "vane.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "vane.fullname" . }}-reader
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "vane.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

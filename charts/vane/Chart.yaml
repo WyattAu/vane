@@ -1,0 +1,15 @@
+apiVersion: v2
+name: vane
+description: Deterministic L4/L7 reverse proxy, edge gateway, and micro sidecar
+type: application
+version: 0.2.0
+appVersion: "0.2.0"
+keywords:
+  - proxy
+  - gateway
+  - ingress
+maintainers:
+  - name: Wyatt Au
+home: https://github.com/WyattAu/vane
+sources:
+  - https://github.com/WyattAu/vane

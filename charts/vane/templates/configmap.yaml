@@ -1,0 +1,50 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "vane.fullname" . }}-config
+  labels:
+    {{- include "vane.labels" . | nindent 4 }}
+data:
+  vane.toml: |
+    {{- $adminAddr := .Values.service.adminPort | printf "0.0.0.0:%v" }}
+    [[listeners]]
+    address = "0.0.0.0:{{ .Values.service.port }}"
+
+    {{- range $name, $cluster := .Values.config.clusters }}
+
+    [clusters.{{ $name }}]
+    backends = {{ $cluster.backends | toJson }}
+    {{- if $cluster.http2 }}
+    http2 = true
+    {{- end }}
+    {{- end }}
+
+    {{- range $route := .Values.config.routes }}
+
+    [[routes]]
+    pattern = {{ $route.pattern | quote }}
+    cluster = {{ $route.cluster | quote }}
+    {{- with $route.host }}
+    host = {{ . | quote }}
+    {{- end }}
+    {{- with $route.methods }}
+    methods = {{ . | toJson }}
+    {{- end }}
+    {{- end }}
+
+    [kubernetes]
+    enabled = {{ .Values.k8sProvider.enabled }}
+    {{- with .Values.k8sProvider.namespaces }}
+    namespaces = {{ . | toJson }}
+    {{- end }}
+
+    [admin]
+    enabled = {{ .Values.admin.enabled }}
+    address = {{ $adminAddr | quote }}
+
+    [access_log]
+    enabled = {{ .Values.config.access_log.enabled | default true }}
+
+    [runtime]
+    force_mio = true
+    workers = 0
