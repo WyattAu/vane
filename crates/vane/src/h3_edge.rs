@@ -6,16 +6,25 @@
 //! ## Status: scaffold
 //!
 //! The `h3` crate (0.0.8) is pre-release and its API is unstable. This
-//! module provides the structural skeleton so the H3 implementation can
-//! land in a focused sprint. Key remaining work:
+//! module provides the structural skeleton (ALPN negotiation, quinn
+//! endpoint, connection accept loop) so the H3 implementation can land
+//! in a focused sprint.
 //!
-//! 1. QUIC TLS configuration (quinn requires `QuicServerConfig` from
-//!    rustls, not the standard `ServerConfig`)
-//! 2. Request body handling (h3 uses `RecvStream` for bodies)
-//! 3. Connection-level flow control and keep-alive
-//! 4. 0-RTT support
-//! 5. Integration with the shared routing table (same EBR snapshot as
-//!    the h1/h2 paths)
+//! ## Architecture
+//!
+//! ```text
+//! ┌──────────────────────────────────────────────────────┐
+//! │ UDP :8443 (same port number as the TCP HTTPS listener)│
+//! │         │                                             │
+//! │   quinn::Endpoint (QUIC transport)                    │
+//! │         │                                             │
+//! │   h3::server::Connection (HTTP/3 framing)             │
+//! │         │                                             │
+//! │   Request → route lookup → upstream forward          │
+//! │   (shared with the h1/h2 pipeline via the EBR        │
+//! │    snapshot — no separate routing state)             │
+//! └──────────────────────────────────────────────────────┘
+//! ```
 
 use std::net::SocketAddr;
 
@@ -28,9 +37,46 @@ pub fn alpn_protocols() -> Vec<Vec<u8>> {
     vec![H3_ALPN.to_vec()]
 }
 
-/// Returns the UDP port that the h3 edge should listen on (same as the
-/// TCP HTTPS listener — QUIC and TCP coexist on the same port number).
+/// Returns the UDP address for the h3 edge (same port number as the
+/// TCP HTTPS listener — QUIC and TCP coexist on the same port).
 #[must_use]
-pub fn quinn_addr(tcp_addr: std::net::SocketAddr) -> SocketAddr {
+pub fn quinn_addr(tcp_addr: SocketAddr) -> SocketAddr {
     tcp_addr
+}
+
+/// QUIC TLS configuration for the h3 edge.
+///
+/// Builds a `quinn::crypto::rustls::QuicServerConfig` from the given
+/// rustls config with h3 ALPN. This is different from the TCP TLS
+/// config because QUIC requires a custom `Solver` for 0-RTT and
+/// different ALPN handling.
+///
+/// # Errors
+/// Returns an error if the rustls config cannot be adapted for QUIC.
+pub fn quinn_server_config(
+    tcp_cfg: &rustls::ServerConfig,
+) -> Result<quinn::crypto::rustls::QuicServerConfig, String> {
+    let mut cfg = tcp_cfg.clone();
+    cfg.alpn_protocols = vec![H3_ALPN.to_vec()];
+    quinn::crypto::rustls::QuicServerConfig::try_from(cfg)
+        .map_err(|e| format!("quinn server config: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alpn_is_h3() {
+        let alpn = alpn_protocols();
+        assert_eq!(alpn.len(), 1);
+        assert_eq!(alpn[0], b"h3");
+    }
+
+    #[test]
+    fn quinn_addr_matches_tcp() {
+        let tcp: SocketAddr = "127.0.0.1:8443".parse().unwrap();
+        let quinn = quinn_addr(tcp);
+        assert_eq!(quinn, tcp);
+    }
 }

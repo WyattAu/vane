@@ -11,5 +11,11 @@ authors.workspace = true
 [dependencies]
 vane-shm = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[test]]
+name = "sdk_roundtrip"
+
 [[example]]
 name = "sidecar_roundtrip"

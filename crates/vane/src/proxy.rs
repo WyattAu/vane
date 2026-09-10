@@ -771,18 +771,9 @@ impl HttpProxy {
                 .cloned();
             match answer {
                 Some(key_auth) => {
-                    eprintln!("[acme-dbg] SERVED token={token} ka={key_auth}");
                     self.respond_full(io, Status::Ok, &key_auth);
                 }
                 None => {
-                    let map = self.config.http01_tokens.as_ref().expect("checked");
-                    let m = map.lock().unwrap_or_else(|e| e.into_inner());
-                    eprintln!(
-                        "[acme-dbg] MISS token={token} map_len={} keys={:?}",
-                        m.len(),
-                        m.keys().collect::<Vec<_>>()
-                    );
-                    drop(m);
                     self.respond_full(io, Status::NotFound, "unknown token\n");
                 }
             }

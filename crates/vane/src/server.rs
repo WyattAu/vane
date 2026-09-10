@@ -120,7 +120,6 @@ pub async fn run(opts: RunOptions) -> i32 {
             return 1;
         }
     };
-    eprintln!("[run-dbg] config loaded");
     if config.listeners.is_empty() {
         eprintln!("vane: no listeners configured");
         return 1;
@@ -190,7 +189,6 @@ pub async fn run(opts: RunOptions) -> i32 {
             None
         };
 
-    eprintln!("[run-dbg] acme wired");
     // Static routes + health probe paths.
     reconciler.publish_static(&config);
     let mut checker = vane_control::HealthChecker::new(Arc::clone(&health), Duration::from_secs(5));
@@ -317,7 +315,6 @@ pub async fn run(opts: RunOptions) -> i32 {
         }
     }
 
-    eprintln!("[run-dbg] listeners bound: {}", bound.len());
     // ---- Spawn workers (one per listener × core) ------------------------
     // Keep dup'd listener fds for the hot-upgrade sender (SCM_RIGHTS needs
     // an owned fd at shutdown; the workers get their own clones).

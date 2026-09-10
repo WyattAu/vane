@@ -24,26 +24,48 @@ async fn acme_full_stack_issue_and_serve() {
         .args(["-9", "-f", "target/debug/vane"])
         .output();
 
-    // Clean slate: no stale pebble/challtestsrv containers or orphan vanes
-    // squatting the fixed ACME port.
-    for c in ["vane-pebble", "vane-challtestsrv"] {
-        let _ = Command::new("docker").args(["rm", "-f", c]).output();
-    }
-    let _ = Command::new("fuser").args(["-k", "5002/tcp"]).output();
+    // Reserve ephemeral ports up-front (bind-then-drop) so concurrent
+    // runs / foreign services on this shared host can't collide.
+    let reserve = || {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        l.local_addr().expect("addr").port()
+    };
+    let mgmt_port = reserve(); // pebble ACME directory (default 14000)
+    let http_port = reserve(); // pebble dials here for HTTP-01 validation
+    let api_port = reserve(); // pebble management endpoint (default 15000)
+
+    // Pebble config: custom directory port + HTTP-01 validation port,
+    // plus the management endpoint the test fetches the root CA from.
+    // Cert/key paths are the stock test certs shipped inside the image.
+    let pebble_cfg = format!(
+        r#"{{"pebble":{{"listenAddress":"0.0.0.0:{mgmt_port}","managementListenAddress":"0.0.0.0:{api_port}","certificate":"test/certs/localhost/cert.pem","privateKey":"test/certs/localhost/key.pem","httpPort":{http_port}}}}}"#
+    );
+    let cfg_dir = tempfile::tempdir().expect("cfgdir");
+    let cfg_path = cfg_dir.path().join("pebble-config.json");
+    std::fs::write(&cfg_path, pebble_cfg).expect("write pebble config");
+    let cfg_mount = format!("{}:/test/pebble-config.json", cfg_path.display());
+
+    let container = format!("vane-pebble-stack-{}", std::process::id());
     let pebble = Command::new("docker")
         .args([
             "run",
             "-d",
             "--name",
-            "vane-pebble",
+            &container,
             "--network",
             "host",
+            "-v",
+            &cfg_mount,
             "ghcr.io/letsencrypt/pebble:latest",
+            "-config",
+            "/test/pebble-config.json",
         ])
         .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .expect("start pebble");
-    // pebble needs a moment to listen on 14000.
+    // pebble needs a moment to listen on the directory port.
+    let dir_url = format!("https://127.0.0.1:{mgmt_port}/dir");
     for _ in 0..20 {
         if let Ok(out) = Command::new("curl")
             .args([
@@ -54,7 +76,7 @@ async fn acme_full_stack_issue_and_serve() {
                 "/dev/null",
                 "-w",
                 "%{http_code}",
-                "https://127.0.0.1:14000/dir",
+                &dir_url,
             ])
             .output()
         {
@@ -91,16 +113,13 @@ async fn acme_full_stack_issue_and_serve() {
 
     let dir = tempfile::tempdir().expect("dir");
     let acme_storage = dir.path().join("acme");
-    let http_port = 15002_u16; // pebble dials localhost:5002 → we must use 5002
-    let _ = http_port;
-    let http_port = 5002_u16;
-    let proxy_addr: SocketAddr = "127.0.0.1:5002".parse().expect("addr");
+    let proxy_addr: SocketAddr = format!("127.0.0.1:{http_port}").parse().expect("addr");
     let tls_probe = TcpListener::bind("127.0.0.1:0").expect("probe tls");
     let tls_addr = tls_probe.local_addr().expect("tls addr");
     let tls_port = tls_addr.port();
     drop(tls_probe);
 
-    // ---- Phase 1: vane with [acme]; HTTP-01 served on :5002 ----
+    // ---- Phase 1: vane with [acme]; HTTP-01 served on the reserved port ----
     let storage_display = acme_storage.display().to_string();
     let phase1 = format!(
         r#"
@@ -118,7 +137,7 @@ pattern = "/*rest"
 cluster = "e2e"
 
 [acme]
-directory_url = "https://127.0.0.1:14000/dir"
+directory_url = "https://127.0.0.1:{mgmt_port}/dir"
 emails = ["ci@example.com"]
 storage_dir = "{storage_display}"
 insecure_tls = true
@@ -202,7 +221,7 @@ force_mio = true
     // binds a DIFFERENT port so no conflict.
     assert!(issued, "certificate was not issued within 60s");
     assert!(
-        key.contains("BEGIN") || key.len() > 0,
+        key.contains("BEGIN") || !key.is_empty(),
         "privkey.pem missing"
     );
 
@@ -259,12 +278,18 @@ force_mio = true
     let _ = server1.wait();
 
     // ---- Serve HTTPS through the proxy using the issued certificate ----
-    // Fetch pebble's root CA from its management endpoint (:15000).
+    // Fetch pebble's root CA from its management endpoint.
+    let root_url = format!("https://127.0.0.1:{api_port}/roots/0");
     let root_pem: Vec<u8> = std::process::Command::new("curl")
-        .args(["-sk", "--max-time", "3", "https://127.0.0.1:15000/roots/0"])
+        .args(["-sk", "--max-time", "3", &root_url])
         .output()
         .expect("root fetch")
         .stdout;
+    assert!(
+        root_pem.starts_with(b"-----BEGIN CERTIFICATE-----"),
+        "pebble root fetch returned no PEM: {:?}",
+        String::from_utf8_lossy(&root_pem[..60.min(root_pem.len())])
+    );
     let mut roots = rustls::RootCertStore::empty();
     // Parse each PEM section of the chain.
     let mut rest = &root_pem[..];
@@ -309,39 +334,11 @@ force_mio = true
 
     // Cleanup: remove the pebble container.
     let _ = Command::new("docker")
-        .args(["rm", "-f", "vane-pebble"])
+        .args(["rm", "-f", &container])
         .output();
 }
 
 /// Blocking cross-process test lock (flock on a temp file).
-/// Minimal base64 (standard alphabet) decoder for the PEM blocks.
-fn base64_decode(input: &str) -> Result<Vec<u8>, &'static str> {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = Vec::new();
-    let bytes: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    let mut chunk = [0u8; 4];
-    for quad in bytes.chunks(4) {
-        if quad.len() < 4 {
-            return Err("bad b64 length");
-        }
-        let mut vals = [0u8; 4];
-        for (i, b) in quad.iter().enumerate() {
-            vals[i] = TABLE.iter().position(|t| t == b).ok_or("bad b64 char")? as u8;
-        }
-        let pad = quad.iter().filter(|b| **b == b'=').count();
-        let vals = [vals[0], vals[1], vals[2], vals[3]];
-        out.push((vals[0] << 2) | (vals[1] >> 4));
-        if pad < 2 {
-            out.push((vals[1] << 4) | (vals[2] >> 2));
-        }
-        if pad < 1 {
-            out.push((vals[2] << 6) | vals[3]);
-        }
-        let _ = chunk;
-    }
-    Ok(out)
-}
-
 fn lock_serial() -> std::fs::File {
     use std::os::unix::io::AsRawFd;
     let path = std::env::temp_dir().join("vane-tests-serial.lock");

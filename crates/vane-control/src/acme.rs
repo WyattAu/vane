@@ -131,6 +131,9 @@ struct Challenge {
     #[serde(default)]
     token: Option<String>,
     url: String,
+    /// Validation failure detail (RFC 8555 §8 — problem document).
+    #[serde(default)]
+    _error: Option<serde_json::Value>,
 }
 
 /// ACME manager — runs the renewal loop and serves HTTP-01 responses.
@@ -238,7 +241,6 @@ impl AcmeManager {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_owned())
             .ok_or_else(|| AcmeError::new("missing replay-nonce"))
-            .inspect(|n| eprintln!("[acme-dbg] fetched nonce: {n}"))
     }
 
     /// Posts a signed JWS request. On `badNonce` (servers may reject
@@ -344,7 +346,6 @@ impl AcmeManager {
     ) -> Result<(Option<T>, Option<String>, Option<String>), AcmeError> {
         let nonce = self.nonce(dir).await?;
         let header = if let Some(kid) = kid {
-            eprintln!("[acme-dbg] kid used: {kid:?} url={url}");
             serde_json::json!({"alg": "ES256", "nonce": nonce, "url": url, "kid": kid})
         } else {
             serde_json::json!({"alg": "ES256", "nonce": nonce, "url": url, "jwk": Self::jwk(key)})
@@ -419,10 +420,6 @@ impl AcmeManager {
     /// Obtains a certificate for the configured domains (blocking flow,
     /// called from the renewal loop).
     pub async fn obtain_certificate(&self) -> Result<Vec<String>, AcmeError> {
-        eprintln!(
-            "[acme-dbg] obtain_certificate start: {:?}",
-            self.config.domains
-        );
         if self.config.domains.is_empty() {
             return Ok(Vec::new());
         }
@@ -435,8 +432,6 @@ impl AcmeManager {
             .text()
             .await
             .map_err(|e| AcmeError::new(e.to_string()))?;
-        eprintln!("[acme-dbg] dir fetched");
-        eprintln!("[acme-dbg] dir: {dir_text}");
         let dir: Directory =
             serde_json::from_str(&dir_text).map_err(|e| AcmeError::new(e.to_string()))?;
         let key = self.account_key()?;
@@ -459,7 +454,6 @@ impl AcmeManager {
         let account_url = account_location
             .clone()
             .ok_or_else(|| AcmeError::new("newAccount missing Location header"))?;
-        eprintln!("[acme-dbg] account url: {account_url}");
         *self.account_url.lock().unwrap_or_else(|e| e.into_inner()) = Some(account_url.clone());
         let kid = account_url;
 
@@ -500,7 +494,6 @@ impl AcmeManager {
             let Some(token) = &ch.token else { continue };
             // Full key authorization (RFC 8555 §8.1): token.thumbprint.
             let key_auth = self.http01_key_auth(token)?;
-            eprintln!("[acme-dbg] http01 token={token} key_auth={key_auth}");
             self.http01
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -557,11 +550,14 @@ impl AcmeManager {
                             break;
                         }
                         "pending" => {
-                            eprintln!("[acme-dbg] authz pending: {auth_url}");
                             tokio::time::sleep(Duration::from_secs(2)).await;
                         }
                         other => {
-                            eprintln!("[acme-dbg] authz {other:?}: {auth_url}");
+                            tracing::warn!(
+                                status = other,
+                                url = auth_url,
+                                "acme authorization failed"
+                            );
                             return Err(AcmeError::new("authorization failed"));
                         }
                     },
@@ -663,10 +659,6 @@ impl AcmeManager {
             jwk["y"].as_str().unwrap_or("")
         );
         let digest = ring::digest::digest(&ring::digest::SHA256, canonical.as_bytes());
-        eprintln!(
-            "[acme-dbg] key_auth token={token} thumb={} canonical={canonical}",
-            Self::b64(digest.as_ref())
-        );
         Ok(format!("{token}.{}", Self::b64(digest.as_ref())))
     }
 

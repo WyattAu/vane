@@ -118,7 +118,7 @@ pub async fn run(config_path: Option<String>, base: String) -> i32 {
 
 /// Blocking minimal HTTP/1.1 relay to `addr`.
 fn blocking_http_call(addr: std::net::SocketAddr, request: &[u8]) -> Vec<u8> {
-    use std::io::{Read, Write};
+    use std::io::{Read as _, Write as _};
     let bad_gw = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n".to_vec();
     let Ok(mut stream) =
         std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3))
@@ -140,3 +140,33 @@ fn blocking_http_call(addr: std::net::SocketAddr, request: &[u8]) -> Vec<u8> {
 // Keep the client import referenced for doc builds.
 #[allow(unused)]
 fn _typecheck(_: SidecarClient) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_call_relays_response() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
+            }
+        });
+        let resp = blocking_http_call(addr, b"GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+        assert!(resp.starts_with(b"HTTP/1.1 200 OK"));
+        assert!(resp.ends_with(b"hi"));
+    }
+
+    #[test]
+    fn http_call_502_on_refused() {
+        // Port 1 on loopback is reliably closed.
+        let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let resp = blocking_http_call(addr, b"GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+        assert!(resp.starts_with(b"HTTP/1.1 502"));
+    }
+}

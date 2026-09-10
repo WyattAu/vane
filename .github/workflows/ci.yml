@@ -76,7 +76,9 @@ jobs:
       - run: cargo install cargo-llvm-cov --locked
       - name: Generate coverage (serial proxy suites)
         run: |
-          cargo llvm-cov --workspace --lcov --output-path lcov.info --             --test-threads=2 -- --skip hot_upgrade
+          cargo llvm-cov --workspace --features vane-plugins/wasm,acme-pebble --lcov \
+            --output-path lcov.info -- \
+            --include-ignored --test-threads=2 -- --skip hot_upgrade
       - name: Enforce Tier A threshold
         run: |
           cargo llvm-cov --workspace --lcov --output-path /dev/null --fail-under-lines 90 || \

@@ -21,5 +21,9 @@ wasmtime = { workspace = true, optional = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 
+[dev-dependencies.wasmtime]
+workspace = true
+features = ["wat"]
+
 [lints]
 workspace = true

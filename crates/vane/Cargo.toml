@@ -69,6 +69,7 @@ h3-quinn = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
 rcgen = { workspace = true }
 libc = { workspace = true }
 loop-retry = { workspace = true }

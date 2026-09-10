@@ -46,6 +46,27 @@ async fn acme_issues_certificate_against_pebble() {
         .output();
     let _ = Command::new("docker").args(["rm", "-f", &chall]).output();
 
+    // Reserve ephemeral ports up-front (bind-then-drop) so concurrent
+    // runs / foreign services on this shared host can't collide.
+    let reserve = || {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        l.local_addr().expect("addr").port()
+    };
+    let mgmt_port = reserve(); // pebble ACME directory (default 14000)
+    let http01_port = reserve(); // challtestsrv HTTP-01 (default 5002)
+    let api_port = reserve(); // challtestsrv management (default 8055)
+
+    // Pebble config: custom directory port + the HTTP-01 validation port
+    // the VA dials (`httpPort`). Cert/key paths are the stock test certs
+    // shipped inside the image.
+    let pebble_cfg = format!(
+        r#"{{"pebble":{{"listenAddress":"0.0.0.0:{mgmt_port}","certificate":"test/certs/localhost/cert.pem","privateKey":"test/certs/localhost/key.pem","httpPort":{http01_port}}}}}"#
+    );
+    let cfg_dir = tempfile::tempdir().expect("cfgdir");
+    let cfg_path = cfg_dir.path().join("pebble-config.json");
+    std::fs::write(&cfg_path, pebble_cfg).expect("write pebble config");
+    let cfg_mount = format!("{}:/test/pebble-config.json", cfg_path.display());
+
     let chall_up = Command::new("docker")
         .args([
             "run",
@@ -60,6 +81,10 @@ async fn acme_issues_certificate_against_pebble() {
             "",
             "-defaultIPv6",
             "",
+            "-http01",
+            &format!(":{http01_port}"),
+            "-management",
+            &format!(":{api_port}"),
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -76,15 +101,20 @@ async fn acme_issues_certificate_against_pebble() {
             &container,
             "--network",
             "host",
+            "-v",
+            &cfg_mount,
             "ghcr.io/letsencrypt/pebble:latest",
+            "-config",
+            "/test/pebble-config.json",
         ])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .status()
         .expect("start pebble");
     assert!(pebble.success(), "pebble failed to start");
 
     // Readiness: wait for the ACME directory.
+    let dir_url = format!("https://127.0.0.1:{mgmt_port}/dir");
     let mut ready = false;
     for _ in 0..40 {
         if let Ok(out) = Command::new("curl")
@@ -96,7 +126,7 @@ async fn acme_issues_certificate_against_pebble() {
                 "/dev/null",
                 "-w",
                 "%{http_code}",
-                "https://127.0.0.1:14000/dir",
+                &dir_url,
             ])
             .output()
         {
@@ -113,13 +143,13 @@ async fn acme_issues_certificate_against_pebble() {
     // Drive the ACME client.
     let storage = tempfile::tempdir().expect("dir");
     let mgr = Arc::new(AcmeManager::new(AcmeConfig {
-        directory_url: "https://127.0.0.1:14000/dir".into(),
+        directory_url: dir_url,
         emails: vec!["ci@example.com".into()],
         domains: vec!["localhost".into()],
         storage: storage.path().to_path_buf(),
         renew_at_fraction: 2.0 / 3.0,
         insecure_tls: true,
-        challenge_answer_url: Some("http://127.0.0.1:8055/add-http01".into()),
+        challenge_answer_url: Some(format!("http://127.0.0.1:{api_port}/add-http01")),
     }));
 
     let worker = Arc::clone(&mgr);
