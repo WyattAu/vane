@@ -742,3 +742,60 @@ workers = 1
     );
     assert!(resp.contains("200 OK"), "routed: {resp:?}");
 }
+
+/// Chunked upstream body delivered in fragments: the terminal 0-chunk
+/// arriving in a later packet must still complete the transaction.
+#[test]
+fn chunked_split_terminal() {
+    let _serial = lock_serial();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut s = stream;
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                let Ok(_) = s.read(&mut buf) else { return };
+                // Head + first chunk now, terminal chunk after a delay so
+                // it lands in a separate packet/read.
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n5\r\nhello\r\n",
+                );
+                std::thread::sleep(Duration::from_millis(200));
+                let _ = s.write_all(b"0\r\n\r\n");
+            });
+        }
+    });
+
+    let port = free_port();
+    let (_dir, cfg) = temp_config(format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.up]
+backends = ["{addr}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = true
+workers = 1
+"#
+    ));
+    spawn_proxy(cfg);
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    let resp = request(
+        proxy,
+        b"GET /chunked HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+    );
+    assert!(resp.contains("200 OK"), "chunked must complete: {resp:?}");
+    assert!(resp.contains("hello"), "chunked body: {resp:?}");
+}

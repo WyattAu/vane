@@ -721,3 +721,110 @@ impl vane_core::HandlerFactory for WorkerFactory {
         ))
     }
 }
+
+#[cfg(test)]
+mod config_override_tests {
+    use super::*;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn write_cfg(dir: &std::path::Path, name: &str, toml: &str) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, toml).expect("write");
+        path.to_str().expect("utf8").to_owned()
+    }
+
+    const BASE: &str = r#"
+[[listeners]]
+address = "127.0.0.1:1"
+
+[clusters.up]
+backends = ["127.0.0.1:2"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+"#;
+
+    #[test]
+    fn env_overrides_listener_admin_and_cluster() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        // SAFETY: env mutation serialized by ENV_LOCK within this binary.
+        unsafe {
+            std::env::set_var("VANE_LISTEN", "127.0.0.1:19991");
+            std::env::set_var("VANE_ADMIN_ADDR", "127.0.0.1:19992");
+            std::env::set_var("VANE_CLUSTER_UP", "10.9.9.9:1, 10.9.9.10:2");
+        }
+        let dir = tempfile::tempdir().expect("dir");
+        let path = write_cfg(dir.path(), "env.toml", BASE);
+        let cfg = load_config(Some(&path)).expect("load");
+        // SAFETY: same lock; restore to avoid cross-test leakage.
+        unsafe {
+            std::env::remove_var("VANE_LISTEN");
+            std::env::remove_var("VANE_ADMIN_ADDR");
+            std::env::remove_var("VANE_CLUSTER_UP");
+        }
+        assert_eq!(cfg.listeners[0].address, "127.0.0.1:19991");
+        assert_eq!(cfg.admin.address, "127.0.0.1:19992");
+        assert!(cfg.admin.enabled);
+        assert_eq!(
+            cfg.clusters["up"].backends,
+            vec!["10.9.9.9:1".to_string(), "10.9.9.10:2".to_string()]
+        );
+    }
+
+    #[test]
+    fn env_listen_creates_listener_when_missing() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        // SAFETY: serialized by ENV_LOCK.
+        unsafe {
+            std::env::set_var("VANE_LISTEN", "127.0.0.1:19993");
+        }
+        let dir = tempfile::tempdir().expect("dir");
+        let path = write_cfg(
+            dir.path(),
+            "nolisten.toml",
+            "[clusters.up]\nbackends = []\n",
+        );
+        let cfg = load_config(Some(&path)).expect("load");
+        // SAFETY: restore.
+        unsafe {
+            std::env::remove_var("VANE_LISTEN");
+        }
+        assert!(cfg.listeners.iter().any(|l| l.address == "127.0.0.1:19993"));
+    }
+
+    #[test]
+    fn load_config_missing_file_errors() {
+        assert!(load_config(Some("/nonexistent/vane.toml")).is_err());
+    }
+
+    #[test]
+    fn flatten_routes_mirrors_table() {
+        let router = Arc::new(Router::new());
+        router.update(|mut editor| {
+            editor.insert(vane_router::RouteEntry {
+                host: Some("h.example".into()),
+                pattern: "/a/*rest".into(),
+                methods: vec!["GET".into()],
+                cluster: "c".into(),
+                strip_prefix: None,
+                timeout_ms: None,
+                backends: vec![vane_router::Backend::new(
+                    "127.0.0.1:5".parse().expect("addr"),
+                    1,
+                )],
+                upstream_h2: false,
+                policy: vane_router::Policy::P2C,
+                gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
+                priority: 0,
+            });
+        });
+        let records = crate::proxy::flatten_routes(&router);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].host.as_deref(), Some("h.example"));
+        assert_eq!(records[0].pattern, "/a/*rest");
+        assert_eq!(records[0].cluster, "c");
+        assert_eq!(records[0].backends, vec!["127.0.0.1:5".to_string()]);
+    }
+}
