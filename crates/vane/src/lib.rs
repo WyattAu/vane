@@ -6,6 +6,8 @@
 pub mod admin;
 #[cfg(feature = "h2")]
 pub mod h2_edge;
+pub mod h3_edge;
+
 pub mod proxy;
 pub mod server;
 pub mod sidecar;

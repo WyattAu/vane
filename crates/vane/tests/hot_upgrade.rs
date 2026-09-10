@@ -30,6 +30,7 @@ fn lock_serial() -> std::fs::File {
     file
 }
 
+#[ignore = "wall-clock sensitive e2e — run with --ignored in the CI e2e job"]
 #[test]
 fn hot_upgrade_zero_connection_refusals() {
     let _lock = lock_serial();
