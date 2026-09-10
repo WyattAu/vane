@@ -46,6 +46,14 @@ async fn acme_full_stack_issue_and_serve() {
     let cfg_mount = format!("{}:/test/pebble-config.json", cfg_path.display());
 
     let container = format!("vane-pebble-stack-{}", std::process::id());
+    // Remove the pebble container when the test scope ends, panic or not.
+    struct ContainerGuard(String);
+    impl Drop for ContainerGuard {
+        fn drop(&mut self) {
+            let _ = Command::new("docker").args(["rm", "-f", &self.0]).output();
+        }
+    }
+    let _guard = ContainerGuard(container.clone());
     let pebble = Command::new("docker")
         .args([
             "run",
@@ -201,10 +209,12 @@ force_mio = true
         );
     }
 
-    // Wait for the certificate to be issued and installed.
+    // Wait for the certificate to be issued and installed. Ceiling is
+    // generous: pebble injects multi-second validation delays and the
+    // chain download may need retries (worst observed ~45s).
     let cert_path = acme_storage.join("cert.pem");
     let mut issued = false;
-    for _ in 0..120 {
+    for _ in 0..150 {
         if let Ok(text) = std::fs::read_to_string(&cert_path) {
             if text.contains("BEGIN CERTIFICATE") {
                 issued = true;

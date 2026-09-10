@@ -635,15 +635,31 @@ impl AcmeManager {
         let Some(cert_url) = order.certificate.clone() else {
             return Err(AcmeError::new("no certificate url"));
         };
-        let (cert_text, _) = self
-            .jws_post_raw_text(
-                &key,
-                &dir,
-                &cert_url,
-                serde_json::Value::Null,
-                Some(kid.as_str()),
-            )
-            .await?;
+        // The chain may not be immediately servable right after finalize
+        // (servers briefly return errors while the chain is assembled);
+        // retry until a PEM body arrives.
+        let mut cert_text = String::new();
+        for _ in 0..10 {
+            let (text, _) = self
+                .jws_post_raw_text(
+                    &key,
+                    &dir,
+                    &cert_url,
+                    serde_json::Value::Null,
+                    Some(kid.as_str()),
+                )
+                .await?;
+            if text.contains("BEGIN CERTIFICATE") {
+                cert_text = text;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        if !cert_text.contains("BEGIN CERTIFICATE") {
+            return Err(AcmeError::new(
+                "certificate chain download did not yield PEM",
+            ));
+        }
         self.persist_certs(&cert_text)?;
         Ok(self.config.domains.clone())
     }
