@@ -566,3 +566,29 @@ workers = 1
     }
     assert_eq!(buf, b"h1-upstream");
 }
+
+/// Zero healthy backends → 503 from the edge (no-healthy-upstream path).
+#[tokio::test]
+async fn no_healthy_backend_yields_503() {
+    let upstream = spawn_h1_upstream().await;
+    let r = Router::new();
+    r.update(|editor| {
+        let be = vane_router::Backend::new(upstream, 1);
+        be.set_healthy(false);
+        editor.insert(RouteEntry {
+            host: None,
+            pattern: "/*rest".into(),
+            methods: Vec::new(),
+            cluster: "up".into(),
+            strip_prefix: None,
+            timeout_ms: None,
+            backends: vec![be],
+            upstream_h2: false,
+            policy: vane_router::Policy::P2C,
+            gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
+            priority: 0,
+        });
+    });
+    let (status, _, _) = request_via_edge(Arc::new(r), "/x").await;
+    assert_eq!(status, 503);
+}

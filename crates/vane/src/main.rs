@@ -299,3 +299,31 @@ force_mio = true
         assert_eq!(code, 1);
     }
 }
+
+#[cfg(test)]
+mod sidecar_cmd_tests {
+
+    #[test]
+    fn cmd_sidecar_no_backends_exits_one() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("sc.toml");
+        // A cluster with no resolvable backends: the bridge cannot start.
+        std::fs::write(
+            &path,
+            r#"
+[clusters.empty]
+backends = []
+
+[sidecar]
+enabled = false
+base = "/nonexistent-vane-sidecar-test"
+"#,
+        )
+        .expect("write");
+        let code = super::cmd_sidecar(
+            Some(path.to_str().expect("utf8").to_owned()),
+            "/nonexistent-vane-sidecar-test".to_owned(),
+        );
+        assert_eq!(code, 1, "sidecar without backends must fail fast");
+    }
+}

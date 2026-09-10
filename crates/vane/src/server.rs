@@ -653,7 +653,6 @@ pub async fn run(opts: RunOptions) -> i32 {
         }
     }
 
-    tracing::info!("shutting down: draining workers");
     let deadline_ms: u64 = 30_000;
     for h in &handles {
         let _ = h.cmd.send(WorkerCmd::Shutdown { deadline_ms });

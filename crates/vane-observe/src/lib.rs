@@ -123,3 +123,39 @@ impl LogLevel {
         }
     }
 }
+
+#[cfg(test)]
+mod log_event_tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_message_and_fields() {
+        let ev = LogEvent::with_ts(42, 3, LogLevel::Warn, b"hello world");
+        assert_eq!(ev.ts_ns, 42);
+        assert_eq!(ev.worker, 3);
+        assert_eq!(ev.msg(), b"hello world");
+    }
+
+    #[test]
+    fn truncates_long_messages() {
+        let big = vec![b'x'; LogEvent::MAX_MSG + 100];
+        let ev = LogEvent::with_ts(1, 0, LogLevel::Info, &big);
+        assert_eq!(ev.msg().len(), LogEvent::MAX_MSG);
+    }
+
+    #[test]
+    fn level_conversion_roundtrip() {
+        for level in [
+            LogLevel::Error,
+            LogLevel::Warn,
+            LogLevel::Info,
+            LogLevel::Debug,
+            LogLevel::Trace,
+        ] {
+            assert_eq!(LogLevel::from_u8(level as u8), level);
+            assert!(!level.as_str().is_empty());
+        }
+        // Unknown byte falls back to Info.
+        assert_eq!(LogLevel::from_u8(200), LogLevel::Info);
+    }
+}

@@ -343,3 +343,58 @@ mod async_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod edge_tests {
+    use super::*;
+    use crate::pipeline::Outcome;
+
+    #[test]
+    fn access_log_filter_logs_short_circuits() {
+        let al = AccessLog::new();
+        let mut path = String::from("/logged");
+        let mut c = crate::RequestCtx::new(
+            "GET",
+            &mut path,
+            "10.1.1.1:5".parse().expect("addr"),
+            Some("edge.test"),
+        );
+        c.short_circuit = Some((429, "rate limited"));
+        assert!(matches!(al.run(&mut c), Outcome::Continue));
+        // No short-circuit: no log, still continue.
+        let mut path2 = String::from("/clean");
+        let mut c2 =
+            crate::RequestCtx::new("GET", &mut path2, "10.1.1.1:5".parse().expect("addr"), None);
+        assert!(matches!(al.run(&mut c2), Outcome::Continue));
+    }
+
+    #[test]
+    fn forwarded_headers_without_host() {
+        let fwd = ForwardedHeaders::default();
+        let mut path = String::from("/h");
+        let mut c = crate::RequestCtx::new(
+            "GET",
+            &mut path,
+            "192.168.0.9:8".parse().expect("addr"),
+            None,
+        );
+        assert!(matches!(fwd.run(&mut c), Outcome::Continue));
+        assert!(
+            !c.inject_headers
+                .iter()
+                .any(|(k, _)| k == "X-Forwarded-Host")
+        );
+        assert!(c.inject_headers.iter().any(|(k, _)| k == "X-Forwarded-For"));
+    }
+
+    #[test]
+    fn breaker_gate_without_cluster_continues() {
+        let registry = std::sync::Arc::new(Registry::new());
+        let gate = BreakerGate::new(registry);
+        let mut path = String::from("/z");
+        let mut c =
+            crate::RequestCtx::new("GET", &mut path, "10.0.0.1:1".parse().expect("addr"), None);
+        // ctx.cluster unset (pre-route): gate must pass through.
+        assert!(matches!(gate.run(&mut c), Outcome::Continue));
+    }
+}

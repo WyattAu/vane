@@ -2,6 +2,7 @@
 //! through a full sidecar round-trip (same process, real SHM transport).
 
 use std::ffi::{CStr, CString};
+use std::time::Duration;
 
 use vane_shm::cabi;
 
@@ -114,4 +115,94 @@ fn cabi_recv_bad_args() {
 fn cabi_close_null_is_noop() {
     // SAFETY: null is explicitly tolerated.
     unsafe { cabi::vane_sc_close(std::ptr::null_mut()) };
+}
+
+/// Recv after a real send: data lands, id matches, length correct.
+#[test]
+fn cabi_recv_returns_sent_data() {
+    use std::thread;
+    let dir = tempfile::tempdir().expect("dir");
+    let base = dir.path().join("recv-data");
+    let cfg = vane_shm::transport::SidecarConfig {
+        base: base.clone(),
+        slot_size: 64 * 1024,
+        slots: 2,
+    };
+    let mut server = vane_shm::transport::SidecarServer::open(&cfg).expect("server");
+    let path = CString::new(base.to_str().expect("utf8")).expect("cstring");
+    // SAFETY: valid C string for the ABI.
+    let client = unsafe { cabi::vane_sc_open(path.as_ptr()) };
+    assert!(!client.is_null());
+
+    // Server echoes: recv then reply with the same payload.
+    thread::spawn(move || {
+        loop {
+            match server.recv(Duration::from_secs(1)) {
+                Ok(Some((id, data))) => {
+                    let _ = server.reply(id, &data, Duration::from_secs(5));
+                }
+                Ok(None) => continue,
+                Err(_) => return,
+            }
+        }
+    });
+
+    // SAFETY: valid handle; payload valid for len.
+    let id = unsafe { cabi::vane_sc_send(client, b"payload-123".as_ptr(), 11, 2000) };
+    assert_ne!(id, u64::MAX);
+
+    let mut out = [0u8; 64];
+    let mut rid = 0u64;
+    // SAFETY: valid handle; out writable.
+    let rc = unsafe { cabi::vane_sc_recv(client, out.as_mut_ptr(), out.len(), &mut rid, 5000) };
+    assert_eq!(rc, 11, "recv length");
+    assert_eq!(rid, id, "reply id matches");
+    assert_eq!(&out[..11], b"payload-123");
+
+    // SAFETY: valid handle.
+    unsafe { cabi::vane_sc_close(client) };
+}
+
+/// Out buffer smaller than the reply: -2 with an error string.
+#[test]
+fn cabi_recv_buffer_too_small() {
+    use std::thread;
+    let dir = tempfile::tempdir().expect("dir");
+    let base = dir.path().join("recv-small");
+    let cfg = vane_shm::transport::SidecarConfig {
+        base: base.clone(),
+        slot_size: 64 * 1024,
+        slots: 2,
+    };
+    let mut server = vane_shm::transport::SidecarServer::open(&cfg).expect("server");
+    let path = CString::new(base.to_str().expect("utf8")).expect("cstring");
+    // SAFETY: valid C string for the ABI.
+    let client = unsafe { cabi::vane_sc_open(path.as_ptr()) };
+    assert!(!client.is_null());
+
+    thread::spawn(move || {
+        loop {
+            match server.recv(Duration::from_secs(1)) {
+                Ok(Some((id, data))) => {
+                    let _ = server.reply(id, &data, Duration::from_secs(5));
+                }
+                Ok(None) => continue,
+                Err(_) => return,
+            }
+        }
+    });
+
+    // SAFETY: valid handle.
+    let id = unsafe { cabi::vane_sc_send(client, b"0123456789".as_ptr(), 10, 2000) };
+    assert_ne!(id, u64::MAX);
+
+    let mut out = [0u8; 4]; // too small
+    let mut rid = 0u64;
+    // SAFETY: valid handle; deliberately small out buffer.
+    let rc = unsafe { cabi::vane_sc_recv(client, out.as_mut_ptr(), out.len(), &mut rid, 5000) };
+    assert_eq!(rc, -2, "buffer-too-small must be -2, got {rc}");
+    assert!(!cabi::vane_sc_last_err().is_null());
+
+    // SAFETY: valid handle.
+    unsafe { cabi::vane_sc_close(client) };
 }

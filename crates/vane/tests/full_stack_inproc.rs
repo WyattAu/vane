@@ -888,3 +888,6 @@ workers = 1
     );
     assert!(resp.contains("200 OK"), "fallback must serve: {resp:?}");
 }
+
+// Handover coverage: the CI e2e job runs tests/hot_upgrade.rs
+// (--handover-from/--handover-to through real worker handoff).

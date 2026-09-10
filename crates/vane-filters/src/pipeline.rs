@@ -197,3 +197,47 @@ mod tests {
         assert_eq!(Pipeline::<Nil>::new().run(h.ctx()), Outcome::Continue);
     }
 }
+
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+    use crate::builtins::RequestId;
+
+    struct RejectAlways;
+
+    impl crate::pipeline::Filter for RejectAlways {
+        fn name(&self) -> &'static str {
+            "reject_always"
+        }
+        fn run(&self, _ctx: &mut crate::RequestCtx<'_>) -> Outcome {
+            Outcome::Reject(503, "nope")
+        }
+    }
+
+    #[test]
+    fn chain_short_circuits_on_first_reject() {
+        // `.then` prepends: head = RejectAlways, tail = RequestId. The
+        // reject at the head must skip the tail entirely.
+        let pipeline = Pipeline::new()
+            .then(RequestId::default())
+            .then(RejectAlways);
+        let mut path = String::from("/p");
+        let mut ctx =
+            crate::RequestCtx::new("GET", &mut path, "127.0.0.1:1".parse().expect("addr"), None);
+        match pipeline.run(&mut ctx) {
+            Outcome::Reject(code, reason) => {
+                assert_eq!(code, 503);
+                assert_eq!(reason, "nope");
+            }
+            other => panic!("expected reject: {other:?}"),
+        }
+        // Short-circuit: the tail filter never injected.
+        assert!(ctx.inject_headers.is_empty());
+    }
+
+    #[test]
+    fn head_name_reports_newest_filter() {
+        let pipeline = Pipeline::new().then(RequestId::default());
+        assert_eq!(pipeline.head_name(), "request_id");
+    }
+}
