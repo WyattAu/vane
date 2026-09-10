@@ -536,3 +536,338 @@ fn parse_sockaddr(sa: &libc::sockaddr_storage) -> SocketAddr {
         }
     }
 }
+
+#[cfg(test)]
+mod fault_tests {
+    use super::*;
+    use crate::buffer::DEFAULT_BUF_SIZE;
+    use crate::token::Op;
+    use std::os::fd::AsRawFd;
+
+    fn test_engine(slots: u32) -> (BufferPool, MioEngine) {
+        let pool = BufferPool::new(slots as usize, DEFAULT_BUF_SIZE).expect("pool");
+        let engine = MioEngine::new(&pool).expect("engine");
+        (pool, engine)
+    }
+
+    fn tok(op: Op) -> Token {
+        Token::new(op, 0, 0, 0)
+    }
+
+    /// Nonblocking AF_UNIX socketpair.
+    fn sockpair() -> (RawFd, RawFd) {
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: plain socketpair with valid out-array.
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0);
+        for fd in fds {
+            // SAFETY: fcntl on a live fd.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            // SAFETY: same live fd; only adds O_NONBLOCK.
+            unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        }
+        (fds[0], fds[1])
+    }
+
+    fn close(fd: RawFd) {
+        // SAFETY: test owns the fd.
+        unsafe { libc::close(fd) };
+    }
+
+    /// Peer aborts with RST (SO_LINGER 0): subsequent writes fail.
+    fn rst_peer(fd: RawFd) {
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        // SAFETY: setsockopt on a live socket.
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                std::ptr::addr_of!(linger).cast(),
+                std::mem::size_of::<libc::linger>() as u32,
+            );
+            libc::close(fd);
+        }
+    }
+
+    #[test]
+    fn write_full_success_queues_cqe() {
+        let (_pool, mut engine) = test_engine(2);
+        let (a, b) = sockpair();
+        let t = tok(Op::DownstreamWrite);
+        let poll = engine.write(t, a, 0, 64, 0).expect("write");
+        assert!(matches!(poll, Poll::Done(64)));
+        assert_eq!(engine.cqes.len(), 1);
+        assert!(engine.cqes[0].result.is_ok());
+        // Peer actually received the slot bytes (zeroed pool content).
+        let mut buf = [0xFFu8; 64];
+        // SAFETY: read into a live buffer from a live fd.
+        let n = unsafe { libc::read(b, buf.as_mut_ptr().cast(), 64) };
+        assert_eq!(n, 64);
+        assert!(buf.iter().all(|&x| x == 0));
+        close(a);
+        close(b);
+    }
+
+    #[test]
+    fn write_partial_rearms_for_edge() {
+        let (_pool, mut engine) = test_engine(2);
+        let (a, b) = sockpair();
+        // Shrink the sender buffer so a big write cannot complete inline.
+        let small: libc::c_int = 4096;
+        // SAFETY: setsockopt on live sockets.
+        unsafe {
+            libc::setsockopt(
+                a,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                std::ptr::addr_of!(small).cast(),
+                std::mem::size_of_val(&small) as u32,
+            );
+        }
+        // Saturate the pipe: receiver never reads until the engine is parked.
+        let chunk = [0xABu8; 8192];
+        loop {
+            // SAFETY: write from a live buffer.
+            let n = unsafe { libc::write(a, chunk.as_ptr().cast(), chunk.len()) };
+            if n < 0 {
+                break;
+            }
+        }
+        let t = tok(Op::DownstreamWrite);
+        let poll = engine.write(t, a, 0, DEFAULT_BUF_SIZE, 0).expect("write");
+        // Either partial (re-armed with remainder) or WouldBlock (re-armed
+        // whole): both park for the readiness edge.
+        assert!(matches!(poll, Poll::Pending));
+        assert!(
+            engine.pending.get(&a).is_some_and(|v| !v.is_empty()),
+            "write must re-arm, got {:?}",
+            engine
+                .cqes
+                .iter()
+                .map(|c| format!("{:?}", c.result))
+                .collect::<Vec<_>>()
+        );
+        close(a);
+        close(b);
+    }
+
+    #[test]
+    fn write_to_reset_peer_reports_error_cqe() {
+        let (_pool, mut engine) = test_engine(2);
+        let (a, b) = sockpair();
+        rst_peer(b);
+        // Give the kernel a beat to process the RST.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // First write may succeed into the dead socket's buffer (TCP/RST
+        // races) — retry until the error surfaces or bound the attempts.
+        let t = tok(Op::DownstreamWrite);
+        let mut saw_err = false;
+        for _ in 0..20 {
+            engine.cqes.clear();
+            let _ = engine.write(t, a, 0, DEFAULT_BUF_SIZE, 0);
+            if engine.cqes.iter().any(|c| c.result.is_err()) {
+                saw_err = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(saw_err, "RST must surface an error CQE");
+        close(a);
+    }
+
+    #[test]
+    fn dispatch_keeps_unready_ops_armed() {
+        let (_pool, mut engine) = test_engine(2);
+        let (a, _b) = sockpair();
+        // Manually park each op kind, then dispatch with no readiness:
+        // everything must stay armed.
+        engine.push(
+            a,
+            Pending::Read {
+                slot: 0,
+                token: tok(Op::DownstreamRead),
+            },
+        );
+        engine.push(
+            a,
+            Pending::Write {
+                slot: 0,
+                len: 16,
+                offset: 0,
+                token: tok(Op::DownstreamWrite),
+            },
+        );
+        engine.push(
+            a,
+            Pending::Splice {
+                from: a,
+                to: a,
+                token: tok(Op::DownstreamRead),
+            },
+        );
+        engine.push(
+            a,
+            Pending::Listener {
+                lfd: a,
+                token: Token::accept(0),
+            },
+        );
+        engine.dispatch(a, false, false);
+        assert_eq!(engine.pending.get(&a).map(|v| v.len()), Some(4));
+        assert!(engine.cqes.is_empty());
+        close(a);
+    }
+
+    #[test]
+    fn dispatch_readable_read_consumes_and_reports() {
+        let (_pool, mut engine) = test_engine(2);
+        let (a, b) = sockpair();
+        let hello = b"hello";
+        // SAFETY: write from a live buffer.
+        unsafe { libc::write(b, hello.as_ptr().cast(), hello.len()) };
+        engine.push(
+            a,
+            Pending::Read {
+                slot: 1,
+                token: tok(Op::DownstreamRead),
+            },
+        );
+        engine.dispatch(a, true, false);
+        assert!(engine.pending.get(&a).is_none_or(|v| v.is_empty()));
+        assert_eq!(engine.cqes.len(), 1);
+        assert!(matches!(engine.cqes[0].result, Ok(5)));
+        close(a);
+        close(b);
+    }
+
+    #[test]
+    fn splice_wouldblock_rearms_without_cqe() {
+        let (_pool, mut engine) = test_engine(2);
+        let (a, b) = sockpair();
+        engine.pump_splice(a, b, tok(Op::DownstreamRead));
+        assert!(engine.cqes.is_empty(), "empty source must not complete");
+        assert!(engine.pending.get(&a).is_some_and(|v| !v.is_empty()));
+        close(a);
+        close(b);
+    }
+
+    #[test]
+    fn splice_moves_bytes_and_reports() {
+        let (_pool, mut engine) = test_engine(2);
+        // Pipe as source (deterministic content), socket as sink.
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: plain pipe2 with valid out-array.
+        assert_eq!(
+            // SAFETY: out-array is a valid 2-element fd buffer.
+            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) },
+            0
+        );
+        let (pr, pw) = (fds[0], fds[1]);
+        let payload = b"splice-payload";
+        // SAFETY: write to a live pipe.
+        unsafe { libc::write(pw, payload.as_ptr().cast(), payload.len()) };
+        let (sa, sb) = sockpair();
+        engine.pump_splice(pr, sb, tok(Op::DownstreamRead));
+        assert_eq!(engine.cqes.len(), 1);
+        assert!(matches!(engine.cqes[0].result, Ok(n) if n as usize == payload.len()));
+        // Sink actually received the bytes (readable from the peer end).
+        let mut buf = [0u8; 32];
+        // SAFETY: read into a live buffer.
+        let n = unsafe { libc::read(sa, buf.as_mut_ptr().cast(), 32) };
+        assert!(n > 0, "sink peer must have data");
+        assert_eq!(&buf[..n as usize], payload);
+        close(pr);
+        close(pw);
+        close(sa);
+        close(sb);
+    }
+
+    #[test]
+    fn splice_to_bad_fd_reports_error() {
+        let (_pool, mut engine) = test_engine(2);
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: plain pipe2 with valid out-array.
+        assert_eq!(
+            // SAFETY: out-array is a valid 2-element fd buffer.
+            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) },
+            0
+        );
+        let (pr, pw) = (fds[0], fds[1]);
+        let payload = b"x";
+        // SAFETY: write to a live pipe.
+        unsafe { libc::write(pw, payload.as_ptr().cast(), payload.len()) };
+        engine.pump_splice(pr, -1, tok(Op::DownstreamRead));
+        assert!(engine.cqes.iter().any(|c| c.result.is_err()));
+        close(pr);
+        close(pw);
+    }
+
+    #[test]
+    fn connect_refused_completes_with_error() {
+        let (_pool, mut engine) = test_engine(2);
+        // Port 1 on loopback is reliably closed.
+        let addr: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+        let t = tok(Op::UpstreamWrite);
+        let (_fd, poll) = engine.connect(t, addr).expect("connect issued");
+        // Either immediate refusal or pending + error CQE on poll.
+        match poll {
+            Poll::Done(_) => {}
+            Poll::Pending => {
+                let mut out = Vec::new();
+                engine
+                    .poll(Some(std::time::Duration::from_secs(2)), &mut out)
+                    .expect("poll");
+                assert!(
+                    out.iter().any(|c| c.result.is_err()),
+                    "refused connect must error, got {out:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn accept_none_then_some() {
+        let (_pool, mut engine) = test_engine(2);
+        let listener = vane_listener();
+        let lfd = listener.as_raw_fd();
+        // Nothing pending: Ok(None) + re-armed listener op.
+        let none = engine.accept(lfd, Token::accept(0)).expect("accept");
+        assert!(none.is_none());
+        assert!(engine.pending.get(&lfd).is_some_and(|v| !v.is_empty()));
+        // Connect a client, then accept must succeed.
+        let addr = listener.local_addr().expect("addr");
+        let _client = std::net::TcpStream::connect(addr).expect("connect");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let some = engine.accept(lfd, Token::accept(0)).expect("accept2");
+        assert!(some.is_some(), "pending connection must accept");
+        if let Some((fd, _)) = some {
+            close(fd);
+        }
+    }
+
+    #[test]
+    fn remove_clears_pending_ops() {
+        let (_pool, mut engine) = test_engine(2);
+        let (a, b) = sockpair();
+        engine.push(
+            a,
+            Pending::Read {
+                slot: 0,
+                token: tok(Op::DownstreamRead),
+            },
+        );
+        assert!(engine.pending.contains_key(&a));
+        engine.remove(a);
+        assert!(!engine.pending.contains_key(&a));
+        close(a);
+        close(b);
+    }
+
+    fn vane_listener() -> std::net::TcpListener {
+        crate::tcp_listener("127.0.0.1:0".parse().expect("addr"), true, 64).expect("bind")
+    }
+}

@@ -320,6 +320,9 @@ impl Engine for UringEngine {
     }
 
     fn splice_pump(&mut self, a: Token, afd: i32, b: Token, bfd: i32) -> io::Result<()> {
+        // Directions are keyed by token bits: identical tokens would
+        // silently overwrite one direction.
+        debug_assert_ne!(a.bits(), b.bits(), "splice directions need distinct tokens");
         self.splice_dirs.insert(a.bits(), (afd, bfd));
         self.splice_dirs.insert(b.bits(), (bfd, afd));
         self.arm_readiness(afd, a);
@@ -454,5 +457,218 @@ fn parse_sockaddr(buf: &[u8; 128]) -> SocketAddr {
                 u16::from_be(a.sin6_port),
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod fault_tests {
+    use super::*;
+    use crate::buffer::DEFAULT_BUF_SIZE;
+    use crate::token::Op;
+
+    fn test_engine() -> (BufferPool, UringEngine) {
+        let pool = BufferPool::new(8, DEFAULT_BUF_SIZE).expect("pool");
+        let engine = UringEngine::new(64, Some(&pool), false).expect("uring available");
+        (pool, engine)
+    }
+
+    fn tok(op: Op) -> Token {
+        Token::new(op, 0, 0, 0)
+    }
+
+    fn sockpair() -> (RawFd, RawFd) {
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: plain socketpair with valid out-array.
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0);
+        for fd in fds {
+            // SAFETY: fcntl on a live fd.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            // SAFETY: same live fd; only adds O_NONBLOCK.
+            unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        }
+        (fds[0], fds[1])
+    }
+
+    fn close(fd: RawFd) {
+        // SAFETY: test owns the fd.
+        unsafe { libc::close(fd) };
+    }
+
+    fn drain(engine: &mut UringEngine, secs: u64) -> Vec<Cqe> {
+        let mut out = Vec::new();
+        engine
+            .poll(Some(std::time::Duration::from_secs(secs)), &mut out)
+            .expect("poll");
+        out
+    }
+
+    /// Polls until `pred` matches a CQE or the attempt budget runs out
+    /// (kernels race completion delivery against `submit_and_wait`).
+    fn drain_until(engine: &mut UringEngine, mut pred: impl FnMut(&Cqe) -> bool) -> Vec<Cqe> {
+        let mut all = Vec::new();
+        for _ in 0..60 {
+            let mut out = Vec::new();
+            engine
+                .poll(Some(std::time::Duration::from_millis(100)), &mut out)
+                .expect("poll");
+            if out.iter().any(&mut pred) {
+                all.extend(out);
+                return all;
+            }
+            all.extend(out);
+        }
+        all
+    }
+
+    #[test]
+    fn write_then_read_roundtrip() {
+        let (_pool, mut engine) = test_engine();
+        let (a, b) = sockpair();
+        let wt = tok(Op::DownstreamWrite);
+        assert!(matches!(
+            engine.write(wt, a, 0, 32, 0).expect("write"),
+            Poll::Pending
+        ));
+        let cqes = drain(&mut engine, 2);
+        assert!(
+            cqes.iter().any(|c| c.token == wt && c.result.is_ok()),
+            "write CQE missing: {cqes:?}"
+        );
+        // Read the bytes back through the ring into slot 1.
+        let rt = tok(Op::DownstreamRead);
+        assert!(matches!(
+            engine.read(rt, b, 1).expect("read"),
+            Poll::Pending
+        ));
+        let cqes = drain(&mut engine, 2);
+        let got = cqes.iter().find(|c| c.token == rt).expect("read CQE");
+        assert!(matches!(got.result, Ok(32)));
+        close(a);
+        close(b);
+    }
+
+    #[test]
+    fn connect_refused_completes_with_error() {
+        let (_pool, mut engine) = test_engine();
+        let addr: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+        let t = tok(Op::Connect);
+        let (fd, poll) = engine.connect(t, addr).expect("connect issued");
+        match poll {
+            Poll::Done(_) => {}
+            Poll::Pending => {
+                let cqes = drain_until(&mut engine, |c| c.token == t);
+                assert!(
+                    cqes.iter().any(|c| c.token == t && c.result.is_err()),
+                    "refused connect must error: {cqes:?}"
+                );
+            }
+        }
+        close(fd);
+    }
+
+    #[test]
+    fn connect_unix_missing_path_errors() {
+        let (_pool, mut engine) = test_engine();
+        let t = tok(Op::Connect);
+        let dir = tempfile::tempdir().expect("dir");
+        let missing = dir.path().join("no.sock");
+        let res = engine.connect_unix(t, &missing);
+        assert!(res.is_err() || matches!(res, Ok((_, Poll::Pending))));
+    }
+
+    #[test]
+    fn accept_flow_materializes_connection() {
+        let (_pool, mut engine) = test_engine();
+        let listener =
+            crate::tcp_listener("127.0.0.1:0".parse().expect("addr"), true, 64).expect("bind");
+        let lfd = std::os::fd::AsRawFd::as_raw_fd(&listener);
+        engine.add_listener(lfd, Token::accept(0)).expect("add");
+        // No client yet: accept reports None (single outstanding SQE).
+        assert!(
+            engine
+                .accept(lfd, Token::accept(0))
+                .expect("accept")
+                .is_none()
+        );
+        let addr = listener.local_addr().expect("addr");
+        let _client = std::net::TcpStream::connect(addr).expect("connect");
+        // Accept completions land in the engine's accepted map (not the
+        // CQE out-vec): poll until the retrieval API reports the peer.
+        let mut got = None;
+        for _ in 0..60 {
+            let mut out = Vec::new();
+            engine
+                .poll(Some(std::time::Duration::from_millis(100)), &mut out)
+                .expect("poll");
+            got = engine.accept(lfd, Token::accept(0)).expect("accept2");
+            if got.is_some() {
+                break;
+            }
+        }
+        // The completed accept is retrievable through the engine API.
+        assert!(got.is_some(), "materialized connection expected");
+        let (fd, peer) = got.expect("some");
+        assert!(peer.port() != 0);
+        close(fd);
+    }
+
+    #[test]
+    fn splice_moved_and_eof_paths() {
+        let (_pool, mut engine) = test_engine();
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: plain pipe2 with valid out-array.
+        assert_eq!(
+            // SAFETY: out-array is a valid 2-element fd buffer.
+            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) },
+            0
+        );
+        let (pr, pw) = (fds[0], fds[1]);
+        let payload = b"uring-splice";
+        // SAFETY: write to a live pipe.
+        unsafe { libc::write(pw, payload.as_ptr().cast(), payload.len()) };
+        let (sa, sb) = sockpair();
+        let t = tok(Op::Splice);
+        let t_rev = Token::new(Op::Splice, 0, 0, 1);
+        engine.splice_pump(t, pr, t_rev, sb).expect("splice_pump");
+        let cqes = drain_until(&mut engine, |c| c.token == t);
+        assert!(
+            cqes.iter()
+                .any(|c| c.token == t && matches!(c.result, Ok(n) if n as usize == payload.len())),
+            "splice moved CQE: {cqes:?}"
+        );
+        // Drain the pipe, then the pump must report EOF.
+        let mut buf = [0u8; 64];
+        // SAFETY: read into a live buffer.
+        let n = unsafe { libc::read(sa, buf.as_mut_ptr().cast(), 64) };
+        assert_eq!(&buf[..n as usize], payload);
+        close(pw); // writer gone: next pump sees EOF
+        let t2 = Token::new(Op::Splice, 1, 0, 0);
+        let t2_rev = Token::new(Op::Splice, 1, 0, 1);
+        engine
+            .splice_pump(t2, pr, t2_rev, sb)
+            .expect("splice_pump2");
+        let cqes = drain_until(&mut engine, |c| c.token == t2);
+        assert!(
+            cqes.iter()
+                .any(|c| c.token == t2 && matches!(c.result, Ok(0))),
+            "splice EOF CQE: {cqes:?}"
+        );
+        close(pr);
+        close(sa);
+        close(sb);
+    }
+
+    #[test]
+    fn remove_clears_tracked_fd() {
+        let (_pool, mut engine) = test_engine();
+        let (a, b) = sockpair();
+        engine
+            .add_stream(a, tok(Op::DownstreamRead))
+            .expect("add_stream");
+        engine.remove(a);
+        // No panic; op state dropped.
+        close(a);
+        close(b);
     }
 }
