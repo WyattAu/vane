@@ -85,7 +85,7 @@ jobs:
         run: |
           cargo llvm-cov --workspace --features vane-plugins/wasm,acme-pebble --lcov \
             --output-path /dev/null --fail-under-lines 90 -- \
-            --include-ignored --skip hot_upgrade --skip large_body_streams_through_edge
+            --include-ignored --test-threads=2 --skip hot_upgrade --skip large_body_streams_through_edge
 
   helm:
     name: helm lint + template
