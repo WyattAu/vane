@@ -264,13 +264,6 @@ pub async fn run(opts: RunOptions) -> i32 {
     // Telemetry after config load (file config + env overrides). The
     // data plane logs through its rings; this is the control plane.
     let _otel_guard = init_telemetry(&config.telemetry);
-    // Startup probe span: proves spans flow to the exporter independent
-    // of request handling (temporary diagnostic).
-    {
-        let span = tracing::info_span!("vane.startup", otel.kind = "internal");
-        let _e = span.enter();
-        tracing::info!("startup probe");
-    }
     if config.listeners.is_empty() {
         eprintln!("vane: no listeners configured");
         return 1;
