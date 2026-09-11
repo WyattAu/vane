@@ -252,3 +252,138 @@ mod status_tests {
         assert!(s.ends_with("\r\n"));
     }
 }
+
+/// Maximum response headers parsed.
+pub const MAX_RESPONSE_HEADERS: usize = 64;
+
+/// Result of parsing an upstream response head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpstreamHead {
+    /// Bytes consumed by the head (including the blank line).
+    pub head_len: usize,
+    /// Numeric status code.
+    pub code: u16,
+    /// Declared Content-Length (`None` = absent/invalid).
+    pub content_length: Option<u64>,
+    /// `Transfer-Encoding: chunked` present.
+    pub chunked: bool,
+    /// `Connection: close` present.
+    pub close: bool,
+}
+
+/// Parses an upstream HTTP/1.1 response head from `data`.
+///
+/// Returns `Ok(None)` when more bytes are needed (incomplete head) and
+/// `Err(())` on malformed input. Never panics on arbitrary bytes — this
+/// is the fuzzing boundary for all upstream response bytes.
+///
+/// # Errors
+/// Malformed response head (httparse error).
+pub fn parse_upstream_head<'a>(
+    data: &'a [u8],
+    storage: &mut [httparse::Header<'a>; MAX_RESPONSE_HEADERS],
+) -> Result<Option<UpstreamHead>, httparse::Error> {
+    let mut resp = httparse::Response::new(storage);
+    match resp.parse(data) {
+        Ok(httparse::Status::Complete(head_len)) => {
+            let code = resp.code.unwrap_or(500);
+            let mut content_length: Option<u64> = None;
+            let mut chunked = false;
+            let mut close = false;
+            for h in resp.headers {
+                let name = h.name.to_ascii_lowercase();
+                if name == "content-length" {
+                    content_length = std::str::from_utf8(h.value)
+                        .ok()
+                        .and_then(|s| s.trim().parse().ok());
+                } else if name == "transfer-encoding"
+                    && h.value
+                        .to_ascii_lowercase()
+                        .windows(7)
+                        .any(|w| w == b"chunked")
+                {
+                    chunked = true;
+                } else if name == "connection"
+                    && h.value
+                        .to_ascii_lowercase()
+                        .windows(5)
+                        .any(|w| w.eq_ignore_ascii_case(b"close"))
+                {
+                    close = true;
+                }
+            }
+            Ok(Some(UpstreamHead {
+                head_len,
+                code,
+                content_length,
+                chunked,
+                close,
+            }))
+        }
+        Ok(httparse::Status::Partial) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod upstream_head_tests {
+    use super::*;
+
+    #[test]
+    fn parses_complete_head() {
+        let mut storage = [httparse::EMPTY_HEADER; MAX_RESPONSE_HEADERS];
+        let head = parse_upstream_head(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nbody",
+            &mut storage,
+        )
+        .expect("ok")
+        .expect("complete");
+        assert_eq!(head.code, 200);
+        assert_eq!(head.content_length, Some(5));
+        assert!(head.close);
+        assert!(!head.chunked);
+        assert!(head.head_len <= 80);
+    }
+
+    #[test]
+    fn incomplete_head_is_none() {
+        let mut storage = [httparse::EMPTY_HEADER; MAX_RESPONSE_HEADERS];
+        let head = parse_upstream_head(b"HTTP/1.1 200 OK\r\n", &mut storage).expect("ok");
+        assert!(head.is_none());
+    }
+
+    #[test]
+    fn malformed_head_is_error() {
+        let mut storage = [httparse::EMPTY_HEADER; MAX_RESPONSE_HEADERS];
+        assert!(parse_upstream_head(b"HTTP/1.1 garbage\r\n\r\n", &mut storage).is_err());
+    }
+
+    #[test]
+    fn chunked_detected() {
+        let mut storage = [httparse::EMPTY_HEADER; MAX_RESPONSE_HEADERS];
+        let head = parse_upstream_head(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+            &mut storage,
+        )
+        .expect("ok")
+        .expect("complete");
+        assert!(head.chunked);
+    }
+
+    #[test]
+    fn arbitrary_bytes_never_panic() {
+        // Deterministic pseudo-fuzz: pseudo-random byte strings.
+        let mut x: u64 = 0x1234_5678_9abc_def0;
+        for len in 0..600u64 {
+            let mut data = Vec::with_capacity(len as usize);
+            for _ in 0..len {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                data.push(x as u8);
+            }
+            let mut storage = [httparse::EMPTY_HEADER; MAX_RESPONSE_HEADERS];
+            let _ = parse_upstream_head(&data, &mut storage);
+        }
+    }
+}

@@ -211,8 +211,14 @@ fn push_escaped(out: &mut String, bytes: &[u8]) {
                 out.push_str(&format!("\\u{:04x}", b));
             }
             0x20..=0x7E => out.push(b as char),
-            // Non-ASCII: pass through as UTF-8 lossy chars.
-            _ => out.push(char::from(b).escape_default().next().unwrap_or('?')),
+            // DEL and C1 controls are not valid raw JSON string content:
+            // escape as proper JSON \u00xx (NOT Rust's \u{..} form).
+            0x7F..=0x9F => {
+                out.push_str(&format!("\\u{:04x}", b));
+            }
+            // 0xA0..=0xFF map Latin-1 → U+00A0..U+00FF: printable, valid
+            // raw JSON string content.
+            _ => out.push(char::from(b)),
         }
     }
 }

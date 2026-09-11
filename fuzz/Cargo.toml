@@ -13,6 +13,7 @@ httparse = "1.10"
 vane-proto = { path = "../crates/vane-proto" }
 vane-router = { path = "../crates/vane-router" }
 vane-shm = { path = "../crates/vane-shm" }
+vane-observe = { path = "../crates/vane-observe" }
 
 [[bin]]
 name = "parse_request"
@@ -31,6 +32,20 @@ bench = false
 [[bin]]
 name = "shm_descriptors"
 path = "fuzz_targets/shm_descriptors.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_response"
+path = "fuzz_targets/parse_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "access_record"
+path = "fuzz_targets/access_record.rs"
 test = false
 doc = false
 bench = false

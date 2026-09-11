@@ -19,4 +19,4 @@ pub mod request;
 pub mod response;
 
 pub use request::RequestView;
-pub use response::{Status, write_full, write_head};
+pub use response::{Status, UpstreamHead, parse_upstream_head, write_full, write_head};

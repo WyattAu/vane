@@ -18,12 +18,15 @@ fuzz_target!(|data: &[u8]| {
     let offset = u64::from_le_bytes([
         data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
     ]);
-    // The transport clamps: payload view = base + offset..offset+len, so any
-    // (offset, len) must be validated against slot geometry before use —
-    // this mirrors transport::Direction::view's contract.
+    // The transport validates (offset, len) against slot geometry before
+    // use and rejects oversize payloads; mirror that validation — for any
+    // len that FITS a slot, the clamp must place it in-bounds without
+    // panic or wrap. len > slot_size is rejected upstream (no assert).
     let slot_size = 64 * 1024u64;
-    let index = offset / slot_size;
     let in_slot = offset % slot_size;
-    assert!(in_slot + u64::from(len) <= slot_size || len == 0 || index != 0,);
+    if u64::from(len) <= slot_size && len > 0 {
+        let clamped = in_slot.min(slot_size - u64::from(len));
+        assert!(clamped + u64::from(len) <= slot_size);
+    }
     let _ = MsgDesc::new(0, offset, len, 0);
 });

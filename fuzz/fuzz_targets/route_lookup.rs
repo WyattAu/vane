@@ -23,6 +23,7 @@ fn build_router() -> Router {
                 cluster: cluster.to_string(),
                 strip_prefix: None,
                 timeout_ms: None,
+                upstream_h2: false,
                 backends: vec![vane_router::Backend::new(
                     SocketAddr::from(([127, 0, 0, 1], 1)),
                     1,

@@ -609,38 +609,16 @@ impl HttpProxy {
 
     /// Parses the upstream response head and decides body framing.
     fn parse_upstream_head(&mut self, slot: u32, data: &[u8]) -> (usize, Status, bool) {
-        let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
-        let mut resp = httparse::Response::new(&mut storage);
-        match resp.parse(data) {
-            Ok(httparse::Status::Complete(head_len)) => {
-                let code = resp.code.unwrap_or(500);
+        let mut storage = [httparse::EMPTY_HEADER; vane_proto::response::MAX_RESPONSE_HEADERS];
+        match vane_proto::response::parse_upstream_head(data, &mut storage) {
+            Ok(Some(head)) => {
+                let head_len = head.head_len;
+                let code = head.code;
                 let status = Status::from_code(code);
                 self.conn(slot).resp_status = code;
-                let mut content_length: Option<u64> = None;
-                let mut chunked = false;
-                let mut upstream_close = false;
-                for h in resp.headers {
-                    let name = h.name.to_ascii_lowercase();
-                    if name == "content-length" {
-                        content_length = std::str::from_utf8(h.value)
-                            .ok()
-                            .and_then(|s| s.trim().parse().ok());
-                    } else if name == "transfer-encoding"
-                        && h.value
-                            .to_ascii_lowercase()
-                            .windows(7)
-                            .any(|w| w == b"chunked")
-                    {
-                        chunked = true;
-                    } else if name == "connection"
-                        && h.value
-                            .to_ascii_lowercase()
-                            .windows(5)
-                            .any(|w| w.eq_ignore_ascii_case(b"close"))
-                    {
-                        upstream_close = true;
-                    }
-                }
+                let content_length = head.content_length;
+                let chunked = head.chunked;
+                let upstream_close = head.close;
                 let framing = if code == 101 {
                     // WebSocket / protocol switch: everything after the
                     // head is a raw bidirectional pump until either side

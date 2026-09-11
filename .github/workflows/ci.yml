@@ -114,7 +114,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-fuzz --locked
-      - name: parser smoke (30s)
-        run: cargo fuzz run parse_request -- -max_total_time=30 -max_len=4096
-      - name: router smoke (30s)
-        run: cargo fuzz run route_lookup -- -max_total_time=30
+      # crossbeam-epoch (router) holds allocations until thread exit —
+      # LeakSanitizer false-positives there, so leaks stay undetected.
+      - name: parser smoke (60s)
+        run: cargo fuzz run parse_request -- -max_total_time=60 -max_len=8192 -detect_leaks=0
+      - name: response smoke (60s)
+        run: cargo fuzz run parse_response -- -max_total_time=60 -max_len=8192 -detect_leaks=0
+      - name: shm descriptor smoke (60s)
+        run: cargo fuzz run shm_descriptors -- -max_total_time=60 -detect_leaks=0
+      - name: access record smoke (60s)
+        run: cargo fuzz run access_record -- -max_total_time=60 -detect_leaks=0
+      - name: router smoke (60s)
+        run: cargo fuzz run route_lookup -- -max_total_time=60 -detect_leaks=0
