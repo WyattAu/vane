@@ -79,6 +79,8 @@ jobs:
           cargo llvm-cov --workspace --features vane-plugins/wasm,acme-pebble --lcov \
             --output-path lcov.info -- \
             --include-ignored --test-threads=2 -- --skip hot_upgrade
+      - name: Chaos suite
+        run: cargo test -p vane --test chaos -- --test-threads=1
       - name: Enforce Tier A threshold
         run: |
           cargo llvm-cov --workspace --features vane-plugins/wasm,acme-pebble --lcov \
