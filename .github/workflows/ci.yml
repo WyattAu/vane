@@ -83,8 +83,7 @@ jobs:
         run: |
           cargo llvm-cov --workspace --features vane-plugins/wasm,acme-pebble --lcov \
             --output-path /dev/null --fail-under-lines 90 -- \
-            --include-ignored --skip hot_upgrade || \
-            { echo "::warning::coverage below 90% — tracked for Tier A completion"; }
+            --include-ignored --skip hot_upgrade
 
   helm:
     name: helm lint + template
