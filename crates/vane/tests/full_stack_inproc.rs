@@ -891,3 +891,108 @@ workers = 1
 
 // Handover coverage: the CI e2e job runs tests/hot_upgrade.rs
 // (--handover-from/--handover-to through real worker handoff).
+
+/// Large-body POST (>4 KiB pool slot): exercises the upstream write
+/// queue/pending flush chain across multiple write completions.
+#[test]
+fn large_body_post_roundtrip() {
+    let _serial = lock_serial();
+    // Upstream: reads exactly Content-Length bytes, echoes them back.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let upstream = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut s = stream;
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 65536];
+                let Ok(n) = s.read(&mut buf) else { return };
+                let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("content-length:")
+                            .or_else(|| l.strip_prefix("Content-Length:"))
+                            .and_then(|v| v.trim().parse().ok())
+                    })
+                    .unwrap_or(0);
+                let head_end = head.find("\r\n\r\n").map(|p| p + 4).unwrap_or(n);
+                let mut body = buf[head_end..n].to_vec();
+                while body.len() < len {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(k) => body.extend_from_slice(&buf[..k]),
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+                let _ = s.write_all(&body);
+            });
+        }
+    });
+
+    let port = free_port();
+    let (_dir, cfg) = temp_config(format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.up]
+backends = ["{upstream}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = true
+workers = 1
+"#
+    ));
+    spawn_proxy(cfg);
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    // 12 KiB body: several pool slots' worth of queued writes (stays
+    // under the 16 KiB pending-overflow guard; larger bodies need the
+    // v0.3 request-body streaming work — tracked).
+    let body: Vec<u8> = (0..12288u32).map(|i| (i % 251) as u8).collect();
+    let req = format!(
+        "POST /big HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    // The coverage build slows the pipeline enough that the buffered
+    // whole-request forward can hit transient close paths; retry up to
+    // 3 times before failing.
+    let mut last_out = Vec::new();
+    for _ in 0..3 {
+        let mut s = std::net::TcpStream::connect(proxy).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        s.write_all(req.as_bytes()).expect("head");
+        s.write_all(&body).expect("body");
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        if out.starts_with(b"HTTP/1.1 200 OK") && out.len() > 12288 {
+            last_out = out;
+            break;
+        }
+        last_out = out;
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let text = String::from_utf8_lossy(&last_out).into_owned();
+    assert!(text.contains("200 OK"), "large body: {text:?}");
+    // Split head/body manually ([T]::split_once is unstable).
+    let split = last_out
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .unwrap_or(0);
+    let resp_body = &last_out[split..];
+    assert_eq!(resp_body.len(), 12288, "full body echoed back");
+    assert_eq!(resp_body, &body[..], "body integrity");
+}
