@@ -116,7 +116,14 @@ impl H2Edge {
     where
         Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        let mut conn = h2::server::handshake(io)
+        // Generous recv windows: streamed request bodies stall when the
+        // default 64 KiB windows starve the body pump (window updates
+        // only flow as fast as the body consumer is polled).
+        let mut builder = h2::server::Builder::new();
+        builder.initial_window_size(1024 * 1024);
+        builder.initial_connection_window_size(2 * 1024 * 1024);
+        let mut conn = builder
+            .handshake::<Io, bytes::Bytes>(io)
             .await
             .map_err(|e| H2Error::Connection(e.to_string()))?;
         // Each stream is served on its own task: the connection MUST
