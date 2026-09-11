@@ -740,6 +740,9 @@ async fn large_body_streams_through_edge() {
         .expect("bind");
     let addr = listener.local_addr().expect("addr");
     eprintln!("DBG stub task spawning");
+    // Yield so the stub task is scheduled before the test proceeds —
+    // mirrors every other working test in this file.
+    tokio::time::sleep(Duration::from_millis(100)).await;
     tokio::spawn(async move {
         eprintln!("DBG stub task started");
         loop {
