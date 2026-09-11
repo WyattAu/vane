@@ -1113,3 +1113,166 @@ workers = 1
     assert_eq!(resp_body.len(), body.len(), "streamed length");
     assert_eq!(resp_body, &body[..], "streamed body integrity");
 }
+
+/// OTLP export end-to-end: a mock OTLP/HTTP receiver gets span payloads
+/// for requests served through the engine path.
+#[test]
+fn otlp_export_emits_spans() {
+    let _serial = lock_serial();
+
+    // Mock OTLP/HTTP endpoint: captures POST bodies.
+    let otlp_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let otlp_addr = otlp_listener.local_addr().expect("addr");
+    let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let bodies2 = std::sync::Arc::clone(&bodies);
+    let conns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let conns2 = std::sync::Arc::clone(&conns);
+    std::thread::spawn(move || {
+        for stream in otlp_listener.incoming().flatten() {
+            conns2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let bodies = std::sync::Arc::clone(&bodies2);
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let mut s = stream;
+                let mut acc = Vec::new();
+                let mut chunk = [0u8; 16384];
+                // One request: head, then Content-Length bytes.
+                let head_end = loop {
+                    match s.read(&mut chunk) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            acc.extend_from_slice(&chunk[..n]);
+                            if let Some(p) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break p + 4;
+                            }
+                        }
+                    }
+                };
+                let head = String::from_utf8_lossy(&acc[..head_end]).into_owned();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("content-length:")
+                            .or_else(|| l.strip_prefix("Content-Length:"))
+                            .and_then(|v| v.trim().parse().ok())
+                    })
+                    .unwrap_or(0);
+                while acc.len() < head_end + len {
+                    match s.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => acc.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                bodies.lock().unwrap_or_else(|e| e.into_inner()).push(acc);
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                );
+            });
+        }
+    });
+
+    let upstream = spawn_upstream();
+    let port = free_port();
+    let (_dir, cfg) = temp_config(format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.up]
+backends = ["{upstream}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[telemetry]
+service_name = "vane-e2e-test"
+otlp_endpoint = "http://{otlp_addr}/v1/traces"
+
+[runtime]
+force_mio = true
+workers = 1
+"#
+    ));
+    // NOTE: the proxy runs as a real CHILD PROCESS (not in-process):
+    // telemetry's global subscriber is process-wide, and whichever
+    // test binary initializes first wins — a child gets a clean slate.
+    let bin = env!("CARGO_BIN_EXE_vane");
+    let child_log_dir = tempfile::tempdir().expect("child log dir");
+    let child_log = child_log_dir.path().join("child.stderr.log");
+    let child_err = std::fs::File::create(&child_log).expect("child log");
+    let mut child = std::process::Command::new(bin)
+        .args(["run", "-c", &cfg])
+        .env("RUST_LOG", "debug")
+        .stdout(std::process::Stdio::from(
+            child_err.try_clone().expect("clone log for stdout"),
+        ))
+        .stderr(child_err)
+        .spawn()
+        .expect("spawn vane");
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+    eprintln!(
+        "child alive: {:?}",
+        child.try_wait().expect("try_wait").is_none()
+    );
+    if let Ok(cmdline) = std::fs::read_to_string(format!("/proc/{}/cmdline", child.id())) {
+        eprintln!("child cmdline: {:?}", cmdline.replace('\0', " "));
+    }
+
+    // A request with a traceparent: the exported span must link to it.
+    let resp = request(
+        proxy,
+        b"GET /traced HTTP/1.1\r\nHost: t\r\ntraceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\r\nConnection: close\r\n\r\n",
+    );
+    assert!(resp.contains("200 OK"), "traced request: {resp:?}");
+
+    // Batch exporter flushes on its interval; poll for the payload.
+    let mut saw_service = false;
+    let mut saw_trace = false;
+    for _ in 0..150 {
+        std::thread::sleep(Duration::from_millis(200));
+        let guard = bodies.lock().unwrap_or_else(|e| e.into_inner());
+        for body in guard.iter() {
+            // OTLP/HTTP protobuf: service name + trace id ride as raw
+            // strings/bytes in the payload.
+            if body.windows(13).any(|w| w == b"vane-e2e-test") {
+                saw_service = true;
+            }
+            if body.windows(4).any(|w| w == b"\x4b\xf9\x2f\x35") {
+                saw_trace = true;
+            }
+        }
+        if saw_service && saw_trace {
+            break;
+        }
+    }
+    if !saw_trace {
+        let guard = bodies.lock().unwrap_or_else(|e| e.into_inner());
+        for (i, body) in guard.iter().enumerate() {
+            let hex: String = body
+                .iter()
+                .rev()
+                .take(120)
+                .rev()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            eprintln!("body[{i}] len={} tail_hex={hex}", body.len());
+        }
+        if let Ok(text) = std::fs::read_to_string(&child_log) {
+            eprintln!(
+                "child stderr tail:\n{}",
+                &text[text.len().saturating_sub(1200)..]
+            );
+        }
+    }
+    assert!(
+        saw_service,
+        "OTLP payload must carry the service name (conns={})",
+        conns.load(std::sync::atomic::Ordering::Relaxed)
+    );
+    assert!(saw_trace, "OTLP payload must carry the request trace id");
+}

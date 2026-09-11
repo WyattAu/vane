@@ -106,6 +106,10 @@ struct Conn {
     access_logged: bool,
     /// L4 splice mode session (no HTTP parsing).
     l4: bool,
+    /// OTLP span for this transaction (recorded + dropped at completion).
+    /// Stored (not entered) because entry guards cannot cross the await
+    /// points in the worker loop; entered briefly at completion sites.
+    span: Option<tracing::Span>,
     /// Request-body relay state.
     req_framing: ReqFraming,
     /// Body bytes held handler-side until the upstream connects
@@ -493,6 +497,11 @@ impl HttpProxy {
     fn respond_full(&mut self, io: &mut SessionIo<'_>, status: Status, body: &str) {
         let slot = io.slot_index();
         self.conn(slot).resp_status = status.code();
+        if let Some(span) = self.conns.get_mut(&slot).and_then(|c| c.span.take()) {
+            span.record("http.status_code", status.code());
+            span.record("http.response_size", body.len() as u64);
+            drop(span);
+        }
         let started = self.conns.get(&slot).and_then(|c| c.started);
         let mut buf = [0u8; 1024];
         if let Ok(n) = write_full(&mut buf, status, body.as_bytes(), &[], &self.date) {
@@ -1059,6 +1068,21 @@ impl HttpProxy {
             return;
         }
 
+        // Request span (after the error exits so 404/405 stay spanless
+        // and cheap). Closed with status at response completion.
+        if let Some(conn) = self.conns.get_mut(&slot) {
+            let tp = view
+                .header("traceparent")
+                .and_then(|h| std::str::from_utf8(h).ok());
+            conn.span = Some(crate::tracing_util::serve_span(
+                view.method,
+                view.path,
+                view.header("host")
+                    .and_then(|h| std::str::from_utf8(h).ok()),
+                tp,
+            ));
+        }
+
         // Request-body framing (set BEFORE dialing so late client bytes
         // take the streaming relay path instead of re-entering here).
         conn_set_framing(&mut self.conns, slot, view);
@@ -1204,6 +1228,19 @@ impl HttpProxy {
             )
         };
         if done {
+            // Take (not clone) the span: ending it promptly lets the
+            // batch exporter export it. Holding it in Conn until session
+            // teardown would race the exporter shutdown at process exit.
+            if let Some(span) = self.conns.get_mut(&slot).and_then(|c| c.span.take()) {
+                let (status, bytes) = self
+                    .conns
+                    .get(&slot)
+                    .map(|c| (c.resp_status, c.bytes_out))
+                    .unwrap_or((0, 0));
+                span.record("http.status_code", status);
+                span.record("http.response_size", bytes);
+                drop(span);
+            }
             self.metrics.latency.observe_us(
                 &self.config.registry,
                 u64::try_from(started.map(|s| s.elapsed().as_micros()).unwrap_or(0))
@@ -1236,6 +1273,7 @@ impl HttpProxy {
                 conn.access_logged = false;
                 conn.req_framing = ReqFraming::AwaitingHead;
                 conn.req_pending.clear();
+                conn.span = None;
                 io.set_deadline(
                     Some(self.deadline(self.config.idle_timeout_ms)),
                     vane_core::handler::DeadlineReason::Idle,

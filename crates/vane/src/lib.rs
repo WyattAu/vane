@@ -13,3 +13,4 @@ pub mod proxy;
 pub mod server;
 pub mod sidecar;
 pub mod tls_reload;
+pub mod tracing_util;

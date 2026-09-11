@@ -20,7 +20,7 @@ pub mod routes;
 pub use acme::{AcmeConfig, AcmeManager};
 pub use config::{
     AccessLogConfig, ClusterConfig, ListenerConfig, ListenerTls, RouteConfig, RuntimeConfig,
-    VaneConfig,
+    TelemetryConfig, VaneConfig,
 };
 pub use health::{HealthChecker, HealthMap};
 pub use providers::ProviderUpdate;

@@ -151,12 +151,27 @@ impl H2Edge {
     }
 
     /// Routes and proxies one h2 request; always answers the stream.
+    ///
+    /// Creates an `http.request` span linked to the inbound `traceparent`
+    /// (when present) so OTLP backends stitch the distributed trace.
     async fn serve_request(
         &self,
         request: http::Request<h2::RecvStream>,
         mut respond: h2::server::SendResponse<bytes::Bytes>,
     ) {
         let started = std::time::Instant::now();
+        // Span is Send+Sync but its entry guard is not: never hold the
+        // guard across awaits. Record completion fields at the end; the
+        // span exports on drop.
+        let span = crate::tracing_util::serve_span(
+            request.method().as_str(),
+            request.uri().path(),
+            request.headers().get("host").and_then(|h| h.to_str().ok()),
+            request
+                .headers()
+                .get("traceparent")
+                .and_then(|h| h.to_str().ok()),
+        );
 
         let path = request
             .uri()
@@ -199,6 +214,7 @@ impl H2Edge {
                 .body(())
                 .expect("static response");
             let _ = respond.send_response(response, true);
+            span.record("http.status_code", status);
             emit(status, 0);
             let _ = reason;
         };
@@ -345,6 +361,8 @@ impl H2Edge {
                     }
                 }
                 let _ = send.send_data(bytes::Bytes::new(), true);
+                span.record("http.status_code", status.as_u16());
+                span.record("http.response_size", bytes_out);
                 emit(status.as_u16(), bytes_out);
             }
             Err(_) => { /* client gone mid-response */ }

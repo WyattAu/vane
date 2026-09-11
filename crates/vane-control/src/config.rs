@@ -50,6 +50,9 @@ pub struct VaneConfig {
     /// Structured access logging.
     #[serde(default)]
     pub access_log: AccessLogConfig,
+    /// OpenTelemetry tracing/metrics export.
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
 }
 
 /// An ingress listener.
@@ -276,6 +279,47 @@ pub enum AcmeChallenge {
     TlsAlpn01,
 }
 
+/// OpenTelemetry export configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelemetryConfig {
+    /// Service name reported to backends.
+    #[serde(default = "default_service_name")]
+    pub service_name: String,
+    /// OTLP/HTTP endpoint (e.g. `http://localhost:4318`). Unset = no
+    /// export (local fmt logging only).
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
+    /// Trace sample rate 0.0–1.0 (deterministic per trace id).
+    #[serde(default = "default_sample_rate")]
+    pub sample_rate: f32,
+    /// Log filter (tracing EnvFilter syntax).
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+}
+
+fn default_service_name() -> String {
+    "vane".to_owned()
+}
+
+fn default_sample_rate() -> f32 {
+    1.0
+}
+
+fn default_log_level() -> String {
+    "info".to_owned()
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            service_name: default_service_name(),
+            otlp_endpoint: None,
+            sample_rate: default_sample_rate(),
+            log_level: default_log_level(),
+        }
+    }
+}
+
 /// Access-log configuration (`Default` = disabled, stderr sink).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AccessLogConfig {
@@ -467,5 +511,52 @@ address = "127.0.0.1:9100"
         let mut cfg = VaneConfig::parse_toml(SAMPLE).expect("parses");
         cfg.listeners[0].address = "not-an-addr".to_owned();
         assert!(cfg.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::*;
+
+    #[test]
+    fn telemetry_defaults_sane() {
+        let cfg = TelemetryConfig::default();
+        assert_eq!(cfg.service_name, "vane");
+        assert!(cfg.otlp_endpoint.is_none());
+        assert!((cfg.sample_rate - 1.0).abs() < f32::EPSILON);
+        assert_eq!(cfg.log_level, "info");
+    }
+
+    #[test]
+    fn telemetry_parses_full_section() {
+        let cfg: VaneConfig = toml::from_str(
+            r#"
+[telemetry]
+service_name = "edge-1"
+otlp_endpoint = "http://otel:4318"
+sample_rate = 0.25
+log_level = "debug"
+"#,
+        )
+        .expect("parse");
+        assert_eq!(cfg.telemetry.service_name, "edge-1");
+        assert_eq!(
+            cfg.telemetry.otlp_endpoint.as_deref(),
+            Some("http://otel:4318")
+        );
+        assert!((cfg.telemetry.sample_rate - 0.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn sample_rate_clamped_by_consumer() {
+        // Config parsing accepts the raw value; clamping happens where
+        // the rate is consumed (documented contract).
+        let cfg: TelemetryConfig = toml::from_str(
+            r#"service_name = "x"
+sample_rate = 2.0
+"#,
+        )
+        .expect("parse");
+        assert!((cfg.sample_rate - 2.0).abs() < f32::EPSILON);
     }
 }

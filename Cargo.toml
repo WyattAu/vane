@@ -59,7 +59,7 @@ breaker = "1.0"
 healthkit = "1.0"
 axum-stack = "0.1"
 graceful = "0.1"
-otelkit = "1.0"
+otelkit = { version = "1.0", features = ["otlp"] }
 envstack = "0.2"
 validkit = "1.0"
 errcode = "0.1.0-alpha.2"
@@ -114,6 +114,12 @@ rcgen = "0.14"
 
 # Observability
 tracing = "0.1"
+# Aligned with otelkit's OTLP stack (0.28/0.29): the parent links we
+# write must use the same type-IDs the export layer reads, or traces
+# silently fragment.
+opentelemetry = "0.28"
+opentelemetry_sdk = "0.28"
+tracing-opentelemetry = "0.29"
 futures-core = "0.3"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std"] }
 

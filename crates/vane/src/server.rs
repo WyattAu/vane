@@ -206,13 +206,54 @@ pub fn load_config(path: Option<&str>) -> Result<VaneConfig, String> {
 
 /// Runs the proxy until shutdown. Returns the process exit code.
 #[allow(clippy::too_many_lines)]
-pub async fn run(opts: RunOptions) -> i32 {
-    // Telemetry (control plane; the data plane logs through its rings).
-    let telemetry = otelkit::TelemetryConfig::from_env().ok();
-    let _otel_guard = telemetry
-        .as_ref()
-        .and_then(|c| otelkit::init(c.clone()).ok());
+/// Initializes process telemetry from the file config with environment
+/// overrides (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`,
+/// `OTEL_SAMPLE_RATE`, `RUST_LOG`). Returns the guard (dropped on
+/// shutdown); failures fall back to a plain stderr logger so a broken
+/// telemetry setup can never take down the proxy.
+#[must_use]
+pub fn init_telemetry(cfg: &vane_control::TelemetryConfig) -> Option<otelkit::TelemetryGuard> {
+    let mut merged = cfg.clone();
+    if let Ok(ep) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
+        if !ep.is_empty() {
+            merged.otlp_endpoint = Some(ep);
+        }
+    }
+    if let Ok(name) = std::env::var("OTEL_SERVICE_NAME") {
+        if !name.is_empty() {
+            merged.service_name = name;
+        }
+    }
+    if let Ok(rate) = std::env::var("OTEL_SAMPLE_RATE") {
+        if let Ok(r) = rate.parse::<f32>() {
+            merged.sample_rate = r.clamp(0.0, 1.0);
+        }
+    }
+    if let Ok(level) = std::env::var("RUST_LOG") {
+        if !level.is_empty() {
+            merged.log_level = level;
+        }
+    }
+    let otel_cfg = otelkit::TelemetryConfig {
+        service_name: merged.service_name,
+        service_version: env!("CARGO_PKG_VERSION").to_owned(),
+        log_level: merged.log_level,
+        log_format: otelkit::LogFormat::Text,
+        otlp_endpoint: merged.otlp_endpoint,
+        sentry_dsn: None,
+        sample_rate: merged.sample_rate.clamp(0.0, 1.0),
+    };
+    match otelkit::init(otel_cfg) {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            eprintln!("vane: telemetry init failed ({e}); continuing without export");
+            None
+        }
+    }
+}
 
+/// Runs the proxy until shutdown. Returns the process exit code.
+pub async fn run(opts: RunOptions) -> i32 {
     let config = match load_config(opts.config_path.as_deref()) {
         Ok(c) => c,
         Err(e) => {
@@ -220,6 +261,16 @@ pub async fn run(opts: RunOptions) -> i32 {
             return 1;
         }
     };
+    // Telemetry after config load (file config + env overrides). The
+    // data plane logs through its rings; this is the control plane.
+    let _otel_guard = init_telemetry(&config.telemetry);
+    // Startup probe span: proves spans flow to the exporter independent
+    // of request handling (temporary diagnostic).
+    {
+        let span = tracing::info_span!("vane.startup", otel.kind = "internal");
+        let _e = span.enter();
+        tracing::info!("startup probe");
+    }
     if config.listeners.is_empty() {
         eprintln!("vane: no listeners configured");
         return 1;
