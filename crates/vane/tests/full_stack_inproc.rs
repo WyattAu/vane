@@ -904,9 +904,24 @@ fn large_body_post_roundtrip() {
         for stream in listener.incoming().flatten() {
             let mut s = stream;
             std::thread::spawn(move || {
-                let mut buf = [0u8; 65536];
-                let Ok(n) = s.read(&mut buf) else { return };
-                let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                // Accumulate until the head terminator, then read to
+                // Content-Length (streaming delivers many small writes).
+                let mut acc: Vec<u8> = Vec::with_capacity(65536);
+                let mut chunk = [0u8; 16384];
+                let head_end = loop {
+                    let n = match s.read(&mut chunk) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                    acc.extend_from_slice(&chunk[..n]);
+                    if let Some(p) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break p + 4;
+                    }
+                    if acc.len() > 1 << 20 {
+                        return;
+                    }
+                };
+                let head = String::from_utf8_lossy(&acc[..head_end]).into_owned();
                 let len: usize = head
                     .lines()
                     .find_map(|l| {
@@ -915,12 +930,11 @@ fn large_body_post_roundtrip() {
                             .and_then(|v| v.trim().parse().ok())
                     })
                     .unwrap_or(0);
-                let head_end = head.find("\r\n\r\n").map(|p| p + 4).unwrap_or(n);
-                let mut body = buf[head_end..n].to_vec();
+                let mut body = acc[head_end..].to_vec();
                 while body.len() < len {
-                    match s.read(&mut buf) {
+                    match s.read(&mut chunk) {
                         Ok(0) | Err(_) => break,
-                        Ok(k) => body.extend_from_slice(&buf[..k]),
+                        Ok(k) => body.extend_from_slice(&chunk[..k]),
                     }
                 }
                 let resp = format!(
@@ -958,10 +972,9 @@ workers = 1
     let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     wait_bound(proxy);
 
-    // 12 KiB body: several pool slots' worth of queued writes (stays
-    // under the 16 KiB pending-overflow guard; larger bodies need the
-    // v0.3 request-body streaming work — tracked).
-    let body: Vec<u8> = (0..12288u32).map(|i| (i % 251) as u8).collect();
+    // 64 KiB body: exceeds the worker's 16 KiB pending buffer — only
+    // passable because bodies stream (never buffered whole).
+    let body: Vec<u8> = (0..65536u32).map(|i| (i % 251) as u8).collect();
     let req = format!(
         "POST /big HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -993,6 +1006,110 @@ workers = 1
         .map(|p| p + 4)
         .unwrap_or(0);
     let resp_body = &last_out[split..];
-    assert_eq!(resp_body.len(), 12288, "full body echoed back");
+    assert_eq!(resp_body.len(), 65536, "full body echoed back");
     assert_eq!(resp_body, &body[..], "body integrity");
+}
+
+/// Streaming integrity under fragment arrival: the body is written in
+/// many small chunks (each a separate downstream read event) and must
+/// arrive at the upstream byte-exact and in order.
+#[test]
+fn streamed_body_fragment_arrival() {
+    let _serial = lock_serial();
+    // Upstream: accumulate to Content-Length, hash-compare via length
+    // echo (body content returned for the client to verify).
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let upstream = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut s = stream;
+            std::thread::spawn(move || {
+                let mut acc: Vec<u8> = Vec::with_capacity(65536);
+                let mut chunk = [0u8; 4096];
+                let head_end = loop {
+                    let n = match s.read(&mut chunk) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                    acc.extend_from_slice(&chunk[..n]);
+                    if let Some(p) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break p + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&acc[..head_end]).into_owned();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("content-length:")
+                            .or_else(|| l.strip_prefix("Content-Length:"))
+                            .and_then(|v| v.trim().parse().ok())
+                    })
+                    .unwrap_or(0);
+                let mut body = acc[head_end..].to_vec();
+                while body.len() < len {
+                    match s.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(k) => body.extend_from_slice(&chunk[..k]),
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+                let _ = s.write_all(&body);
+            });
+        }
+    });
+
+    let port = free_port();
+    let (_dir, cfg) = temp_config(format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.up]
+backends = ["{upstream}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = true
+workers = 1
+"#
+    ));
+    spawn_proxy(cfg);
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    // 30 KiB in 500-byte fragments: every fragment is its own write.
+    let body: Vec<u8> = (0..30720u32).map(|i| (i % 241) as u8).collect();
+    let req = format!(
+        "POST /frag HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut s = std::net::TcpStream::connect(proxy).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    s.write_all(req.as_bytes()).expect("head");
+    for fragment in body.chunks(500) {
+        s.write_all(fragment).expect("fragment");
+        // Let the worker observe each fragment as a separate event.
+        std::thread::sleep(Duration::from_micros(200));
+    }
+
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let split = out
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .unwrap_or(0);
+    let resp_body = &out[split..];
+    assert_eq!(resp_body.len(), body.len(), "streamed length");
+    assert_eq!(resp_body, &body[..], "streamed body integrity");
 }

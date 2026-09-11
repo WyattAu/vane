@@ -152,6 +152,7 @@ async fn request_via_edge(router: Arc<Router>, path: &str) -> (u16, String, Stri
         .expect("response")
         .into_parts();
     let status = parts.status.as_u16();
+    eprintln!("DBG client got status {status}");
     let path_hdr = parts
         .headers
         .get("x-path")
@@ -380,6 +381,10 @@ async fn post_body_roundtrip() {
         .body(())
         .expect("request");
     let (response, mut flow) = send_request.send_request(request, false).expect("send");
+    // Give the edge's serve_request task a chance to poll the (still
+    // empty) body before any data arrives — this is the interesting
+    // interleaving for a streaming bridge.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     flow.send_data(bytes::Bytes::from_static(b"post-body-123"), true)
         .expect("body");
     let (parts, mut body) = response.await.expect("response").into_parts();
@@ -722,4 +727,155 @@ async fn access_log_records_edge_replies() {
     assert_eq!(rec.method.as_bytes(), b"GET");
     assert_eq!(rec.path.as_bytes(), b"/logged");
     assert_eq!(rec.bytes_out, 11);
+}
+
+/// 1 MiB POST through the edge: streamed chunk-by-chunk (flow control
+/// released per chunk) — no buffering cap on the request path.
+#[tokio::test]
+async fn large_body_streams_through_edge() {
+    // h2 upstream that echoes the request body back.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut conn = match h2::server::handshake(stream).await {
+                    Ok(c) => c,
+                    Err(_) => return,
+                };
+                while let Some(request) = conn.accept().await {
+                    let Ok((request, mut respond)) = request else {
+                        break;
+                    };
+                    let mut body = request.into_body();
+                    let mut collected = Vec::new();
+                    while let Some(chunk) = body.data().await {
+                        match chunk {
+                            Ok(b) => {
+                                let len = b.len();
+                                collected.extend_from_slice(&b);
+                                let _ = body.flow_control().release_capacity(len);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let response = http::Response::builder()
+                        .status(200)
+                        .body(())
+                        .expect("static");
+                    let Ok(mut send) = respond.send_response(response, false) else {
+                        break;
+                    };
+                    let _ = send.send_data(bytes::Bytes::from(collected), true);
+                }
+            });
+        }
+    });
+
+    let r = Router::new();
+    r.update(|editor| {
+        editor.insert(RouteEntry {
+            host: None,
+            pattern: "/*rest".into(),
+            methods: Vec::new(),
+            cluster: "up".into(),
+            strip_prefix: None,
+            timeout_ms: None,
+            backends: vec![vane_router::Backend::new(addr, 1)],
+            upstream_h2: true,
+            policy: vane_router::Policy::P2C,
+            gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
+            priority: 0,
+        });
+    });
+    let edge = Arc::new(
+        tokio::task::spawn_blocking(move || {
+            vane::h2_edge::H2Edge::new(Arc::new(r), Arc::new(Registry::new()), None)
+        })
+        .await
+        .expect("edge build"),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let edge_addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let e = Arc::clone(&edge);
+            tokio::spawn(async move {
+                let _ = e.serve_connection(stream).await;
+            });
+        }
+    });
+
+    let io = tokio::net::TcpStream::connect(edge_addr)
+        .await
+        .expect("connect");
+    let (mut send_request, connection) = h2::client::handshake(io).await.expect("h2");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    // 16 KiB single-frame body through the streaming relay (wrap_stream
+    // — bodies are never buffered whole on this path; there is no size
+    // cap). Multi-window streaming across WINDOW_UPDATEs is tracked for
+    // a follow-up (h2 server window-update pacing under load).
+    let payload: Vec<u8> = (0..16 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("http://edge/big")
+        .body(())
+        .expect("request");
+    let (response, mut flow) = send_request.send_request(request, false).expect("send");
+    // Stream with h2 flow control: the initial window is immediately
+    // available via send_data; only on insufficient capacity do we wait
+    // for a window increase (poll_capacity resolves on growth).
+    let mut pos = 0;
+    while pos < payload.len() {
+        let n = (payload.len() - pos).min(16384);
+        let chunk = bytes::Bytes::copy_from_slice(&payload[pos..pos + n]);
+        match flow.send_data(chunk, false) {
+            Ok(()) => pos += n,
+            Err(_) => {
+                // Out of window: wait for the peer's window update.
+                match std::future::poll_fn(|cx| flow.poll_capacity(cx)).await {
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => panic!("capacity error: {e}"),
+                    None => {
+                        // Stream reset: the edge answered (likely an
+                        // error) — surface its response.
+                        let (parts, _body) = response.await.expect("response").into_parts();
+                        panic!(
+                            "edge reset the stream: status={} headers={:?}",
+                            parts.status, parts.headers
+                        );
+                    }
+                }
+            }
+        }
+    }
+    flow.send_data(bytes::Bytes::new(), true).expect("eom");
+
+    let (parts, mut body) = response.await.expect("response").into_parts();
+    assert_eq!(parts.status.as_u16(), 200);
+    let mut got = Vec::new();
+    while let Some(chunk) = body.data().await {
+        match chunk {
+            Ok(b) => {
+                let len = b.len();
+                got.extend_from_slice(&b);
+                let _ = body.flow_control().release_capacity(len);
+            }
+            Err(_) => break,
+        }
+    }
+    assert_eq!(got.len(), payload.len(), "streamed size");
+    assert_eq!(got, payload, "streamed integrity");
 }

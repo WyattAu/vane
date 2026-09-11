@@ -22,6 +22,11 @@ use crate::buffer::{BufferPool, DEFAULT_BUF_SIZE, DEFAULT_POOL_SIZE};
 use crate::engine::{Engine, create_engine};
 use crate::handler::{Handler, HandlerFactory, Mode, SessionIo};
 use crate::net::{StreamFd, set_nodelay, shutdown_write};
+
+/// Per-session queued-write budget (burst cap). Steady-state flow
+/// control is read throttling (2 slots); this bounds a single handler
+/// burst (e.g. a large pre-connect body queue).
+const WRITE_PENDING_CAP: usize = 1024 * 1024;
 use crate::slab::SessionSlab;
 use crate::spsc::{SpscReceiver, SpscSender};
 use crate::token::{Op, Token};
@@ -229,9 +234,9 @@ impl WorkerState {
         let overflow = self
             .slab
             .get(slot)
-            .is_some_and(|s| s.pending_down.len() + bytes.len() > 4 * self.pool.buf_size());
+            .is_some_and(|s| s.pending_down.len() + bytes.len() > WRITE_PENDING_CAP);
         if overflow {
-            self.close_session(slot, generation, "runaway-write-queue");
+            self.close_session(slot, generation, "write-queue-overflow");
             return;
         }
         if let Some(s) = self.slab.get_mut(slot) {
@@ -268,9 +273,9 @@ impl WorkerState {
         let overflow = self
             .slab
             .get(slot)
-            .is_some_and(|s| s.pending_up.len() + bytes.len() > 4 * self.pool.buf_size());
+            .is_some_and(|s| s.pending_up.len() + bytes.len() > WRITE_PENDING_CAP);
         if overflow {
-            self.close_session(slot, generation, "generic");
+            self.close_session(slot, generation, "write-queue-overflow");
             return;
         }
         if let Some(s) = self.slab.get_mut(slot) {
@@ -390,7 +395,9 @@ impl WorkerState {
     /// Closes and drops a session. `reason` documents the call site for
     /// crash triage (compiled out in release... kept as a parameter so the
     /// next debug session can re-enable the trace in one line).
-    pub(crate) fn close_session(&mut self, slot: u32, generation: u16, _reason: &str) {
+    pub(crate) fn close_session(&mut self, slot: u32, generation: u16, reason: &str) {
+        // vane-core stays dependency-light: no tracing here.
+        let _ = reason;
         if !self.valid(slot, generation) {
             return;
         }
@@ -596,6 +603,16 @@ impl WorkerState {
     }
 
     fn arm_downstream_read(&mut self, slot: u32, generation: u16) {
+        // Read throttling (backpressure): while queued upstream writes
+        // exceed two slots, stop reading the client. Resumed from
+        // `continue_upstream_write` once the queue drains.
+        let paused = self
+            .slab
+            .get(slot)
+            .is_some_and(|s| s.pending_up.len() > 2 * self.pool.buf_size());
+        if paused {
+            return;
+        }
         let Some(s) = self.slab.get_mut(slot) else {
             return;
         };
@@ -622,6 +639,11 @@ impl WorkerState {
         // here would submit a read on fd -1 / a closed descriptor whose
         // EBADF completion then kills the idle keep-alive session.
         if s.upstream.is_none() {
+            return;
+        }
+        // Read throttling: pause while the client-bound write queue is
+        // backed up (resumed from the downstream write-completion path).
+        if s.pending_down.len() > 2 * self.pool.buf_size() {
             return;
         }
         if s.upstream_read_inflight || s.splice {
@@ -693,6 +715,14 @@ impl WorkerState {
                 let mut io = self.io_for(slot, generation);
                 h.on_downstream_flushed(&mut io);
             }
+        }
+        // Queue drained: resume client reads paused by backpressure.
+        let drained = self
+            .slab
+            .get(slot)
+            .is_some_and(|s| s.pending_up.len() <= 2 * self.pool.buf_size());
+        if drained {
+            self.arm_downstream_read(slot, generation);
         }
     }
 

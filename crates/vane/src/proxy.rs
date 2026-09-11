@@ -106,6 +106,26 @@ struct Conn {
     access_logged: bool,
     /// L4 splice mode session (no HTTP parsing).
     l4: bool,
+    /// Request-body relay state.
+    req_framing: ReqFraming,
+    /// Body bytes held handler-side until the upstream connects
+    /// (preserves ordering: inline bytes forward first, then these).
+    req_pending: Vec<u8>,
+}
+
+/// Request-side body framing (streaming relay — bodies are never
+/// buffered whole; bytes go upstream as read events arrive).
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+enum ReqFraming {
+    /// Head not yet handled for this connection.
+    #[default]
+    AwaitingHead,
+    /// Content-Length body: bytes remaining to relay.
+    ContentLength(u64),
+    /// Chunked request body: relay raw until the terminal 0-chunk.
+    Chunked { seen_zero: bool },
+    /// No body / body complete.
+    Done,
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -362,6 +382,60 @@ impl HttpProxy {
             .bytes_in
             .add(&self.config.registry, data.len() as u64);
         let slot = io.slot_index();
+
+        // Streaming request body: bytes relay upstream as they arrive —
+        // never buffered whole. Until the upstream connects they queue
+        // handler-side (req_pending) so ordering with the inline bytes
+        // forwarded at connect is preserved.
+        let (framing, upstream_ready) = self
+            .conns
+            .get(&slot)
+            .map(|c| (c.req_framing, c.upstream_ready))
+            .unwrap_or((ReqFraming::AwaitingHead, false));
+        let body_active = match framing {
+            ReqFraming::ContentLength(remaining) => remaining > 0,
+            ReqFraming::Chunked { seen_zero } => !seen_zero,
+            _ => false,
+        };
+        if body_active {
+            {
+                let conn = self.conn(slot);
+                match &mut conn.req_framing {
+                    ReqFraming::ContentLength(remaining) => {
+                        let n = (data.len() as u64).min(*remaining) as usize;
+                        *remaining -= n as u64;
+                        if upstream_ready {
+                            io.write_upstream(&data[..n]);
+                        } else {
+                            conn.req_pending.extend_from_slice(&data[..n]);
+                            if conn.req_pending.len() > REQ_PENDING_CAP {
+                                // Unreasonable pre-connect buffering.
+                                self.respond_full(io, Status::PayloadTooLarge, "body too large\n");
+                                io.close();
+                            }
+                            return;
+                        }
+                    }
+                    ReqFraming::Chunked { seen_zero } => {
+                        if !*seen_zero && data.windows(5).any(|w| w == b"0\r\n\r\n") {
+                            *seen_zero = true;
+                        }
+                        if upstream_ready {
+                            io.write_upstream(data);
+                        } else {
+                            conn.req_pending.extend_from_slice(data);
+                            if conn.req_pending.len() > REQ_PENDING_CAP {
+                                self.respond_full(io, Status::PayloadTooLarge, "body too large\n");
+                                io.close();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                return;
+            }
+        }
+
         {
             let conn = self.conn(slot);
             conn.head_buf.extend_from_slice(data);
@@ -596,6 +670,27 @@ impl HttpProxy {
     }
 }
 
+/// Handler-side cap for body bytes arriving before the upstream
+/// connects. The window is one dial; anything beyond this is abusive.
+const REQ_PENDING_CAP: usize = 1024 * 1024;
+
+/// Sets the request-body framing from the parsed view.
+fn conn_set_framing(conns: &mut HashMap<u32, Conn>, slot: u32, view: &RequestView<'_>) {
+    if let Some(c) = conns.get_mut(&slot) {
+        c.req_framing = if view.is_chunked() {
+            ReqFraming::Chunked { seen_zero: false }
+        } else if let Some(Some(n)) = view.content_length() {
+            if n > 0 {
+                ReqFraming::ContentLength(n)
+            } else {
+                ReqFraming::Done
+            }
+        } else {
+            ReqFraming::Done
+        };
+    }
+}
+
 impl Handler for HttpProxy {
     fn on_connected(&mut self, io: &mut SessionIo<'_>) {
         let slot = io.slot_index();
@@ -722,11 +817,31 @@ impl Handler for HttpProxy {
             let head = self.build_upstream_head(&view, &route, &upstream_path, &inject, false, 0);
             io.write_upstream(&head);
             io.mark_request_sent();
-            // Forward any body bytes that arrived with the head.
+            // Forward any body bytes that arrived with the head, then
+            // the pre-connect queue (ordering preserved).
             let body = &buf[head_len..];
+            {
+                let conn = self.conn(slot);
+                if let ReqFraming::ContentLength(remaining) = &mut conn.req_framing {
+                    *remaining = remaining.saturating_sub(body.len() as u64);
+                }
+                if let ReqFraming::Chunked { seen_zero } = &mut conn.req_framing {
+                    if !*seen_zero && body.windows(5).any(|w| w == b"0\r\n\r\n") {
+                        *seen_zero = true;
+                    }
+                }
+            }
             if !body.is_empty() {
                 io.write_upstream(body);
             }
+            // Pre-connect queue behind the inline bytes.
+            let pending = std::mem::take(&mut self.conn(slot).req_pending);
+            if !pending.is_empty() {
+                io.write_upstream(&pending);
+            }
+            // Trim the forwarded head+inline body: the buffer must not
+            // re-parse old bytes on the next keep-alive transaction.
+            self.conn(slot).head_buf.drain(..head_len + body.len());
             // First-byte deadline.
             io.set_deadline(
                 Some(self.deadline(self.config.first_byte_timeout_ms)),
@@ -966,6 +1081,10 @@ impl HttpProxy {
             return;
         }
 
+        // Request-body framing (set BEFORE dialing so late client bytes
+        // take the streaming relay path instead of re-entering here).
+        conn_set_framing(&mut self.conns, slot, view);
+
         // Path rewrite.
         let upstream_path = route
             .strip_prefix
@@ -1137,6 +1256,8 @@ impl HttpProxy {
                 conn.resp_status = 0;
                 conn.bytes_out = 0;
                 conn.access_logged = false;
+                conn.req_framing = ReqFraming::AwaitingHead;
+                conn.req_pending.clear();
                 io.set_deadline(
                     Some(self.deadline(self.config.idle_timeout_ms)),
                     vane_core::handler::DeadlineReason::Idle,

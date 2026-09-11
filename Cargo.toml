@@ -114,6 +114,7 @@ rcgen = "0.14"
 
 # Observability
 tracing = "0.1"
+futures-core = "0.3"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std"] }
 
 # HTTP/2 + HTTP/3 (experimental features)

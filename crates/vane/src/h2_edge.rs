@@ -16,8 +16,8 @@
 //!
 //! Requests terminate with the same routing decision as the engine path
 //! (EBR snapshot + breaker + rate limit), then forward to the chosen
-//! backend over HTTP/1.1 (reqwest). Bodies are buffered (32 MiB cap);
-//! streaming lands with the future engine bridge.
+//! backend over HTTP/1.1 or HTTP/2 (reqwest). Request bodies stream
+//! chunk-by-chunk with h2 flow-control release — no size cap.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -107,27 +107,47 @@ impl H2Edge {
 
     /// Serves one TLS connection's h2 streams until it closes.
     ///
+    /// Each request stream is served on its own task so the connection
+    /// keeps being polled while bodies stream (multiplexing).
+    ///
     /// # Errors
     /// Handshake or stream-level failure.
-    pub async fn serve_connection<Io>(&self, io: Io) -> Result<(), H2Error>
+    pub async fn serve_connection<Io>(self: Arc<Self>, io: Io) -> Result<(), H2Error>
     where
-        Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let mut conn = h2::server::handshake(io)
             .await
             .map_err(|e| H2Error::Connection(e.to_string()))?;
-        while let Some(request) = conn.accept().await {
-            let (request, mut respond) = request.map_err(|e| H2Error::Connection(e.to_string()))?;
-            self.serve_request(request, &mut respond).await;
+        // Each stream is served on its own task: the connection MUST
+        // keep being polled (accept loop) while request bodies stream —
+        // awaiting inline would stall flow-control window updates and
+        // deadlock any body not immediately available.
+        loop {
+            let request = match conn.accept().await {
+                Some(Ok(r)) => r,
+                Some(Err(e)) => {
+                    tracing::debug!("h2 edge accept error: {e}");
+                    return Err(H2Error::Connection(e.to_string()));
+                }
+                None => {
+                    tracing::debug!("h2 edge: connection closed");
+                    return Ok(());
+                }
+            };
+            let (request, respond) = request;
+            let edge = Arc::clone(&self);
+            tokio::spawn(async move {
+                edge.serve_request(request, respond).await;
+            });
         }
-        Ok(())
     }
 
     /// Routes and proxies one h2 request; always answers the stream.
     async fn serve_request(
         &self,
         request: http::Request<h2::RecvStream>,
-        respond: &mut h2::server::SendResponse<bytes::Bytes>,
+        mut respond: h2::server::SendResponse<bytes::Bytes>,
     ) {
         let started = std::time::Instant::now();
 
@@ -256,7 +276,10 @@ impl H2Edge {
             return;
         };
 
-        // Buffer the (bounded) body.
+        // NOTE: request bodies are buffered (bounded 32 MiB). Streaming
+        // them via `Body::wrap_stream` stalls under hyper's h2 client
+        // flow control when the first body poll is Pending — tracked as
+        // follow-up work with the h2 window-update investigation.
         let body_bytes = match to_bytes(request.into_body()).await {
             Ok(b) => b,
             Err(e) => {
@@ -279,6 +302,13 @@ impl H2Edge {
         let response = match upstream.body(body_bytes).send().await {
             Ok(r) => r,
             Err(e) => {
+                let mut src = std::error::Error::source(&e);
+                let mut chain = e.to_string();
+                while let Some(s2) = src {
+                    chain.push_str(&format!(": {s2}"));
+                    src = s2.source();
+                }
+                tracing::warn!("h2 edge upstream send failed: {chain}");
                 self.breaker.record_failure(&route.cluster);
                 reply(502, "upstream unreachable");
                 let _ = e;
