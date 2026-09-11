@@ -48,6 +48,92 @@ impl RunOptions {
     }
 }
 
+/// Receives inherited listeners from the handover socket and seeds the
+/// router from the archived route state. Returns the inherited listeners.
+///
+/// # Errors
+/// Handover receive or state-archive failure.
+pub fn receive_inherited(
+    sock: &str,
+    router: &Arc<Router>,
+    health: &Arc<vane_control::HealthMap>,
+    expected: usize,
+) -> Result<Vec<StdTcpListener>, String> {
+    let state_path = std::path::PathBuf::from("/tmp/vane-handover-state.json");
+    let received =
+        vane_shm::handover::receive_listeners(std::path::Path::new(sock), &state_path, expected)
+            .map_err(|e| e.to_string())?;
+    tracing::info!(
+        "hot upgrade: inherited {} listeners, generation {}",
+        received.listeners.len(),
+        received.state.generation
+    );
+    let records = received.state.routes;
+    let health2 = Arc::clone(health);
+    router.update(|editor| {
+        for r in records {
+            let backends: Vec<vane_router::Backend> = r
+                .backends
+                .iter()
+                .filter_map(|b| b.parse::<std::net::SocketAddr>().ok())
+                .map(|addr| {
+                    let mut be = vane_router::Backend::new(addr, 1);
+                    be.attach_health(health2.flag(addr));
+                    be
+                })
+                .collect();
+            let builder = vane_router::RouteBuilder {
+                host: r.host,
+                pattern: r.pattern,
+                methods: Vec::new(),
+                cluster: r.cluster,
+                strip_prefix: r.strip_prefix,
+                timeout_ms: None,
+                backends,
+                upstream_h2: false,
+                policy: vane_router::Policy::P2C,
+                priority: 20,
+            };
+            match builder.compile() {
+                Ok(entry) => editor.insert(entry),
+                Err(e) => tracing::warn!("handover route: {e}"),
+            }
+        }
+    });
+    Ok(received.listeners)
+}
+
+/// Sends this instance's listeners + live route table to the standby
+/// (hot-upgrade `--handover-to` shutdown path).
+///
+/// # Errors
+/// Handover send or state-archive failure.
+pub fn send_handover(
+    sock: &str,
+    listeners: &[StdTcpListener],
+    router: &Arc<Router>,
+) -> Result<(), String> {
+    let state = vane_shm::handover::HandoverState {
+        generation: 0,
+        routes: crate::proxy::flatten_routes(router)
+            .into_iter()
+            .map(|r| vane_shm::handover::RouteRecord {
+                host: r.host,
+                pattern: r.pattern,
+                cluster: r.cluster,
+                backends: r.backends,
+                strip_prefix: r.strip_prefix,
+            })
+            .collect(),
+        at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or_else(|_| "unknown".to_owned(), |d| format!("{}s", d.as_secs())),
+    };
+    let state_path = std::path::PathBuf::from("/tmp/vane-handover-state.json");
+    vane_shm::handover::send_listeners(std::path::Path::new(sock), listeners, &state, &state_path)
+        .map_err(|e| e.to_string())
+}
+
 /// Loads config from the given path or the default locations, then applies
 /// `VANE_*` environment overrides (container-friendly layering):
 ///
@@ -261,53 +347,9 @@ pub async fn run(opts: RunOptions) -> i32 {
     // ---- Bind listeners (or inherit via hot upgrade) --------------------
     let mut bound: Vec<StdTcpListener> = Vec::new();
     if let Some(sock) = &opts.handover_from {
-        let state_path = std::path::PathBuf::from("/tmp/vane-handover-state.json");
-        match vane_shm::handover::receive_listeners(
-            std::path::Path::new(sock),
-            &state_path,
-            config.listeners.len(),
-        ) {
+        match receive_inherited(sock, &router, &health, config.listeners.len()) {
             Ok(received) => {
-                tracing::info!(
-                    "hot upgrade: inherited {} listeners, generation {}",
-                    received.listeners.len(),
-                    received.state.generation
-                );
-                bound = received.listeners;
-                // Seed the router from the archived state so routes serve
-                // before providers reconcile.
-                let records = received.state.routes;
-                let health2 = Arc::clone(&health);
-                router.update(|editor| {
-                    for r in records {
-                        let backends: Vec<vane_router::Backend> = r
-                            .backends
-                            .iter()
-                            .filter_map(|b| b.parse::<std::net::SocketAddr>().ok())
-                            .map(|addr| {
-                                let mut be = vane_router::Backend::new(addr, 1);
-                                be.attach_health(health2.flag(addr));
-                                be
-                            })
-                            .collect();
-                        let builder = vane_router::RouteBuilder {
-                            host: r.host,
-                            pattern: r.pattern,
-                            methods: Vec::new(),
-                            cluster: r.cluster,
-                            strip_prefix: r.strip_prefix,
-                            timeout_ms: None,
-                            backends,
-                            upstream_h2: false,
-                            policy: vane_router::Policy::P2C,
-                            priority: 20,
-                        };
-                        match builder.compile() {
-                            Ok(entry) => editor.insert(entry),
-                            Err(e) => tracing::warn!("handover route: {e}"),
-                        }
-                    }
-                });
+                bound = received;
             }
             Err(e) => {
                 eprintln!("vane: handover failed: {e}");
@@ -625,31 +667,8 @@ pub async fn run(opts: RunOptions) -> i32 {
         // The standby (started earlier with --handover-from) is bound to
         // this socket waiting to receive. Send listeners + route state so
         // it serves the instant we start draining — zero connection resets.
-        let state = vane_shm::handover::HandoverState {
-            generation: 0,
-            routes: crate::proxy::flatten_routes(&router)
-                .into_iter()
-                .map(|r| vane_shm::handover::RouteRecord {
-                    host: r.host,
-                    pattern: r.pattern,
-                    cluster: r.cluster,
-                    backends: r.backends,
-                    strip_prefix: r.strip_prefix,
-                })
-                .collect(),
-            at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or_else(|_| "unknown".to_owned(), |d| format!("{}s", d.as_secs())),
-        };
-        let state_path = std::path::PathBuf::from("/tmp/vane-handover-state.json");
-        match vane_shm::handover::send_listeners(
-            std::path::Path::new(sock),
-            &handover_listeners,
-            &state,
-            &state_path,
-        ) {
-            Ok(()) => tracing::info!("hot upgrade: handed over to standby"),
-            Err(e) => tracing::warn!("hot upgrade handover failed (plain drain): {e}"),
+        if let Err(e) = send_handover(sock, &handover_listeners, &router) {
+            tracing::warn!("hot upgrade handover failed (plain drain): {e}");
         }
     }
 
@@ -853,5 +872,79 @@ cluster = "up"
         assert_eq!(records[0].pattern, "/a/*rest");
         assert_eq!(records[0].cluster, "c");
         assert_eq!(records[0].backends, vec!["127.0.0.1:5".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod handover_helper_tests {
+    use super::*;
+
+    /// receive_inherited + send_handover round-trip through a real
+    /// handover socket with a live listener.
+    #[test]
+    fn send_then_receive_roundtrip() {
+        let dir = tempfile::tempdir().expect("dir");
+        let sock = dir.path().join("hs.sock");
+        vane_shm::handover::prepare_socket(&sock);
+
+        let router = Arc::new(Router::new());
+        router.update(|editor| {
+            editor.insert(vane_router::RouteEntry {
+                host: Some("roundtrip.test".into()),
+                pattern: "/*rest".into(),
+                methods: Vec::new(),
+                cluster: "c".into(),
+                strip_prefix: None,
+                timeout_ms: None,
+                backends: vec![vane_router::Backend::new(
+                    "127.0.0.1:1".parse().expect("addr"),
+                    1,
+                )],
+                upstream_h2: false,
+                policy: vane_router::Policy::P2C,
+                gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
+                priority: 0,
+            });
+        });
+        let health = Arc::new(vane_control::HealthMap::new());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        // listener moves into send_handover (fd ownership transfers).
+
+        // Receiver thread: blocks until the send lands.
+        let rx_sock = sock.clone();
+        let rx_router = Arc::clone(&router);
+        let rx_health = Arc::clone(&health);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let res = receive_inherited(rx_sock.to_str().expect("utf8"), &rx_router, &rx_health, 1);
+            tx.send(res).expect("send");
+        });
+
+        send_handover(sock.to_str().expect("utf8"), &[listener], &router).expect("send_handover");
+
+        let listeners = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("join")
+            .expect("receive_inherited");
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners[0].local_addr().expect("local"), addr);
+
+        // The router was seeded from the archived state.
+        let table = router.load();
+        let matched = table.table().lookup(Some("roundtrip.test"), "/x");
+        assert!(matched.is_some(), "archived route seeded");
+    }
+
+    /// send_handover with an absent receiver errors (socket missing).
+    #[test]
+    fn send_handover_missing_socket_errors() {
+        let dir = tempfile::tempdir().expect("dir");
+        let sock = dir.path().join("nopeer.sock");
+        let router = Arc::new(Router::new());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        // No receiver bound at that path: connect fails.
+        let res = send_handover(sock.to_str().expect("utf8"), &[listener], &router);
+        assert!(res.is_err(), "absent socket must error");
     }
 }

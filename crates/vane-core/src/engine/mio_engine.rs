@@ -952,7 +952,7 @@ mod partial_write_tests {
             }
         });
 
-        let mut client = std::net::TcpStream::connect(addr).expect("connect");
+        let client = std::net::TcpStream::connect(addr).expect("connect");
         client.set_nonblocking(true).expect("nonblock");
         let fd = std::os::fd::AsRawFd::as_raw_fd(&client);
 
@@ -982,7 +982,7 @@ mod partial_write_tests {
         // Partial/would-block: op re-armed; pump via poll until the CQE
         // lands (the peer never reads, but 12 KiB fits typical buffers —
         // shrink the send buffer first to force partiality).
-        let mut deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while engine.cqes.is_empty() && std::time::Instant::now() < deadline {
             engine
                 .poll(Some(std::time::Duration::from_millis(100)), &mut out)

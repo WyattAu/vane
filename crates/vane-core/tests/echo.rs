@@ -263,6 +263,7 @@ fn upstream_buffer_overflow_reaps_session() {
         .cmd
         .send(vane_core::WorkerCmd::Shutdown { deadline_ms: 100 });
     handle.join();
+    assert!(handle.is_done(), "worker must report done after join");
 }
 
 /// Handler that dials a UDS upstream on connect (exercises

@@ -15,6 +15,7 @@ fn make_proxy(
     router: Arc<Router>,
     registry: Arc<Registry>,
     events: Arc<EventRing<LogEvent, { vane_observe::EVENT_RING_CAPACITY }>>,
+    plugins: Vec<String>,
 ) -> HttpProxy {
     HttpProxy::new(
         ProxyConfig {
@@ -27,13 +28,28 @@ fn make_proxy(
             first_byte_timeout_ms: 30_000,
             pool_per_backend: 4,
             tls: None,
-            plugins: Vec::new(),
+            plugins,
             http01_tokens: None,
             access: None,
             l4_splice: false,
         },
         0,
     )
+}
+
+/// Plugins configured without the `wasm` feature: construction must
+/// succeed (a warning is printed) rather than fail.
+#[test]
+fn constructs_with_plugins_without_wasm_feature() {
+    let registry = Arc::new(Registry::new());
+    let router = make_router(&[("/*rest", "c")]);
+    let events = Arc::new(vane_observe::ring::EventRing::new());
+    let _proxy = make_proxy(
+        router,
+        registry,
+        events,
+        vec!["nonexistent-plugin.wasm".to_string()],
+    );
 }
 
 fn make_router(routes: &[(&str, &str)]) -> Arc<Router> {
@@ -66,7 +82,7 @@ fn proxy_constructs_with_all_options() {
     let registry = Arc::new(Registry::new());
     let router = make_router(&[("/*rest", "c")]);
     let events = Arc::new(EventRing::new());
-    let _p = make_proxy(router, registry, events);
+    let _p = make_proxy(router, registry, events, Vec::new());
     // Construction succeeds — the handler is ready to serve.
 }
 
