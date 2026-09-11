@@ -160,27 +160,19 @@ are faster):
 
 ### Comparison against nginx (same box, same upstream)
 
-`ab -k -c 64/-c 256` against an identical upstream (threaded Rust stub,
-~76–78k rps direct), vane release build (2 workers) vs nginx:alpine in
-Docker with host networking (1 worker, stock `proxy_pass` config):
+Full matrix, methodology, and reproduction commands:
+[docs/benchmarks.md](docs/benchmarks.md). Summary — the nginx
+configuration is the hidden variable in every proxy benchmark:
 
-| Scenario | vane | nginx (stock) |
-|---|---|---|
-| keep-alive, c=64 | 37.4–39.1k rps | 9.1–9.3k rps |
-| keep-alive, c=256 | 37.8k rps | 8.5k rps |
-| short connections, c=64 | 7.0k rps | 7.7k rps |
+| Scenario | vane (2 workers, pool) | nginx + upstream keepalive | nginx stock |
+|---|---|---|---|
+| keep-alive c=64 | 33–35k rps | 50–51k rps | 9–10k rps |
+| short connections c=64 | 6.1k rps | 10.5k rps | — |
 
-Caveats, honestly stated:
-
-- nginx's stock `proxy_pass` speaks HTTP/1.0 upstream **without
-  keep-alive** — it opens a fresh upstream connection per request. That
-  is the default most deployments run, but `upstream` keep-alive pools
-  narrow the gap.
-- vane pools upstream connections by default (epoch-invalidated), which
-  is where the keep-alive advantage comes from.
-- Short-connection rate is accept-bound and effectively at parity.
-- Measurements are single-run means on a shared multi-tenant host; treat
-  ratios (≈4× keep-alive, ≈1× short) as indicative, not absolute.
+Honest reading: vane beats **stock** nginx ~3.5x on keep-alive, but a
+tuned nginx (upstream keepalive) holds a ~1.4x lead over vane's current
+proxy loop — that loop is v0.4's main optimization target. The upstream
+ceiling (shared `ab` client) is 65-72k rps.
 
 ## Admin plane & metrics
 
