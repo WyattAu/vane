@@ -437,6 +437,12 @@ pub async fn run(opts: RunOptions) -> i32 {
         Arc<EventRing<vane_observe::LogEvent, { vane_observe::EVENT_RING_CAPACITY }>>,
     > = Vec::new();
     let mut access_logs: Vec<Arc<vane_observe::access::AccessLog>> = Vec::new();
+    // ONE process-wide GCRA bucket: the configured rate is the true
+    // aggregate across workers (constructed once, shared by all).
+    let shared_rate_limit = config
+        .rate_limit
+        .as_ref()
+        .map(|rl| Arc::new(vane_shm::ratelimit::SharedGcra::new(rl.rps, rl.burst)));
     for (li, listener) in bound.into_iter().enumerate() {
         let mode = match config
             .listeners
@@ -543,6 +549,7 @@ pub async fn run(opts: RunOptions) -> i32 {
                 http01_tokens: http01_tokens.clone(),
                 access,
                 jwt,
+                shared_rate_limit: shared_rate_limit.clone(),
             };
             match spawn_worker(
                 li * workers_per_listener + w,
@@ -744,6 +751,8 @@ struct WorkerFactory {
     access: Option<Arc<vane_observe::access::AccessLog>>,
     /// JWT bearer auth (`None` = disabled).
     jwt: Option<Arc<vane_filters::jwt::JwtValidator>>,
+    /// Process-wide GCRA bucket (`None` = unlimited).
+    shared_rate_limit: Option<Arc<vane_shm::ratelimit::SharedGcra>>,
 }
 
 impl vane_core::HandlerFactory for WorkerFactory {
@@ -758,6 +767,7 @@ impl vane_core::HandlerFactory for WorkerFactory {
                 registry: Arc::clone(&self.registry),
                 events: Arc::clone(&self.events),
                 rate_limit_rps: None,
+                shared_rate_limit: self.shared_rate_limit.clone(),
                 connect_timeout_ms: self.runtime.connect_timeout_ms,
                 idle_timeout_ms: self.runtime.idle_timeout_ms,
                 first_byte_timeout_ms: self.runtime.first_byte_timeout_ms,

@@ -47,6 +47,9 @@ pub struct VaneConfig {
     /// JWT bearer authentication (absent = disabled).
     #[serde(default)]
     pub jwt: Option<JwtConfig>,
+    /// Process-wide rate limiting (absent = unlimited).
+    #[serde(default)]
+    pub rate_limit: Option<RateLimitConfig>,
     /// Runtime tuning.
     #[serde(default)]
     pub runtime: RuntimeConfig,
@@ -391,6 +394,20 @@ pub struct ClusterOutlierConfig {
     /// Per-backend outlier ejection policy.
     #[serde(default)]
     pub outlier: Option<OutlierConfig>,
+}
+
+/// Process-wide rate limiting (one GCRA bucket across all workers).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitConfig {
+    /// Sustained requests per second (aggregate).
+    pub rps: u32,
+    /// Instantaneous burst allowance.
+    #[serde(default = "default_rate_burst")]
+    pub burst: u32,
+}
+
+fn default_rate_burst() -> u32 {
+    100
 }
 
 /// JWT bearer authentication for edge listeners.

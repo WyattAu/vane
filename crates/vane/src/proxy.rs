@@ -65,6 +65,9 @@ pub struct ProxyConfig {
     pub access: Option<std::sync::Arc<vane_observe::access::AccessLog>>,
     /// JWT bearer authentication (`None` = disabled).
     pub jwt: Option<std::sync::Arc<vane_filters::jwt::JwtValidator>>,
+    /// Process-wide GCRA bucket (`Some` replaces the per-worker
+    /// limiter so the configured rate is the true aggregate).
+    pub shared_rate_limit: Option<std::sync::Arc<vane_shm::ratelimit::SharedGcra>>,
     /// L4 splice mode (`mode = "tcp"` listeners): kernel zero-copy
     /// passthrough to the first matching route's cluster — no HTTP
     /// parsing on the data path.
@@ -243,9 +246,15 @@ impl HttpProxy {
         let breaker = Arc::new(BreakerGate::new(Arc::clone(&registry)));
         // None = unlimited in practice (1M rps burst; GCRA stays O(1) and
         // rate limiting remains opt-in via config).
-        let (rps, burst) = config
-            .rate_limit_rps
-            .map_or((1_000_000, 1_000_000), |r| (r, r));
+        // With a shared bucket the aggregate is enforced there, so the
+        // per-worker stage runs wide open (it would multiply the rate).
+        let (rps, burst) = if config.shared_rate_limit.is_some() {
+            (1_000_000, 1_000_000)
+        } else {
+            config
+                .rate_limit_rps
+                .map_or((1_000_000, 1_000_000), |r| (r, r))
+        };
         let pipeline = Pipeline::new().then(RateLimit::new(Arc::clone(&registry), rps, burst));
         // Wasm plugins (feature `wasm`): compiled per module, instantiated
         // once per worker.
@@ -1324,6 +1333,15 @@ impl HttpProxy {
             conn.resp_status = 0;
             conn.bytes_out = 0;
             conn.access_logged = false;
+        }
+
+        // Process-wide rate limiting (cross-worker aggregate).
+        if let Some(gcra) = &self.config.shared_rate_limit {
+            if !gcra.allow() {
+                self.respond_full(io, Status::TooManyRequests, "rate limited\n");
+                io.close();
+                return;
+            }
         }
 
         // JWT bearer authentication: before routing; health probes stay

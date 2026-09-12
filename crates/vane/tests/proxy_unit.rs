@@ -32,6 +32,7 @@ fn make_proxy(
             http01_tokens: None,
             access: None,
             jwt: None,
+            shared_rate_limit: None,
             l4_splice: false,
         },
         0,

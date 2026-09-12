@@ -35,6 +35,7 @@ pub mod cabi;
 pub mod descriptor;
 pub mod fdpass;
 pub mod handover;
+pub mod ratelimit;
 pub mod transport;
 
 pub use descriptor::MsgDesc;

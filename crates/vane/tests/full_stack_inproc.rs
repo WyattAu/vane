@@ -1541,3 +1541,57 @@ workers = 1
     assert!(resp.contains("200 OK"), "valid token: {resp:?}");
     assert!(resp.contains("hello-vane"), "upstream body: {resp:?}");
 }
+
+/// Process-wide rate limiting: a [rate_limit] section rejects over-
+/// budget requests with 429 while under-budget requests pass.
+#[test]
+fn shared_rate_limit_rejects_over_budget() {
+    let _serial = lock_serial();
+    let upstream = spawn_upstream();
+    let port = free_port();
+    let (_dir, cfg) = temp_config(format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.up]
+backends = ["{upstream}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[rate_limit]
+rps = 5
+burst = 5
+
+[runtime]
+force_mio = true
+workers = 1
+"#
+    ));
+    spawn_proxy(cfg);
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    // Burst of 5 admitted (plus slack), the flood that follows is
+    // rejected 429.
+    let mut ok = 0;
+    let mut limited = 0;
+    for _ in 0..40 {
+        let resp = request(
+            proxy,
+            b"GET /api/items HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        );
+        if resp.contains("429") {
+            limited += 1;
+        } else if resp.contains("200") {
+            ok += 1;
+        }
+    }
+    assert!(ok >= 1, "under-budget requests must pass (ok={ok})");
+    assert!(
+        limited >= 10,
+        "over-budget requests must be limited (limited={limited})"
+    );
+}
