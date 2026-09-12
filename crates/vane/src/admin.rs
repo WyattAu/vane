@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::routing::get;
+use axum::routing::{get, post};
 use vane_observe::metrics::Registry;
 use vane_router::Router as RouteRouter;
 
@@ -57,6 +57,19 @@ pub fn build_admin_router(
         )
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/config/dry-run", post(dry_run))
+}
+
+/// `POST /config/dry-run`: TOML body in, JSON validation report out.
+/// The candidate config is parsed and semantically validated but never
+/// applied — the control-plane gate for GitOps pipelines and operator
+/// rollouts. `400` with the failure detail on invalid configs.
+async fn dry_run(
+    body: String,
+) -> Result<axum::Json<vane_control::config::DryRunReport>, (axum::http::StatusCode, String)> {
+    vane_control::config::dry_run_toml(&body)
+        .map(axum::Json)
+        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e))
 }
 
 async fn healthz() -> &'static str {

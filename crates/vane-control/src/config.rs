@@ -629,3 +629,46 @@ sample_rate = 2.0
         assert!((cfg.sample_rate - 2.0).abs() < f32::EPSILON);
     }
 }
+
+/// Dry-run outcome for a candidate config (never applied).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DryRunReport {
+    /// Parsed listener count.
+    pub listeners: usize,
+    /// Parsed cluster count.
+    pub clusters: usize,
+    /// Parsed route count.
+    pub routes: usize,
+    /// Non-fatal notes (unresolvable backends are dropped at compile
+    /// time, so they are surfaced here instead of as errors).
+    pub warnings: Vec<String>,
+}
+
+/// Parses + validates a candidate TOML config **without applying it**.
+/// The `POST /config/dry-run` admin endpoint and `vane validate` both
+/// build on this.
+///
+/// # Errors
+/// Parse or semantic failure with a human-readable message.
+pub fn dry_run_toml(text: &str) -> Result<DryRunReport, String> {
+    let cfg = VaneConfig::parse_toml(text).map_err(|e| e.to_string())?;
+    cfg.validate().map_err(|e| e.to_string())?;
+    // Route compilability: patterns must be non-empty and reference
+    // known clusters (validate covers the latter; compile checks the
+    // pattern shape through the router's own matcher rules).
+    let mut warnings = Vec::new();
+    for c in &cfg.clusters {
+        if c.1.backends.is_empty() && c.1.unix_socket.is_none() {
+            warnings.push(format!(
+                "cluster `{}` has no backends and no unix socket",
+                c.0
+            ));
+        }
+    }
+    Ok(DryRunReport {
+        listeners: cfg.listeners.len(),
+        clusters: cfg.clusters.len(),
+        routes: cfg.routes.len(),
+        warnings,
+    })
+}

@@ -178,3 +178,78 @@ async fn serve_binds_and_answers() {
     assert!(text.contains("ok"), "body missing: {text}");
     task.abort();
 }
+
+/// POST /config/dry-run: valid TOML yields a structured report; broken
+/// TOML or semantic violations yield 400 with the failure detail. The
+/// candidate is never applied to the live table.
+#[tokio::test]
+async fn config_dry_run_reports() {
+    let good = r#"
+[[listeners]]
+address = "0.0.0.0:8080"
+
+[clusters.web]
+backends = ["127.0.0.1:9001"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "web"
+"#;
+    let res = app()
+        .oneshot(
+            Request::post("/config/dry-run")
+                .header("content-type", "application/toml")
+                .body(Body::from(good))
+                .expect("valid request"),
+        )
+        .await
+        .expect("oneshot");
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), 4096)
+        .await
+        .expect("body");
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("\"listeners\":1"), "{text}");
+    assert!(text.contains("\"clusters\":1"), "{text}");
+    assert!(text.contains("\"routes\":1"), "{text}");
+
+    // Semantic violation: route references an unknown cluster.
+    let bad = r#"
+[[listeners]]
+address = "0.0.0.0:8080"
+
+[clusters.web]
+backends = ["127.0.0.1:9001"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "missing"
+"#;
+    let res = app()
+        .oneshot(
+            Request::post("/config/dry-run")
+                .body(Body::from(bad))
+                .expect("valid request"),
+        )
+        .await
+        .expect("oneshot");
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(res.into_body(), 4096)
+        .await
+        .expect("body");
+    assert!(
+        String::from_utf8_lossy(&body).contains("unknown cluster"),
+        "error detail present"
+    );
+
+    // Parse error.
+    let res = app()
+        .oneshot(
+            Request::post("/config/dry-run")
+                .body(Body::from("this is not toml ====="))
+                .expect("valid request"),
+        )
+        .await
+        .expect("oneshot");
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
