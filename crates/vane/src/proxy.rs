@@ -115,6 +115,15 @@ struct Conn {
     /// Body bytes held handler-side until the upstream connects
     /// (preserves ordering: inline bytes forward first, then these).
     req_pending: Vec<u8>,
+    /// HTTP/2 server session (engine TLS path, ALPN negotiated h2).
+    #[cfg(feature = "h2")]
+    h2: Option<Box<crate::h2_server::H2Server>>,
+    /// h2 frames queued for the peer (drained on flush).
+    #[cfg(feature = "h2")]
+    h2_out: Vec<u8>,
+    /// Ciphertext received but not yet consumed by rustls (partial
+    /// TLS records straddling read boundaries).
+    tls_backlog: Vec<u8>,
 }
 
 /// Request-side body framing (streaming relay — bodies are never
@@ -281,6 +290,12 @@ impl HttpProxy {
     /// Writes bytes downstream, encrypting through TLS when terminated.
     fn write_downstream(&mut self, io: &mut SessionIo<'_>, bytes: &[u8]) {
         let slot = io.slot_index();
+        #[cfg(feature = "h2")]
+        if self.conns.get(&slot).is_some_and(|c| c.h2.is_some()) {
+            // h2 sessions translate response bytes into frames.
+            self.h2_write(io, bytes);
+            return;
+        }
         let Some(conn) = self.conns.get_mut(&slot) else {
             return;
         };
@@ -320,7 +335,13 @@ impl HttpProxy {
             self.plain_request_data(io, data);
             return;
         };
-        let _ = tls.read_tls(&mut io::Cursor::new(data));
+        // Feed through a persistent backlog: rustls' read_tls leaves
+        // partial trailing records unconsumed, and the engine's next
+        // read event must line up behind them.
+        let mut backlog = std::mem::take(&mut conn.tls_backlog);
+        backlog.extend_from_slice(data);
+        let consumed = tls.read_tls(&mut io::Cursor::new(&backlog)).unwrap_or(0);
+        backlog.drain(..consumed);
         let mut decrypted = Vec::new();
         // Process until no more plaintext emerges: the peer may batch its
         // Finished flight and application data in one TCP segment.
@@ -352,8 +373,32 @@ impl HttpProxy {
             }
             first = false;
         }
+        // Park the unconsumed ciphertext tail with the connection.
+        conn.tls_backlog = backlog;
+        // ALPN is only known once the handshake completes: promote the
+        // session to HTTP/2 here (on_connected fires too early).
+        #[cfg(feature = "h2")]
+        let alpn_h2 = {
+            let handshaking = conn.tls.as_ref().is_some_and(|t| t.is_handshaking());
+            !handshaking
+                && conn
+                    .tls
+                    .as_ref()
+                    .is_some_and(|t| t.alpn_protocol() == Some(b"h2"))
+        };
         // Emit any TLS flight (ServerHello..Finished) before app data.
         self.flush_tls(io);
+        #[cfg(feature = "h2")]
+        if alpn_h2 && self.conns.get(&slot).is_some_and(|c| c.h2.is_none()) {
+            let mut h2s = Box::new(crate::h2_server::H2Server::new(slot));
+            // The engine's initial SETTINGS were queued at
+            // construction — flush them before app data.
+            let out = h2s.pending_writes();
+            self.conn(slot).h2 = Some(h2s);
+            if !out.is_empty() {
+                self.raw_downstream(io, &out);
+            }
+        }
         if !decrypted.is_empty() {
             self.plain_request_data(io, &decrypted);
         }
@@ -381,7 +426,179 @@ impl HttpProxy {
     }
 
     /// Plaintext request bytes (post-TLS or plain listener).
+    /// Raw TLS-wrapped write to the client (shared h1/h2 writer).
+    #[cfg(feature = "h2")]
+    fn h2_intake(&mut self, io: &mut SessionIo<'_>, data: &[u8]) {
+        let slot = io.slot_index();
+        let Some(mut h2s) = self.conn(slot).h2.take() else {
+            return;
+        };
+        let mut events = Vec::new();
+        h2s.handle_read(data, &mut events);
+        self.conn(slot).h2 = Some(h2s);
+        for ev in events {
+            self.h2_event(io, ev);
+        }
+        self.h2_flush(io);
+    }
+
+    /// Acts on a translated h2 driver event.
+    #[cfg(feature = "h2")]
+    fn h2_event(&mut self, io: &mut SessionIo<'_>, ev: crate::h2_server::H2Event) {
+        match ev {
+            crate::h2_server::H2Event::RequestHead { head, end_stream } => {
+                // The shim's backlog guarantees the head is complete.
+                self.h1_plain_request_data(io, &head);
+                if end_stream {
+                    let slot = io.slot_index();
+                    if let Some(c) = self.conns.get_mut(&slot) {
+                        c.req_framing = ReqFraming::Done;
+                    }
+                }
+            }
+            crate::h2_server::H2Event::RequestBody { data } => {
+                self.h1_plain_request_data(io, &data);
+            }
+            crate::h2_server::H2Event::RequestComplete => {
+                // Content-Length framing terminates the upstream relay
+                // naturally (h2 has no chunked encoding).
+            }
+            crate::h2_server::H2Event::SendCredit => {
+                let slot = io.slot_index();
+                let frames = {
+                    let Some(h2s) = self.conn(slot).h2.as_mut() else {
+                        return;
+                    };
+                    h2s.take_held()
+                };
+                for f in frames {
+                    self.conn(slot).h2_out.extend_from_slice(&f);
+                }
+                self.h2_flush(io);
+            }
+        }
+    }
+
+    /// Sends upstream response bytes (or error text) to an h2 client.
+    #[cfg(feature = "h2")]
+    fn h2_write(&mut self, io: &mut SessionIo<'_>, bytes: &[u8]) {
+        let slot = io.slot_index();
+        let (frames, done) = {
+            let Some(h2s) = self.conn(slot).h2.as_mut() else {
+                return;
+            };
+            h2s.response_bytes(bytes)
+        };
+        let out = &mut self.conn(slot).h2_out;
+        for f in frames {
+            out.extend_from_slice(&f);
+        }
+        if done {
+            self.conn(slot).body = BodyFraming::Done;
+            self.check_done(io);
+        }
+        self.h2_flush(io);
+    }
+
+    /// Upstream EOF on an h2 transaction: end the stream (empty DATA
+    /// with END_STREAM) unless already done.
+    #[cfg(feature = "h2")]
+    fn h2_upstream_eof(&mut self, io: &mut SessionIo<'_>) {
+        let slot = io.slot_index();
+        let (frames, done) = {
+            let Some(h2s) = self.conn(slot).h2.as_mut() else {
+                return;
+            };
+            h2s.response_eof()
+        };
+        let out = &mut self.conn(slot).h2_out;
+        for f in frames {
+            out.extend_from_slice(&f);
+        }
+        if done {
+            self.conn(slot).body = BodyFraming::Done;
+            self.check_done(io);
+        }
+        self.h2_flush(io);
+    }
+
+    /// Drains engine-queued frames and the response frame buffer to
+    /// the client (TLS-wrapped). Closes on engine connection errors.
+    #[cfg(feature = "h2")]
+    fn h2_flush(&mut self, io: &mut SessionIo<'_>) {
+        let slot = io.slot_index();
+        let failed = self
+            .conns
+            .get(&slot)
+            .and_then(|c| c.h2.as_ref())
+            .is_some_and(|h| h.failed());
+        let engine_out = self
+            .conn(slot)
+            .h2
+            .as_mut()
+            .map_or_else(Vec::new, |h2s| h2s.pending_writes());
+        let frames = std::mem::take(&mut self.conn(slot).h2_out);
+        if !engine_out.is_empty() {
+            self.raw_downstream(io, &engine_out);
+        }
+        if !frames.is_empty() {
+            self.raw_downstream(io, &frames);
+        }
+        if failed {
+            // Abort any in-flight transaction; never reuse the session.
+            io.close();
+        }
+    }
+
+    /// Raw TLS-wrapped write to the client (h2 control + data frames).
+    #[cfg(feature = "h2")]
+    fn raw_downstream(&mut self, io: &mut SessionIo<'_>, bytes: &[u8]) {
+        let slot = io.slot_index();
+        let Some(conn) = self.conns.get_mut(&slot) else {
+            return;
+        };
+        conn.bytes_out += bytes.len() as u64;
+        let Some(tls) = &mut conn.tls else {
+            io.respond(bytes);
+            return;
+        };
+        use std::io::Write as _;
+        let _ = tls.writer().write_all(bytes);
+        let mut out = Vec::with_capacity(16 * 1024);
+        loop {
+            let mut buf = [0u8; 16 * 1024];
+            let n = tls.write_tls(&mut buf.as_mut_slice()).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+            if out.len() > 512 * 1024 {
+                io.respond(&out);
+                out.clear();
+            }
+        }
+        if !out.is_empty() {
+            io.respond(&out);
+        }
+    }
+
     fn plain_request_data(&mut self, io: &mut SessionIo<'_>, data: &[u8]) {
+        // HTTP/2 sessions enter through the h2 translation shim.
+        #[cfg(feature = "h2")]
+        if self
+            .conns
+            .get(&io.slot_index())
+            .is_some_and(|c| c.h2.is_some())
+        {
+            self.h2_intake(io, data);
+            return;
+        }
+        self.h1_plain_request_data(io, data);
+    }
+
+    /// HTTP/1.1 intake (h2 events call this directly to avoid
+    /// re-entering the h2 shim).
+    fn h1_plain_request_data(&mut self, io: &mut SessionIo<'_>, data: &[u8]) {
         self.metrics
             .bytes_in
             .add(&self.config.registry, data.len() as u64);
@@ -727,7 +944,21 @@ impl Handler for HttpProxy {
             // shared slot (uncontended read lock, once per connection).
             let tls_cfg = tls_slot.read().expect("tls slot").clone();
             match rustls::ServerConnection::new(tls_cfg) {
-                Ok(conn) => self.conn(slot).tls = Some(conn),
+                Ok(conn) => {
+                    #[cfg(feature = "h2")]
+                    {
+                        let alpn_h2 = conn.alpn_protocol() == Some(b"h2");
+                        let c = self.conn(slot);
+                        c.tls = Some(conn);
+                        if alpn_h2 {
+                            c.h2 = Some(Box::new(crate::h2_server::H2Server::new(slot)));
+                        }
+                    }
+                    #[cfg(not(feature = "h2"))]
+                    {
+                        self.conn(slot).tls = Some(conn);
+                    }
+                }
                 Err(e) => {
                     self.log(LogLevel::Error, &format!("tls setup: {e}"));
                     io.close();
@@ -856,6 +1087,10 @@ impl Handler for HttpProxy {
             self.write_downstream(io, &data);
             return;
         }
+        #[cfg(feature = "h2")]
+        let is_h2 = self.conns.get(&slot).is_some_and(|c| c.h2.is_some());
+        #[cfg(not(feature = "h2"))]
+        let is_h2 = false;
         let framing = self.conn(slot).body;
         match framing {
             BodyFraming::AwaitingHead => {
@@ -866,6 +1101,15 @@ impl Handler for HttpProxy {
                     return;
                 }
                 self.metrics.responses.inc(&self.config.registry);
+                #[cfg(feature = "h2")]
+                if is_h2 {
+                    // The shim re-parses the head from `data` and
+                    // flow-controls the body portion.
+                    self.h2_write(io, data);
+                    return;
+                }
+                #[cfg(not(feature = "h2"))]
+                let _ = is_h2;
                 // Relay the head verbatim (hop-by-hop cleanup minimal).
                 let head = data[..head_len].to_vec();
                 self.write_downstream(io, &head);
@@ -882,8 +1126,19 @@ impl Handler for HttpProxy {
                 self.check_done(io);
             }
             BodyFraming::ContentLength | BodyFraming::Chunked { .. } => {
-                self.relay_body(io, data);
-                self.check_done(io);
+                #[cfg(feature = "h2")]
+                if is_h2 {
+                    self.h2_write(io, data);
+                } else {
+                    self.relay_body(io, data);
+                    self.check_done(io);
+                }
+                #[cfg(not(feature = "h2"))]
+                {
+                    let _ = is_h2;
+                    self.relay_body(io, data);
+                    self.check_done(io);
+                }
             }
             BodyFraming::Tunnel => {
                 // Tunnel: relay raw both directions.
@@ -896,6 +1151,10 @@ impl Handler for HttpProxy {
 
     fn on_upstream_eof(&mut self, io: &mut SessionIo<'_>) {
         let slot = io.slot_index();
+        #[cfg(feature = "h2")]
+        let is_h2 = self.conns.get(&slot).is_some_and(|c| c.h2.is_some());
+        #[cfg(not(feature = "h2"))]
+        let is_h2 = false;
         let (framing, remaining, request_sent, ready) = {
             let conn = self.conns.get(&slot).expect("conn exists");
             (
@@ -922,6 +1181,13 @@ impl Handler for HttpProxy {
                 io.close();
             }
             _ => {
+                #[cfg(feature = "h2")]
+                if is_h2 {
+                    self.h2_upstream_eof(io);
+                    return;
+                }
+                #[cfg(not(feature = "h2"))]
+                let _ = is_h2;
                 io.downstream_eof_write();
                 let done = {
                     let conn = self.conn(slot);

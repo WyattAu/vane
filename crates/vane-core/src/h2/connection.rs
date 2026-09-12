@@ -127,6 +127,14 @@ pub enum Event {
     },
     /// Peer ACKed our SETTINGS.
     SettingsAck,
+    /// Peer granted send credit (a WINDOW_UPDATE frame, or a SETTINGS
+    /// INITIAL_WINDOW_SIZE increase for `stream_id` 0). Drivers holding
+    /// back response bytes on flow control should retry pending sends.
+    /// `stream_id` 0 is connection-level credit (all streams may retry).
+    WindowUpdate {
+        /// Stream credited, or 0 for connection-level credit.
+        stream_id: u32,
+    },
 }
 
 /// Connection-level failure: the driver must send a GOAWAY with this
@@ -170,6 +178,8 @@ struct Stream {
     state: StreamState,
     recv_window: i64,
     send_window: i64,
+    /// Our send side ended with END_STREAM.
+    sent_end: bool,
 }
 
 /// Assembles a HEADERS block across CONTINUATION frames.
@@ -238,7 +248,9 @@ impl Connection {
             settings_acked: false,
             peer_max_frame: DEFAULT_MAX_FRAME_SIZE,
             peer_initial_window: 65_535,
-            conn_recv_window: i64::from(cfg.initial_window_size),
+            // Connection-level receive window: fixed 65535 initial
+            // (RFC 9113 §6.9.1); SETTINGS only raises stream windows.
+            conn_recv_window: 65_535,
             conn_send_window: 65_535,
             next_stream_id: match role {
                 Role::Server => 2,
@@ -292,6 +304,34 @@ impl Connection {
     #[must_use]
     pub fn connection_error(&self) -> Option<ConnectionError> {
         self.connection_error
+    }
+
+    /// The peer's SETTINGS_MAX_FRAME_SIZE (largest frame payload we
+    /// may send).
+    #[must_use]
+    pub fn peer_max_frame_size(&self) -> usize {
+        self.peer_max_frame as usize
+    }
+
+    /// Available send credit for `stream_id` (min of stream and
+    /// connection windows, clamped at zero).
+    #[must_use]
+    pub fn send_budget(&self, stream_id: u32) -> usize {
+        let stream = self
+            .streams
+            .get(&stream_id)
+            .map_or(i64::MAX, |st| st.send_window);
+        self.conn_send_window
+            .min(stream)
+            .max(0)
+            .try_into()
+            .unwrap_or(0)
+    }
+
+    /// Whether the stream is currently tracked (open or half-closed).
+    #[must_use]
+    pub fn stream_is_open(&self, stream_id: u32) -> bool {
+        self.streams.contains_key(&stream_id)
     }
 
     /// Whether the peer sent GOAWAY.
@@ -439,9 +479,9 @@ impl Connection {
         events: &mut Vec<Event>,
     ) -> Result<(), u32> {
         match hdr.kind {
-            FrameKind::Settings => self.handle_settings(hdr, payload),
+            FrameKind::Settings => self.handle_settings(hdr, payload, events),
             FrameKind::Ping => self.handle_ping(hdr, payload),
-            FrameKind::WindowUpdate => self.handle_window_update(hdr, payload),
+            FrameKind::WindowUpdate => self.handle_window_update(hdr, payload, events),
             FrameKind::GoAway => {
                 if payload.len() < 8 {
                     return Err(error_code::FRAME_SIZE_ERROR);
@@ -488,7 +528,12 @@ impl Connection {
         }
     }
 
-    fn handle_settings(&mut self, hdr: &FrameHeader, payload: &[u8]) -> Result<(), u32> {
+    fn handle_settings(
+        &mut self,
+        hdr: &FrameHeader,
+        payload: &[u8],
+        events: &mut Vec<Event>,
+    ) -> Result<(), u32> {
         if hdr.flags.ack() {
             if !self.settings_acked {
                 return Err(error_code::PROTOCOL_ERROR);
@@ -511,8 +556,17 @@ impl Connection {
                     }
                     let delta = i64::from(v) - self.peer_initial_window;
                     self.peer_initial_window = i64::from(v);
-                    for st in self.streams.values_mut() {
-                        st.send_window += delta;
+                    if delta > 0 {
+                        for st in self.streams.values_mut() {
+                            st.send_window += delta;
+                        }
+                        // Credit grew for every open stream (connection
+                        // window unchanged) — let drivers retry holds.
+                        events.push(Event::WindowUpdate { stream_id: 0 });
+                    } else {
+                        for st in self.streams.values_mut() {
+                            st.send_window += delta;
+                        }
                     }
                 }
                 Setting::HeaderTableSize(_) => {
@@ -550,7 +604,12 @@ impl Connection {
         Ok(())
     }
 
-    fn handle_window_update(&mut self, hdr: &FrameHeader, payload: &[u8]) -> Result<(), u32> {
+    fn handle_window_update(
+        &mut self,
+        hdr: &FrameHeader,
+        payload: &[u8],
+        events: &mut Vec<Event>,
+    ) -> Result<(), u32> {
         let inc = parse_window_update(payload).map_err(|_| error_code::FRAME_SIZE_ERROR)?;
         if inc == 0 {
             return Err(error_code::PROTOCOL_ERROR);
@@ -561,6 +620,9 @@ impl Connection {
         } else if let Some(st) = self.streams.get_mut(&hdr.stream_id) {
             st.send_window += inc;
         }
+        events.push(Event::WindowUpdate {
+            stream_id: hdr.stream_id,
+        });
         Ok(())
     }
 
@@ -681,9 +743,15 @@ impl Connection {
             state: StreamState::Open,
             recv_window: i64::from(self.cfg.initial_window_size),
             send_window: self.peer_initial_window,
+            sent_end: false,
         });
         if end_stream {
+            let retire = entry.sent_end;
             entry.state = StreamState::HalfClosedRemote;
+            // Both halves done (we already sent END_STREAM): retire.
+            if retire {
+                self.streams.remove(&id);
+            }
         }
     }
 
@@ -727,10 +795,14 @@ impl Connection {
     /// connection + stream when the freed amount is significant).
     pub fn release_capacity(&mut self, stream_id: u32, n: usize) {
         let n = n as i64;
-        let half = i64::from(self.cfg.initial_window_size) / 2;
-        let conn_before = self.conn_recv_window;
+        // Credit is returned IMMEDIATELY on every release: batching at
+        // a half-mark deadlocks transfers sized near a window multiple
+        // (the peer's remaining credit hits zero while our threshold
+        // waits for more consumption). The connection-level initial
+        // window is fixed at 65535 (RFC 9113 §6.9.1); SETTINGS only
+        // raises per-stream windows.
         self.conn_recv_window += n;
-        if conn_before < half && self.conn_recv_window >= half {
+        if n > 0 {
             write_header(
                 &mut self.out,
                 4,
@@ -738,13 +810,11 @@ impl Connection {
                 FrameFlags::EMPTY,
                 0,
             );
-            let inc = (self.conn_recv_window - conn_before) as u32;
-            self.out.extend_from_slice(&inc.to_be_bytes());
+            self.out.extend_from_slice(&(n as u32).to_be_bytes());
         }
         if let Some(st) = self.streams.get_mut(&stream_id) {
-            let before = st.recv_window;
             st.recv_window += n;
-            if before < half && st.recv_window >= half {
+            if n > 0 {
                 write_header(
                     &mut self.out,
                     4,
@@ -752,8 +822,7 @@ impl Connection {
                     FrameFlags::EMPTY,
                     stream_id,
                 );
-                let inc = (st.recv_window - before) as u32;
-                self.out.extend_from_slice(&inc.to_be_bytes());
+                self.out.extend_from_slice(&(n as u32).to_be_bytes());
             }
         }
     }
@@ -765,6 +834,7 @@ impl Connection {
             state: StreamState::Open,
             recv_window: i64::from(self.cfg.initial_window_size),
             send_window: self.peer_initial_window,
+            sent_end: false,
         });
     }
 
@@ -822,11 +892,19 @@ impl Connection {
             rest = &rest[n..];
         }
         if end_stream {
+            let mut retire = false;
             if let Some(st) = self.streams.get_mut(&stream_id) {
+                st.sent_end = true;
                 st.state = match st.state {
-                    StreamState::HalfClosedRemote => StreamState::Closed,
+                    StreamState::HalfClosedRemote => {
+                        retire = true; // both halves done
+                        StreamState::Closed
+                    }
                     _ => StreamState::HalfClosedLocal,
                 };
+            }
+            if retire {
+                self.streams.remove(&stream_id);
             }
         }
     }
@@ -858,14 +936,22 @@ impl Connection {
         self.out.extend_from_slice(&data[..n]);
 
         self.conn_send_window -= n as i64;
+        let mut retire = false;
         if let Some(st) = self.streams.get_mut(&stream_id) {
             st.send_window -= n as i64;
             if last && end_stream {
+                st.sent_end = true;
                 st.state = match st.state {
-                    StreamState::HalfClosedRemote => StreamState::Closed,
+                    StreamState::HalfClosedRemote => {
+                        retire = true; // both halves done
+                        StreamState::Closed
+                    }
                     _ => StreamState::HalfClosedLocal,
                 };
             }
+        }
+        if retire {
+            self.streams.remove(&stream_id);
         }
         n
     }
@@ -1087,28 +1173,26 @@ mod conn_tests {
         c.handle_read(CLIENT_PREFACE, &mut events);
         let _ = c.take_pending_writes();
 
-        // HEADERS END_STREAM=off on stream 1 (stream recv window = 512 KiB).
+        // HEADERS END_STREAM=off on stream 1 (stream recv window =
+        // 512 KiB; connection window fixed at 65535).
         c.handle_read(
             &frame_bytes(FrameKind::Headers, 0x04, 1, &[0x82]),
             &mut events,
         );
 
-        // Consume 300 KiB without releasing: both windows drop below
-        // half (256 KiB). One release then crosses back above half →
-        // connection + stream WINDOW_UPDATEs fire.
+        // 5 rounds of 60 KiB: each release returns credit IMMEDIATELY
+        // (both connection and stream) — no half-mark batching, which
+        // deadlocks transfers sized near a window multiple.
         let chunk = vec![0u8; 61440];
         for _ in 0..5 {
-            let hdr_frame = frame_bytes(FrameKind::Data, 0x00, 1, &chunk);
-            c.handle_read(&hdr_frame, &mut events);
+            c.handle_read(&frame_bytes(FrameKind::Data, 0x00, 1, &chunk), &mut events);
+            c.release_capacity(1, chunk.len());
         }
-        let writes = c.take_pending_writes();
-        assert_eq!(writes.len(), 0, "no updates while below half");
-        c.release_capacity(1, 5 * chunk.len());
         let writes = c.take_pending_writes();
         assert_eq!(
             writes.len(),
-            13 * 2,
-            "conn + stream WINDOW_UPDATEs (9 hdr + 4 payload each)"
+            13 * 10,
+            "5 conn + 5 stream WINDOW_UPDATEs (9 hdr + 4 payload each)"
         );
     }
 

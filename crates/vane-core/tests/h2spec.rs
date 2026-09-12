@@ -116,6 +116,9 @@ impl Driver {
                     self.respond(stream_id, b"200");
                 }
             }
+            Event::WindowUpdate { .. } => {
+                self.try_send_pending();
+            }
             Event::Reset { .. } | Event::GoAway { .. } | Event::SettingsAck => {}
         }
     }

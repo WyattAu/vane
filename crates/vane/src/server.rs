@@ -461,8 +461,11 @@ pub async fn run(opts: RunOptions) -> i32 {
                         std::path::Path::new(&t.key),
                     ) {
                         Ok(mut cfg) => {
+                            // ALPN: h2 + http/1.1 when enabled — the
+                            // engine path serves both (h2 via the
+                            // native engine's translation shim).
                             if want_h2 {
-                                cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+                                cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
                             }
                             Some(Arc::new(std::sync::RwLock::new(Arc::new(cfg))))
                         }
@@ -593,45 +596,9 @@ pub async fn run(opts: RunOptions) -> i32 {
         });
     }
 
-    // ---- HTTP/2 edge (feature `h2`) ---------------------------------------
-    #[cfg(feature = "h2")]
-    for (li, listener) in handover_listeners.iter().enumerate() {
-        let want_h2 = config
-            .listeners
-            .get(li)
-            .and_then(|l| l.tls.as_ref())
-            .is_some_and(|t| t.alpn_h2);
-        if !want_h2 {
-            continue;
-        }
-        match vane_tls::server_config(
-            std::path::Path::new(&config.listeners[li].tls.as_ref().expect("checked").cert),
-            std::path::Path::new(&config.listeners[li].tls.as_ref().expect("checked").key),
-        ) {
-            Ok(cfg) => {
-                let mut cfg = cfg;
-                cfg.alpn_protocols = vec![b"h2".to_vec()];
-                let dup = listener.try_clone().expect("dup for h2 edge");
-                let access = if config.access_log.enabled {
-                    let a = Arc::new(vane_observe::access::AccessLog::new());
-                    access_logs.push(Arc::clone(&a));
-                    Some(a)
-                } else {
-                    None
-                };
-                let edge = Arc::new(crate::h2_edge::H2Edge::new(
-                    Arc::clone(&router),
-                    Arc::clone(&registry),
-                    access,
-                ));
-                crate::h2_edge::spawn(dup, Arc::new(cfg), edge);
-                tracing::info!("h2 edge listening (REUSEPORT) for listener {li}");
-            }
-            Err(e) => {
-                tracing::warn!("h2 edge tls config: {e}");
-            }
-        }
-    }
+    // HTTP/2 (feature `h2`) is served on the engine data path via
+    // ALPN negotiation (crates/vane/src/h2_server.rs) — the former
+    // REUSEPORT tokio edge is retired.
 
     // ---- Access-log drain: render one JSON line per transaction into
     // the configured sink (stderr by default). Dropping on a full ring

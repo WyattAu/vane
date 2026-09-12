@@ -6,6 +6,8 @@
 pub mod admin;
 #[cfg(feature = "h2")]
 pub mod h2_edge;
+#[cfg(feature = "h2")]
+pub mod h2_server;
 #[cfg(feature = "h3")]
 pub mod h3_edge;
 
