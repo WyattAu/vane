@@ -3142,7 +3142,8 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "slab-pool"
 version = "0.1.0"
-source = "git+https://github.com/WyattAu/slab-pool.git?branch=main#912deeeab66d090222212f4fa9c1d2f3a5b8d579"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc64d989e4c609452da794175b29987139c3f0053d40f0f44974d8e91f1382f3"
 dependencies = [
  "thiserror 2.0.20",
 ]
@@ -3775,7 +3776,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vane"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "axum-stack",
@@ -3822,7 +3823,7 @@ dependencies = [
 
 [[package]]
 name = "vane-client-sdk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tempfile",
  "vane-shm",
@@ -3830,7 +3831,7 @@ dependencies = [
 
 [[package]]
 name = "vane-control"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "envstack",
@@ -3856,7 +3857,7 @@ dependencies = [
 
 [[package]]
 name = "vane-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "core_affinity",
@@ -3873,7 +3874,7 @@ dependencies = [
 
 [[package]]
 name = "vane-filters"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "breaker",
  "tempfile",
@@ -3884,7 +3885,7 @@ dependencies = [
 
 [[package]]
 name = "vane-observe"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "loom",
  "rand 0.9.5",
@@ -3893,7 +3894,7 @@ dependencies = [
 
 [[package]]
 name = "vane-plugins"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tempfile",
  "thiserror 2.0.20",
@@ -3904,7 +3905,7 @@ dependencies = [
 
 [[package]]
 name = "vane-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "criterion",
@@ -3915,7 +3916,7 @@ dependencies = [
 
 [[package]]
 name = "vane-router"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "crossbeam-epoch",
@@ -3928,7 +3929,7 @@ dependencies = [
 
 [[package]]
 name = "vane-shm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "libc",
@@ -3945,7 +3946,7 @@ dependencies = [
 
 [[package]]
 name = "vane-tls"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rcgen",
  "ring",

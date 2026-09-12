@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -38,22 +38,20 @@ expect_used = "allow"
 
 [workspace.dependencies]
 # Internal
-vane-core = { version = "0.1.0", path = "crates/vane-core" }
-vane-observe = { version = "0.1.0", path = "crates/vane-observe" }
-vane-proto = { version = "0.1.0", path = "crates/vane-proto" }
-vane-router = { version = "0.1.0", path = "crates/vane-router" }
-vane-filters = { version = "0.1.0", path = "crates/vane-filters" }
-vane-control = { version = "0.1.0", path = "crates/vane-control" }
-vane-shm = { version = "0.1.0", path = "crates/vane-shm" }
-vane-client-sdk = { version = "0.1.0", path = "crates/vane-client-sdk" }
-vane-tls = { version = "0.1.0", path = "crates/vane-tls" }
-vane-plugins = { version = "0.1.0", path = "crates/vane-plugins" }
+vane-core = { version = "0.2.0", path = "crates/vane-core" }
+vane-observe = { version = "0.2.0", path = "crates/vane-observe" }
+vane-proto = { version = "0.2.0", path = "crates/vane-proto" }
+vane-router = { version = "0.2.0", path = "crates/vane-router" }
+vane-filters = { version = "0.2.0", path = "crates/vane-filters" }
+vane-control = { version = "0.2.0", path = "crates/vane-control" }
+vane-shm = { version = "0.2.0", path = "crates/vane-shm" }
+vane-client-sdk = { version = "0.2.0", path = "crates/vane-client-sdk" }
+vane-tls = { version = "0.2.0", path = "crates/vane-tls" }
+vane-plugins = { version = "0.2.0", path = "crates/vane-plugins" }
 
 # WyattAu kit ecosystem (reuse, do not reinvent)
 shm-rings = "0.1.1"
-# NOTE: publish blocker — slab-pool must be on crates.io first (currently git).
-# Once published, switch to: slab-pool = "0.1"
-slab-pool = { git = "https://github.com/WyattAu/slab-pool.git", branch = "main" }
+slab-pool = "0.1"
 throttle-kit = "1.0"
 breaker = "1.0"
 healthkit = "1.0"
