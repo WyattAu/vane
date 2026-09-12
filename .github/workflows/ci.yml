@@ -141,6 +141,8 @@ jobs:
         run: cargo fuzz run parse_request -- -max_total_time=60 -max_len=8192 -detect_leaks=0
       - name: response smoke (60s)
         run: cargo fuzz run parse_response -- -max_total_time=60 -max_len=8192 -detect_leaks=0
+      - name: hpack smoke (60s)
+        run: cargo fuzz run hpack -- -max_total_time=60 -detect_leaks=0
       - name: shm descriptor smoke (60s)
         run: cargo fuzz run shm_descriptors -- -max_total_time=60 -detect_leaks=0
       - name: access record smoke (60s)

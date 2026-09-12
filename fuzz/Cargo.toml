@@ -14,6 +14,7 @@ vane-proto = { path = "../crates/vane-proto" }
 vane-router = { path = "../crates/vane-router" }
 vane-shm = { path = "../crates/vane-shm" }
 vane-observe = { path = "../crates/vane-observe" }
+vane-core = { path = "../crates/vane-core" }
 
 [[bin]]
 name = "parse_request"
@@ -46,6 +47,13 @@ bench = false
 [[bin]]
 name = "access_record"
 path = "fuzz_targets/access_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hpack"
+path = "fuzz_targets/hpack.rs"
 test = false
 doc = false
 bench = false

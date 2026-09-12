@@ -23,6 +23,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 pub mod buffer;
 pub mod engine;
+pub mod h2;
 pub mod handler;
 pub mod net;
 pub mod slab;
