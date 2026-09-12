@@ -511,14 +511,15 @@ workers = 1
     let server_name = rustls::pki_types::ServerName::try_from("localhost".to_owned()).expect("sni");
     // REUSEPORT: connections land on either the engine's h1-TLS worker
     // (which aborts h2-only ALPN) or the dedicated h2 acceptor. Retry
-    // with backoff until the h2 acceptor wins the coin flip.
+    // with backoff until the h2 acceptor wins the coin flip. Budget is
+    // generous: coverage-instrumented runs are ~5x slower.
     let mut tls = None;
-    for attempt in 0..80u32 {
+    for attempt in 0..200u32 {
         let tcp = tokio::net::TcpStream::connect(edge)
             .await
             .expect("tcp connect");
         let attempt_result = tokio::time::timeout(
-            Duration::from_secs(3),
+            Duration::from_secs(10),
             connector.clone().connect(server_name.clone(), tcp),
         )
         .await;
@@ -536,7 +537,7 @@ workers = 1
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
-        if attempt == 79 {
+        if attempt == 199 {
             panic!("h2 acceptor never answered with ALPN h2");
         }
     }
