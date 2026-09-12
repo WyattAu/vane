@@ -1126,6 +1126,38 @@ impl HttpProxy {
             return;
         }
 
+        // Wasm plugins (feature `wasm`): request-phase hooks run after
+        // the native pipeline; the first Reject short-circuits with the
+        // guest's status. Guest errors are logged and skipped.
+        #[cfg(feature = "wasm")]
+        if !self.plugins.is_empty() {
+            let headers: Vec<(String, String)> = view
+                .headers
+                .iter()
+                .filter_map(|h| {
+                    let value = std::str::from_utf8(h.value).ok()?;
+                    Some((h.name.to_owned(), value.to_owned()))
+                })
+                .collect();
+            let mut rejected = None;
+            for plugin in &mut self.plugins {
+                match plugin.on_request_with_headers(&upstream_path, &headers) {
+                    Ok(vane_plugins::GuestVerdict::Continue) => {}
+                    Ok(vane_plugins::GuestVerdict::Reject(code)) => {
+                        rejected = Some(code);
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("[vane:warn] plugin on_request: {e}");
+                    }
+                }
+            }
+            if let Some(code) = rejected {
+                self.respond_full(io, Status::from_code(code), "rejected by plugin\n");
+                return;
+            }
+        }
+
         // Pick a backend.
         let mut balancer = route.balancer(u64::from(slot) ^ started.elapsed().as_nanos() as u64);
         let Some(addr) = balancer.pick_addr() else {

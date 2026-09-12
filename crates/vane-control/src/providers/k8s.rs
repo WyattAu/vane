@@ -340,6 +340,10 @@ fn parse_endpoints(json: &str, port: u16) -> Vec<std::net::SocketAddr> {
     out
 }
 
+// Silence unused import in non-k8s feature builds of this module's deps.
+#[allow(unused)]
+type Unused = HashMap<String, String>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,7 +412,3 @@ mod tests {
         );
     }
 }
-
-// Silence unused import in non-k8s feature builds of this module's deps.
-#[allow(unused)]
-type Unused = HashMap<String, String>;

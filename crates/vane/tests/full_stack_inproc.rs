@@ -1276,3 +1276,75 @@ workers = 1
     );
     assert!(saw_trace, "OTLP payload must carry the request trace id");
 }
+
+/// Wasm plugins (feature `wasm`) run in the request path: a guest that
+/// reads the request path from its linear memory and rejects `/secret`
+/// with 403 while letting everything else through.
+#[cfg(feature = "wasm")]
+#[test]
+fn wasm_plugin_rejects_configured_path() {
+    const GUEST: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "alloc") (param i32) (result i32) i32.const 1024)
+  (func (export "on_request") (param i32 i32 i32) (result i32)
+    ;; path is written at 1024 (alloc's ptr); len is param 1.
+    (if (i32.ne (local.get 1) (i32.const 7))
+      (then (return (i32.const 0))))
+    ;; first 4 bytes "/sec" (LE 0x6365732f)?
+    (if (i32.ne (i32.load (i32.const 1024)) (i32.const 0x6365732f))
+      (then (return (i32.const 0))))
+    ;; byte 4 == 'r' → "/secret" → 403
+    (if (i32.eq (i32.load8_u (i32.const 1028)) (i32.const 0x72))
+      (then (return (i32.const 403))))
+    (i32.const 0))
+)
+"#;
+    let _serial = lock_serial();
+    let upstream = spawn_upstream();
+    let port = free_port();
+    let plugin_dir = tempfile::tempdir().expect("plugin dir");
+    let plugin_path = plugin_dir.path().join("path_guard.wasm");
+    let plugin_path = plugin_path.to_str().expect("utf8");
+    std::fs::write(plugin_path, GUEST).expect("write wat");
+
+    let (_dir, cfg) = temp_config(format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.up]
+backends = ["{upstream}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[[plugins]]
+path = "{plugin_path}"
+
+[runtime]
+force_mio = true
+workers = 1
+"#
+    ));
+
+    spawn_proxy(cfg);
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    // Non-matching path → plugin Continue → upstream 200.
+    let resp = request(
+        proxy,
+        b"GET /api/items HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+    );
+    assert!(resp.contains("200 OK"), "continue path: {resp:?}");
+
+    // /secret → plugin Reject(403), never reaches the upstream.
+    let resp = request(
+        proxy,
+        b"GET /secret HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+    );
+    assert!(resp.contains("403"), "reject path: {resp:?}");
+    assert!(resp.contains("rejected by plugin"), "body: {resp:?}");
+}
