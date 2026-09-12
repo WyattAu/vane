@@ -164,6 +164,7 @@ pub fn load_config(path: Option<&str>) -> Result<VaneConfig, String> {
                 mode: vane_control::config::ListenerMode::Http,
                 workers: 0,
                 tls: None,
+                h2c: false,
             });
         }
     }
@@ -550,6 +551,7 @@ pub async fn run(opts: RunOptions) -> i32 {
                 access,
                 jwt,
                 shared_rate_limit: shared_rate_limit.clone(),
+                h2c: config.listeners.get(li).is_some_and(|l| l.h2c),
             };
             match spawn_worker(
                 li * workers_per_listener + w,
@@ -753,6 +755,8 @@ struct WorkerFactory {
     jwt: Option<Arc<vane_filters::jwt::JwtValidator>>,
     /// Process-wide GCRA bucket (`None` = unlimited).
     shared_rate_limit: Option<Arc<vane_shm::ratelimit::SharedGcra>>,
+    /// Serve h2c on this plain listener (feature `h2`).
+    h2c: bool,
 }
 
 impl vane_core::HandlerFactory for WorkerFactory {
@@ -768,6 +772,7 @@ impl vane_core::HandlerFactory for WorkerFactory {
                 events: Arc::clone(&self.events),
                 rate_limit_rps: None,
                 shared_rate_limit: self.shared_rate_limit.clone(),
+                h2c: self.h2c,
                 connect_timeout_ms: self.runtime.connect_timeout_ms,
                 idle_timeout_ms: self.runtime.idle_timeout_ms,
                 first_byte_timeout_ms: self.runtime.first_byte_timeout_ms,

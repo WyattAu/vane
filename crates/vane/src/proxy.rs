@@ -68,6 +68,8 @@ pub struct ProxyConfig {
     /// Process-wide GCRA bucket (`Some` replaces the per-worker
     /// limiter so the configured rate is the true aggregate).
     pub shared_rate_limit: Option<std::sync::Arc<vane_shm::ratelimit::SharedGcra>>,
+    /// Serve h2c (prior-knowledge HTTP/2) on this plain listener.
+    pub h2c: bool,
     /// L4 splice mode (`mode = "tcp"` listeners): kernel zero-copy
     /// passthrough to the first matching route's cluster — no HTTP
     /// parsing on the data path.
@@ -1135,6 +1137,16 @@ impl Handler for HttpProxy {
                 vane_core::handler::DeadlineReason::Connect,
             );
             return;
+        }
+        // h2c: plain listeners speak prior-knowledge HTTP/2 directly.
+        #[cfg(feature = "h2")]
+        if self.config.h2c && self.config.tls.is_none() {
+            let mut h2s = Box::new(crate::h2_server::H2Server::new(slot));
+            let out = h2s.pending_writes();
+            self.conn(slot).h2 = Some(h2s);
+            if !out.is_empty() {
+                self.raw_downstream(io, &out);
+            }
         }
         if let Some(tls_slot) = &self.config.tls {
             // Hot-reload point: read the current generation through the

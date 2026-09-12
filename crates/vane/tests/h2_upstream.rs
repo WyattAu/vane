@@ -899,20 +899,21 @@ async fn large_body_streams_through_edge() {
 /// request body streams to an echoing h1 upstream, response streams
 /// back through the engine's flow-controlled DATA relay.
 ///
-/// INVESTIGATION (narrowed further): sub-window bodies (4 KiB) pass
-/// end-to-end after the h2_write flush-ordering fix (frames must flush
-/// before check_done queues a FIN). Bodies beyond one window (70 KB+)
-/// stall: the shim receives exactly two intakes (preface + first
-/// flight), the client exhausts its initial send window, and no third
-/// downstream intake ever happens — the engine stops re-delivering
-/// reads after the upstream dial completes inside handle_request.
-/// Verified NOT the cause: pool exhaustion, backpressure pauses, TLS
-/// record corruption (record headers valid; mid-record splits handled
-/// by the backlog), mio epoll sweep starvation (fix applied anyway),
-/// io_uring vs mio (both fail), request-head translation. NEXT: build
-/// an h2c (cleartext) harness using our own H2Upstream driver as the
-/// client — removes the h2-crate/tokio client from the equation and
-/// makes the intake starvation directly observable.
+/// INVESTIGATION (narrowed — h2c harness): sub-window bodies (4 KiB)
+/// pass end-to-end. Bodies beyond one window (65535): the request side
+/// streams perfectly (all 1 MiB intakes + relays), the response head +
+/// first window go out, then the server's downstream reads stop
+/// arriving once response writes begin — the client's credit flights
+/// sit unread, its window exhausts, deadlock. Verified NOT the cause:
+/// the h2-crate client (reproduces with our own driver), TLS (h2c is
+/// cleartext), request-side relay, window debits, held accounting,
+/// probe-session leaks (fixed: maybe_finish now closes sessions whose
+/// upstream half never existed; EOF arms now set downstream/upstream
+/// EOF flags — non-splice EOF never set them, leaking sessions and
+/// mio registrations, which made reused fd numbers collide with stale
+/// registrations and break dials). NEXT: with this harness, instrument
+/// arm_downstream_read + DownstreamRead cqes at the stall point — the
+/// engine read-starvation interplay with pending downstream writes.
 #[ignore = "INVESTIGATION: response bodies beyond one window (65535) stall — see doc comment"]
 #[tokio::test]
 async fn large_body_streams_native_engine() {
@@ -1236,4 +1237,178 @@ workers = 1
         }
     }
     assert_eq!(&got[..], b"h2-upstream", "h2 upstream body");
+}
+
+/// h2c harness: our own H2Upstream driver as the client over plain
+/// TCP (listener `h2c = true`) — removes the h2-crate/tokio client
+/// from the equation entirely. Used to bisect the >window streaming
+/// stall; also the regression gate for h2c support itself.
+#[ignore = "INVESTIGATION: same >window stall as large_body_streams_native_engine (shared tracking)"]
+#[tokio::test]
+async fn h2c_native_engine_large_body() {
+    let _serial = lock_serial();
+    // h1 echo upstream (reads CL body, responds with it).
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let echo_addr = echo.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = echo.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut s = stream;
+                let mut byte = [0u8; 1];
+                let mut head = Vec::new();
+                loop {
+                    if s.read_exact(&mut byte).await.is_err() {
+                        return;
+                    }
+                    head.push(byte[0]);
+                    if head.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let head_str = String::from_utf8_lossy(&head).into_owned();
+                let content_length = head_str
+                    .to_ascii_lowercase()
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut buf = vec![0u8; content_length];
+                if s.read_exact(&mut buf).await.is_err() {
+                    return;
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    buf.len()
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+                let _ = s.write_all(&buf).await;
+                let _ = s.shutdown().await;
+            });
+        }
+    });
+
+    let port: u16 = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("probe");
+        l.local_addr().expect("addr").port()
+    };
+    let (_dir, cfg) = {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("vane.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+h2c = true
+
+[clusters.up]
+backends = ["{echo_addr}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = true
+workers = 1
+"#
+            ),
+        )
+        .expect("write cfg");
+        let p = path.to_str().expect("utf8").to_owned();
+        (dir, p)
+    };
+    // keep the tempdir alive for the server lifetime
+    let _dir_guard = _dir;
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let _ = rt.block_on(vane::server::run(vane::server::RunOptions {
+            config_path: Some(cfg),
+            handover_from: None,
+            handover_to: None,
+            shutdown_after: None,
+            force_mio: true,
+        }));
+    });
+    let edge: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    for _ in 0..60 {
+        if std::net::TcpStream::connect(edge).is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // --- client: our H2Upstream driver over a blocking socket ---
+    let size: usize = std::env::var("H2C_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024 * 1024);
+    let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Write};
+        use vane::h2_client::{H2Upstream, UpstreamEvent};
+        let mut sock = std::net::TcpStream::connect(edge).expect("connect");
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let mut h2up = H2Upstream::new();
+        sock.write_all(&h2up.pending_writes()).expect("preface");
+        let head = format!(
+            "POST /big HTTP/1.1\r\nhost: t\r\ncontent-length: {}\r\n\r\n",
+            payload.len()
+        );
+        h2up.send_request(head.as_bytes(), Some(payload.len() as u64));
+        sock.write_all(&h2up.pending_writes()).expect("request");
+        for chunk in payload.chunks(16384) {
+            let frames = h2up.request_body(chunk);
+            if !frames.is_empty() {
+                sock.write_all(&frames).expect("body frames");
+            }
+        }
+        sock.write_all(&h2up.pending_writes()).expect("flush");
+
+        let mut got = Vec::new();
+        let mut buf = [0u8; 16384];
+        loop {
+            let n = match sock.read(&mut buf) {
+                Ok(0) => {
+                    break;
+                }
+                Err(_) => {
+                    break;
+                }
+                Ok(n) => n,
+            };
+            let mut events = Vec::new();
+            h2up.handle_read(&buf[..n], &mut events);
+            for ev in &events {
+                if let UpstreamEvent::ResponseBody(b) = ev {
+                    got.extend_from_slice(b);
+                }
+            }
+            let out = h2up.pending_writes();
+            if !out.is_empty() {
+                sock.write_all(&out).expect("credit frames");
+            }
+            if got.len() >= payload.len() {
+                break;
+            }
+        }
+        assert_eq!(got.len(), payload.len(), "h2c streamed size");
+        assert_eq!(got, payload, "h2c streamed integrity");
+    })
+    .await
+    .expect("client task");
 }

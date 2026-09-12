@@ -75,6 +75,10 @@ pub struct ListenerConfig {
     /// TLS termination (absent = plaintext).
     #[serde(default)]
     pub tls: Option<ListenerTls>,
+    /// Serve HTTP/2 cleartext (h2c, prior knowledge) on this plain
+    /// listener — containers/service meshes speak h2c without TLS.
+    #[serde(default)]
+    pub h2c: bool,
 }
 
 /// TLS material for a listener.

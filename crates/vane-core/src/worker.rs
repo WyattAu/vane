@@ -396,6 +396,7 @@ impl WorkerState {
     /// crash triage (compiled out in release... kept as a parameter so the
     /// next debug session can re-enable the trace in one line).
     pub(crate) fn close_session(&mut self, slot: u32, generation: u16, reason: &str) {
+        eprintln!("ACCDBG close slot={slot} reason={reason}");
         // vane-core stays dependency-light: no tracing here.
         let _ = reason;
         if !self.valid(slot, generation) {
@@ -806,7 +807,12 @@ impl WorkerState {
     fn maybe_finish(&mut self, slot: u32, generation: u16) {
         let done = self.slab.get(slot).is_some_and(|s| {
             s.downstream_eof
-                && s.upstream_eof
+                // A session whose upstream half never existed (client
+                // connected + dropped before any dial) must close too —
+                // otherwise it leaks its fd and its mio registration,
+                // and the REUSED fd number later collides with the
+                // stale registration (dial failures, hung sessions).
+                && (s.upstream_eof || s.upstream.is_none())
                 && s.wq.is_empty()
                 && s.pending_down.is_empty()
                 && s.uwq.is_empty()
@@ -877,6 +883,7 @@ impl WorkerState {
                         if let Some(rs) = s.rslot.take() {
                             self.pool.release(rs);
                         }
+                        s.downstream_eof = true;
                         let mut io = self.io_for(slot, generation);
                         h.on_downstream_eof(&mut io);
                         self.maybe_finish(slot, generation);
@@ -1044,6 +1051,7 @@ impl WorkerState {
                 if let Some(rs) = s.urslot.take() {
                     self.pool.release(rs);
                 }
+                s.upstream_eof = true;
                 let mut io = self.io_for(slot, generation);
                 h.on_upstream_eof(&mut io);
                 self.maybe_finish(slot, generation);
@@ -1200,6 +1208,7 @@ impl WorkerState {
             s.downstream = StreamFd(fd);
         }
         std::mem::forget(guard); // ownership moved into the session
+        eprintln!("ACCDBG accept fd={fd} slot={slot} gen={generation}");
         let token = Token::new(Op::DownstreamRead, slot, generation, 0);
         if self.engine.add_stream(fd, token).is_err() {
             self.close_session(slot, generation, "add-stream-failed");

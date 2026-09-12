@@ -33,6 +33,7 @@ fn make_proxy(
             access: None,
             jwt: None,
             shared_rate_limit: None,
+            h2c: false,
             l4_splice: false,
         },
         0,
