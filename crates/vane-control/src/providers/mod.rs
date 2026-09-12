@@ -43,6 +43,8 @@ pub struct ProviderRouteSpec {
     pub priority: u32,
     /// HTTP/2 upstream (prior knowledge).
     pub upstream_h2: bool,
+    /// Gzip-compress responses on this route.
+    pub compression: bool,
 }
 
 /// Builds a route from provider-discovered backends, sharing health
@@ -68,6 +70,7 @@ pub fn build_route(spec: ProviderRouteSpec, health: &crate::health::HealthMap) -
         timeout_ms: None,
         backends,
         upstream_h2: spec.upstream_h2,
+        compression: spec.compression,
         policy: vane_router::Policy::P2C,
         priority: spec.priority,
     }
@@ -92,6 +95,7 @@ mod build_route_tests {
                 strip_prefix: Some("/v1".into()),
                 priority: 9,
                 upstream_h2: true,
+                compression: false,
             },
             &health,
         );
@@ -118,6 +122,7 @@ mod build_route_tests {
                 strip_prefix: None,
                 priority: 0,
                 upstream_h2: false,
+                compression: false,
             },
             &health,
         )
@@ -138,6 +143,7 @@ mod build_route_tests {
                 strip_prefix: None,
                 priority: 0,
                 upstream_h2: false,
+                compression: false,
             },
             &health,
         );

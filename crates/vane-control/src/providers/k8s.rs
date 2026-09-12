@@ -168,6 +168,7 @@ impl K8sProvider {
                                             strip_prefix: None,
                                             priority: 30,
                                             upstream_h2: false,
+                                            compression: false,
                                         },
                                         &health,
                                     ));

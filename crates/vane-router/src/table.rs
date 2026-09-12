@@ -28,6 +28,8 @@ pub struct RouteEntry {
     /// Speak HTTP/2 to this cluster's backends (prior knowledge). The
     /// engine's zero-copy h1 pool ignores this; the h2 edge honors it.
     pub upstream_h2: bool,
+    /// Gzip-compress compressible responses on this route.
+    pub compression: bool,
     /// LB policy for the cluster.
     pub policy: Policy,
     /// Shared gauges for the backend list.
@@ -165,6 +167,8 @@ pub struct RouteBuilder {
     pub policy: Policy,
     /// HTTP/2 upstream (prior knowledge).
     pub upstream_h2: bool,
+    /// Gzip-compress compressible responses on this route.
+    pub compression: bool,
     /// Priority.
     pub priority: u32,
 }
@@ -195,6 +199,7 @@ impl RouteBuilder {
             timeout_ms: self.timeout_ms,
             backends,
             upstream_h2: self.upstream_h2,
+            compression: self.compression,
             policy: self.policy,
             gauges,
             priority: self.priority,

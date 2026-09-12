@@ -91,6 +91,7 @@ pub fn receive_inherited(
                 timeout_ms: None,
                 backends,
                 upstream_h2: false,
+                compression: false,
                 policy: vane_router::Policy::P2C,
                 priority: 20,
             };
@@ -872,6 +873,7 @@ cluster = "up"
                     1,
                 )],
                 upstream_h2: false,
+                compression: false,
                 policy: vane_router::Policy::P2C,
                 gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
                 priority: 0,
@@ -912,6 +914,7 @@ mod handover_helper_tests {
                     1,
                 )],
                 upstream_h2: false,
+                compression: false,
                 policy: vane_router::Policy::P2C,
                 gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
                 priority: 0,

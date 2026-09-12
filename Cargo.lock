@@ -3784,6 +3784,7 @@ dependencies = [
  "clap",
  "envstack",
  "errcode",
+ "flate2",
  "h2",
  "h3",
  "h3-quinn",
@@ -3909,6 +3910,7 @@ version = "0.2.0"
 dependencies = [
  "bytes",
  "criterion",
+ "flate2",
  "httparse",
  "thiserror 2.0.20",
  "vane-observe",

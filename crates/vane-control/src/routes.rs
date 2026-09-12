@@ -28,6 +28,7 @@ pub fn static_routes(cfg: &VaneConfig, health: &HealthMap) -> Vec<RouteBuilder> 
             timeout_ms: r.timeout_ms,
             backends,
             upstream_h2: cluster.http2,
+            compression: cluster.compression,
             policy: cluster.policy.into(),
             priority: r.priority,
         });
@@ -76,6 +77,7 @@ mod resolve_tests {
             policy: Default::default(),
             health_path: None,
             http2: false,
+            compression: false,
         };
         let backends = resolve_backends(&cluster, &health);
         assert_eq!(backends.len(), 2);
@@ -90,6 +92,7 @@ mod resolve_tests {
             policy: Default::default(),
             health_path: None,
             http2: false,
+            compression: false,
         };
         let backends = resolve_backends(&cluster, &health);
         assert_eq!(backends.len(), 1, "localhost must resolve");
@@ -105,6 +108,7 @@ mod resolve_tests {
             policy: Default::default(),
             health_path: None,
             http2: false,
+            compression: false,
         };
         let backends = resolve_backends(&cluster, &health);
         assert!(

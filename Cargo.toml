@@ -82,6 +82,8 @@ zerocopy = { version = "0.8", features = ["derive"] }
 
 # Protocol / parsing
 httparse = "1.10"
+# Response compression (pure-Rust miniz backend)
+flate2 = "1"
 
 # Config / serialization
 serde = { version = "1", features = ["derive"] }

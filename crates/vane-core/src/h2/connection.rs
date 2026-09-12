@@ -334,6 +334,24 @@ impl Connection {
         self.streams.contains_key(&stream_id)
     }
 
+    /// Reserves `n` bytes of send credit for DATA the driver emits
+    /// directly (frame bytes assembled outside the engine). The engine
+    /// never sees those frames through [`Self::send_data`], so the
+    /// stream and connection windows must be debited here; peer
+    /// WINDOW_UPDATEs replenish via [`Self::handle_read`].
+    /// Returns the amount actually reserved (≤ n).
+    pub fn consume_send_budget(&mut self, stream_id: u32, n: usize) -> usize {
+        let Some(st) = self.streams.get_mut(&stream_id) else {
+            return 0;
+        };
+        let reserved = (n as i64)
+            .min(self.conn_send_window.max(0))
+            .min(st.send_window.max(0));
+        self.conn_send_window -= reserved;
+        st.send_window -= reserved;
+        reserved as usize
+    }
+
     /// Whether the peer sent GOAWAY.
     #[must_use]
     pub fn peer_goaway(&self) -> Option<(u32, u32)> {

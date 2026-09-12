@@ -71,6 +71,9 @@ struct ResponseTranslator {
     head_done: bool,
     /// END_STREAM emitted.
     done: bool,
+    /// Upstream bytes held while the head is incomplete (straddling
+    /// reads); drained into translation once the head parses.
+    head_buf: Vec<u8>,
 }
 
 impl H2Server {
@@ -279,27 +282,57 @@ impl H2Server {
             self.translator = Some(ResponseTranslator::new());
         }
         let mut out = Vec::new();
-        let mut rest = data;
-        let consumed_head = {
-            let t = self.translator.as_mut().expect("translator just created");
-            if t.head_done {
-                0
-            } else {
-                let consumed =
-                    t.translate_head(self.active_stream.unwrap_or(0), rest, &mut out, max_frame);
-                if consumed == 0 {
-                    return (out, false); // partial head — re-feed
+
+        // Phase 1: head. Upstream heads may straddle reads; the bytes
+        // are buffered in the translator until the head parses whole.
+        let head_done = self.translator.as_ref().is_some_and(|t| t.head_done);
+        if !head_done {
+            let parsed: Option<usize> = {
+                let t = self.translator.as_mut().expect("checked");
+                t.head_buf.extend_from_slice(data);
+                let scratch = t.head_buf.clone();
+                let mut storage =
+                    [httparse::EMPTY_HEADER; vane_proto::response::MAX_RESPONSE_HEADERS];
+                let mut resp = httparse::Response::new(&mut storage);
+                match resp.parse(&scratch) {
+                    Ok(httparse::Status::Complete(head_len)) => Some(head_len),
+                    _ => None,
                 }
-                consumed
+            };
+            let Some(head_len) = parsed else {
+                // Whole prefix stays buffered for the next read.
+                return (out, false);
+            };
+            // Draining borrows sequentially; each step takes what it
+            // needs before the next.
+            let head_bytes: Vec<u8> = {
+                let t = self.translator.as_mut().expect("checked");
+                t.head_buf.drain(..head_len).collect()
+            };
+            {
+                let t = self.translator.as_mut().expect("checked");
+                t.translate_head_bytes(
+                    self.active_stream.unwrap_or(0),
+                    &head_bytes,
+                    &mut out,
+                    max_frame,
+                );
             }
-        };
-        rest = &rest[consumed_head..];
-        if !rest.is_empty() {
-            self.queue_body(rest, &mut out, max_frame);
+            // Body bytes that rode behind the head in the same read.
+            let buffered = {
+                let t = self.translator.as_mut().expect("checked");
+                std::mem::take(&mut t.head_buf)
+            };
+            if !buffered.is_empty() {
+                self.queue_body(&buffered, &mut out, max_frame);
+            }
+        } else {
+            self.queue_body(data, &mut out, max_frame);
         }
         let done = self.translator.as_ref().is_some_and(|t| t.done);
         if done {
             self.translator = None;
+            self.active_stream = None;
         }
         (out, done)
     }
@@ -337,19 +370,18 @@ impl H2Server {
     fn queue_body(&mut self, data: &[u8], out: &mut Vec<Vec<u8>>, max_frame: usize) {
         let stream_id = self.active_stream.unwrap_or(0);
         let t = self.translator.as_mut().expect("body after head");
-        let mut window = self.conn.send_budget(stream_id);
         let mut offset = 0usize;
         loop {
             let want = data.len() - offset;
             if want == 0 {
                 break;
             }
-            let room = window.min(max_frame);
-            if room == 0 {
+            let room = max_frame;
+            // Debit the engine's windows for driver-emitted frames.
+            let take = self.conn.consume_send_budget(stream_id, room.min(want));
+            if take == 0 {
                 break;
             }
-            let take = want.min(room);
-            window -= take;
             t.sent += take as u64;
             let last = t.content_length.is_some_and(|len| t.sent >= len);
             if last {
@@ -415,50 +447,48 @@ impl ResponseTranslator {
             sent: 0,
             head_done: false,
             done: false,
+            head_buf: Vec::new(),
         }
     }
 
-    /// Parses the upstream HTTP/1.1 head and queues HEADERS frames.
-    fn translate_head(
+    /// Translates an already-parsed upstream head into HEADERS frames.
+    /// `head` must be a complete HTTP/1.1 response head (status line +
+    /// headers + blank line).
+    fn translate_head_bytes(
         &mut self,
         stream_id: u32,
-        data: &[u8],
+        head: &[u8],
         out: &mut Vec<Vec<u8>>,
         max_frame: usize,
-    ) -> usize {
+    ) {
         let mut storage = [httparse::EMPTY_HEADER; vane_proto::response::MAX_RESPONSE_HEADERS];
         let mut resp = httparse::Response::new(&mut storage);
-        match resp.parse(data) {
-            Ok(httparse::Status::Complete(head_len)) => {
-                let code = resp.code.unwrap_or(200);
-                let mut headers: Vec<(Vec<u8>, Vec<u8>)> =
-                    Vec::with_capacity(resp.headers.len() + 1);
-                headers.push((b":status".to_vec(), code.to_string().into_bytes()));
-                for h in resp.headers.iter() {
-                    let lname = h.name.to_ascii_lowercase();
-                    // Connection-scoped headers do not exist in h2
-                    // (RFC 9113 §8.2.2); Content-Length maps to the
-                    // body delimiter, not a header.
-                    if matches!(
-                        lname.as_bytes(),
-                        b"connection" | b"keep-alive" | b"transfer-encoding" | b"upgrade"
-                    ) {
-                        continue;
-                    }
-                    if lname == "content-length" {
-                        self.content_length = std::str::from_utf8(h.value)
-                            .ok()
-                            .and_then(|v| v.parse().ok());
-                        continue;
-                    }
-                    headers.push((lname.into_bytes(), h.value.to_vec()));
-                }
-                self.head_done = true;
-                out.extend(emit_header_block(stream_id, &headers, max_frame));
-                head_len
-            }
-            _ => 0, // partial head — the caller re-feeds
+        if resp.parse(head).is_err() {
+            return; // unreachable: the caller parsed this head already
         }
+        let code = resp.code.unwrap_or(200);
+        let mut headers: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(resp.headers.len() + 1);
+        headers.push((b":status".to_vec(), code.to_string().into_bytes()));
+        for h in resp.headers.iter() {
+            let lname = h.name.to_ascii_lowercase();
+            // Connection-scoped headers do not exist in h2 (RFC 9113
+            // §8.2.2); Content-Length maps to the body delimiter.
+            if matches!(
+                lname.as_bytes(),
+                b"connection" | b"keep-alive" | b"transfer-encoding" | b"upgrade"
+            ) {
+                continue;
+            }
+            if lname == "content-length" {
+                self.content_length = std::str::from_utf8(h.value)
+                    .ok()
+                    .and_then(|v| v.parse().ok());
+                continue;
+            }
+            headers.push((lname.into_bytes(), h.value.to_vec()));
+        }
+        self.head_done = true;
+        out.extend(emit_header_block(stream_id, &headers, max_frame));
     }
 }
 

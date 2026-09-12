@@ -23,6 +23,7 @@ fn test_router() -> Arc<RouteRouter> {
             timeout_ms: None,
             backends: Vec::new(),
             upstream_h2: false,
+            compression: false,
             policy: vane_router::Policy::P2C,
             gauges: Arc::new(vane_router::balancer::ConnGauges::new(0)),
             priority: 0,

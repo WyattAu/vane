@@ -20,6 +20,7 @@ fn config_with_cluster(cluster: &str, backends: &[&str]) -> VaneConfig {
             policy: Default::default(),
             health_path: None,
             http2: false,
+            compression: false,
         },
     );
     VaneConfig {
@@ -62,6 +63,7 @@ fn resolve_bridge_prefers_route_cluster() {
             policy: Default::default(),
             health_path: None,
             http2: false,
+            compression: false,
         },
     );
     cfg.routes = vec![RouteConfig {

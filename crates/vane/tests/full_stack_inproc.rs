@@ -1348,3 +1348,125 @@ workers = 1
     assert!(resp.contains("403"), "reject path: {resp:?}");
     assert!(resp.contains("rejected by plugin"), "body: {resp:?}");
 }
+
+/// Response compression: a cluster with `compression = true` gzips
+/// compressible responses when the client sends Accept-Encoding: gzip
+/// (chunked framing downstream); passthrough otherwise.
+#[test]
+fn gzip_compression_roundtrip() {
+    let _serial = lock_serial();
+    // Upstream: fixed JSON with content-type + length.
+    let body = r#"{"message":"compress me please","pad":"#;
+    let body = format!("{body}{}", "x".repeat(2000));
+    let body = format!("{}}}", &body[..body.len() - 1]);
+    let payload = body.into_bytes();
+    let expected = payload.clone();
+    let upstream = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let upstream_addr = upstream.local_addr().expect("addr");
+    let expected_head = payload.clone();
+    std::thread::spawn(move || {
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            expected_head.len()
+        )
+        .into_bytes();
+        for stream in upstream.incoming().flatten() {
+            let mut s = stream;
+            let mut buf = [0u8; 8192];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(&head);
+            let _ = s.write_all(&expected_head);
+        }
+    });
+
+    let port = free_port();
+    let (_dir, cfg) = temp_config(format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.up]
+backends = ["{upstream_addr}"]
+compression = true
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = true
+workers = 1
+"#
+    ));
+    spawn_proxy(cfg);
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    // With Accept-Encoding: gzip → chunked + gzipped (binary-safe raw read).
+    let mut raw = std::net::TcpStream::connect(proxy).expect("connect");
+    raw.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    raw.write_all(
+        b"GET /api/data HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n",
+    )
+    .expect("write");
+    let mut bytes = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut raw, &mut bytes);
+    let head_end = bytes
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("head");
+    let head = String::from_utf8_lossy(&bytes[..head_end]).into_owned();
+    assert!(
+        head.to_lowercase().contains("content-encoding: gzip"),
+        "{head}"
+    );
+    assert!(
+        head.to_lowercase().contains("transfer-encoding: chunked"),
+        "{head}"
+    );
+    assert!(!head.to_lowercase().contains("content-length"), "{head}");
+    let body = &bytes[head_end + 4..];
+    // Dechunk.
+    let mut dechunked = Vec::new();
+    let mut pos = 0usize;
+    while pos < body.len() {
+        let Some(line_end) = body[pos..].windows(2).position(|w| w == b"\r\n") else {
+            break;
+        };
+        let size = usize::from_str_radix(
+            std::str::from_utf8(&body[pos..pos + line_end]).expect("hex"),
+            16,
+        )
+        .expect("chunk size");
+        if size == 0 {
+            break;
+        }
+        dechunked.extend_from_slice(&body[pos + line_end + 2..pos + line_end + 2 + size]);
+        pos += line_end + 2 + size + 2;
+    }
+    // Gunzip via the same decoder the engine uses (round-trip check).
+    let decoded = {
+        // Simple one-shot decoder over the gzip stream.
+        let mut dec = flate2::read::GzDecoder::new(&dechunked[..]);
+        let mut d = Vec::new();
+        use std::io::Read as _;
+        dec.read_to_end(&mut d).expect("gunzip");
+        d
+    };
+    assert_eq!(decoded, expected, "decompressed body matches upstream");
+
+    // Without Accept-Encoding → verbatim passthrough.
+    let resp = request(
+        proxy,
+        b"GET /api/data HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+    );
+    let resp_bytes = resp.clone().into_bytes();
+    assert!(
+        resp_bytes.windows(payload.len()).any(|w| w == &payload[..]),
+        "passthrough body intact"
+    );
+    assert!(!resp.to_lowercase().contains("content-encoding: gzip"));
+}

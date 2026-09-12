@@ -9,6 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+flate2 = { workspace = true }
 httparse = { workspace = true }
 bytes = { workspace = true }
 vane-observe = { workspace = true }

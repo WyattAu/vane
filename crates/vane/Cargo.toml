@@ -72,6 +72,7 @@ h3 = { workspace = true, optional = true }
 h3-quinn = { workspace = true, optional = true }
 
 [dev-dependencies]
+flate2 = { workspace = true }
 tempfile = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 h2 = { workspace = true }

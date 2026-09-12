@@ -110,6 +110,10 @@ pub struct ClusterConfig {
     /// Active health check path (HTTP GET); empty disables HTTP checks.
     #[serde(default)]
     pub health_path: Option<String>,
+    /// Gzip-compress compressible responses for routes on this cluster
+    /// (h1 downstream relay).
+    #[serde(default)]
+    pub compression: bool,
     /// Speak HTTP/2 to this cluster's backends (prior knowledge).
     /// Honored by the h2 edge; the engine's h1 pool ignores it.
     #[serde(default)]
