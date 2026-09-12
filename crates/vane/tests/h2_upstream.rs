@@ -899,22 +899,21 @@ async fn large_body_streams_through_edge() {
 /// request body streams to an echoing h1 upstream, response streams
 /// back through the engine's flow-controlled DATA relay.
 ///
-/// INVESTIGATION (narrowed): response streaming past the initial
-/// 65535 window stalls in one of two timing-dependent shapes:
-/// (A) response resolves, body stops at exactly 65535, connection
-/// reset; (B) the response future never resolves. Engine-side traces
-/// (intake/write/response_bytes/WU logs) show: the shim receives ZERO
-/// WINDOW_UPDATE events after the response begins — the client either
-/// never sends them (shape B: its response future never resolved, so
-/// the test never reads chunks or releases capacity) or they are never
-/// read (shape A). Verified correct: held-byte accounting, EOF
-/// semantics (CL bodies no longer truncated at upstream EOF), window
-/// debits via consume_send_budget, deadline handling, downstream
-/// read re-arming (no backpressure pauses observed). Next step: test-
-/// side client trace — determine why the h2 crate's connection task
-/// does not surface HEADERS in shape B, and whether shape A's reset
-/// originates from our close paths (close_session never logged).
-#[ignore = "INVESTIGATION: response-side flow control beyond 65535 (see doc comment)"]
+/// INVESTIGATION (narrowed further): sub-window bodies (4 KiB) pass
+/// end-to-end after the h2_write flush-ordering fix (frames must flush
+/// before check_done queues a FIN). Bodies beyond one window (70 KB+)
+/// stall: the shim receives exactly two intakes (preface + first
+/// flight), the client exhausts its initial send window, and no third
+/// downstream intake ever happens — the engine stops re-delivering
+/// reads after the upstream dial completes inside handle_request.
+/// Verified NOT the cause: pool exhaustion, backpressure pauses, TLS
+/// record corruption (record headers valid; mid-record splits handled
+/// by the backlog), mio epoll sweep starvation (fix applied anyway),
+/// io_uring vs mio (both fail), request-head translation. NEXT: build
+/// an h2c (cleartext) harness using our own H2Upstream driver as the
+/// client — removes the h2-crate/tokio client from the equation and
+/// makes the intake starvation directly observable.
+#[ignore = "INVESTIGATION: response bodies beyond one window (65535) stall — see doc comment"]
 #[tokio::test]
 async fn large_body_streams_native_engine() {
     let _serial = lock_serial();
@@ -942,7 +941,6 @@ async fn large_body_streams_native_engine() {
                         break;
                     }
                 }
-                let mut buf = Vec::new();
                 let head_str = String::from_utf8_lossy(&head).into_owned();
                 let content_length = head_str
                     .to_ascii_lowercase()
@@ -950,7 +948,8 @@ async fn large_body_streams_native_engine() {
                     .find_map(|l| l.strip_prefix("content-length:"))
                     .and_then(|v| v.trim().parse::<usize>().ok())
                     .unwrap_or(0);
-                buf.resize(content_length, 0);
+                #[allow(clippy::vec_init_then_push)] // test echo: explicit zero-fill
+                let mut buf = vec![0u8; content_length];
                 if s.read_exact(&mut buf).await.is_err() {
                     return;
                 }
@@ -1025,13 +1024,12 @@ workers = 1
                 }))
         }));
         if let Err(p) = rt {
-            if let Some(m) = p.downcast_ref::<&str>() {
-                eprintln!("SERV Panic: {m}");
-            } else if let Some(m) = p.downcast_ref::<String>() {
-                eprintln!("SERV Panic: {m}");
-            } else {
-                eprintln!("SERV Panic: (non-string)");
-            }
+            let msg = p
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| p.downcast_ref::<&str>().map(|m| m.to_string()))
+                .unwrap_or_else(|| "(non-string panic)".into());
+            eprintln!("SERV Panic: {msg}");
         }
     });
     let edge: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");

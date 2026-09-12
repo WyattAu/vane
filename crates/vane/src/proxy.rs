@@ -618,6 +618,7 @@ impl HttpProxy {
     #[cfg(feature = "h2")]
     fn h2up_intake(&mut self, io: &mut SessionIo<'_>, data: &[u8]) {
         let slot = io.slot_index();
+        eprintln!("H2UPDBG intake {} bytes", data.len());
         let mut events = Vec::new();
         {
             let Some(h2up) = self.conn(slot).h2up.as_mut() else {
@@ -674,11 +675,14 @@ impl HttpProxy {
         for f in frames {
             out.extend_from_slice(&f);
         }
+        // Flush the frames BEFORE completing the transaction: check_done
+        // may queue a FIN (close_after) or park the session, and bytes
+        // queued after the FIN would never reach the client.
+        self.h2_flush(io);
         if done {
             self.conn(slot).body = BodyFraming::Done;
             self.check_done(io);
         }
-        self.h2_flush(io);
     }
 
     /// Upstream EOF on an h2 transaction: end the stream (empty DATA
