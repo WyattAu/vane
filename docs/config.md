@@ -135,3 +135,59 @@ Fields per line: `ts_ns`, `duration_us`, `worker`, `status`,
 `bytes_out`, `client`, `upstream` (null for locally-answered requests),
 `method`, `host`, `path`, `trace_id` (when W3C context propagated).
 A full ring drops records (counted) rather than blocking workers.
+
+## `[rate_limit]` — process-wide rate limiting
+
+One GCRA bucket shared by **all** workers: the configured rate is the
+true aggregate, not per-worker. Over-budget requests are rejected
+`429` before routing.
+
+| field | type | default | notes |
+|---|---|---|---|
+| `rps` | int | — | sustained requests/second (aggregate) |
+| `burst` | int | `100` | instantaneous allowance |
+
+Absent section = unlimited.
+
+## `[jwt]` — bearer authentication
+
+Requests to edge listeners must carry `Authorization: Bearer <jwt>`;
+failures are `401`. Checked before routing.
+
+| field | type | notes |
+|---|---|---|
+| `jwks_path` | string | JWKS file (RS256/ES256, `kid`-matched) |
+| `secret_path` | string | HMAC secret file (HS256; trailing newline trimmed) |
+| `issuer` | string | required `iss` claim (optional) |
+| `audience` | string | required `aud` claim (optional) |
+
+Either material file is required. The file is reloaded when its mtime
+changes — rotate keys without restart.
+
+## cluster `compression` — response gzip
+
+```toml
+[clusters.api]
+backends = ["127.0.0.1:9001"]
+compression = true
+```
+
+When the client sends `Accept-Encoding: gzip` and the upstream response
+is a compressible type (text/*, JSON, XML, JS, SVG, wasm) without an
+existing encoding, the body is gzipped and relayed chunked
+(`Content-Encoding: gzip`, `Transfer-Encoding: chunked`). Otherwise
+responses pass through verbatim. HTTP/2 (engine path) responses are not
+compressed in 0.2.
+
+## cluster `outlier` — ejection
+
+```toml
+[clusters.api.outlier]
+consecutive_failures = 5   # dial errors or 5xx
+ejection_ms = 30000
+```
+
+A backend reaching `consecutive_failures` is skipped by the balancer
+for `ejection_ms` (it remains the fallback of last resort when nothing
+else is live); any non-5xx completion resets its streak. Independent of
+the active health checker.
