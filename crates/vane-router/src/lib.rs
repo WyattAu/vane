@@ -18,6 +18,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 pub mod balancer;
+pub mod outlier;
 pub mod table;
 pub mod trie;
 

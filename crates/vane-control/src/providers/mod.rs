@@ -45,6 +45,8 @@ pub struct ProviderRouteSpec {
     pub upstream_h2: bool,
     /// Gzip-compress responses on this route.
     pub compression: bool,
+    /// Per-backend outlier ejection (absent = disabled).
+    pub outlier: Option<crate::config::OutlierConfig>,
 }
 
 /// Builds a route from provider-discovered backends, sharing health
@@ -61,6 +63,10 @@ pub fn build_route(spec: ProviderRouteSpec, health: &crate::health::HealthMap) -
             b
         })
         .collect();
+    let outlier = spec.outlier.map(|o| {
+        let addrs: Vec<std::net::SocketAddr> = backends.iter().map(|b| b.addr).collect();
+        vane_router::outlier::OutlierSet::new(addrs, o.consecutive_failures, o.ejection_ms).shared()
+    });
     RouteBuilder {
         host: spec.host,
         pattern: spec.pattern,
@@ -71,6 +77,7 @@ pub fn build_route(spec: ProviderRouteSpec, health: &crate::health::HealthMap) -
         backends,
         upstream_h2: spec.upstream_h2,
         compression: spec.compression,
+        outlier,
         policy: vane_router::Policy::P2C,
         priority: spec.priority,
     }
@@ -96,6 +103,7 @@ mod build_route_tests {
                 priority: 9,
                 upstream_h2: true,
                 compression: false,
+                outlier: None,
             },
             &health,
         );
@@ -123,6 +131,7 @@ mod build_route_tests {
                 priority: 0,
                 upstream_h2: false,
                 compression: false,
+                outlier: None,
             },
             &health,
         )
@@ -144,6 +153,7 @@ mod build_route_tests {
                 priority: 0,
                 upstream_h2: false,
                 compression: false,
+                outlier: None,
             },
             &health,
         );

@@ -30,6 +30,8 @@ pub struct RouteEntry {
     pub upstream_h2: bool,
     /// Gzip-compress compressible responses on this route.
     pub compression: bool,
+    /// Per-backend outlier ejection (absent = disabled).
+    pub outlier: Option<Arc<crate::outlier::OutlierSet>>,
     /// LB policy for the cluster.
     pub policy: Policy,
     /// Shared gauges for the backend list.
@@ -169,6 +171,8 @@ pub struct RouteBuilder {
     pub upstream_h2: bool,
     /// Gzip-compress compressible responses on this route.
     pub compression: bool,
+    /// Per-backend outlier ejection (absent = disabled).
+    pub outlier: Option<Arc<crate::outlier::OutlierSet>>,
     /// Priority.
     pub priority: u32,
 }
@@ -200,6 +204,7 @@ impl RouteBuilder {
             backends,
             upstream_h2: self.upstream_h2,
             compression: self.compression,
+            outlier: self.outlier,
             policy: self.policy,
             gauges,
             priority: self.priority,

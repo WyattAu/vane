@@ -1253,6 +1253,15 @@ impl Handler for HttpProxy {
                 .errors
                 .inc(&self.config.registry);
         }
+        if let (Some(outlier), Some(addr)) = (
+            self.conns
+                .get(&slot)
+                .and_then(|c| c.route.as_ref())
+                .and_then(|r| r.outlier.clone()),
+            self.conns.get(&slot).and_then(|c| c.upstream_addr),
+        ) {
+            outlier.record_failure(addr);
+        }
         self.log(LogLevel::Warn, &format!("upstream error: {err}"));
         self.upstream_failed(io);
     }
@@ -1479,9 +1488,20 @@ impl HttpProxy {
             }
         }
 
-        // Pick a backend.
+        // Pick a backend (skipping outliers when detection is enabled).
         let mut balancer = route.balancer(u64::from(slot) ^ started.elapsed().as_nanos() as u64);
-        let Some(addr) = balancer.pick_addr() else {
+        let mut addr = balancer.pick_addr();
+        if let (Some(outlier), Some(picked)) = (&route.outlier, addr) {
+            if outlier.is_ejected(picked) {
+                // Prefer a live backend; the ejected one is the fallback
+                // of last resort (mirrors pick_addr_except semantics).
+                addr = balancer.pick_addr_except(Some(picked));
+                if addr.is_none() {
+                    addr = Some(picked);
+                }
+            }
+        }
+        let Some(addr) = addr else {
             self.respond_full(io, Status::ServiceUnavailable, "no healthy upstream\n");
             return;
         };
@@ -1543,6 +1563,9 @@ impl HttpProxy {
         if !io.connect_upstream(addr) {
             self.metrics.upstream_errors.inc(&self.config.registry);
             self.breaker.record_failure(&route.cluster);
+            if let Some(outlier) = &route.outlier {
+                outlier.record_failure(addr);
+            }
             self.upstream_failed(io);
             return;
         }
@@ -1645,8 +1668,16 @@ impl HttpProxy {
                     .unwrap_or(u64::MAX),
             );
             self.access_emit(io, started);
-            if let Some(route) = &self.conns.get(&slot).expect("conn").route {
+            let conn = self.conns.get(&slot).expect("conn");
+            if let Some(route) = &conn.route {
                 self.breaker.record_success(&route.cluster);
+                if let (Some(outlier), Some(addr)) = (&route.outlier, conn.upstream_addr) {
+                    if conn.resp_status >= 500 {
+                        outlier.record_failure(addr);
+                    } else {
+                        outlier.record_success(addr);
+                    }
+                }
             }
             if close_after {
                 // FIN after the queued response bytes flush (deferred).

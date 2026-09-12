@@ -23,6 +23,7 @@ fn entry(host: Option<String>, pattern: String) -> RouteEntry {
         )],
         upstream_h2: false,
         compression: false,
+        outlier: None,
         policy: Policy::P2C,
         priority: 0,
     }

@@ -138,6 +138,7 @@ impl DockerProvider {
                             builders.push(build_route(
                                 ProviderRouteSpec {
                                     compression: false,
+                                    outlier: None,
                                     host: r.host.clone(),
                                     pattern: r.pattern.clone(),
                                     cluster: r.cluster.clone(),

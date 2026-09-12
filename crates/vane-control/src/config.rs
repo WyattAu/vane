@@ -117,6 +117,9 @@ pub struct ClusterConfig {
     /// (h1 downstream relay).
     #[serde(default)]
     pub compression: bool,
+    /// Per-backend outlier ejection (absent = disabled).
+    #[serde(default)]
+    pub outlier: Option<OutlierConfig>,
     /// Speak HTTP/2 to this cluster's backends (prior knowledge).
     /// Honored by the h2 edge; the engine's h1 pool ignores it.
     #[serde(default)]
@@ -361,6 +364,33 @@ impl Default for SidecarConfig {
             slots: 16,
         }
     }
+}
+
+/// Per-backend outlier ejection policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutlierConfig {
+    /// Consecutive failures (dial errors or 5xx) before ejection.
+    #[serde(default = "default_outlier_threshold")]
+    pub consecutive_failures: u32,
+    /// Ejection duration in milliseconds.
+    #[serde(default = "default_outlier_ejection_ms")]
+    pub ejection_ms: u64,
+}
+
+fn default_outlier_threshold() -> u32 {
+    5
+}
+
+fn default_outlier_ejection_ms() -> u64 {
+    30_000
+}
+
+/// Per-cluster outlier detection settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterOutlierConfig {
+    /// Per-backend outlier ejection policy.
+    #[serde(default)]
+    pub outlier: Option<OutlierConfig>,
 }
 
 /// JWT bearer authentication for edge listeners.

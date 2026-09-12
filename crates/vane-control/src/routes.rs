@@ -19,6 +19,11 @@ pub fn static_routes(cfg: &VaneConfig, health: &HealthMap) -> Vec<RouteBuilder> 
         if backends.is_empty() {
             continue;
         }
+        let outlier = cluster.outlier.as_ref().map(|o| {
+            let addrs: Vec<std::net::SocketAddr> = backends.iter().map(|b| b.addr).collect();
+            vane_router::outlier::OutlierSet::new(addrs, o.consecutive_failures, o.ejection_ms)
+                .shared()
+        });
         out.push(RouteBuilder {
             host: r.host.clone(),
             pattern: r.pattern.clone(),
@@ -29,6 +34,7 @@ pub fn static_routes(cfg: &VaneConfig, health: &HealthMap) -> Vec<RouteBuilder> 
             backends,
             upstream_h2: cluster.http2,
             compression: cluster.compression,
+            outlier,
             policy: cluster.policy.into(),
             priority: r.priority,
         });
@@ -78,6 +84,7 @@ mod resolve_tests {
             health_path: None,
             http2: false,
             compression: false,
+            outlier: None,
         };
         let backends = resolve_backends(&cluster, &health);
         assert_eq!(backends.len(), 2);
@@ -93,6 +100,7 @@ mod resolve_tests {
             health_path: None,
             http2: false,
             compression: false,
+            outlier: None,
         };
         let backends = resolve_backends(&cluster, &health);
         assert_eq!(backends.len(), 1, "localhost must resolve");
@@ -109,6 +117,7 @@ mod resolve_tests {
             health_path: None,
             http2: false,
             compression: false,
+            outlier: None,
         };
         let backends = resolve_backends(&cluster, &health);
         assert!(
