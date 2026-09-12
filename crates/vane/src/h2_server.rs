@@ -22,6 +22,18 @@
 
 use vane_core::h2::connection::{Connection, ConnectionConfig, Event, Role};
 
+/// What the driver should do when the upstream EOFs mid-response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EofOutcome {
+    /// Body still flowing (held bytes) — keep the transaction open.
+    Continue,
+    /// Response fully emitted (END_STREAM sent) — finish the
+    /// transaction.
+    Completed,
+    /// Upstream died before the declared Content-Length — close.
+    Truncated,
+}
+
 /// Engine events the driver must act on.
 #[derive(Debug)]
 pub enum H2Event {
@@ -339,10 +351,22 @@ impl H2Server {
 
     /// Upstream EOF with an EOF-delimited (or empty) body: end the
     /// stream. Returns frames plus whether the response completed now.
-    pub fn response_eof(&mut self) -> (Vec<Vec<u8>>, bool) {
+    pub fn response_eof(&mut self) -> (Vec<Vec<u8>>, EofOutcome) {
         let Some(t) = self.translator.as_mut() else {
-            return (Vec::new(), false);
+            return (Vec::new(), EofOutcome::Continue);
         };
+        // Content-Length bodies: the upstream closing is EXPECTED before
+        // the client has drained everything — held bytes keep flowing on
+        // credit, and completion fires from take_held instead. Ending
+        // the stream here would cut off delivered body.
+        if t.head_done && t.content_length.is_some() {
+            if self.held.is_empty() && t.sent < t.content_length.expect("checked") {
+                // Upstream died mid-body with nothing left to send.
+                return (Vec::new(), EofOutcome::Truncated);
+            }
+            return (Vec::new(), EofOutcome::Continue);
+        }
+        // EOF-delimited body: the upstream EOF IS the end.
         let stream_id = self.active_stream.unwrap_or(0);
         let mut out = Vec::new();
         if !t.done {
@@ -358,12 +382,9 @@ impl H2Server {
             out.push(frame);
             t.done = true;
         }
-        let done = t.done;
-        if done {
-            self.translator = None;
-            self.active_stream = None;
-        }
-        (out, done)
+        self.translator = None;
+        self.active_stream = None;
+        (out, EofOutcome::Completed)
     }
 
     /// Queues body bytes, honoring the send window; excess held.
@@ -398,16 +419,23 @@ impl H2Server {
         }
     }
 
-    /// Retries held bytes after WINDOW_UPDATE credit.
-    pub fn take_held(&mut self) -> Vec<Vec<u8>> {
+    /// Retries held bytes after WINDOW_UPDATE credit. The bool reports
+    /// whether the response completed now (END_STREAM emitted) — the
+    /// driver must finish the transaction when true.
+    pub fn take_held(&mut self) -> (Vec<Vec<u8>>, bool) {
         if self.held.is_empty() {
-            return Vec::new();
+            return (Vec::new(), false);
         }
         let held = std::mem::take(&mut self.held);
         let max_frame = self.conn.peer_max_frame_size();
         let mut out = Vec::new();
         self.queue_body(&held, &mut out, max_frame);
-        out
+        let done = self.translator.as_ref().is_some_and(|t| t.done);
+        if done {
+            self.translator = None;
+            self.active_stream = None;
+        }
+        (out, done)
     }
 
     /// Marks the active stream finished (transaction complete): future

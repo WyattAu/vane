@@ -899,17 +899,21 @@ async fn large_body_streams_through_edge() {
 /// request body streams to an echoing h1 upstream, response streams
 /// back through the engine's flow-controlled DATA relay.
 ///
-/// INVESTIGATION (next session): small responses stream fine; at sizes
-/// beyond the initial 65535 window the response stalls after exactly
-/// one window and the connection is reset. The request side (same
-/// mechanics, reverse direction) streams 1 MiB correctly. Suspects,
-/// in order: (1) the shim's SendCredit path — take_held may run
-/// before the client's WINDOW_UPDATE is applied to the engine's
-/// send windows, or repeatedly with stale credit; (2) check_done /
-/// park_upstream interacting with in-flight held bytes; (3) the
-/// FirstByte deadline conversion for the h2 arm (now cleared, but
-/// verify on_deadline ordering). All sub-window e2e + h2spec 44/44
-/// pass; this is response-side flow control beyond one window only.
+/// INVESTIGATION (narrowed): response streaming past the initial
+/// 65535 window stalls in one of two timing-dependent shapes:
+/// (A) response resolves, body stops at exactly 65535, connection
+/// reset; (B) the response future never resolves. Engine-side traces
+/// (intake/write/response_bytes/WU logs) show: the shim receives ZERO
+/// WINDOW_UPDATE events after the response begins — the client either
+/// never sends them (shape B: its response future never resolved, so
+/// the test never reads chunks or releases capacity) or they are never
+/// read (shape A). Verified correct: held-byte accounting, EOF
+/// semantics (CL bodies no longer truncated at upstream EOF), window
+/// debits via consume_send_budget, deadline handling, downstream
+/// read re-arming (no backpressure pauses observed). Next step: test-
+/// side client trace — determine why the h2 crate's connection task
+/// does not surface HEADERS in shape B, and whether shape A's reset
+/// originates from our close paths (close_session never logged).
 #[ignore = "INVESTIGATION: response-side flow control beyond 65535 (see doc comment)"]
 #[tokio::test]
 async fn large_body_streams_native_engine() {

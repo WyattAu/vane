@@ -483,7 +483,7 @@ impl HttpProxy {
             }
             crate::h2_server::H2Event::SendCredit => {
                 let slot = io.slot_index();
-                let frames = {
+                let (frames, done) = {
                     let Some(h2s) = self.conn(slot).h2.as_mut() else {
                         return;
                     };
@@ -492,7 +492,13 @@ impl HttpProxy {
                 for f in frames {
                     self.conn(slot).h2_out.extend_from_slice(&f);
                 }
-                self.h2_flush(io);
+                if done {
+                    self.conn(slot).body = BodyFraming::Done;
+                    self.h2_flush(io);
+                    self.check_done(io);
+                } else {
+                    self.h2_flush(io);
+                }
             }
         }
     }
@@ -523,7 +529,7 @@ impl HttpProxy {
     #[cfg(feature = "h2")]
     fn h2_upstream_eof(&mut self, io: &mut SessionIo<'_>) {
         let slot = io.slot_index();
-        let (frames, done) = {
+        let (frames, outcome) = {
             let Some(h2s) = self.conn(slot).h2.as_mut() else {
                 return;
             };
@@ -533,11 +539,23 @@ impl HttpProxy {
         for f in frames {
             out.extend_from_slice(&f);
         }
-        if done {
-            self.conn(slot).body = BodyFraming::Done;
-            self.check_done(io);
+        match outcome {
+            crate::h2_server::EofOutcome::Completed => {
+                self.conn(slot).body = BodyFraming::Done;
+                self.h2_flush(io);
+                self.check_done(io);
+            }
+            crate::h2_server::EofOutcome::Truncated => {
+                // Upstream died before its declared Content-Length:
+                // nothing honest to send — drop the connection.
+                self.log(LogLevel::Warn, "upstream truncated h2 response; closing");
+                io.close();
+            }
+            crate::h2_server::EofOutcome::Continue => {
+                // Held body bytes keep flowing on client credit.
+                self.h2_flush(io);
+            }
         }
-        self.h2_flush(io);
     }
 
     /// Drains engine-queued frames and the response frame buffer to

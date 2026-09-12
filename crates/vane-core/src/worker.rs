@@ -620,7 +620,9 @@ impl WorkerState {
             return;
         }
         if s.rslot.is_none() {
-            let Some(rs) = self.pool.take() else { return }; // backpressure
+            let Some(rs) = self.pool.take() else {
+                return;
+            }; // backpressure
             s.rslot = Some(rs);
         }
         let Some(rs) = s.rslot else { return };
