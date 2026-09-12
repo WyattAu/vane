@@ -1470,3 +1470,74 @@ workers = 1
     );
     assert!(!resp.to_lowercase().contains("content-encoding: gzip"));
 }
+
+/// JWT bearer authentication: requests without/with an invalid token
+/// are rejected 401; a valid HS256 token (secret file material) passes
+/// through to the upstream.
+#[test]
+fn jwt_auth_gates_the_edge() {
+    let _serial = lock_serial();
+    let upstream = spawn_upstream();
+    let port = free_port();
+
+    // Secret material + a valid token minted offline.
+    let auth_dir = tempfile::tempdir().expect("auth dir");
+    let secret_path = auth_dir.path().join("secret");
+    let secret_path = secret_path.to_str().expect("utf8").to_owned();
+    std::fs::write(&secret_path, b"edge-hmac-secret-1").expect("write secret");
+    let claims = serde_json::json!({"sub": "edge-user", "exp": 4102444800u64});
+    let key = jsonwebtoken::EncodingKey::from_secret(b"edge-hmac-secret-1");
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &claims,
+        &key,
+    )
+    .expect("sign");
+
+    let (_dir, cfg) = temp_config(format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.up]
+backends = ["{upstream}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[jwt]
+secret_path = "{secret_path}"
+
+[runtime]
+force_mio = true
+workers = 1
+"#
+    ));
+
+    spawn_proxy(cfg);
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    // No token -> 401.
+    let resp = request(
+        proxy,
+        b"GET /api/items HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+    );
+    assert!(resp.contains("401"), "missing token: {resp:?}");
+
+    // Bad token -> 401.
+    let resp = request(
+        proxy,
+        b"GET /api/items HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer junk.token.here\r\nConnection: close\r\n\r\n",
+    );
+    assert!(resp.contains("401"), "bad token: {resp:?}");
+
+    // Valid token -> 200 through to the upstream.
+    let req = format!(
+        "GET /api/items HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
+    let resp = request(proxy, req.as_bytes());
+    assert!(resp.contains("200 OK"), "valid token: {resp:?}");
+    assert!(resp.contains("hello-vane"), "upstream body: {resp:?}");
+}

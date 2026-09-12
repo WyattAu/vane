@@ -9,11 +9,15 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+jsonwebtoken = { workspace = true }
+serde_json = { workspace = true }
 throttle-kit = { workspace = true }
 breaker = { workspace = true }
 vane-observe = { workspace = true }
 
 [dev-dependencies]
+base64 = "0.22"
+rsa = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
 

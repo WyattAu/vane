@@ -31,6 +31,7 @@ fn make_proxy(
             plugins,
             http01_tokens: None,
             access: None,
+            jwt: None,
             l4_splice: false,
         },
         0,

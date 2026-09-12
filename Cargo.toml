@@ -99,6 +99,8 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 futures = "0.3"
 
 # TLS / crypto
+jsonwebtoken = "9"
+rsa = { version = "0.9", features = ["sha2"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
 # Pin ring: the tokio-rustls default pulls `rustls/aws_lc_rs`, which —

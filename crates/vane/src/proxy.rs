@@ -63,6 +63,8 @@ pub struct ProxyConfig {
     pub plugins: Vec<String>,
     /// Structured access log (`None` = disabled — no per-request work).
     pub access: Option<std::sync::Arc<vane_observe::access::AccessLog>>,
+    /// JWT bearer authentication (`None` = disabled).
+    pub jwt: Option<std::sync::Arc<vane_filters::jwt::JwtValidator>>,
     /// L4 splice mode (`mode = "tcp"` listeners): kernel zero-copy
     /// passthrough to the first matching route's cluster — no HTTP
     /// parsing on the data path.
@@ -1313,6 +1315,23 @@ impl HttpProxy {
             conn.resp_status = 0;
             conn.bytes_out = 0;
             conn.access_logged = false;
+        }
+
+        // JWT bearer authentication: before routing; health probes stay
+        // open (the admin plane has its own listener).
+        if let Some(jwt) = &self.config.jwt {
+            let authz = view
+                .header("authorization")
+                .and_then(|h| std::str::from_utf8(h).ok());
+            jwt.maybe_reload();
+            match authz.map(|a| jwt.verify(a)) {
+                Some(Ok(_claims)) => {}
+                _ => {
+                    self.respond_full(io, Status::Unauthorized, "unauthorized\n");
+                    io.close();
+                    return;
+                }
+            }
         }
 
         // ACME HTTP-01 challenges bypass routing entirely (RFC 8555 §8.3):

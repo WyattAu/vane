@@ -72,6 +72,8 @@ h3 = { workspace = true, optional = true }
 h3-quinn = { workspace = true, optional = true }
 
 [dev-dependencies]
+jsonwebtoken = { workspace = true }
+serde_json = { workspace = true }
 flate2 = { workspace = true }
 tempfile = { workspace = true }
 tower = { version = "0.5", features = ["util"] }

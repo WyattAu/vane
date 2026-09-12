@@ -24,6 +24,7 @@ use std::net::SocketAddr;
 use vane_observe::trace::TraceContext;
 
 pub mod builtins;
+pub mod jwt;
 pub mod pipeline;
 
 /// Worker log bridge hook (bin installs a thread-local sink).

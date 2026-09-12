@@ -513,6 +513,22 @@ pub async fn run(opts: RunOptions) -> i32 {
             if let Some(a) = &access {
                 access_logs.push(Arc::clone(a));
             }
+            // Per-worker JWT validator (mtime-triggered JWKS reload).
+            let jwt = config.jwt.as_ref().map(|j| {
+                match vane_filters::jwt::JwtValidator::new(
+                    j.jwks_path.as_deref().map(std::path::Path::new),
+                    j.secret_path.as_deref().map(std::path::Path::new),
+                    j.issuer.as_deref(),
+                    j.audience.as_deref(),
+                ) {
+                    Ok(v) => Some(Arc::new(v)),
+                    Err(e) => {
+                        eprintln!("vane: jwt auth disabled: {e}");
+                        None
+                    }
+                }
+            });
+            let jwt = jwt.flatten();
             tls_cfg_slots.push(tls_cfg.clone());
             let factory = WorkerFactory {
                 mode,
@@ -525,6 +541,7 @@ pub async fn run(opts: RunOptions) -> i32 {
                 plugins: config.plugins.iter().map(|p| p.path.clone()).collect(),
                 http01_tokens: http01_tokens.clone(),
                 access,
+                jwt,
             };
             match spawn_worker(
                 li * workers_per_listener + w,
@@ -724,6 +741,8 @@ struct WorkerFactory {
     http01_tokens: Option<Arc<std::sync::Mutex<HashMap<String, String>>>>,
     /// Per-worker access log (`None` = disabled).
     access: Option<Arc<vane_observe::access::AccessLog>>,
+    /// JWT bearer auth (`None` = disabled).
+    jwt: Option<Arc<vane_filters::jwt::JwtValidator>>,
 }
 
 impl vane_core::HandlerFactory for WorkerFactory {
@@ -746,6 +765,7 @@ impl vane_core::HandlerFactory for WorkerFactory {
                 plugins: self.plugins.clone(),
                 http01_tokens: self.http01_tokens.clone(),
                 access: self.access.clone(),
+                jwt: self.jwt.clone(),
                 l4_splice: self.mode == CoreMode::L4,
             },
             self.worker_id,

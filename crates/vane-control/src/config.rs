@@ -44,6 +44,9 @@ pub struct VaneConfig {
     /// Wasm plugins (feature `wasm`), applied to every request in order.
     #[serde(default)]
     pub plugins: Vec<PluginConfig>,
+    /// JWT bearer authentication (absent = disabled).
+    #[serde(default)]
+    pub jwt: Option<JwtConfig>,
     /// Runtime tuning.
     #[serde(default)]
     pub runtime: RuntimeConfig,
@@ -358,6 +361,21 @@ impl Default for SidecarConfig {
             slots: 16,
         }
     }
+}
+
+/// JWT bearer authentication for edge listeners.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JwtConfig {
+    /// JWKS file (RS256/ES256 public keys, with `kid`s).
+    pub jwks_path: Option<String>,
+    /// HMAC secret file (HS256; trailing newline trimmed).
+    pub secret_path: Option<String>,
+    /// Required issuer (`iss`), if any.
+    #[serde(default)]
+    pub issuer: Option<String>,
+    /// Required audience (`aud`), if any.
+    #[serde(default)]
+    pub audience: Option<String>,
 }
 
 /// A Wasm plugin loaded into every worker (feature `wasm`).
