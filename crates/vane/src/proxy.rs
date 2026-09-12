@@ -123,6 +123,9 @@ struct Conn {
     /// HTTP/2 server session (engine TLS path, ALPN negotiated h2).
     #[cfg(feature = "h2")]
     h2: Option<Box<crate::h2_server::H2Server>>,
+    /// HTTP/2 upstream client (route `upstream_h2 = true`).
+    #[cfg(feature = "h2")]
+    h2up: Option<Box<crate::h2_client::H2Upstream>>,
     /// h2 frames queued for the peer (drained on flush).
     #[cfg(feature = "h2")]
     h2_out: Vec<u8>,
@@ -500,6 +503,160 @@ impl HttpProxy {
                     self.h2_flush(io);
                 }
             }
+        }
+    }
+
+    /// The HTTP/1.1 upstream response path (also fed by the h2 upstream
+    /// client's synthetic h1 stream).
+    fn on_upstream_data_h1(&mut self, io: &mut SessionIo<'_>, data: &[u8]) {
+        let slot = io.slot_index();
+        self.metrics
+            .bytes_out
+            .add(&self.config.registry, data.len() as u64);
+        if self.conn(slot).body == BodyFraming::AwaitingHead {
+            // First upstream byte: clear the FirstByte deadline.
+            io.set_deadline(None, vane_core::handler::DeadlineReason::FirstByte);
+        }
+        #[cfg(feature = "h2")]
+        if self.conns.get(&slot).is_some_and(|c| c.h2.is_some()) {
+            // The h2 arm returns early below; keep deadline handling
+            // identical to the h1 path.
+            io.set_deadline(None, vane_core::handler::DeadlineReason::FirstByte);
+        }
+        if self.conn(slot).tunnel {
+            // Tunnel: relay raw both ways, no deadlines (long-lived).
+            io.set_deadline(None, vane_core::handler::DeadlineReason::Idle);
+            let data = data.to_vec();
+            self.write_downstream(io, &data);
+            return;
+        }
+        #[cfg(feature = "h2")]
+        let is_h2 = self.conns.get(&slot).is_some_and(|c| c.h2.is_some());
+        #[cfg(not(feature = "h2"))]
+        let is_h2 = false;
+        let framing = self.conn(slot).body;
+        match framing {
+            BodyFraming::AwaitingHead => {
+                let (head_len, _status, _close) = self.parse_upstream_head(slot, data);
+                if head_len == 0 {
+                    self.respond_full(io, Status::BadGateway, "bad upstream response\n");
+                    io.close();
+                    return;
+                }
+                self.metrics.responses.inc(&self.config.registry);
+                #[cfg(feature = "h2")]
+                if is_h2 {
+                    // The shim re-parses the head from `data` and
+                    // flow-controls the body portion.
+                    self.h2_write(io, data);
+                    return;
+                }
+                #[cfg(not(feature = "h2"))]
+                let _ = is_h2;
+                let head = data[..head_len].to_vec();
+                // Gzip relay: compressible type, not already encoded,
+                // and a body actually follows.
+                let ct = vane_proto::compression::head_header(&head, b"content-type");
+                let compressible = vane_proto::compression::is_compressible(ct)
+                    && !vane_proto::compression::head_already_encoded(&head)
+                    && !matches!(framing, BodyFraming::Done);
+                let use_gzip =
+                    self.conns.get(&slot).is_some_and(|c| c.gzip.is_some()) && compressible;
+                if use_gzip {
+                    // Rewrite the head: CL out, gzip + chunked in. The
+                    // body relay then compresses through GzipRelay.
+                    if let Some(rewritten) = vane_proto::compression::rewrite_head_for_gzip(&head) {
+                        self.write_downstream(io, &rewritten);
+                    } else {
+                        self.write_downstream(io, &head);
+                    }
+                } else {
+                    // Not compressing: release the encoder, relay raw.
+                    if let Some(c) = self.conns.get_mut(&slot) {
+                        c.gzip = None;
+                    }
+                    self.write_downstream(io, &head);
+                }
+                if self.conns.get(&slot).is_some_and(|c| c.tunnel) {
+                    // 101 switch: the transaction is complete at upgrade;
+                    // tunnel bytes belong to the stream, not this record.
+                    let started = self.conns.get(&slot).and_then(|c| c.started);
+                    self.access_emit(io, started);
+                }
+                let rest = &data[head_len..];
+                if !rest.is_empty() {
+                    self.relay_body(io, rest);
+                }
+                self.check_done(io);
+            }
+            BodyFraming::ContentLength | BodyFraming::Chunked { .. } => {
+                #[cfg(feature = "h2")]
+                if is_h2 {
+                    self.h2_write(io, data);
+                } else {
+                    self.relay_body(io, data);
+                    self.check_done(io);
+                }
+                #[cfg(not(feature = "h2"))]
+                {
+                    let _ = is_h2;
+                    self.relay_body(io, data);
+                    self.check_done(io);
+                }
+            }
+            BodyFraming::Tunnel => {
+                // Tunnel: relay raw both directions.
+                let data = data.to_vec();
+                self.write_downstream(io, &data);
+            }
+            BodyFraming::Done => { /* trailing bytes after done: ignore */ }
+        }
+    }
+
+    /// h2 upstream intake: driver events become synthetic h1 bytes fed
+    /// through the normal response path.
+    #[cfg(feature = "h2")]
+    fn h2up_intake(&mut self, io: &mut SessionIo<'_>, data: &[u8]) {
+        let slot = io.slot_index();
+        let mut events = Vec::new();
+        {
+            let Some(h2up) = self.conn(slot).h2up.as_mut() else {
+                return;
+            };
+            h2up.handle_read(data, &mut events);
+        }
+        if self.conn(slot).h2up.as_ref().is_some_and(|h| h.failed()) {
+            self.log(LogLevel::Warn, "h2 upstream protocol error");
+            self.respond_full(io, Status::BadGateway, "upstream unreachable\n");
+            io.close();
+            return;
+        }
+        // Synthetic h1 stream, in event order.
+        let mut out = Vec::new();
+        let mut complete = false;
+        for ev in events {
+            match ev {
+                crate::h2_client::UpstreamEvent::ResponseHead(h) => out.extend_from_slice(&h),
+                crate::h2_client::UpstreamEvent::ResponseBody(b) => out.extend_from_slice(&b),
+                crate::h2_client::UpstreamEvent::ResponseComplete => complete = true,
+            }
+        }
+        if !out.is_empty() {
+            self.on_upstream_data_h1(io, &out);
+        }
+        if complete && self.conn(slot).body != BodyFraming::Done {
+            self.conn(slot).body = BodyFraming::Done;
+            self.check_done(io);
+        }
+        // Request-side frames (credit retries) still pending?
+        let pending = self
+            .conn(slot)
+            .h2up
+            .as_mut()
+            .map(|h| h.pending_writes())
+            .unwrap_or_default();
+        if !pending.is_empty() {
+            io.write_upstream(&pending);
         }
     }
 
@@ -1063,6 +1220,65 @@ impl Handler for HttpProxy {
                 std::mem::take(&mut conn.inject),
             )
         };
+        // HTTP/2 upstream: speak h2 to the backend (prior knowledge),
+        // translating the buffered h1 request head.
+        #[cfg(feature = "h2")]
+        if route.upstream_h2 {
+            let buf = self.conn(slot).head_buf.clone();
+            let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
+            if let Parsed::Complete(view, head_len) = RequestView::parse_in(&buf, &mut storage) {
+                if view.is_chunked() {
+                    // h2 has no chunked encoding; v0.2 declines.
+                    self.respond_full(
+                        io,
+                        Status::BadGateway,
+                        "chunked to h2 upstream unsupported\n",
+                    );
+                    io.close();
+                    return;
+                }
+                let mut h2up = Box::new(crate::h2_client::H2Upstream::new());
+                let remaining = view.content_length().flatten().filter(|n| *n > 0);
+                h2up.send_request(&buf, remaining);
+                io.write_upstream(&h2up.pending_writes());
+                io.mark_request_sent();
+                let body = &buf[head_len..];
+                {
+                    let conn = self.conn(slot);
+                    if let ReqFraming::ContentLength(remaining) = &mut conn.req_framing {
+                        *remaining = remaining.saturating_sub(body.len() as u64);
+                    }
+                }
+                if !body.is_empty() {
+                    let frames = h2up.request_body(body);
+                    if !frames.is_empty() {
+                        io.write_upstream(&frames);
+                    }
+                }
+                // Pre-connect queue behind the inline bytes.
+                let pending = std::mem::take(&mut self.conn(slot).req_pending);
+                if !pending.is_empty() {
+                    let frames = h2up.request_body(&pending);
+                    if !frames.is_empty() {
+                        io.write_upstream(&frames);
+                    }
+                }
+                let out = h2up.pending_writes();
+                self.conn(slot).h2up = Some(h2up);
+                if !out.is_empty() {
+                    io.write_upstream(&out);
+                }
+                self.conn(slot).head_buf.drain(..head_len + body.len());
+                io.set_deadline(
+                    Some(self.deadline(self.config.first_byte_timeout_ms)),
+                    vane_core::handler::DeadlineReason::FirstByte,
+                );
+            } else {
+                self.respond_full(io, Status::BadGateway, "bad request\n");
+                io.close();
+            }
+            return;
+        }
         // Re-parse the buffered head for serialization (view borrows our
         // buffer; the handler call is synchronous so this is safe).
         let buf = self.conn(slot).head_buf.clone();
@@ -1108,112 +1324,34 @@ impl Handler for HttpProxy {
     }
 
     fn on_upstream_data(&mut self, io: &mut SessionIo<'_>, data: &[u8]) {
-        self.metrics
-            .bytes_out
-            .add(&self.config.registry, data.len() as u64);
-        let slot = io.slot_index();
-        if self.conn(slot).body == BodyFraming::AwaitingHead {
-            // First upstream byte: clear the FirstByte deadline.
-            io.set_deadline(None, vane_core::handler::DeadlineReason::FirstByte);
-        }
         #[cfg(feature = "h2")]
-        if self.conns.get(&slot).is_some_and(|c| c.h2.is_some()) {
-            // The h2 arm returns early below; keep deadline handling
-            // identical to the h1 path.
-            io.set_deadline(None, vane_core::handler::DeadlineReason::FirstByte);
-        }
-        if self.conn(slot).tunnel {
-            // Tunnel: relay raw both ways, no deadlines (long-lived).
-            io.set_deadline(None, vane_core::handler::DeadlineReason::Idle);
-            let data = data.to_vec();
-            self.write_downstream(io, &data);
-            return;
-        }
-        #[cfg(feature = "h2")]
-        let is_h2 = self.conns.get(&slot).is_some_and(|c| c.h2.is_some());
-        #[cfg(not(feature = "h2"))]
-        let is_h2 = false;
-        let framing = self.conn(slot).body;
-        match framing {
-            BodyFraming::AwaitingHead => {
-                let (head_len, _status, _close) = self.parse_upstream_head(slot, data);
-                if head_len == 0 {
-                    self.respond_full(io, Status::BadGateway, "bad upstream response\n");
-                    io.close();
-                    return;
-                }
-                self.metrics.responses.inc(&self.config.registry);
-                #[cfg(feature = "h2")]
-                if is_h2 {
-                    // The shim re-parses the head from `data` and
-                    // flow-controls the body portion.
-                    self.h2_write(io, data);
-                    return;
-                }
-                #[cfg(not(feature = "h2"))]
-                let _ = is_h2;
-                let head = data[..head_len].to_vec();
-                // Gzip relay: compressible type, not already encoded,
-                // and a body actually follows.
-                let ct = vane_proto::compression::head_header(&head, b"content-type");
-                let compressible = vane_proto::compression::is_compressible(ct)
-                    && !vane_proto::compression::head_already_encoded(&head)
-                    && !matches!(framing, BodyFraming::Done);
-                let use_gzip =
-                    self.conns.get(&slot).is_some_and(|c| c.gzip.is_some()) && compressible;
-                if use_gzip {
-                    // Rewrite the head: CL out, gzip + chunked in. The
-                    // body relay then compresses through GzipRelay.
-                    if let Some(rewritten) = vane_proto::compression::rewrite_head_for_gzip(&head) {
-                        self.write_downstream(io, &rewritten);
-                    } else {
-                        self.write_downstream(io, &head);
-                    }
-                } else {
-                    // Not compressing: release the encoder, relay raw.
-                    if let Some(c) = self.conns.get_mut(&slot) {
-                        c.gzip = None;
-                    }
-                    self.write_downstream(io, &head);
-                }
-                if self.conns.get(&slot).is_some_and(|c| c.tunnel) {
-                    // 101 switch: the transaction is complete at upgrade;
-                    // tunnel bytes belong to the stream, not this record.
-                    let started = self.conns.get(&slot).and_then(|c| c.started);
-                    self.access_emit(io, started);
-                }
-                let rest = &data[head_len..];
-                if !rest.is_empty() {
-                    self.relay_body(io, rest);
-                }
-                self.check_done(io);
+        {
+            let slot = io.slot_index();
+            if self.conns.get(&slot).is_some_and(|c| c.h2up.is_some()) {
+                self.h2up_intake(io, data);
+                return;
             }
-            BodyFraming::ContentLength | BodyFraming::Chunked { .. } => {
-                #[cfg(feature = "h2")]
-                if is_h2 {
-                    self.h2_write(io, data);
-                } else {
-                    self.relay_body(io, data);
-                    self.check_done(io);
-                }
-                #[cfg(not(feature = "h2"))]
-                {
-                    let _ = is_h2;
-                    self.relay_body(io, data);
-                    self.check_done(io);
-                }
-            }
-            BodyFraming::Tunnel => {
-                // Tunnel: relay raw both directions.
-                let data = data.to_vec();
-                self.write_downstream(io, &data);
-            }
-            BodyFraming::Done => { /* trailing bytes after done: ignore */ }
         }
+        self.on_upstream_data_h1(io, data);
     }
 
     fn on_upstream_eof(&mut self, io: &mut SessionIo<'_>) {
         let slot = io.slot_index();
+        #[cfg(feature = "h2")]
+        if self.conns.get(&slot).is_some_and(|c| c.h2up.is_some()) {
+            // h2 upstream: completion arrives via END_STREAM/CL; an EOF
+            // before completion is a truncation.
+            let complete = self
+                .conn(slot)
+                .h2up
+                .as_ref()
+                .is_some_and(|h| h.response_complete());
+            if !complete {
+                self.log(LogLevel::Warn, "h2 upstream closed mid-response; closing");
+                io.close();
+            }
+            return;
+        }
         #[cfg(feature = "h2")]
         let is_h2 = self.conns.get(&slot).is_some_and(|c| c.h2.is_some());
         #[cfg(not(feature = "h2"))]
@@ -1739,6 +1877,11 @@ impl HttpProxy {
                 conn.req_framing = ReqFraming::AwaitingHead;
                 conn.req_pending.clear();
                 conn.gzip = None;
+                #[cfg(feature = "h2")]
+                {
+                    // h2 upstream connections cannot sit in the h1 pool.
+                    conn.h2up = None;
+                }
                 conn.span = None;
                 io.set_deadline(
                     Some(self.deadline(self.config.idle_timeout_ms)),
@@ -1750,6 +1893,7 @@ impl HttpProxy {
     /// Upstream unusable: fail over to another backend while the request
     /// is still unsent, otherwise answer 502/504.
     fn upstream_failed(&mut self, io: &mut SessionIo<'_>) {
+        eprintln!("UFDBG upstream_failed sent={}", io.request_sent_upstream());
         if io.request_sent_upstream() {
             if self
                 .conns

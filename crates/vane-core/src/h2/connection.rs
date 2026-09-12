@@ -52,24 +52,9 @@ pub mod error_code {
 pub enum Role {
     /// Receives odd stream ids, allocates even (servers).
     Server,
-    /// Allocates odd stream ids, receives even (clients).
+    /// Allocates odd stream ids, receives even (clients; server push
+    /// is refused).
     Client,
-}
-
-impl Role {
-    fn my_stream_parity(self) -> u32 {
-        match self {
-            Self::Server => 0, // servers allocate even ids
-            Self::Client => 1, // clients allocate odd ids
-        }
-    }
-
-    fn peer_stream_parity(self) -> u32 {
-        match self {
-            Self::Server => 1,
-            Self::Client => 0,
-        }
-    }
 }
 
 /// Per-stream lifecycle state (RFC 9113 §5.1).
@@ -452,15 +437,17 @@ impl Connection {
             let payload = &data[off + 9..off + 9 + hdr.length as usize];
             off += 9 + hdr.length as usize;
 
-            // Stream-id direction rules (RFC 9113 §5.1.1).
-            let peer_parity = self.role.peer_stream_parity();
+            // Stream-id direction rules (RFC 9113 §5.1.1): clients
+            // initiate streams with odd ids; responses (and any other
+            // peer frames) reference those same odd streams. Even ids
+            // exist only for server push, which we never accept.
             match hdr.kind {
                 FrameKind::Data
                 | FrameKind::Headers
                 | FrameKind::Continuation
                 | FrameKind::RstStream
                 | FrameKind::PushPromise => {
-                    if hdr.stream_id == 0 || hdr.stream_id & 1 != peer_parity {
+                    if hdr.stream_id == 0 || hdr.stream_id & 1 == 0 {
                         let _ = self.conn_error(error_code::PROTOCOL_ERROR);
                         return off;
                     }
@@ -654,7 +641,10 @@ impl Connection {
         let Ok(split) = validate_payload(hdr, payload, self.peer_max_frame) else {
             return Err(error_code::FRAME_SIZE_ERROR);
         };
-        if hdr.stream_id & 1 == self.role.my_stream_parity() {
+        // Inbound HEADERS reference odd ids in both roles: odd are
+        // client-initiated streams (responses ride them); even ids are
+        // server push, which is refused.
+        if hdr.stream_id & 1 == 0 {
             return Err(error_code::PROTOCOL_ERROR);
         }
 
@@ -1314,17 +1304,20 @@ mod conn_tests {
     }
 
     /// Client role: server even-id HEADERS produce events.
+    /// Client role: server response HEADERS arrive on the client's own
+    /// ODD streams; EVEN ids are server push and are refused.
     #[test]
-    fn client_receives_even_stream_headers() {
+    fn client_receives_response_headers() {
         let mut c = client_conn();
         // Client preface is queued in pending writes at construction.
         let _ = c.take_pending_writes();
 
+        // The client opened stream 1; the server responds on it.
+        c.open_stream(1);
         let mut events = Vec::new();
-        // :status 200 indexed = 0x88, END_STREAM. Server-initiated
-        // streams are even (client receives even ids).
+        // :status 200 indexed = 0x88, END_STREAM.
         c.handle_read(
-            &frame_bytes(FrameKind::Headers, 0x05, 2, &[0x88]),
+            &frame_bytes(FrameKind::Headers, 0x05, 1, &[0x88]),
             &mut events,
         );
         assert_eq!(events.len(), 1);
@@ -1334,13 +1327,30 @@ mod conn_tests {
                 end_stream,
                 headers,
             } => {
-                assert_eq!(*stream_id, 2);
+                assert_eq!(*stream_id, 1);
                 assert!(*end_stream);
                 assert_eq!(headers[0].name, b":status");
                 assert_eq!(headers[0].value, b"200");
             }
             other => panic!("expected headers: {other:?}"),
         }
+    }
+
+    /// Client role: even-stream HEADERS are server push (banned) —
+    /// connection error.
+    #[test]
+    fn client_rejects_even_stream_headers() {
+        let mut c = client_conn();
+        let _ = c.take_pending_writes();
+        let mut events = Vec::new();
+        c.handle_read(
+            &frame_bytes(FrameKind::Headers, 0x05, 2, &[0x88]),
+            &mut events,
+        );
+        assert_eq!(
+            c.connection_error().map(|e| e.code),
+            Some(error_code::PROTOCOL_ERROR)
+        );
     }
 
     /// CONTINUATION assembles multi-frame header blocks.

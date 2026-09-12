@@ -359,8 +359,8 @@ impl H2Server {
         // the client has drained everything — held bytes keep flowing on
         // credit, and completion fires from take_held instead. Ending
         // the stream here would cut off delivered body.
-        if t.head_done && t.content_length.is_some() {
-            if self.held.is_empty() && t.sent < t.content_length.expect("checked") {
+        if let (true, Some(cl)) = (t.head_done, t.content_length) {
+            if self.held.is_empty() && t.sent < cl {
                 // Upstream died mid-body with nothing left to send.
                 return (Vec::new(), EofOutcome::Truncated);
             }

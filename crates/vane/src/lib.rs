@@ -5,6 +5,8 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 pub mod admin;
 #[cfg(feature = "h2")]
+pub mod h2_client;
+#[cfg(feature = "h2")]
 pub mod h2_edge;
 #[cfg(feature = "h2")]
 pub mod h2_server;
