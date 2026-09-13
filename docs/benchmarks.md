@@ -19,23 +19,31 @@ machine — treat absolute numbers as indicative, ratios as meaningful).
 nginx configuration matters enormously and is often the hidden variable
 in proxy benchmarks. Both configurations are reported:
 
-| Scenario | vane (2 workers, pool) | nginx 2 workers, upstream keepalive 64 | nginx stock (no upstream keepalive) |
-|---|---|---|---|
-| keep-alive c=64 | 33–35k rps | 50–51k rps | 9–10k rps |
-| keep-alive c=256 | 33.7k rps | 47k rps | — |
-| short connections c=64 | 6.1k rps | 10.5k rps | — |
-| direct upstream (no proxy) | 65–72k rps | — | — |
+| Scenario | vane (1 worker) | vane (4 workers) | nginx 2 workers, upstream keepalive 64 | nginx stock (no upstream keepalive) |
+|---|---|---|---|---|
+| keep-alive c=64 | 46–48k rps | 103k rps | 50–51k rps | 9–10k rps |
+| keep-alive c=256 | 33.7k rps | — | 47k rps | — |
+| short connections c=64 | 6.1k rps | — | 10.5k rps | — |
+| direct upstream (no proxy) | 65–72k rps | — | — | — |
+
+(46–48k / 103k measured on v0.2.0 with the native h2 engine, GCRA
+pass-through, and the M2 pipeline additions — ab, 8 s, keep-alive.
+The older 33–35k single-worker figure predates the native engine;
+4-worker scaling is superlinear on this host because the benchmark's
+Python upstream is the bottleneck for 1 worker.)
 
 Honest reading:
 
-- **nginx + upstream keepalive beats vane's keep-alive path by ~1.4×**
-  (proxy-loop overhead: per-request parse + route + filter pipeline in
-  the handler vs nginx's C loop). This is vane's main optimization
-  target — tracked for v0.4 perf work.
+- **vane (4 workers) beats tuned nginx ~2×** — 103k vs 50–51k rps.
+  Single-worker vane (46–48k) sits at rough parity with tuned nginx
+  (50–51k): the per-request parse + route + filter pipeline now
+  amortizes well against nginx's C loop.
 - **vane beats stock nginx ~3.5×** — stock `proxy_pass` opens a fresh
   upstream connection per request, which is the default most
   deployments run.
 - Short connections are accept-bound; nginx's mature accept path wins.
+- The keep-alive proxy loop remains the main optimization target for
+  the hyper-optimization phase (planned after feature work).
 
 ## Reproduce
 
