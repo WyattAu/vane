@@ -899,22 +899,19 @@ async fn large_body_streams_through_edge() {
 /// request body streams to an echoing h1 upstream, response streams
 /// back through the engine's flow-controlled DATA relay.
 ///
-/// INVESTIGATION (final narrowing): h2c 1 MiB passes consistently.
-/// The TLS variant passes intermittently; failing runs end with the
-/// h2-crate client reporting "frame with invalid size" after receiving
-/// exactly 131070 bytes (2 windows), while the server-side frame dump
-/// shows every emitted frame legal (DATA <= 16384 = the peer's
-/// advertised max). Conclusion: the invalid "frame" is the CLIENT's
-/// parse of a TRUNCATED TLS record — the FIN (downstream_eof_write
-/// from close_after) or a session close races the final queued
-/// downstream write, so the last TLS record is cut mid-payload.
-/// Fixed this session en route: h2_write flush ordering, EOF flags in
-/// non-splice EOF arms, maybe_finish for upstream-less sessions, the
-/// continue_upstream_write resume (upstream-write completions now
-/// re-arm paused downstream reads), h2c support. NEXT: audit the
-/// close/flush path — raw_downstream -> io.respond completions vs
-/// downstream_eof_write/close ordering per session — the FIN must be
-/// queued strictly after the last data write completes.
+/// INVESTIGATION (h2c vs TLS): h2c 1 MiB passes consistently (our own
+/// H2Upstream client). The TLS + h2-crate-client variant stalls after
+/// exactly 131070 bytes (2x the client's initial windows): the crate
+/// sends two WINDOW_UPDATE pairs then stops, while the server-side
+/// frame dump shows every emitted frame legal. Server-side resume is
+/// verified fixed (continue_upstream_write now re-arms paused reads).
+/// Delta is the TLS layer + h2-crate client: next session instrument
+/// the engine's downstream-read arms after the second window in the
+/// TLS run (ARMD/IODBG probes are quick to re-add) and check whether
+/// the crate's third update flight is written at all — if it is, the
+/// reads pause again; if not, the crate's update batching needs a
+/// `Settings` push (e.g. advertise a larger initial window from the
+/// server so the client rarely needs to update).
 #[ignore = "INVESTIGATION: response bodies beyond one window (65535) stall — see doc comment"]
 #[tokio::test]
 async fn large_body_streams_native_engine() {
