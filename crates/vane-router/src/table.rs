@@ -308,6 +308,17 @@ pub struct TableEditor {
 }
 
 impl TableEditor {
+    /// Replaces the entire table with `entries` (full-state semantics
+    /// for dynamic config: an ADS snapshot is authoritative).
+    pub fn replace_all(&mut self, entries: Vec<RouteEntry>) {
+        self.hosts = std::collections::BTreeMap::new();
+        self.default_trie = PathTrie::new();
+        self.entries = Vec::new();
+        for entry in entries {
+            self.insert(entry);
+        }
+    }
+
     /// Inserts a compiled route.
     pub fn insert(&mut self, entry: RouteEntry) {
         let arc = Arc::new(entry);

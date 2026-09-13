@@ -610,12 +610,14 @@ pub async fn run(opts: RunOptions) -> i32 {
     }
 
     // ---- Admin server ----------------------------------------------------
+    let xds_state = crate::admin::xds_state_handle();
     if config.admin.enabled {
         let admin_addr: std::net::SocketAddr = config.admin.address.parse().expect("validated");
         let admin_router = crate::admin::build_admin_router(
             Arc::clone(&router),
             Arc::clone(&registry),
             Arc::clone(&health),
+            xds_state,
         );
         tokio::spawn(async move {
             if let Err(e) = crate::admin::serve(admin_addr, admin_router).await {
