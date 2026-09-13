@@ -1372,6 +1372,15 @@ impl Handler for HttpProxy {
         let is_h2 = self.conns.get(&slot).is_some_and(|c| c.h2.is_some());
         #[cfg(not(feature = "h2"))]
         let is_h2 = false;
+        // h2 sessions own their EOF semantics (the shim knows whether
+        // body bytes are still mid-flight in its held queue): the h1
+        // framing arms below would misread a CL body as truncated while
+        // held bytes await client credit.
+        #[cfg(feature = "h2")]
+        if is_h2 {
+            self.h2_upstream_eof(io);
+            return;
+        }
         let (framing, remaining, request_sent, ready) = {
             let conn = self.conns.get(&slot).expect("conn exists");
             (
@@ -1398,11 +1407,6 @@ impl Handler for HttpProxy {
                 io.close();
             }
             _ => {
-                #[cfg(feature = "h2")]
-                if is_h2 {
-                    self.h2_upstream_eof(io);
-                    return;
-                }
                 #[cfg(not(feature = "h2"))]
                 let _ = is_h2;
                 // Flush the gzip trailer + terminal chunk before the FIN.

@@ -899,21 +899,19 @@ async fn large_body_streams_through_edge() {
 /// request body streams to an echoing h1 upstream, response streams
 /// back through the engine's flow-controlled DATA relay.
 ///
-/// INVESTIGATION (narrowed — h2c harness): sub-window bodies (4 KiB)
-/// pass end-to-end. Bodies beyond one window (65535): the request side
-/// streams perfectly (all 1 MiB intakes + relays), the response head +
-/// first window go out, then the server's downstream reads stop
-/// arriving once response writes begin — the client's credit flights
-/// sit unread, its window exhausts, deadlock. Verified NOT the cause:
-/// the h2-crate client (reproduces with our own driver), TLS (h2c is
-/// cleartext), request-side relay, window debits, held accounting,
-/// probe-session leaks (fixed: maybe_finish now closes sessions whose
-/// upstream half never existed; EOF arms now set downstream/upstream
-/// EOF flags — non-splice EOF never set them, leaking sessions and
-/// mio registrations, which made reused fd numbers collide with stale
-/// registrations and break dials). NEXT: with this harness, instrument
-/// arm_downstream_read + DownstreamRead cqes at the stall point — the
-/// engine read-starvation interplay with pending downstream writes.
+/// INVESTIGATION (narrowed — TLS trace): the credit cycle WORKS for
+/// two windows (client updates arrive, take_held drains, frames go
+/// out; client receives 131070 = 2x65535) then the third client
+/// update flight reaches the shim (small intakes visible) but yields
+/// no engine WindowUpdate events — handle_read's frame loop stops
+/// converting those frames. Suspicion: the shim's handle_read loop
+/// breaks on partial backlog or failed() during multi-frame flights.
+/// Also fixed this session: h2_write flush ordering (frames must
+/// precede the check_done FIN), EOF flags in non-splice EOF arms
+/// (session/mio-registration leaks), maybe_finish for upstream-less
+/// sessions, h2c support. Next session: instrument
+/// engine handle_window_update (inc/stream) + shim failed() in the
+/// h2c harness — 30 minutes from the fix.
 #[ignore = "INVESTIGATION: response bodies beyond one window (65535) stall — see doc comment"]
 #[tokio::test]
 async fn large_body_streams_native_engine() {
@@ -1243,7 +1241,6 @@ workers = 1
 /// TCP (listener `h2c = true`) — removes the h2-crate/tokio client
 /// from the equation entirely. Used to bisect the >window streaming
 /// stall; also the regression gate for h2c support itself.
-#[ignore = "INVESTIGATION: same >window stall as large_body_streams_native_engine (shared tracking)"]
 #[tokio::test]
 async fn h2c_native_engine_large_body() {
     let _serial = lock_serial();
