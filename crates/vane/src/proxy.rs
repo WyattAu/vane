@@ -743,11 +743,10 @@ impl HttpProxy {
         let slot = io.slot_index();
         thread_local! { static FLUSHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
         FLUSHED.with(|c| {
-            let t = c.get() + self.conn(slot).h2_out.len() as u64;
-            c.set(t);
-            if t / 100000 > (t - self.conn(slot).h2_out.len() as u64) / 100000 {
-                eprintln!("WIREDBG ~{t} response bytes flushed");
-            }
+            let prev = c.get();
+            let now = prev + self.conn(slot).h2_out.len() as u64;
+            c.set(now);
+            if now / 65536 > prev / 65536 {}
         });
         #[cfg(feature = "h2")]
         if !self.conn(slot).h2_out.is_empty() {

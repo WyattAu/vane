@@ -486,33 +486,23 @@ impl Engine for MioEngine {
     }
 
     fn poll(&mut self, timeout: Option<Duration>, out: &mut Vec<Cqe>) -> io::Result<()> {
-        // Inline completions go out first (per-session ordering: a
-        // completion must reach the handler before readiness edges for
-        // later operations on the same fd).
-        if !self.cqes.is_empty() {
-            out.append(&mut self.cqes);
-            // Starvation guard: sweep epoll with zero wait even while
-            // inline completions stream, so parked ops (a downstream
-            // read parked on WouldBlock) dispatch alongside the inline
-            // flow. Their completions ride the NEXT round — inline
-            // priority is preserved, nothing starves.
-            self.poller
-                .poll(&mut self.events, Some(Duration::ZERO))
-                .unwrap_or(());
-            let mut ready: Vec<(RawFd, bool, bool)> = Vec::with_capacity(64);
-            for ev in self.events.iter() {
-                if ev.token() == MioToken(WAKER) {
-                    continue;
-                }
-                let fd = ev.token().0 as RawFd;
-                ready.push((fd, ev.is_readable(), ev.is_writable()));
-            }
-            for (fd, readable, writable) in ready {
-                self.dispatch(fd, readable, writable);
-            }
-            return Ok(());
-        }
-        self.poller.poll(&mut self.events, timeout)?;
+        // ALWAYS collect epoll edges — even when inline completions are
+        // queued. The early-return-only variant starves parked ops: a
+        // continuous stream of inline completions (e.g. upstream write
+        // completions while relaying a large body) would defer the
+        // epoll sweep indefinitely, and a parked downstream read would
+        // never dispatch — the client's window updates sit unread and
+        // the connection deadlocks.
+        //
+        // Ordering: inline completions are delivered FIRST (they are
+        // chronologically older); readiness completions from the zero-
+        // wait sweep ride the same batch after them.
+        let wait = if self.cqes.is_empty() {
+            timeout
+        } else {
+            Some(Duration::ZERO) // non-blocking: keep inline priority
+        };
+        self.poller.poll(&mut self.events, wait)?;
         // Snapshot readiness (events buffer is reused by the poller).
         let mut ready: Vec<(RawFd, bool, bool)> = Vec::with_capacity(64);
         for ev in self.events.iter() {

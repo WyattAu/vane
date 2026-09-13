@@ -919,7 +919,7 @@ async fn large_body_streams_through_edge() {
 /// `release_capacity` semantics; or sidestep by advertising a larger
 /// server SETTINGS_INITIAL_WINDOW_SIZE (reduces client update
 /// pressure). Not a blocker for h2c deployments.
-#[ignore = "INVESTIGATION: response bodies beyond one window (65535) stall — see doc comment"]
+#[ignore = "INVESTIGATION (TLS-only): h2-crate client reports 'frame with invalid size' after 131070 bytes (2 windows); all server frames verified legal. Suspect TLS write-boundary corruption on close — wire capture next. h2c path green (h2c_native_engine_large_body)."]
 #[tokio::test]
 async fn large_body_streams_native_engine() {
     let _serial = lock_serial();
@@ -1110,11 +1110,13 @@ workers = 1
                 got.extend_from_slice(&b);
                 let _ = body.flow_control().release_capacity(len);
             }
-            Err(_) => {
+            Err(e) => {
+                eprintln!("BODYDBG body error after {}: {e}", got.len());
                 break;
             }
         }
     }
+    eprintln!("BODYDBG loop end got={}", got.len());
     assert_eq!(got.len(), payload.len(), "streamed size");
     assert_eq!(got, payload, "streamed integrity");
 }
