@@ -116,6 +116,16 @@ impl Driver {
                     self.respond(stream_id, b"200");
                 }
             }
+            // Trailers: HEADERS-after-DATA carry the peer's END_STREAM
+            // — surface them like Headers with end_stream for the
+            // malformed-check (h2spec 8.1 expects a response either way).
+            Event::Trailers { stream_id, headers } => {
+                self.react(Event::Headers {
+                    stream_id,
+                    end_stream: true,
+                    headers,
+                });
+            }
             Event::WindowUpdate { .. } => {
                 self.try_send_pending();
             }

@@ -85,6 +85,15 @@ pub enum Event {
         /// Decoded header fields.
         headers: Vec<super::hpack::Header>,
     },
+    /// Trailers: HEADERS arriving after peer DATA on the same stream
+    /// (gRPC grpc-status, h1-style chunked trailers). Always carries
+    /// the peer's END_STREAM.
+    Trailers {
+        /// Stream the block belongs to.
+        stream_id: u32,
+        /// Decoded header fields.
+        headers: Vec<super::hpack::Header>,
+    },
     /// Body bytes (flow-control consumed — call
     /// [`Connection::release_capacity`] to credit the peer).
     Data {
@@ -165,6 +174,9 @@ struct Stream {
     send_window: i64,
     /// Our send side ended with END_STREAM.
     sent_end: bool,
+    /// The peer sent us DATA (request/response body). HEADERS after
+    /// this are trailers, not new header blocks.
+    peer_data: bool,
 }
 
 /// Assembles a HEADERS block across CONTINUATION frames.
@@ -693,17 +705,30 @@ impl Connection {
             };
             match headers {
                 Ok(headers) => {
+                    // HEADERS after peer DATA on the same stream are
+                    // trailers (gRPC grpc-status, h1 chunked trailers).
+                    let are_trailers = self
+                        .streams
+                        .get(&hdr.stream_id)
+                        .is_some_and(|st| st.peer_data);
                     self.ensure_stream(hdr.stream_id, end_stream);
                     if end_stream {
                         if let Some(st) = self.streams.get_mut(&hdr.stream_id) {
                             st.state = StreamState::HalfClosedRemote;
                         }
                     }
-                    events.push(Event::Headers {
-                        stream_id: hdr.stream_id,
-                        end_stream,
-                        headers,
-                    });
+                    if are_trailers {
+                        events.push(Event::Trailers {
+                            stream_id: hdr.stream_id,
+                            headers,
+                        });
+                    } else {
+                        events.push(Event::Headers {
+                            stream_id: hdr.stream_id,
+                            end_stream,
+                            headers,
+                        });
+                    }
                     return Ok(());
                 }
                 Err(_) => return Err(error_code::COMPRESSION_ERROR),
@@ -729,17 +754,23 @@ impl Connection {
         self.header_block.active = false;
         match decoder.decode_all() {
             Ok(headers) => {
+                // HEADERS after peer DATA on the same stream are trailers.
+                let are_trailers = self.streams.get(&stream_id).is_some_and(|st| st.peer_data);
                 self.ensure_stream(stream_id, end_stream);
                 if end_stream {
                     if let Some(st) = self.streams.get_mut(&stream_id) {
                         st.state = StreamState::HalfClosedRemote;
                     }
                 }
-                events.push(Event::Headers {
-                    stream_id,
-                    end_stream,
-                    headers,
-                });
+                if are_trailers {
+                    events.push(Event::Trailers { stream_id, headers });
+                } else {
+                    events.push(Event::Headers {
+                        stream_id,
+                        end_stream,
+                        headers,
+                    });
+                }
                 Ok(())
             }
             Err(_) => Err(error_code::COMPRESSION_ERROR),
@@ -752,6 +783,7 @@ impl Connection {
             recv_window: i64::from(self.cfg.initial_window_size),
             send_window: self.peer_initial_window,
             sent_end: false,
+            peer_data: false,
         });
         if end_stream {
             let retire = entry.sent_end;
@@ -786,6 +818,9 @@ impl Connection {
         // Flow control: connection + stream recv windows must cover it.
         self.conn_recv_window -= content.len() as i64;
         st.recv_window -= content.len() as i64;
+        if !content.is_empty() {
+            st.peer_data = true;
+        }
 
         let end_stream = hdr.flags.end_stream();
         if end_stream {
@@ -843,6 +878,7 @@ impl Connection {
             recv_window: i64::from(self.cfg.initial_window_size),
             send_window: self.peer_initial_window,
             sent_end: false,
+            peer_data: false,
         });
     }
 
@@ -1333,6 +1369,107 @@ mod conn_tests {
                 assert_eq!(headers[0].value, b"200");
             }
             other => panic!("expected headers: {other:?}"),
+        }
+    }
+
+    /// Client role: response trailers (HEADERS after server DATA with
+    /// END_STREAM — gRPC grpc-status) surface as Event::Trailers.
+    #[test]
+    fn client_receives_response_trailers() {
+        let mut c = client_conn();
+        let _ = c.take_pending_writes();
+        let mut events = Vec::new();
+
+        // Server HEADERS on stream 2? No — client streams are odd: we
+        // opened stream 1; the server responds on it.
+        c.open_stream(1);
+        // :status 200 (0x88), END_HEADERS off END_STREAM off.
+        c.handle_read(
+            &frame_bytes(FrameKind::Headers, 0x04, 1, &[0x88]),
+            &mut events,
+        );
+        // DATA (no END_STREAM).
+        c.handle_read(
+            &frame_bytes(FrameKind::Data, 0x00, 1, b"grpc-payload"),
+            &mut events,
+        );
+        // Trailers: grpc-status: 0, END_STREAM.
+        let mut trailers = Vec::new();
+        trailers.extend_from_slice(&[0x00, 0x0b]);
+        trailers.extend_from_slice(b"grpc-status");
+        trailers.extend_from_slice(&[0x01, b'0']);
+        c.handle_read(
+            &frame_bytes(FrameKind::Headers, 0x05, 1, &trailers),
+            &mut events,
+        );
+
+        let kinds: Vec<&str> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                Event::Headers { .. } => Some("headers"),
+                Event::Data { .. } => Some("data"),
+                Event::Trailers { .. } => Some("trailers"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kinds, vec!["headers", "data", "trailers"], "{events:?}");
+        match &events[2] {
+            Event::Trailers { headers, .. } => {
+                assert_eq!(headers[0].name, b"grpc-status");
+            }
+            other => panic!("expected trailers: {other:?}"),
+        }
+    }
+
+    /// Request trailers: HEADERS arriving after DATA on the same
+    /// stream surface as Event::Trailers (with END_STREAM semantics).
+    #[test]
+    fn request_trailers_surfaces_as_trailers_event() {
+        let mut c = server();
+        let mut events = Vec::new();
+        // Preface + client SETTINGS.
+        let mut flight = CLIENT_PREFACE.to_vec();
+        flight.extend_from_slice(&frame_bytes(FrameKind::Settings, 0x00, 0, &[]));
+        c.handle_read(&flight, &mut events);
+        let _ = c.take_pending_writes();
+
+        // HEADERS (POST, END_STREAM off) + DATA + trailers HEADERS.
+        c.handle_read(
+            &frame_bytes(FrameKind::Headers, 0x04, 1, &[0x83, 0x86]), // :method POST, :scheme https
+            &mut events,
+        );
+        c.handle_read(
+            &frame_bytes(FrameKind::Data, 0x00, 1, b"payload"),
+            &mut events,
+        );
+        // Trailers: HEADERS END_STREAM with a literal header
+        // (0x00 0x0a "grpc-status" 0x01 "0" — name len 11, value len 1).
+        let mut trailers = Vec::new();
+        trailers.extend_from_slice(&[0x00, 0x0b]);
+        trailers.extend_from_slice(b"grpc-status");
+        trailers.extend_from_slice(&[0x01, b'0']);
+        c.handle_read(
+            &frame_bytes(FrameKind::Headers, 0x05, 1, &trailers),
+            &mut events,
+        );
+
+        let kinds: Vec<&str> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                Event::Headers { .. } => Some("headers"),
+                Event::Data { .. } => Some("data"),
+                Event::Trailers { .. } => Some("trailers"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kinds, vec!["headers", "data", "trailers"], "{events:?}");
+        match &events[2] {
+            Event::Trailers { stream_id, headers } => {
+                assert_eq!(*stream_id, 1);
+                assert_eq!(headers[0].name, b"grpc-status");
+                assert_eq!(headers[0].value, b"0");
+            }
+            other => panic!("expected trailers: {other:?}"),
         }
     }
 

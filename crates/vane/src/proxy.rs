@@ -641,6 +641,21 @@ impl HttpProxy {
             match ev {
                 crate::h2_client::UpstreamEvent::ResponseHead(h) => out.extend_from_slice(&h),
                 crate::h2_client::UpstreamEvent::ResponseBody(b) => out.extend_from_slice(&b),
+                // Upstream response trailers (gRPC grpc-status): relay
+                // to an h2 client via the server shim's trailer path;
+                // dropped for h1 clients (h1 trailers need chunked
+                // relay, documented v0.2 limitation).
+                crate::h2_client::UpstreamEvent::ResponseTrailers(trailers) => {
+                    let frames = self
+                        .conn(slot)
+                        .h2
+                        .as_mut()
+                        .map_or_else(Vec::new, |h2s| h2s.response_trailers(&trailers));
+                    let out = &mut self.conn(slot).h2_out;
+                    for f in frames {
+                        out.extend_from_slice(&f);
+                    }
+                }
                 crate::h2_client::UpstreamEvent::ResponseComplete => complete = true,
             }
         }

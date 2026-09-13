@@ -221,6 +221,16 @@ impl H2Server {
                     events.push(H2Event::RequestComplete);
                 }
             }
+            Event::Trailers { stream_id, .. } => {
+                // Request trailers (gRPC-style). h1 upstreams with
+                // Content-Length framing cannot carry them — relay the
+                // completion semantics only; the trailer fields are
+                // dropped (v0.2 relays CL'd bodies, documented).
+                if self.active_stream == Some(stream_id) {
+                    self.body_remaining = None;
+                    events.push(H2Event::RequestComplete);
+                }
+            }
             Event::WindowUpdate { .. } => {
                 if !self.held.is_empty() {
                     events.push(H2Event::SendCredit);
@@ -438,6 +448,26 @@ impl H2Server {
         (out, done)
     }
 
+    /// Relays upstream response trailers to the client as a HEADERS
+    /// (END_STREAM) frame — the gRPC grpc-status path for h2→h2 relay.
+    /// Pseudo-headers are dropped; the response's END_STREAM rides this
+    /// frame. Returns the frames for the driver to flush.
+    pub fn response_trailers(&mut self, trailers: &[(Vec<u8>, Vec<u8>)]) -> Vec<Vec<u8>> {
+        let stream_id = self.active_stream.unwrap_or(0);
+        let max_frame = self.conn.peer_max_frame_size();
+        let mut headers: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(trailers.len());
+        for (name, value) in trailers {
+            if name.starts_with(b":") {
+                continue;
+            }
+            headers.push((name.to_ascii_lowercase(), value.clone()));
+        }
+        let frames = emit_header_block_full_end(stream_id, &headers, max_frame);
+        self.translator = None;
+        self.active_stream = None;
+        frames
+    }
+
     /// Marks the active stream finished (transaction complete): future
     /// HEADERS may open the next stream.
     pub fn finish_stream(&mut self) {
@@ -518,6 +548,45 @@ impl ResponseTranslator {
         self.head_done = true;
         out.extend(emit_header_block(stream_id, &headers, max_frame));
     }
+}
+
+/// Encodes headers and splits the block into HEADERS + CONTINUATION
+/// frames sized to `max_frame` (END_HEADERS on the final fragment,
+/// per RFC 9113 §4.3). The final HEADERS fragment carries END_STREAM.
+fn emit_header_block_full_end(
+    stream_id: u32,
+    headers: &[(Vec<u8>, Vec<u8>)],
+    max_frame: usize,
+) -> Vec<Vec<u8>> {
+    let mut encoder = vane_core::h2::hpack::HpackEncoder::new();
+    let mut block = Vec::new();
+    encoder.encode(headers, &mut block);
+    let mut frames = Vec::new();
+    let mut first = true;
+    let mut off = 0usize;
+    while first || off < block.len() {
+        let take = (block.len() - off).min(max_frame);
+        let last = off + take == block.len();
+        let mut frame = Vec::with_capacity(9 + take);
+        let kind = if first {
+            vane_core::h2::frame::FrameKind::Headers
+        } else {
+            vane_core::h2::frame::FrameKind::Continuation
+        };
+        let flags = if last { 0x04 | 0x01 } else { 0 };
+        vane_core::h2::frame::write_header(
+            &mut frame,
+            take as u32,
+            kind,
+            vane_core::h2::frame::FrameFlags::from_u8(flags),
+            stream_id,
+        );
+        frame.extend_from_slice(&block[off..off + take]);
+        frames.push(frame);
+        off += take;
+        first = false;
+    }
+    frames
 }
 
 /// Encodes headers and splits the block into HEADERS + CONTINUATION

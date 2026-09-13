@@ -23,6 +23,9 @@ pub enum UpstreamEvent {
     /// The response is fully received (Content-Length satisfied or
     /// END_STREAM for lengthless bodies).
     ResponseComplete,
+    /// Upstream response trailers (gRPC grpc-status). Header fields as
+    /// received (HPACK-decoded, lowercase names).
+    ResponseTrailers(Vec<(Vec<u8>, Vec<u8>)>),
 }
 
 /// Client-side h2 state for one backend connection.
@@ -265,6 +268,20 @@ impl H2Upstream {
             }
             Event::WindowUpdate { .. } => {
                 self.on_request_credit();
+            }
+            Event::Trailers { stream_id, headers } => {
+                if self.stream != Some(stream_id) {
+                    return;
+                }
+                self.resp_done = true;
+                events.push(UpstreamEvent::ResponseTrailers(
+                    headers
+                        .iter()
+                        .filter(|h| !h.name.starts_with(b":"))
+                        .map(|h| (h.name.clone(), h.value.clone()))
+                        .collect(),
+                ));
+                events.push(UpstreamEvent::ResponseComplete);
             }
             Event::Reset { .. } | Event::GoAway { .. } | Event::SettingsAck => {}
         }
