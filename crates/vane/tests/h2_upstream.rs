@@ -1609,3 +1609,175 @@ workers = 1
     .await
     .expect("client task");
 }
+
+/// gRPC-style h2→h2 relay: an upstream that responds HEADERS (no CL) +
+/// DATA + HEADERS(trailers, END_STREAM) — the grpc-status pattern.
+/// Verifies the engine's Event::Trailers surfacing end-to-end through
+/// the proxy with an h2 upstream (route `upstream_h2 = true`).
+#[tokio::test]
+async fn grpc_trailers_relay_h2_to_h2() {
+    let _serial = lock_serial();
+    // h2 upstream: responds HEADERS(no CL, END off) + DATA +
+    // trailers HEADERS(END_STREAM) — grpc-status: 0.
+    let grpc = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let grpc_addr = grpc.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = grpc.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let Ok(mut conn) = h2::server::handshake(stream).await else {
+                    return;
+                };
+                while let Some(Ok((request, mut respond))) = conn.accept().await {
+                    let _ = request.into_body().data().await; // drain
+                    let response = http::Response::builder()
+                        .status(200)
+                        .body(())
+                        .expect("static");
+                    let Ok(mut send) = respond.send_response(response, false) else {
+                        break;
+                    };
+                    let _ =
+                        send.send_data(bytes::Bytes::from_static(b"\x00\x00\x00\x04test"), false);
+                    let trailers = http::HeaderMap::from_iter([(
+                        http::HeaderName::from_static("grpc-status"),
+                        http::HeaderValue::from_static("0"),
+                    )]);
+                    let _ = send.send_trailers(trailers);
+                }
+            });
+        }
+    });
+
+    let dir = tempfile::tempdir().expect("dir");
+    let cert_path = dir.path().join("cert.pem");
+    let key_path = dir.path().join("key.pem");
+    let certs = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
+    std::fs::write(&cert_path, certs.cert.pem()).expect("cert");
+    std::fs::write(&key_path, certs.signing_key.serialize_pem()).expect("key");
+    let port: u16 = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("probe");
+        l.local_addr().expect("addr").port()
+    };
+    std::fs::write(
+        dir.path().join("vane.toml"),
+        format!(
+            r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[listeners.tls]
+cert = "{}"
+key = "{}"
+alpn_h2 = true
+
+[clusters.up]
+backends = ["{grpc_addr}"]
+http2 = true
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = true
+workers = 1
+"#,
+            cert_path.display(),
+            key_path.display()
+        ),
+    )
+    .expect("write cfg");
+    let cfg = dir
+        .path()
+        .join("vane.toml")
+        .to_str()
+        .expect("utf8")
+        .to_owned();
+    let _dir_guard = dir;
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let _ = rt.block_on(vane::server::run(vane::server::RunOptions {
+            config_path: Some(cfg),
+            handover_from: None,
+            handover_to: None,
+            shutdown_after: None,
+            force_mio: true,
+        }));
+    });
+    let edge: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    for _ in 0..60 {
+        if std::net::TcpStream::connect(edge).is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    use rustls::pki_types::pem::PemObject as _;
+    let der = rustls::pki_types::CertificateDer::from_pem_file(&cert_path).expect("der");
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(der).expect("root");
+    let mut client_cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    client_cfg.alpn_protocols = vec![b"h2".to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_cfg));
+    let server_name = rustls::pki_types::ServerName::try_from("localhost".to_owned()).expect("sni");
+    let tcp = tokio::net::TcpStream::connect(edge)
+        .await
+        .expect("tcp connect");
+    let tls = connector.connect(server_name, tcp).await.expect("tls");
+
+    let (mut send, connection) = h2::client::handshake(tls).await.expect("h2");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("https://edge/rpc/Call")
+        .body(())
+        .expect("request");
+    let (response, _) = send.send_request(request, true).expect("send");
+    let (parts, mut body) = tokio::time::timeout(Duration::from_secs(10), response)
+        .await
+        .expect("in time")
+        .expect("response")
+        .into_parts();
+    assert_eq!(parts.status.as_u16(), 200);
+
+    let mut got = Vec::new();
+    let mut trailers_seen = None;
+    while let Some(chunk) = body.data().await {
+        match chunk {
+            Ok(b) => {
+                let len = b.len();
+                got.extend_from_slice(&b);
+                let _ = body.flow_control().release_capacity(len);
+            }
+            Err(e) => {
+                break;
+            }
+        }
+        if let Some(trailers) = body.trailers().await.expect("trailers poll") {
+            trailers_seen = trailers
+                .get("grpc-status")
+                .map(|v| v.to_str().expect("ascii").to_owned());
+        }
+    }
+    assert_eq!(&got[..], b"\x00\x00\x00\x04test", "gRPC message relayed");
+    assert_eq!(
+        trailers_seen.as_deref(),
+        Some("0"),
+        "grpc-status trailers must be relayed"
+    );
+}

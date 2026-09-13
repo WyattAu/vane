@@ -635,32 +635,54 @@ impl HttpProxy {
             return;
         }
         // Synthetic h1 stream, in event order.
-        let mut out = Vec::new();
+        let mut head: Option<Vec<u8>> = None;
+        let mut body: Vec<u8> = Vec::new();
+        let mut trailers: Option<Vec<(Vec<u8>, Vec<u8>)>> = None;
         let mut complete = false;
         for ev in events {
             match ev {
-                crate::h2_client::UpstreamEvent::ResponseHead(h) => out.extend_from_slice(&h),
-                crate::h2_client::UpstreamEvent::ResponseBody(b) => out.extend_from_slice(&b),
-                // Upstream response trailers (gRPC grpc-status): relay
-                // to an h2 client via the server shim's trailer path;
-                // dropped for h1 clients (h1 trailers need chunked
-                // relay, documented v0.2 limitation).
-                crate::h2_client::UpstreamEvent::ResponseTrailers(trailers) => {
-                    let frames = self
-                        .conn(slot)
-                        .h2
-                        .as_mut()
-                        .map_or_else(Vec::new, |h2s| h2s.response_trailers(&trailers));
-                    let out = &mut self.conn(slot).h2_out;
-                    for f in frames {
-                        out.extend_from_slice(&f);
-                    }
-                }
+                crate::h2_client::UpstreamEvent::ResponseHead(h) => head = Some(h),
+                crate::h2_client::UpstreamEvent::ResponseBody(b) => body.extend_from_slice(&b),
+                crate::h2_client::UpstreamEvent::ResponseTrailers(t) => trailers = Some(t),
                 crate::h2_client::UpstreamEvent::ResponseComplete => complete = true,
             }
         }
-        if !out.is_empty() {
-            self.on_upstream_data_h1(io, &out);
+        // Head first: parse_upstream_head sets the framing (CL present
+        // or not) and the h2 shim's translator consumes it.
+        if let Some(h) = &head {
+            self.on_upstream_data_h1(io, h);
+        }
+        // CL-less upstream responses (gRPC: length-delimited messages +
+        // trailers) would read as BodyFraming::Done and drop the body —
+        // switch to an unbounded relay; the upstream's trailers frame
+        // (END_STREAM) completes the response.
+        if self.conn(slot).body == BodyFraming::Done
+            && (!body.is_empty() || trailers.is_some() || !complete)
+        {
+            let conn = self.conn(slot);
+            conn.body = BodyFraming::ContentLength;
+            conn.remaining = u64::MAX;
+        }
+        if !body.is_empty() {
+            self.on_upstream_data_h1(io, &body);
+        }
+        // Response trailers (gRPC grpc-status): relay to an h2 client
+        // via the server shim's trailer path; dropped for h1 clients
+        // (h1 trailers need chunked relay — documented v0.2 limit).
+        if let Some(trailers) = trailers {
+            let is_h2_down = self.conns.get(&slot).is_some_and(|c| c.h2.is_some());
+            if is_h2_down {
+                let frames = self
+                    .conn(slot)
+                    .h2
+                    .as_mut()
+                    .map_or_else(Vec::new, |h2s| h2s.response_trailers(&trailers));
+                let out = &mut self.conn(slot).h2_out;
+                for f in frames {
+                    out.extend_from_slice(&f);
+                }
+                self.h2_flush(io);
+            }
         }
         if complete && self.conn(slot).body != BodyFraming::Done {
             self.conn(slot).body = BodyFraming::Done;
