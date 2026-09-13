@@ -486,10 +486,30 @@ impl Engine for MioEngine {
     }
 
     fn poll(&mut self, timeout: Option<Duration>, out: &mut Vec<Cqe>) -> io::Result<()> {
-        // Inline completions queued since the last round go out first; do
-        // not wait behind epoll for them.
+        // Inline completions go out first (per-session ordering: a
+        // completion must reach the handler before readiness edges for
+        // later operations on the same fd).
         if !self.cqes.is_empty() {
             out.append(&mut self.cqes);
+            // Starvation guard: sweep epoll with zero wait even while
+            // inline completions stream, so parked ops (a downstream
+            // read parked on WouldBlock) dispatch alongside the inline
+            // flow. Their completions ride the NEXT round — inline
+            // priority is preserved, nothing starves.
+            self.poller
+                .poll(&mut self.events, Some(Duration::ZERO))
+                .unwrap_or(());
+            let mut ready: Vec<(RawFd, bool, bool)> = Vec::with_capacity(64);
+            for ev in self.events.iter() {
+                if ev.token() == MioToken(WAKER) {
+                    continue;
+                }
+                let fd = ev.token().0 as RawFd;
+                ready.push((fd, ev.is_readable(), ev.is_writable()));
+            }
+            for (fd, readable, writable) in ready {
+                self.dispatch(fd, readable, writable);
+            }
             return Ok(());
         }
         self.poller.poll(&mut self.events, timeout)?;

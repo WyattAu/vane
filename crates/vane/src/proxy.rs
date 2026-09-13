@@ -726,6 +726,11 @@ impl HttpProxy {
     #[cfg(feature = "h2")]
     fn h2_flush(&mut self, io: &mut SessionIo<'_>) {
         let slot = io.slot_index();
+        #[cfg(feature = "h2")]
+        if !self.conn(slot).h2_out.is_empty() {
+            let frames = std::mem::take(&mut self.conn(slot).h2_out);
+            self.raw_downstream(io, &frames);
+        }
         let failed = self
             .conns
             .get(&slot)

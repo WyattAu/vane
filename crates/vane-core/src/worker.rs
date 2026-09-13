@@ -396,7 +396,6 @@ impl WorkerState {
     /// crash triage (compiled out in release... kept as a parameter so the
     /// next debug session can re-enable the trace in one line).
     pub(crate) fn close_session(&mut self, slot: u32, generation: u16, reason: &str) {
-        eprintln!("ACCDBG close slot={slot} reason={reason}");
         // vane-core stays dependency-light: no tracing here.
         let _ = reason;
         if !self.valid(slot, generation) {
@@ -799,6 +798,12 @@ impl WorkerState {
             let token = Token::new(Op::UpstreamWrite, slot, generation, 0);
             let _ = self.engine.write(token, fd, ws, len as usize, off as usize);
         } else {
+            // Queue fully drained: resume client reads that were paused
+            // by the pending_up backpressure (arm_downstream_read's
+            // pause condition). Without this the pause never lifts —
+            // the client's socket goes unread and the connection
+            // deadlocks once its send window exhausts.
+            self.arm_downstream_read(slot, generation);
             let mut io = self.io_for(slot, generation);
             h.on_upstream_flushed(&mut io);
         }
@@ -1208,7 +1213,6 @@ impl WorkerState {
             s.downstream = StreamFd(fd);
         }
         std::mem::forget(guard); // ownership moved into the session
-        eprintln!("ACCDBG accept fd={fd} slot={slot} gen={generation}");
         let token = Token::new(Op::DownstreamRead, slot, generation, 0);
         if self.engine.add_stream(fd, token).is_err() {
             self.close_session(slot, generation, "add-stream-failed");

@@ -899,19 +899,22 @@ async fn large_body_streams_through_edge() {
 /// request body streams to an echoing h1 upstream, response streams
 /// back through the engine's flow-controlled DATA relay.
 ///
-/// INVESTIGATION (narrowed — TLS trace): the credit cycle WORKS for
-/// two windows (client updates arrive, take_held drains, frames go
-/// out; client receives 131070 = 2x65535) then the third client
-/// update flight reaches the shim (small intakes visible) but yields
-/// no engine WindowUpdate events — handle_read's frame loop stops
-/// converting those frames. Suspicion: the shim's handle_read loop
-/// breaks on partial backlog or failed() during multi-frame flights.
-/// Also fixed this session: h2_write flush ordering (frames must
-/// precede the check_done FIN), EOF flags in non-splice EOF arms
-/// (session/mio-registration leaks), maybe_finish for upstream-less
-/// sessions, h2c support. Next session: instrument
-/// engine handle_window_update (inc/stream) + shim failed() in the
-/// h2c harness — 30 minutes from the fix.
+/// INVESTIGATION (final narrowing): h2c 1 MiB passes consistently.
+/// The TLS variant passes intermittently; failing runs end with the
+/// h2-crate client reporting "frame with invalid size" after receiving
+/// exactly 131070 bytes (2 windows), while the server-side frame dump
+/// shows every emitted frame legal (DATA <= 16384 = the peer's
+/// advertised max). Conclusion: the invalid "frame" is the CLIENT's
+/// parse of a TRUNCATED TLS record — the FIN (downstream_eof_write
+/// from close_after) or a session close races the final queued
+/// downstream write, so the last TLS record is cut mid-payload.
+/// Fixed this session en route: h2_write flush ordering, EOF flags in
+/// non-splice EOF arms, maybe_finish for upstream-less sessions, the
+/// continue_upstream_write resume (upstream-write completions now
+/// re-arm paused downstream reads), h2c support. NEXT: audit the
+/// close/flush path — raw_downstream -> io.respond completions vs
+/// downstream_eof_write/close ordering per session — the FIN must be
+/// queued strictly after the last data write completes.
 #[ignore = "INVESTIGATION: response bodies beyond one window (65535) stall — see doc comment"]
 #[tokio::test]
 async fn large_body_streams_native_engine() {
