@@ -14,6 +14,7 @@ pub mod acme;
 pub mod config;
 pub mod gateway;
 pub mod health;
+pub mod operator;
 pub mod providers;
 pub mod reconcile;
 pub mod routes;

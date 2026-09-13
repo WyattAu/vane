@@ -1764,7 +1764,7 @@ workers = 1
                 got.extend_from_slice(&b);
                 let _ = body.flow_control().release_capacity(len);
             }
-            Err(e) => {
+            Err(_) => {
                 break;
             }
         }

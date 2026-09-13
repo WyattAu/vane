@@ -43,6 +43,27 @@ enum Cmd {
         #[arg(long, default_value = "/dev/shm/vane-sidecar")]
         base: String,
     },
+    /// Watch Gateway API resources and drive a vane admin plane.
+    GatewayOperator {
+        /// Kubernetes API server base URL.
+        #[arg(long, default_value = "https://kubernetes.default.svc")]
+        api_server: String,
+        /// Namespace to watch (v0.2: single namespace).
+        #[arg(long, default_value = "default")]
+        namespace: String,
+        /// Path to the service-account token.
+        #[arg(
+            long,
+            default_value = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+        )]
+        token_path: String,
+        /// vane admin plane base URL (receives xDS snapshots).
+        #[arg(long, default_value = "http://127.0.0.1:7900")]
+        admin: String,
+        /// Poll interval seconds (v0.2: poll, not watch).
+        #[arg(long, default_value = "5")]
+        poll_secs: u64,
+    },
 }
 
 fn main() {
@@ -60,6 +81,13 @@ fn main() {
         } => cmd_run(config, handover_from, handover_to, force_mio),
         Cmd::Validate { config } => cmd_validate(&config),
         Cmd::Sidecar { config, base } => cmd_sidecar(config, base),
+        Cmd::GatewayOperator {
+            api_server,
+            namespace,
+            token_path,
+            admin,
+            poll_secs,
+        } => cmd_gateway_operator(api_server, namespace, token_path, admin, poll_secs),
     };
     std::process::exit(code);
 }
@@ -322,4 +350,106 @@ base = "/nonexistent-vane-sidecar-test"
         );
         assert_eq!(code, 1, "sidecar without backends must fail fast");
     }
+}
+
+/// `vane gateway-operator` body: polls the K8s API for Gateway API
+/// resources, compiles them, and POSTs xDS snapshots to the vane admin
+/// plane. v0.2: poll-based, single namespace, SA-token auth.
+fn cmd_gateway_operator(
+    api_server: String,
+    namespace: String,
+    token_path: String,
+    admin: String,
+    poll_secs: u64,
+) -> i32 {
+    use vane_control::gateway::{GatewayState, compile};
+
+    let token = std::fs::read_to_string(&token_path)
+        .map(|t| t.trim().to_owned())
+        .unwrap_or_default();
+    let client = reqwest::blocking::Client::builder()
+        // The K8s API serves a cluster-specific CA; the SA token
+        // authenticates and the operator pins nothing else.
+        .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("http client");
+    let routes_url = format!(
+        "{api_server}{}/namespaces/{namespace}/httproutes",
+        vane_control::operator::HTTPROUTES_PATH
+    );
+    let gateways_url = format!(
+        "{api_server}{}/namespaces/{namespace}/gateways",
+        vane_control::operator::GATEWAYS_PATH
+    );
+    let snapshot_url = format!("{admin}/xds/snapshot");
+
+    eprintln!("gateway-operator: ns={namespace} api={api_server} admin={admin} poll={poll_secs}s");
+    loop {
+        match (
+            fetch_k8s_json(&client, &routes_url, &token),
+            fetch_k8s_json(&client, &gateways_url, &token),
+        ) {
+            (Ok(routes_json), Ok(gateways_json)) => {
+                let compiled = (|| -> Result<String, String> {
+                    let state = GatewayState {
+                        gateways: vane_control::operator::map_gateways(&gateways_json)?,
+                        httproutes: vane_control::operator::map_httproutes(
+                            &routes_json,
+                            &namespace,
+                        )?,
+                    };
+                    let snapshot = compile(&state)?;
+                    serde_json::to_string(&snapshot).map_err(|e| e.to_string())
+                })();
+                match compiled {
+                    Ok(body) => {
+                        let resp = client
+                            .post(&snapshot_url)
+                            .header("content-type", "application/json")
+                            .body(body)
+                            .send();
+                        match resp {
+                            Ok(r) if r.status().is_success() => {
+                                eprintln!("gateway-operator: snapshot applied");
+                            }
+                            Ok(r) => {
+                                let status = r.status();
+                                let text = r.text().unwrap_or_default();
+                                eprintln!("gateway-operator: snapshot rejected: {status} {text}");
+                            }
+                            Err(e) => {
+                                eprintln!("gateway-operator: admin unreachable: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("gateway-operator: compile: {e}"),
+                }
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("gateway-operator: fetch: {e}");
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(poll_secs));
+    }
+}
+
+/// GETs a K8s API list endpoint with SA-token auth.
+fn fetch_k8s_json(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    token: &str,
+) -> Result<String, String> {
+    let resp = client
+        .get(url)
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let body = resp.text().map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        let head: String = body.chars().take(200).collect();
+        return Err(format!("{status}: {head}"));
+    }
+    Ok(body)
 }

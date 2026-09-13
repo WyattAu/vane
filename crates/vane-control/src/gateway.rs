@@ -14,7 +14,6 @@
 //!   to `[[listeners]]` entries; carried in the snapshot for parity)
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 
@@ -139,32 +138,14 @@ pub fn compile(state: &GatewayState) -> Result<XdsSnapshot, String> {
             }
             let cluster_name = format!("c-{}-{rule_idx}", route.name);
             let mut backends = Vec::new();
-            for (ref_idx, backend) in rule.backend_refs.iter().enumerate() {
+            for backend in rule.backend_refs.iter() {
                 version_hash = version_hash
                     .wrapping_mul(31)
                     .wrapping_add(u64::from(backend.port))
                     .wrapping_add(u64::from(backend.weight));
-                let addr: SocketAddr = backend
-                    .host
-                    .parse::<SocketAddr>()
-                    .ok()
-                    .or_else(|| {
-                        format!(
-                            "{}:{}",
-                            backend.host.trim_start_matches("http://"),
-                            backend.port
-                        )
-                        .parse()
-                        .ok()
-                    })
-                    .ok_or_else(|| {
-                        format!(
-                            "route `{}` rule {rule_idx} ref {ref_idx}: cannot parse `{}`",
-                            route.name, backend.host
-                        )
-                    })?;
-                let _ = ref_idx;
-                backends.push(addr.to_string());
+                // `host:port` — bare DNS names resolve later in
+                // `resolve_backends` (kube-dns / ToSocketAddrs).
+                backends.push(format!("{}:{}", backend.host, backend.port));
             }
             clusters.insert(
                 cluster_name.clone(),
