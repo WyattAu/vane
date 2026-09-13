@@ -899,19 +899,26 @@ async fn large_body_streams_through_edge() {
 /// request body streams to an echoing h1 upstream, response streams
 /// back through the engine's flow-controlled DATA relay.
 ///
-/// INVESTIGATION (h2c vs TLS): h2c 1 MiB passes consistently (our own
-/// H2Upstream client). The TLS + h2-crate-client variant stalls after
-/// exactly 131070 bytes (2x the client's initial windows): the crate
-/// sends two WINDOW_UPDATE pairs then stops, while the server-side
-/// frame dump shows every emitted frame legal. Server-side resume is
-/// verified fixed (continue_upstream_write now re-arms paused reads).
-/// Delta is the TLS layer + h2-crate client: next session instrument
-/// the engine's downstream-read arms after the second window in the
-/// TLS run (ARMD/IODBG probes are quick to re-add) and check whether
-/// the crate's third update flight is written at all — if it is, the
-/// reads pause again; if not, the crate's update batching needs a
-/// `Settings` push (e.g. advertise a larger initial window from the
-/// server so the client rarely needs to update).
+/// INVESTIGATION (final state): TLS + h2-crate client stalls at
+/// exactly 131070 bytes (2x the client's 65535 initial window). Full
+/// frame trace: every emitted DATA frame is legal (<= 16384 = the
+/// peer's max_frame_size); the last frame before the client's error
+/// is a 2-byte DATA frame (trailing fragment of a held-queue drain
+/// after a small WINDOW_UPDATE grant). The h2-crate then reports
+/// "frame with invalid size" and closes. Server-side mechanics
+/// verified: session leaks fixed, read-resume on upstream-write flush
+/// fixed, flush ordering fixed, all frame sizes legal, budget/window
+/// accounting consistent (server holds ~868 KB awaiting credit the
+/// client's crate never sends — its third WINDOW_UPDATE flight never
+/// reaches us). H2C (our driver, cleartext) and TLS (our driver) both
+/// pass 1 MiB, so the core is sound. NEXT: the h2-crate's own
+/// recv-window accounting rejects a legal stream — likely its
+/// `local window` vs `flow` tracking diverges when a server
+/// WINDOW_UPDATE (for the request direction) races its response
+/// window. Compare against h2-crate's recv.rs `add_flow`/
+/// `release_capacity` semantics; or sidestep by advertising a larger
+/// server SETTINGS_INITIAL_WINDOW_SIZE (reduces client update
+/// pressure). Not a blocker for h2c deployments.
 #[ignore = "INVESTIGATION: response bodies beyond one window (65535) stall — see doc comment"]
 #[tokio::test]
 async fn large_body_streams_native_engine() {
@@ -1103,7 +1110,9 @@ workers = 1
                 got.extend_from_slice(&b);
                 let _ = body.flow_control().release_capacity(len);
             }
-            Err(_) => break,
+            Err(_) => {
+                break;
+            }
         }
     }
     assert_eq!(got.len(), payload.len(), "streamed size");
@@ -1405,6 +1414,195 @@ workers = 1
         }
         assert_eq!(got.len(), payload.len(), "h2c streamed size");
         assert_eq!(got, payload, "h2c streamed integrity");
+    })
+    .await
+    .expect("client task");
+}
+
+/// TLS variant of the h2c harness: our own H2Upstream client over the
+/// TLS listener. Isolates the >window stall — same driver, TLS layer
+/// added. If this passes where the h2-crate variant fails, the delta
+/// is client-side; if it fails, the TLS server path is implicated.
+#[tokio::test]
+async fn tls_h2upstream_large_body() {
+    let _serial = lock_serial();
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let echo_addr = echo.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = echo.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut s = stream;
+                let mut byte = [0u8; 1];
+                let mut head = Vec::new();
+                loop {
+                    if s.read_exact(&mut byte).await.is_err() {
+                        return;
+                    }
+                    head.push(byte[0]);
+                    if head.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let head_str = String::from_utf8_lossy(&head).into_owned();
+                let content_length = head_str
+                    .to_ascii_lowercase()
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut buf = vec![0u8; content_length];
+                if s.read_exact(&mut buf).await.is_err() {
+                    return;
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    buf.len()
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+                let _ = s.write_all(&buf).await;
+                let _ = s.shutdown().await;
+            });
+        }
+    });
+
+    let dir = tempfile::tempdir().expect("dir");
+    let cert_path = dir.path().join("cert.pem");
+    let key_path = dir.path().join("key.pem");
+    let certs = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
+    std::fs::write(&cert_path, certs.cert.pem()).expect("cert");
+    std::fs::write(&key_path, certs.signing_key.serialize_pem()).expect("key");
+    let port: u16 = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("probe");
+        l.local_addr().expect("addr").port()
+    };
+    let cfg_path = dir.path().join("vane.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[listeners.tls]
+cert = "{}"
+key = "{}"
+alpn_h2 = true
+
+[clusters.up]
+backends = ["{echo_addr}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = true
+workers = 1
+"#,
+            cert_path.display(),
+            key_path.display()
+        ),
+    )
+    .expect("write cfg");
+    let cfg = cfg_path.to_str().expect("utf8").to_owned();
+    let _dir_guard = dir;
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let _ = rt.block_on(vane::server::run(vane::server::RunOptions {
+            config_path: Some(cfg),
+            handover_from: None,
+            handover_to: None,
+            shutdown_after: None,
+            force_mio: true,
+        }));
+    });
+    let edge: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    for _ in 0..60 {
+        if std::net::TcpStream::connect(edge).is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let payload: Vec<u8> = (0..1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let cert_path2 = cert_path.clone();
+    let edge2 = edge;
+    tokio::task::spawn_blocking(move || {
+        use rustls::pki_types::pem::PemObject as _;
+        use std::io::{Read, Write};
+        use vane::h2_client::{H2Upstream, UpstreamEvent};
+        let der = rustls::pki_types::CertificateDer::from_pem_file(&cert_path2).expect("der");
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(der).expect("root");
+        let mut client_cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client_cfg.alpn_protocols = vec![b"h2".to_vec()];
+        let server_config = std::sync::Arc::new(client_cfg);
+        let server_name =
+            rustls::pki_types::ServerName::try_from("localhost".to_owned()).expect("sni");
+        let conn = rustls::ClientConnection::new(server_config, server_name).expect("conn");
+        let tcp = std::net::TcpStream::connect(edge2).expect("connect");
+        tcp.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let mut tls = rustls::StreamOwned::new(conn, tcp);
+        // Drive the handshake; ALPN is negotiated within it.
+        tls.conn.complete_io(&mut tls.sock).expect("tls handshake");
+        assert_eq!(tls.conn.alpn_protocol(), Some(&b"h2"[..]));
+
+        let mut h2up = H2Upstream::new();
+        let pfx = h2up.pending_writes();
+        tls.write_all(&pfx).expect("preface");
+        let head = format!(
+            "POST /big HTTP/1.1\r\nhost: t\r\ncontent-length: {}\r\n\r\n",
+            payload.len()
+        );
+        h2up.send_request(head.as_bytes(), Some(payload.len() as u64));
+        tls.write_all(&h2up.pending_writes()).expect("request");
+        for chunk in payload.chunks(16384) {
+            let frames = h2up.request_body(chunk);
+            if !frames.is_empty() {
+                tls.write_all(&frames).expect("body frames");
+            }
+        }
+        tls.write_all(&h2up.pending_writes()).expect("flush");
+
+        let mut got = Vec::new();
+        let mut buf = [0u8; 16384];
+        loop {
+            let n = match tls.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let mut events = Vec::new();
+            h2up.handle_read(&buf[..n], &mut events);
+            for ev in &events {
+                if let UpstreamEvent::ResponseBody(b) = ev {
+                    got.extend_from_slice(b);
+                }
+            }
+            let out = h2up.pending_writes();
+            if !out.is_empty() {
+                tls.write_all(&out).expect("credit frames");
+            }
+            if got.len() >= payload.len() {
+                break;
+            }
+        }
+        assert_eq!(got.len(), payload.len(), "tls h2upstream streamed size");
+        assert_eq!(got, payload, "tls h2upstream streamed integrity");
     })
     .await
     .expect("client task");

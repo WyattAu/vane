@@ -726,6 +726,14 @@ impl HttpProxy {
     #[cfg(feature = "h2")]
     fn h2_flush(&mut self, io: &mut SessionIo<'_>) {
         let slot = io.slot_index();
+        thread_local! { static FLUSHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+        FLUSHED.with(|c| {
+            let t = c.get() + self.conn(slot).h2_out.len() as u64;
+            c.set(t);
+            if t / 100000 > (t - self.conn(slot).h2_out.len() as u64) / 100000 {
+                eprintln!("WIREDBG ~{t} response bytes flushed");
+            }
+        });
         #[cfg(feature = "h2")]
         if !self.conn(slot).h2_out.is_empty() {
             let frames = std::mem::take(&mut self.conn(slot).h2_out);
