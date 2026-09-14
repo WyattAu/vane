@@ -336,6 +336,12 @@ impl H2Server {
     /// Feeds upstream response bytes; returns h2 frames to emit plus
     /// whether the response is fully emitted (END_STREAM sent).
     pub fn response_bytes(&mut self, data: &[u8]) -> (Vec<Vec<u8>>, bool) {
+        eprintln!(
+            "RSPBDBG response_bytes active={:?} done={} resp_done={}",
+            self.active_stream,
+            self.translator.is_some(),
+            self.resp_done
+        );
         // Response already complete: further upstream bytes exceed the
         // declared framing — drop them (the driver logs at EOF).
         if self.resp_done {
@@ -426,6 +432,7 @@ impl H2Server {
         }
         // EOF-delimited body: the upstream EOF IS the end.
         let stream_id = self.active_stream.unwrap_or(0);
+        eprintln!("EMITDBG eof-end sid={stream_id}");
         let mut out = Vec::new();
         if !t.done {
             // Empty DATA with END_STREAM.
@@ -458,6 +465,11 @@ impl H2Server {
             let room = max_frame;
             // Debit the engine's windows for driver-emitted frames.
             let take = self.conn.consume_send_budget(stream_id, room.min(want));
+            eprintln!(
+                "QBBDBG take={take} conn={} stream={}",
+                self.conn.conn_send_window_probe(),
+                self.conn.stream_send_window_probe(stream_id)
+            );
             if take == 0 {
                 break;
             }
@@ -747,9 +759,14 @@ mod flow_tests {
         for b in upstream_head {
             let (f, _) = h2s.response_bytes(&[*b]);
             for frame in &f {
+                // Only DATA frames carry flow-controlled payload; the
+                // HEADERS frame's 28-byte block must not be counted.
+                if frame.len() >= 9 && frame[3] != 0x00 {
+                    continue;
+                }
                 let len = u32::from_be_bytes([0, frame[0], frame[1], frame[2]]) as u64;
-                let sid = u32::from_be_bytes([0, frame[5], frame[6], frame[7]]);
                 emitted_total += len;
+                let sid = u32::from_be_bytes([0, frame[5], frame[6], frame[7]]);
                 h2s.conn.grant_send_for_test(sid, len as u32);
             }
         }
@@ -775,15 +792,30 @@ mod flow_tests {
                 }
             };
             done = d;
+            let mut granted_this_iter: u64 = 0;
             for f in &frames {
-                // DATA frame payload length from the serialized frame.
+                // Only DATA frames consume the flow window.
+                let ftype = f[3];
+                if ftype != 0x00 {
+                    eprintln!(
+                        "TYPDBG non-data frame type={ftype:#04x} len={}",
+                        f.len() - 9
+                    );
+                    continue;
+                }
                 let len = u32::from_be_bytes([0, f[0], f[1], f[2]]) as u64;
-                let sid = u32::from_be_bytes([0, f[5], f[6], f[7]]);
+                let sid = u32::from_be_bytes([f[5] & 0x7f, f[6], f[7], f[8]]);
                 emitted_total += len;
                 // The client reads and releases: grant credit back.
                 h2s.conn.grant_send_for_test(sid, len as u32);
+                granted_this_iter += len;
                 granted_total += len;
             }
+            let (cw, sw) = h2s.conn_debug_windows();
+            eprintln!(
+                "FLWDBG it={guard} emitted_delta={granted_this_iter} emitted_total={emitted_total} granted_total={granted_total} cw={cw} sw={sw} held={} fed={fed}",
+                h2s.held.len()
+            );
             assert!(
                 emitted_total <= granted_total,
                 "over-send: emitted {emitted_total} > granted {granted_total}"

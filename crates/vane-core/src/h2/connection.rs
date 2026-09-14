@@ -331,6 +331,18 @@ impl Connection {
         self.streams.contains_key(&stream_id)
     }
 
+    /// Debug: connection send window.
+    #[must_use]
+    pub fn conn_send_window_probe(&self) -> i64 {
+        self.conn_send_window
+    }
+
+    /// Debug: stream send window.
+    #[must_use]
+    pub fn stream_send_window_probe(&self, stream_id: u32) -> i64 {
+        self.streams.get(&stream_id).map_or(0, |st| st.send_window)
+    }
+
     /// Debug: current send windows (conn, stream if open).
     #[must_use]
     pub fn debug_send_windows(&self, stream_id: u32) -> (i64, i64) {
@@ -346,6 +358,8 @@ impl Connection {
         self.conn_send_window += i64::from(n);
         if let Some(st) = self.streams.get_mut(&stream_id) {
             st.send_window += i64::from(n);
+        } else {
+            eprintln!("GRANTDBG grant({n}) dropped: stream {stream_id} missing");
         }
     }
 
