@@ -529,10 +529,6 @@ impl H2Server {
 
 /// Serializes one DATA frame.
 fn data_frame(stream_id: u32, data: &[u8], end_stream: bool) -> Vec<u8> {
-    eprintln!(
-        "FRMDBG data sid={stream_id} len={} end={end_stream} budget_hint",
-        data.len()
-    );
     let mut frame = Vec::with_capacity(9 + data.len());
     vane_core::h2::frame::write_header(
         &mut frame,
