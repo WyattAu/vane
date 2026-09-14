@@ -74,6 +74,9 @@ pub struct H2Server {
     /// A flow-control-stall PING is outstanding (client owes us a
     /// PONG that should flush its queued WINDOW_UPDATEs).
     probe_inflight: bool,
+    /// The response completed (END_STREAM emitted). Further upstream
+    /// bytes exceed the declared framing and must never be re-fed.
+    resp_done: bool,
 }
 
 /// Translates one upstream HTTP/1.1 response into h2 HEADERS + DATA.
@@ -109,6 +112,7 @@ impl H2Server {
             translator: None,
             held: Vec::new(),
             probe_inflight: false,
+            resp_done: false,
         }
     }
 
@@ -323,6 +327,11 @@ impl H2Server {
     /// Feeds upstream response bytes; returns h2 frames to emit plus
     /// whether the response is fully emitted (END_STREAM sent).
     pub fn response_bytes(&mut self, data: &[u8]) -> (Vec<Vec<u8>>, bool) {
+        // Response already complete: further upstream bytes exceed the
+        // declared framing — drop them (the driver logs at EOF).
+        if self.resp_done {
+            return (Vec::new(), true);
+        }
         let max_frame = self.conn.peer_max_frame_size();
         if self.translator.is_none() {
             self.translator = Some(ResponseTranslator::new());
@@ -379,6 +388,7 @@ impl H2Server {
         if done {
             self.translator = None;
             self.active_stream = None;
+            self.resp_done = true;
         } else if !self.held.is_empty() {
             self.maybe_probe_stall();
         }
@@ -388,6 +398,9 @@ impl H2Server {
     /// Upstream EOF with an EOF-delimited (or empty) body: end the
     /// stream. Returns frames plus whether the response completed now.
     pub fn response_eof(&mut self) -> (Vec<Vec<u8>>, EofOutcome) {
+        if self.resp_done {
+            return (Vec::new(), EofOutcome::Continue);
+        }
         let Some(t) = self.translator.as_mut() else {
             return (Vec::new(), EofOutcome::Continue);
         };
@@ -470,6 +483,7 @@ impl H2Server {
         if done {
             self.translator = None;
             self.active_stream = None;
+            self.resp_done = true;
         } else if !self.held.is_empty() {
             self.maybe_probe_stall();
         }
@@ -493,6 +507,7 @@ impl H2Server {
         let frames = emit_header_block_full_end(stream_id, &headers, max_frame);
         self.translator = None;
         self.active_stream = None;
+        self.resp_done = true;
         frames
     }
 
