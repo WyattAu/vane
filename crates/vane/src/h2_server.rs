@@ -71,6 +71,9 @@ pub struct H2Server {
     translator: Option<ResponseTranslator>,
     /// Response bytes held back by flow control.
     held: Vec<u8>,
+    /// A flow-control-stall PING is outstanding (client owes us a
+    /// PONG that should flush its queued WINDOW_UPDATEs).
+    probe_inflight: bool,
 }
 
 /// Translates one upstream HTTP/1.1 response into h2 HEADERS + DATA.
@@ -105,7 +108,26 @@ impl H2Server {
             body_remaining: None,
             translator: None,
             held: Vec::new(),
+            probe_inflight: false,
         }
+    }
+
+    /// Flow-control stall: response bytes are held with zero send
+    /// budget. The client's queued WINDOW_UPDATE may sit unflushed in
+    /// its connection task — a PING forces it to process input and
+    /// flush output (standard keepalive-style tickle). Sent at most
+    /// once per stall; re-armed when credit arrives.
+    fn maybe_probe_stall(&mut self) {
+        let stream_id = self.active_stream.unwrap_or(0);
+        if self.held.is_empty() || self.conn.send_budget(stream_id) > 0 {
+            return;
+        }
+        if self.probe_inflight {
+            return;
+        }
+        self.probe_inflight = true;
+        self.conn
+            .send_ping(&[0x56, 0x41, 0x4e, 0x45, 0x50, 0x52, 0x4f, 0x42]); // "VANEPROB"
     }
 
     /// Connection is in an error state: flush GOAWAY and close.
@@ -232,6 +254,8 @@ impl H2Server {
                 }
             }
             Event::WindowUpdate { .. } => {
+                // Credit arrived: the stall probe did its job.
+                self.probe_inflight = false;
                 if !self.held.is_empty() {
                     events.push(H2Event::SendCredit);
                 }
@@ -355,6 +379,8 @@ impl H2Server {
         if done {
             self.translator = None;
             self.active_stream = None;
+        } else if !self.held.is_empty() {
+            self.maybe_probe_stall();
         }
         (out, done)
     }
@@ -444,6 +470,8 @@ impl H2Server {
         if done {
             self.translator = None;
             self.active_stream = None;
+        } else if !self.held.is_empty() {
+            self.maybe_probe_stall();
         }
         (out, done)
     }
@@ -486,6 +514,10 @@ impl H2Server {
 
 /// Serializes one DATA frame.
 fn data_frame(stream_id: u32, data: &[u8], end_stream: bool) -> Vec<u8> {
+    eprintln!(
+        "FRMDBG data sid={stream_id} len={} end={end_stream} budget_hint",
+        data.len()
+    );
     let mut frame = Vec::with_capacity(9 + data.len());
     vane_core::h2::frame::write_header(
         &mut frame,

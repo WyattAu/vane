@@ -899,29 +899,34 @@ async fn large_body_streams_through_edge() {
 /// request body streams to an echoing h1 upstream, response streams
 /// back through the engine's flow-controlled DATA relay.
 ///
-/// INVESTIGATION (final state): TLS + h2-crate client stalls at
-/// exactly 131070 bytes (2x the client's 65535 initial window). Full
-/// frame trace: every emitted DATA frame is legal (<= 16384 = the
-/// peer's max_frame_size); the last frame before the client's error
-/// is a 2-byte DATA frame (trailing fragment of a held-queue drain
-/// after a small WINDOW_UPDATE grant). The h2-crate then reports
-/// "frame with invalid size" and closes. Server-side mechanics
-/// verified: session leaks fixed, read-resume on upstream-write flush
-/// fixed, flush ordering fixed, all frame sizes legal, budget/window
-/// accounting consistent (server holds ~868 KB awaiting credit the
-/// client's crate never sends — its third WINDOW_UPDATE flight never
-/// reaches us). H2C (our driver, cleartext) and TLS (our driver) both
-/// pass 1 MiB, so the core is sound. NEXT: the h2-crate's own
-/// recv-window accounting rejects a legal stream — likely its
-/// `local window` vs `flow` tracking diverges when a server
-/// WINDOW_UPDATE (for the request direction) races its response
-/// window. Compare against h2-crate's recv.rs `add_flow`/
-/// `release_capacity` semantics; or sidestep by advertising a larger
-/// server SETTINGS_INITIAL_WINDOW_SIZE (reduces client update
-/// pressure). Not a blocker for h2c deployments.
-#[ignore = "INVESTIGATION (TLS-only): h2-crate client reports 'frame with invalid size' after 131070 bytes (2 windows); all server frames verified legal. Suspect TLS write-boundary corruption on close — wire capture next. h2c path green (h2c_native_engine_large_body)."]
+/// INVESTIGATION (final state): TLS + h2-crate client stalls after
+/// exactly 131070 bytes (2x its initial windows). Diagnostic trail:
+/// (1) every server-emitted frame is legal (<= 16384); (2) the server
+/// ends with budget=0 + held data, waiting for the client's third
+/// WINDOW_UPDATE flight; (3) that flight IS written by the client but
+/// the engine's downstream read never delivers it — the last dispatch
+/// shows a READABLE event for the client fd with ZERO parked ops (ET
+/// consumed the edge while the read was paused/not-submitted), after
+/// which the fd never fires again: classic edge-triggered lost wakeup
+/// through the pause window. Fixed en route: the upstream-write flush
+/// resume (continue_upstream_write now re-arms paused reads). NEXT
+/// SESSION (focused, ~1h): close the pause-vs-edge race — either
+/// (a) keep a Pending::Read permanently parked per connection and
+/// resubmit on resume, or (b) after lifting a pause, ALWAYS submit a
+/// fresh read even if read_inflight was true (dedupe via token), or
+/// (c) drop the pending_up pause for h2 sessions (the shim's own
+/// budget holds unbounded data safely). H2C path (cleartext, our
+/// driver) is green at 1 MiB and is the documented production mode
+/// for containers/meshes.
 #[tokio::test]
 async fn large_body_streams_native_engine() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("h2=debug,warn")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
     let _serial = lock_serial();
     // Echo upstream: 200 + request body verbatim.
     let echo = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -956,9 +961,12 @@ async fn large_body_streams_native_engine() {
                     .unwrap_or(0);
                 #[allow(clippy::vec_init_then_push)] // test echo: explicit zero-fill
                 let mut buf = vec![0u8; content_length];
+                eprintln!("ECHODBG head CL={content_length}");
                 if s.read_exact(&mut buf).await.is_err() {
+                    eprintln!("ECHODBG body read failed at CL={content_length}");
                     return;
                 }
+                eprintln!("ECHODBG body complete ({content_length} bytes)");
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     buf.len()
@@ -1288,8 +1296,10 @@ async fn h2c_native_engine_large_body() {
                     .unwrap_or(0);
                 let mut buf = vec![0u8; content_length];
                 if s.read_exact(&mut buf).await.is_err() {
+                    eprintln!("ECHODBG body read failed at CL={content_length}");
                     return;
                 }
+                eprintln!("ECHODBG got head+{content_length} body bytes");
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     buf.len()
