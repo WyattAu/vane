@@ -603,16 +603,11 @@ impl WorkerState {
     }
 
     fn arm_downstream_read(&mut self, slot: u32, generation: u16) {
-        // Read throttling (backpressure): while queued upstream writes
-        // exceed two slots, stop reading the client. Resumed from
-        // `continue_upstream_write` once the queue drains.
-        let paused = self
-            .slab
-            .get(slot)
-            .is_some_and(|s| s.pending_up.len() > 2 * self.pool.buf_size());
-        if paused {
-            return;
-        }
+        // NOTE: no upstream-write backpressure pause here. Skipping the
+        // read while paused loses epoll ET edges (a readable event
+        // consumed with no parked read op is gone forever), which
+        // deadlocks streaming responses. Upstream buffering is already
+        // bounded by WRITE_PENDING_CAP at write_upstream time.
         let Some(s) = self.slab.get_mut(slot) else {
             return;
         };
