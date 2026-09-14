@@ -191,3 +191,39 @@ A backend reaching `consecutive_failures` is skipped by the balancer
 for `ejection_ms` (it remains the fallback of last resort when nothing
 else is live); any non-5xx completion resets its streak. Independent of
 the active health checker.
+
+## Listener `h2c` — cleartext HTTP/2
+
+```toml
+[[listeners]]
+address = "0.0.0.0:8080"
+h2c = true
+```
+
+Plain listeners with `h2c = true` speak prior-knowledge HTTP/2
+(RFC 9113 §3.2: the client sends the 24-byte preface first). For
+containers and service meshes that terminate TLS elsewhere. Requires
+no TLS material; coexists with plain HTTP/1.1 on other listeners.
+
+## `vane gateway-operator` — Gateway API dynamic config
+
+Watches Kubernetes Gateway API resources (Gateways + HTTPRoutes,
+`gateway.networking.k8s.io/v1`) in one namespace, compiles them into
+xDS snapshots, and POSTs them to a vane admin plane
+(`POST /xds/snapshot` — atomic router swap, errors leave the live
+table untouched).
+
+```bash
+vane gateway-operator \
+  --api-server https://kubernetes.default.svc \
+  --namespace default \
+  --token-path /var/run/secrets/kubernetes.io/serviceaccount/token \
+  --admin http://vane-admin:7900 \
+  --poll-secs 5
+```
+
+Backend refs resolve to `{name}.{namespace}.svc:{port}` (kube-dns).
+Weighted refs become weighted backends. TLS listeners map to secret-
+mount convention paths (`/etc/vane/certs/{secret}`). v0.2 is
+poll-based (no watch API) and single-namespace; the Helm chart ships
+a `gatewayOperator.enabled=true` deployment + read-only RBAC.

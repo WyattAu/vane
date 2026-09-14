@@ -1,0 +1,70 @@
+{{- if .Values.gatewayOperator.enabled }}
+{{- $fullname := include "vane.fullname" . }}
+{{- if .Values.gatewayOperator.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullname }}-gateway-operator
+  labels:
+    {{- include "vane.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gateways", "httproutes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $fullname }}-gateway-operator
+  labels:
+    {{- include "vane.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $fullname }}-gateway-operator
+subjects:
+  - kind: ServiceAccount
+    name: {{ $fullname }}
+    namespace: {{ .Release.Namespace }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}-gateway-operator
+  labels:
+    {{- include "vane.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "vane.name" . }}
+      app.kubernetes.io/component: gateway-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "vane.name" . }}
+        app.kubernetes.io/component: gateway-operator
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ $fullname }}
+      containers:
+        - name: gateway-operator
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - gateway-operator
+            - --api-server
+            - {{ .Values.gatewayOperator.apiServer }}
+            - --namespace
+            - {{ .Values.gatewayOperator.namespace }}
+            - --admin
+            - {{ .Values.gatewayOperator.admin }}
+            - --poll-secs
+            - "{{ .Values.gatewayOperator.pollSecs }}"
+          resources:
+            {{- toYaml .Values.gatewayOperator.resources | nindent 12 }}
+{{- end }}

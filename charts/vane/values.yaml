@@ -72,3 +72,21 @@ prometheus:
 k8sProvider:
   enabled: false
   namespaces: []
+
+# Gateway API operator: watches Gateways/HTTPRoutes and drives the
+# proxy's xDS snapshot endpoint. Requires the gateway.networking.k8s.io
+# CRDs and `vane gateway-operator` (in the same image).
+gatewayOperator:
+  enabled: false
+  apiServer: https://kubernetes.default.svc
+  namespace: default
+  admin: http://vane-admin:7900
+  pollSecs: 5
+  rbac:
+    create: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 32Mi
+    limits:
+      memory: 128Mi
