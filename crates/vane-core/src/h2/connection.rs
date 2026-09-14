@@ -331,6 +331,15 @@ impl Connection {
         self.streams.contains_key(&stream_id)
     }
 
+    /// Test-only: grants `n` bytes of send credit (simulates a peer
+    /// WINDOW_UPDATE on stream + connection without a frame round-trip).
+    pub fn grant_send_for_test(&mut self, stream_id: u32, n: u32) {
+        self.conn_send_window += i64::from(n);
+        if let Some(st) = self.streams.get_mut(&stream_id) {
+            st.send_window += i64::from(n);
+        }
+    }
+
     /// Reserves `n` bytes of send credit for DATA the driver emits
     /// directly (frame bytes assembled outside the engine). The engine
     /// never sees those frames through [`Self::send_data`], so the

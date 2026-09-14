@@ -153,6 +153,7 @@ impl H2Server {
     /// Feeds decrypted h2 bytes; emits driver events. Callers must
     /// flush [`Self::pending_writes`] and honor [`Self::failed`].
     pub fn handle_read(&mut self, data: &[u8], events: &mut Vec<H2Event>) {
+        eprintln!("SHIMDBG intake {}", data.len());
         self.backlog.extend_from_slice(data);
         loop {
             let mut engine_events = Vec::new();
@@ -196,6 +197,7 @@ impl H2Server {
                 // without Content-Length is refused with
                 // REFUSED_STREAM (retryable and honest).
                 let accepted = end_stream || Self::request_content_length(&headers).is_some();
+
                 if accepted {
                     if let Some(head) = Self::translate_head(&headers) {
                         self.active_stream = Some(stream_id);
@@ -669,4 +671,107 @@ fn emit_header_block(
         first = false;
     }
     frames
+}
+
+#[cfg(test)]
+mod flow_tests {
+    use super::*;
+
+    /// Flow-accounting invariant: total emitted DATA payload must never
+    /// exceed the client's total granted window (initial 65535 + all
+    /// simulated WINDOW_UPDATE grants), for a 1 MiB response fed in
+    /// 4096-byte upstream chunks with a 65535-initial-window client.
+    #[ignore = "DETERMINISTIC reproducer of the TLS streaming stall: shim trickles to a stop after the initial window (budget fragmentation cascade). Fix + un-ignore next session."]
+    #[test]
+    fn emitted_bytes_never_exceed_granted_window() {
+        const BODY: usize = 1024 * 1024;
+        let mut h2s = H2Server::new(0);
+        // Request head (POST, CL = BODY, END_STREAM off) as h2 frames.
+        let mut events = Vec::new();
+        // HPACK literal (no indexing, new name): :method POST
+        // Simplest legal request head: :method GET indexed + :path. We
+        // need a body though — use POST with content-length. Build the
+        // head via the shim's own translate path: feed real frames.
+        //
+        // :method POST = indexed 3 (0x83); :scheme https = 7 (0x87);
+        // :authority "t" = literal indexed name 1; :path /big = 4.
+        let mut head = Vec::new();
+        head.extend_from_slice(&[0x83]); // :method POST
+        head.extend_from_slice(&[0x87]); // :scheme https
+        head.extend_from_slice(&[0x41, 0x01, b't']); // :authority t
+        head.extend_from_slice(&[0x44, 0x04, b'/', b'b', b'i', b'g']); // :path /big
+        head.extend_from_slice(&[0x00, 0x0e]); // literal CL
+        head.extend_from_slice(b"content-length");
+        head.extend_from_slice(&[0x07]);
+        head.extend_from_slice(b"1048576");
+        h2s.conn
+            .handle_read(vane_core::h2::connection::CLIENT_PREFACE, &mut Vec::new());
+        // Wrap head as a HEADERS frame via the public handle_read.
+        let frame_head = {
+            let mut f = Vec::new();
+            vane_core::h2::frame::write_header(
+                &mut f,
+                head.len() as u32,
+                vane_core::h2::frame::FrameKind::Headers,
+                vane_core::h2::frame::FrameFlags::from_u8(0x04),
+                1,
+            );
+            f.extend_from_slice(&head);
+            f
+        };
+        h2s.handle_read(&frame_head, &mut events);
+        eprintln!(
+            "FTDBG events={} conn_err={:?}",
+            events.len(),
+            h2s.conn_error_code()
+        );
+        assert!(matches!(events[0], H2Event::RequestHead { .. }));
+
+        // Simulate the upstream feeding the full body through
+        // response_bytes, with the client granting credit as it reads.
+        let mut granted_total: u64 = 65_535; // initial (stream + conn tracked together here via budget)
+        let mut emitted_total: u64 = 0;
+        let mut fed: usize = 0;
+        let body = vec![0u8; BODY];
+        let mut done = false;
+        let mut guard = 0;
+        while !done && guard < 10_000 {
+            guard += 1;
+            // Server sends what its budget allows, from fresh upstream
+            // data + held queue.
+            let (frames, d) = {
+                if !done && fed < BODY {
+                    let chunk = &body[fed..(fed + 4096).min(BODY)];
+                    fed += chunk.len();
+                    let (f1, d1) = h2s.response_bytes(chunk);
+                    let mut all = f1;
+                    let (f2, d2) = h2s.take_held();
+                    all.extend(f2);
+                    (all, d1 || d2)
+                } else {
+                    let (f, d) = h2s.take_held();
+                    (f, d)
+                }
+            };
+            done = d;
+            for f in &frames {
+                // DATA frame payload length from the serialized frame.
+                let len = u32::from_be_bytes([0, f[0], f[1], f[2]]) as u64;
+                let sid = u32::from_be_bytes([0, f[5], f[6], f[7]]);
+                emitted_total += len;
+                // The client reads and releases: grant credit back.
+                h2s.conn.grant_send_for_test(sid, len as u32);
+                granted_total += len;
+            }
+            assert!(
+                emitted_total <= granted_total,
+                "over-send: emitted {emitted_total} > granted {granted_total}"
+            );
+            if guard > 9_900 {
+                panic!("no progress; flow-control stall");
+            }
+        }
+        assert!(done, "response must complete");
+        assert_eq!(emitted_total, BODY as u64, "all body bytes emitted");
+    }
 }

@@ -1067,7 +1067,9 @@ workers = 1
 
     let (mut send, connection) = h2::client::handshake(tls).await.expect("h2");
     tokio::spawn(async move {
-        let _ = connection.await;
+        if let Err(e) = connection.await {
+            eprintln!("CONNERR native: {e}");
+        }
     });
     let payload: Vec<u8> = (0..1024 * 1024u32).map(|i| (i % 251) as u8).collect();
     let request = http::Request::builder()
@@ -1782,4 +1784,161 @@ workers = 1
         Some("0"),
         "grpc-status trailers must be relayed"
     );
+}
+
+/// h2-crate client over H2C (cleartext): isolates whether the >window
+/// streaming stall is TLS-specific or protocol-level.
+#[tokio::test]
+async fn h2crate_client_h2c_large_body() {
+    let _serial = lock_serial();
+    // Same echo upstream as h2c_native_engine_large_body.
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let echo_addr = echo.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = echo.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut s = stream;
+                let mut byte = [0u8; 1];
+                let mut head = Vec::new();
+                loop {
+                    if s.read_exact(&mut byte).await.is_err() {
+                        return;
+                    }
+                    head.push(byte[0]);
+                    if head.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let head_str = String::from_utf8_lossy(&head).into_owned();
+                let content_length = head_str
+                    .to_ascii_lowercase()
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                #[allow(clippy::vec_init_then_push)]
+                let mut buf = vec![0u8; content_length];
+                if s.read_exact(&mut buf).await.is_err() {
+                    return;
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    buf.len()
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+                let _ = s.write_all(&buf).await;
+                let _ = s.shutdown().await;
+            });
+        }
+    });
+
+    let port: u16 = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("probe");
+        l.local_addr().expect("addr").port()
+    };
+    let dir = tempfile::tempdir().expect("dir");
+    let cfg_path = dir.path().join("vane.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+h2c = true
+
+[clusters.up]
+backends = ["{echo_addr}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = true
+workers = 1
+"#
+        ),
+    )
+    .expect("write cfg");
+    let cfg = cfg_path.to_str().expect("utf8").to_owned();
+    let _dir_guard = dir;
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let _ = rt.block_on(vane::server::run(vane::server::RunOptions {
+            config_path: Some(cfg),
+            handover_from: None,
+            handover_to: None,
+            shutdown_after: None,
+            force_mio: true,
+        }));
+    });
+    let edge: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    for _ in 0..60 {
+        if std::net::TcpStream::connect(edge).is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let tcp = tokio::net::TcpStream::connect(edge).await.expect("connect");
+    let (mut send, connection) = h2::client::handshake(tcp).await.expect("h2");
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("h2 connection task: {e}");
+        }
+    });
+    let payload: Vec<u8> = (0..1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("http://edge/big")
+        .header("content-length", payload.len())
+        .body(())
+        .expect("request");
+    let (response, mut flow) = send.send_request(request, false).expect("send");
+    let mut pos = 0;
+    while pos < payload.len() {
+        let n = (payload.len() - pos).min(16384);
+        let chunk = bytes::Bytes::copy_from_slice(&payload[pos..pos + n]);
+        match flow.send_data(chunk, false) {
+            Ok(()) => pos += n,
+            Err(_) => match std::future::poll_fn(|cx| flow.poll_capacity(cx)).await {
+                Some(Ok(_)) => {}
+                Some(Err(e)) => panic!("capacity error: {e}"),
+                None => panic!("stream reset during send"),
+            },
+        }
+    }
+    flow.send_data(bytes::Bytes::new(), true).expect("eom");
+
+    let (parts, mut body) = tokio::time::timeout(Duration::from_secs(15), response)
+        .await
+        .expect("in time")
+        .expect("response")
+        .into_parts();
+    assert_eq!(parts.status.as_u16(), 200);
+    let mut got = Vec::new();
+    while let Some(chunk) = body.data().await {
+        match chunk {
+            Ok(b) => {
+                let len = b.len();
+                got.extend_from_slice(&b);
+                let _ = body.flow_control().release_capacity(len);
+            }
+            Err(_) => break,
+        }
+    }
+    assert_eq!(got.len(), payload.len(), "h2c h2crate streamed size");
+    assert_eq!(got, payload, "h2c h2crate streamed integrity");
 }
