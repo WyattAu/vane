@@ -331,6 +331,15 @@ impl Connection {
         self.streams.contains_key(&stream_id)
     }
 
+    /// Debug: current send windows (conn, stream if open).
+    #[must_use]
+    pub fn debug_send_windows(&self, stream_id: u32) -> (i64, i64) {
+        (
+            self.conn_send_window,
+            self.streams.get(&stream_id).map_or(0, |st| st.send_window),
+        )
+    }
+
     /// Test-only: grants `n` bytes of send credit (simulates a peer
     /// WINDOW_UPDATE on stream + connection without a frame round-trip).
     pub fn grant_send_for_test(&mut self, stream_id: u32, n: u32) {

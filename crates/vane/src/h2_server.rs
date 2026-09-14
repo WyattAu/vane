@@ -139,6 +139,13 @@ impl H2Server {
         self.conn.connection_error().is_some()
     }
 
+    /// Debug: engine send windows (conn, active stream).
+    #[must_use]
+    pub fn conn_debug_windows(&self) -> (i64, i64) {
+        self.conn
+            .debug_send_windows(self.active_stream.unwrap_or(0))
+    }
+
     /// The engine's connection error code, if any.
     pub fn conn_error_code(&self) -> Option<u32> {
         self.conn.connection_error().map(|e| e.code)
@@ -727,11 +734,25 @@ mod flow_tests {
         );
         assert!(matches!(events[0], H2Event::RequestHead { .. }));
 
-        // Simulate the upstream feeding the full body through
-        // response_bytes, with the client granting credit as it reads.
+        // Simulate the upstream feeding the response head + full body
+        // through response_bytes, with the client granting credit as it
+        // reads.
         let mut granted_total: u64 = 65_535; // initial (stream + conn tracked together here via budget)
         let mut emitted_total: u64 = 0;
         let mut fed: usize = 0;
+        let upstream_head =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 1048576\r\n\r\n";
+        // Feed one byte at a time to exercise the head-buffer; the head
+        // parse completes on the final byte, emitting the HEADERS frame.
+        for b in upstream_head {
+            let (f, _) = h2s.response_bytes(&[*b]);
+            for frame in &f {
+                let len = u32::from_be_bytes([0, frame[0], frame[1], frame[2]]) as u64;
+                let sid = u32::from_be_bytes([0, frame[5], frame[6], frame[7]]);
+                emitted_total += len;
+                h2s.conn.grant_send_for_test(sid, len as u32);
+            }
+        }
         let body = vec![0u8; BODY];
         let mut done = false;
         let mut guard = 0;
@@ -768,7 +789,19 @@ mod flow_tests {
                 "over-send: emitted {emitted_total} > granted {granted_total}"
             );
             if guard > 9_900 {
-                panic!("no progress; flow-control stall");
+                let (cw, sw) = h2s.conn_debug_windows();
+                let open = h2s.conn.stream_is_open(1);
+                let held_len = h2s.held.len();
+                panic!(
+                    "no progress; guard={guard} emitted={emitted_total} granted={granted_total} fed={fed} held={held_len} budget={budget} conn_w={cw} stream_w={sw} stream_open={open} resp_done={rd} probe={probe}",
+                    held_len = held_len,
+                    budget = h2s.conn.send_budget(1),
+                    cw = cw,
+                    sw = sw,
+                    open = open,
+                    rd = h2s.resp_done,
+                    probe = h2s.probe_inflight
+                );
             }
         }
         assert!(done, "response must complete");
