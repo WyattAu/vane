@@ -21,8 +21,14 @@ jobs:
   e2e:
     name: end-to-end proxy
     runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: sccache stats
+        run: sccache --start-server || true
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run proxy integration tests
@@ -31,8 +37,14 @@ jobs:
   h2spec:
     name: h2 conformance (h2spec generic)
     runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: sccache stats
+        run: sccache --start-server || true
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install h2spec
@@ -74,8 +86,14 @@ jobs:
   feature-matrix:
     name: feature matrix
     runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: sccache stats
+        run: sccache --start-server || true
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: no default features (mio-only core)

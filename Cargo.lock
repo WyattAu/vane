@@ -3975,6 +3975,7 @@ dependencies = [
  "vane-router",
  "vane-shm",
  "vane-tls",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -3983,6 +3984,7 @@ version = "0.2.0"
 dependencies = [
  "tempfile",
  "vane-shm",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -4009,6 +4011,7 @@ dependencies = [
  "validkit",
  "vane-observe",
  "vane-router",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -4026,6 +4029,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "vane-observe",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -4041,6 +4045,7 @@ dependencies = [
  "throttle-kit",
  "tokio",
  "vane-observe",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -4050,6 +4055,7 @@ dependencies = [
  "loom",
  "rand 0.9.5",
  "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -4061,6 +4067,7 @@ dependencies = [
  "tracing",
  "vane-observe",
  "wasmtime",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -4073,6 +4080,7 @@ dependencies = [
  "httparse",
  "thiserror 2.0.20",
  "vane-observe",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -4086,6 +4094,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.20",
  "vane-observe",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -4102,6 +4111,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tracing",
  "vane-router",
+ "workspace-hack",
  "zerocopy",
 ]
 
@@ -4117,6 +4127,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tracing",
+ "workspace-hack",
  "zerocopy",
 ]
 
@@ -4908,6 +4919,66 @@ dependencies = [
  "serde_json",
  "unicode-ident",
  "wasmparser 0.254.0",
+]
+
+[[package]]
+name = "workspace-hack"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "cc",
+ "clap",
+ "clap_builder",
+ "cranelift-bitset",
+ "crossbeam-epoch",
+ "crossbeam-utils",
+ "crypto-common",
+ "digest",
+ "fnv",
+ "futures",
+ "futures-channel",
+ "futures-core",
+ "futures-executor",
+ "futures-io",
+ "futures-sink",
+ "futures-util",
+ "getrandom 0.2.17",
+ "hashbrown 0.17.1",
+ "indexmap",
+ "lazy_static",
+ "log",
+ "memchr",
+ "mio",
+ "num-traits",
+ "percent-encoding",
+ "pulley-interpreter",
+ "rand 0.8.8",
+ "rand_chacha 0.3.1",
+ "regex-automata",
+ "reqwest",
+ "rustls",
+ "semver",
+ "serde",
+ "serde_core",
+ "serde_json",
+ "sha2",
+ "slab",
+ "smallvec",
+ "syn 2.0.119",
+ "syn 3.0.5",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-core",
+ "tracing-subscriber",
+ "uuid",
+ "wasm-encoder 0.254.0",
+ "wasmparser 0.254.0",
+ "wasmtime-internal-core",
+ "winnow 0.7.15",
+ "zerocopy",
 ]
 
 [[package]]

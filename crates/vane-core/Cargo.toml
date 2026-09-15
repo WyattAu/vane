@@ -25,6 +25,7 @@ slab-pool = { workspace = true }
 vane-observe = { workspace = true }
 loom = { workspace = true, optional = true }
 thiserror = { workspace = true }
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
 loom = { workspace = true }
