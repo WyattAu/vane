@@ -188,6 +188,13 @@ pub struct AdminConfig {
     pub address: String,
     /// Enabled flag.
     pub enabled: bool,
+    /// Path to a file containing the admin bearer token (leading/trailing
+    /// whitespace trimmed). When set, every admin request must present
+    /// `Authorization: Bearer <token>` (compared in constant time) or be
+    /// answered `401`. The `VANE_ADMIN_TOKEN` environment variable
+    /// overrides the file. Unset = no auth (acceptable only on loopback).
+    #[serde(default)]
+    pub auth_token_file: Option<String>,
 }
 
 impl Default for AdminConfig {
@@ -195,6 +202,7 @@ impl Default for AdminConfig {
         Self {
             address: "127.0.0.1:9100".to_owned(),
             enabled: true,
+            auth_token_file: None,
         }
     }
 }

@@ -4,6 +4,31 @@ All notable changes to vane are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 semver.
 
+## [Unreleased]
+
+### Security
+
+- Request-smuggling hardening: ambiguous request framing is rejected
+  with `400` — `Content-Length` + `Transfer-Encoding` together,
+  duplicate `Content-Length` (even self-consistent), multiple
+  `Transfer-Encoding` headers, and transfer codings that do not end in
+  `chunked` (vane-proto `ParseError::ConflictingFraming`).
+- `Transfer-Encoding` is now treated as hop-by-hop on the h1 edge: the
+  upstream head re-emits a normalized `Transfer-Encoding: chunked`
+  instead of relaying the client's value verbatim.
+- Inbound `X-Forwarded-For` / `X-Forwarded-Proto` / `X-Forwarded-Host`
+  are stripped before the edge appends its own (spoofed values no
+  longer reach upstreams).
+- `X-Forwarded-Proto` reflects the terminating listener: `https` on
+  TLS listeners (was hardcoded `http`).
+- Admin plane: optional bearer-token auth via `[admin]
+  auth_token_file` or the `VANE_ADMIN_TOKEN` env var; requests without
+  a matching `Authorization: Bearer <token>` get `401` (constant-time
+  compare). Default bind remains `127.0.0.1:9100`.
+- `/readyz` now reports real readiness (`503` + JSON until routes are
+  loaded and listeners are bound); `/healthz` liveness is unchanged.
+- Added `SECURITY.md` and `THREAT-MODEL.md` (STRIDE per surface).
+
 ## [0.1.0] — 2026-09-09
 
 First tagged release of the full implementation.

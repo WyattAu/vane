@@ -151,3 +151,119 @@ fn no_route_is_404() {
         "got: {resp}"
     );
 }
+
+/// Upstream that echoes the raw request head back as the response body —
+/// lets a test assert exactly which headers reached the backend.
+fn spawn_reflecting_upstream() -> (SocketAddr, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind upstream");
+    let addr = listener.local_addr().expect("addr");
+    let handle = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { break };
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                // Read until the end of the request head.
+                loop {
+                    match s.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let body = String::from_utf8_lossy(&buf).into_owned();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            });
+        }
+    });
+    (addr, handle)
+}
+
+/// POSTs a raw request and returns the (possibly partial) response.
+fn post_raw(proxy: SocketAddr, req: &[u8]) -> String {
+    let mut s = TcpStream::connect(proxy).expect("connect proxy");
+    s.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .ok();
+    s.write_all(req).expect("write");
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    out
+}
+
+/// Request-smuggling guard, end to end: a `Content-Length` +
+/// `Transfer-Encoding` request is answered 400 by the edge itself and the
+/// smuggled second request never reaches the upstream.
+#[test]
+fn cl_plus_te_request_is_rejected_end_to_end() {
+    let _lock = lock_serial();
+
+    let (upstream, _up_handle) = spawn_reflecting_upstream();
+    let proxy = spawn_proxy(upstream, true);
+
+    let smuggle =
+        b"POST /x HTTP/1.1\r\nHost: t.local\r\nContent-Length: 6\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: t.local\r\n\r\n";
+    let resp = post_raw(proxy, smuggle);
+    assert!(
+        resp.starts_with("HTTP/1.1 400"),
+        "CL+TE must be rejected with 400: {resp}"
+    );
+    assert!(
+        !resp.contains("/smuggled"),
+        "smuggled request must never reach the upstream: {resp}"
+    );
+}
+
+/// Inbound X-Forwarded-* headers are stripped and replaced: the upstream
+/// sees exactly our own XFF (peer IP) and XFP (listener scheme), never
+/// client-supplied values.
+#[test]
+fn inbound_x_forwarded_headers_are_sanitized_end_to_end() {
+    let _lock = lock_serial();
+
+    let (upstream, _up_handle) = spawn_reflecting_upstream();
+    let proxy = spawn_proxy(upstream, true);
+
+    let req = b"GET /hdr HTTP/1.1\r\nHost: t.local\r\nX-Forwarded-For: 1.2.3.4\r\nX-Forwarded-Proto: https\r\nX-Forwarded-Host: evil.example\r\nConnection: close\r\n\r\n";
+    let resp = post_raw(proxy, req);
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+
+    // The spoofed values must not survive.
+    assert!(
+        !resp.contains("1.2.3.4"),
+        "spoofed XFF reached upstream: {resp}"
+    );
+    assert!(
+        !resp.contains("evil.example"),
+        "spoofed XFH reached upstream: {resp}"
+    );
+    // Exactly one XFF, carrying the real peer IP.
+    let xff_count = resp
+        .to_ascii_lowercase()
+        .matches("x-forwarded-for:")
+        .count();
+    assert_eq!(xff_count, 1, "exactly one XFF expected: {resp}");
+    assert!(
+        resp.to_ascii_lowercase()
+            .contains("x-forwarded-for: 127.0.0.1"),
+        "XFF must carry the peer IP: {resp}"
+    );
+    // Plaintext listener → http, not the spoofed https.
+    let xfp_count = resp
+        .to_ascii_lowercase()
+        .matches("x-forwarded-proto:")
+        .count();
+    assert_eq!(xfp_count, 1, "exactly one XFP expected: {resp}");
+    assert!(
+        resp.to_ascii_lowercase()
+            .contains("x-forwarded-proto: http\r\n"),
+        "XFP must be http on a plaintext listener: {resp}"
+    );
+}

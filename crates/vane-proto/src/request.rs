@@ -7,7 +7,7 @@
 use httparse::{Header, Status as HpStatus};
 
 /// Parse outcome.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Parsed<'h> {
     /// Complete head: view + total head byte length (incl. CRLFCRLF).
     Complete(RequestView<'h>, usize),
@@ -26,10 +26,17 @@ pub enum ParseError {
     /// Not HTTP semantics we speak.
     #[error("malformed request")]
     Malformed,
+    /// Framing headers are ambiguous or contradictory (duplicate or
+    /// divergent `Content-Length`, `Content-Length` + `Transfer-Encoding`
+    /// together, multiple `Transfer-Encoding` headers, or a transfer
+    /// coding that does not end in `chunked`). Classic request-smuggling
+    /// vectors: the request is rejected instead of guessed at.
+    #[error("conflicting framing headers")]
+    ConflictingFraming,
 }
 
 /// Borrowed view of a parsed request head.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestView<'h> {
     /// Request method (`GET`, `POST`, ...).
     pub method: &'h str,
@@ -66,15 +73,16 @@ impl<'h> RequestView<'h> {
                 if version > 1 {
                     return Parsed::Error(ParseError::Malformed);
                 }
-                Parsed::Complete(
-                    RequestView {
-                        method,
-                        path,
-                        version,
-                        headers: req.headers,
-                    },
-                    len,
-                )
+                let view = RequestView {
+                    method,
+                    path,
+                    version,
+                    headers: req.headers,
+                };
+                if framing_is_ambiguous(&view) {
+                    return Parsed::Error(ParseError::ConflictingFraming);
+                }
+                Parsed::Complete(view, len)
             }
             Ok(HpStatus::Partial) => {
                 if buf.len() >= MAX_HEAD_BYTES {
@@ -147,6 +155,57 @@ impl<'h> RequestView<'h> {
     {
         &buf[head_len.min(buf.len())..]
     }
+}
+
+/// Request-smuggling guard (RFC 9112 §6): the framing headers must name
+/// exactly one body-framing mechanism, unambiguously.
+///
+/// Rejects:
+/// - any `Content-Length` together with any `Transfer-Encoding`
+/// - duplicate `Content-Length` headers (even self-consistent values —
+///   frontends and backends disagree on first-vs-last, which is the
+///   smuggling primitive)
+/// - multiple `Transfer-Encoding` headers
+/// - a transfer coding list whose final coding is not `chunked`
+///   (chunked must be applied last; anything else is not a framing we
+///   can relay faithfully)
+fn framing_is_ambiguous(view: &RequestView<'_>) -> bool {
+    let mut content_lengths = 0usize;
+    let mut transfer_encodings = 0usize;
+    let mut te_value: Option<&[u8]> = None;
+    for h in view.headers {
+        let lname = h.name.to_ascii_lowercase();
+        match lname.as_str() {
+            "content-length" => content_lengths += 1,
+            "transfer-encoding" => {
+                transfer_encodings += 1;
+                te_value = Some(h.value);
+            }
+            _ => {}
+        }
+    }
+    if content_lengths > 1 || transfer_encodings > 1 {
+        return true;
+    }
+    if content_lengths > 0 && transfer_encodings > 0 {
+        return true;
+    }
+    match te_value {
+        Some(v) => !ends_with_chunked(v),
+        None => false,
+    }
+}
+
+/// `true` when the (single) `Transfer-Encoding` value's final coding is
+/// `chunked` (case-insensitive, comma-separated list, e.g. `gzip, chunked`).
+fn ends_with_chunked(value: &[u8]) -> bool {
+    let lowered = value.to_ascii_lowercase();
+    let last = match lowered.iter().rposition(|&b| b == b',') {
+        Some(pos) => &lowered[pos + 1..],
+        None => &lowered[..],
+    };
+    let last = last.trim_ascii();
+    last == b"chunked"
 }
 
 /// Maximum accepted head size.
@@ -247,5 +306,115 @@ mod tests {
             RequestView::parse_in(b"NOT-HTTP\r\n\r\n\r\n", &mut storage),
             Parsed::Error(_)
         ));
+    }
+
+    // ---- Request-smuggling guards ------------------------------------
+    // (Parsed borrows the caller's storage array, so each test declares
+    // its own — same pattern as the tests above.)
+
+    #[test]
+    fn cl_plus_te_is_rejected() {
+        // CL + TE: the classic smuggling ambiguity (RFC 9112 §6.1).
+        let raw = b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
+        assert_eq!(
+            RequestView::parse_in(raw, &mut storage),
+            Parsed::Error(ParseError::ConflictingFraming)
+        );
+    }
+
+    #[test]
+    fn te_plus_cl_is_rejected_regardless_of_order() {
+        let raw = b"POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n";
+        let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
+        assert_eq!(
+            RequestView::parse_in(raw, &mut storage),
+            Parsed::Error(ParseError::ConflictingFraming)
+        );
+    }
+
+    #[test]
+    fn duplicate_content_length_divergent_is_rejected() {
+        let raw =
+            b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\nContent-Length: 11\r\n\r\nhello";
+        let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
+        assert_eq!(
+            RequestView::parse_in(raw, &mut storage),
+            Parsed::Error(ParseError::ConflictingFraming)
+        );
+    }
+
+    #[test]
+    fn duplicate_content_length_identical_is_rejected() {
+        // Even self-consistent duplicates are refused: implementations
+        // disagree on first-vs-last, which is the smuggling primitive.
+        let raw =
+            b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello";
+        let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
+        assert_eq!(
+            RequestView::parse_in(raw, &mut storage),
+            Parsed::Error(ParseError::ConflictingFraming)
+        );
+    }
+
+    #[test]
+    fn multiple_transfer_encoding_headers_are_rejected() {
+        let raw = b"POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
+        assert_eq!(
+            RequestView::parse_in(raw, &mut storage),
+            Parsed::Error(ParseError::ConflictingFraming)
+        );
+    }
+
+    #[test]
+    fn transfer_encoding_not_ending_in_chunked_is_rejected() {
+        let raw = b"POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip\r\n\r\n";
+        let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
+        assert_eq!(
+            RequestView::parse_in(raw, &mut storage),
+            Parsed::Error(ParseError::ConflictingFraming)
+        );
+    }
+
+    #[test]
+    fn chunked_with_prefix_codings_is_accepted() {
+        let raw =
+            b"POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n";
+        let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
+        match RequestView::parse_in(raw, &mut storage) {
+            Parsed::Complete(v, _) => assert!(v.is_chunked()),
+            other => panic!("expected complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn single_content_length_still_accepted() {
+        let raw = b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nhello";
+        let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
+        match RequestView::parse_in(raw, &mut storage) {
+            Parsed::Complete(v, _) => assert_eq!(v.content_length(), Some(Some(5))),
+            other => panic!("expected complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_framing_headers_still_accepted() {
+        let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
+        match RequestView::parse_in(GET, &mut storage) {
+            Parsed::Complete(v, _) => assert!(!v.has_body()),
+            other => panic!("expected complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn case_insensitive_framing_header_names_are_caught() {
+        // Obfuscated casing must not slip past the guard.
+        let raw = b"POST /x HTTP/1.1\r\nHost: h\r\ncontent-length: 5\r\ntRaNsFeR-eNcOdInG: chunked\r\n\r\n0\r\n\r\n";
+        let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
+        assert_eq!(
+            RequestView::parse_in(raw, &mut storage),
+            Parsed::Error(ParseError::ConflictingFraming)
+        );
     }
 }

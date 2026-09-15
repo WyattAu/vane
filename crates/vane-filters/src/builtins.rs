@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::OnceLock;
 use std::time::Instant;
 
 use breaker::{CircuitBreaker, CircuitBreakerConfig};
@@ -169,9 +168,29 @@ fn now_micros() -> u128 {
 }
 
 /// Adds `X-Forwarded-For` / `X-Forwarded-Proto` / `X-Forwarded-Host`.
-#[derive(Default)]
+///
+/// The proto stamp must match the listener that terminated the request:
+/// construct with [`ForwardedHeaders::new`] (`"https"`) on TLS-terminating
+/// listeners; the `Default` stamps `"http"`. Inbound `X-Forwarded-*`
+/// values are never appended to — the proxy serializes a fresh head, so
+/// whatever the upstream receives originates here.
 pub struct ForwardedHeaders {
-    _private: OnceLock<()>,
+    proto: &'static str,
+}
+
+impl Default for ForwardedHeaders {
+    fn default() -> Self {
+        Self { proto: "http" }
+    }
+}
+
+impl ForwardedHeaders {
+    /// Creates the filter stamping `proto` into `X-Forwarded-Proto`
+    /// (typically `"http"` or `"https"`).
+    #[must_use]
+    pub fn new(proto: &'static str) -> Self {
+        Self { proto }
+    }
 }
 
 impl Filter for ForwardedHeaders {
@@ -183,7 +202,7 @@ impl Filter for ForwardedHeaders {
         // Append to existing XFF if the handler supplied one (it reads the
         // request headers; here we only know the client addr).
         ctx.inject("X-Forwarded-For", &ctx.client.ip().to_string());
-        ctx.inject("X-Forwarded-Proto", "http");
+        ctx.inject("X-Forwarded-Proto", self.proto);
         if let Some(host) = ctx.host {
             ctx.inject("X-Forwarded-Host", host);
         }
@@ -307,6 +326,25 @@ mod builtin_tests {
             c.inject_headers
                 .iter()
                 .any(|(k, _)| k == "X-Forwarded-Host")
+        );
+        // Default proto: plaintext listener.
+        assert!(
+            c.inject_headers
+                .iter()
+                .any(|(k, v)| k == "X-Forwarded-Proto" && v == "http")
+        );
+    }
+
+    #[test]
+    fn forwarded_proto_reflects_listener_scheme() {
+        let fwd = ForwardedHeaders::new("https");
+        let mut path = String::from("/tls");
+        let mut c = ctx("GET", &mut path, None);
+        assert!(matches!(fwd.run(&mut c), Outcome::Continue));
+        assert!(
+            c.inject_headers
+                .iter()
+                .any(|(k, v)| k == "X-Forwarded-Proto" && v == "https")
         );
     }
 }

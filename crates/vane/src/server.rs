@@ -142,6 +142,8 @@ pub fn send_handover(
 /// - `VANE_LISTEN` — replaces the first listener's address
 /// - `VANE_TLS_CERT` / `VANE_TLS_KEY` — TLS material for the first listener
 /// - `VANE_ADMIN_ADDR` — admin bind address
+/// - `VANE_ADMIN_TOKEN` — admin bearer token (overrides `[admin]
+///   auth_token_file`)
 /// - `VANE_CLUSTER_<NAME>` — comma-separated backends for cluster `<NAME>`
 /// - `VANE_WORKERS` — workers per listener (0 = per core)
 ///
@@ -252,6 +254,35 @@ pub fn init_telemetry(cfg: &vane_control::TelemetryConfig) -> Option<otelkit::Te
             eprintln!("vane: telemetry init failed ({e}); continuing without export");
             None
         }
+    }
+}
+
+/// Resolves the admin bearer token: `VANE_ADMIN_TOKEN` (env) wins over
+/// `[admin] auth_token_file`; the file's contents are whitespace-trimmed.
+/// `Ok(None)` = auth disabled (loopback-only default bind applies).
+///
+/// # Errors
+/// The configured token file is missing, unreadable, or empty.
+fn resolve_admin_token(
+    admin: &vane_control::config::AdminConfig,
+) -> Result<Option<Arc<str>>, String> {
+    if let Ok(tok) = std::env::var("VANE_ADMIN_TOKEN") {
+        let trimmed = tok.trim();
+        if !trimmed.is_empty() {
+            return Ok(Some(Arc::from(trimmed.to_owned())));
+        }
+    }
+    match &admin.auth_token_file {
+        Some(path) => {
+            let raw = std::fs::read_to_string(path)
+                .map_err(|e| format!("admin auth_token_file {path}: {e}"))?;
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(format!("admin auth_token_file {path} is empty"));
+            }
+            Ok(Some(Arc::from(trimmed.to_owned())))
+        }
+        None => Ok(None),
     }
 }
 
@@ -392,6 +423,7 @@ pub async fn run(opts: RunOptions) -> i32 {
     }
 
     // ---- Bind listeners (or inherit via hot upgrade) --------------------
+    let listeners_bound = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut bound: Vec<StdTcpListener> = Vec::new();
     if let Some(sock) = &opts.handover_from {
         match receive_inherited(sock, &router, &health, config.listeners.len()) {
@@ -418,6 +450,17 @@ pub async fn run(opts: RunOptions) -> i32 {
             }
         }
     }
+    // Reaching here means every configured listener bound successfully.
+    listeners_bound.store(true, std::sync::atomic::Ordering::Release);
+
+    // ---- Admin auth material (file config + env override) ---------------
+    let admin_token = match resolve_admin_token(&config.admin) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("vane: {e}");
+            return 1;
+        }
+    };
 
     // ---- Spawn workers (one per listener × core) ------------------------
     // Keep dup'd listener fds for the hot-upgrade sender (SCM_RIGHTS needs
@@ -618,6 +661,8 @@ pub async fn run(opts: RunOptions) -> i32 {
             Arc::clone(&registry),
             Arc::clone(&health),
             xds_state,
+            Arc::clone(&listeners_bound),
+            admin_token,
         );
         tokio::spawn(async move {
             if let Err(e) = crate::admin::serve(admin_addr, admin_router).await {

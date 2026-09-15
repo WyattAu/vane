@@ -1,6 +1,7 @@
 //! Admin plane endpoints exercised in-process through `tower::ServiceExt`.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -39,6 +40,23 @@ fn app() -> axum::Router {
         Arc::new(Registry::new()),
         Arc::new(vane_control::HealthMap::new()),
         vane_control::xds::shared_state(),
+        Arc::new(AtomicBool::new(true)),
+        None,
+    )
+}
+
+fn app_with(
+    router: Arc<RouteRouter>,
+    listeners_bound: bool,
+    auth_token: Option<&str>,
+) -> axum::Router {
+    build_admin_router(
+        router,
+        Arc::new(Registry::new()),
+        Arc::new(vane_control::HealthMap::new()),
+        vane_control::xds::shared_state(),
+        Arc::new(AtomicBool::new(listeners_bound)),
+        auth_token.map(Arc::from),
     )
 }
 
@@ -76,6 +94,138 @@ async fn readyz_ok() {
     assert_eq!(&body[..], b"ready\n");
 }
 
+/// No routes loaded (empty table): readiness must answer 503 with a JSON
+/// body naming the missing half, not the stale hardcoded "ready".
+#[tokio::test]
+async fn readyz_503_with_empty_routes() {
+    let empty = Arc::new(RouteRouter::new());
+    let res = app_with(empty, true, None)
+        .oneshot(
+            Request::get("/readyz")
+                .body(Body::empty())
+                .expect("valid request"),
+        )
+        .await
+        .expect("test");
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(res.into_body(), 1024)
+        .await
+        .expect("body");
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("not-ready"), "{text}");
+    assert!(text.contains("\"routes\":0"), "{text}");
+    assert!(text.contains("\"listeners_bound\":true"), "{text}");
+}
+
+/// Listeners not yet bound: 503 even with a populated route table.
+#[tokio::test]
+async fn readyz_503_before_listeners_bound() {
+    let res = app_with(test_router(), false, None)
+        .oneshot(
+            Request::get("/readyz")
+                .body(Body::empty())
+                .expect("valid request"),
+        )
+        .await
+        .expect("test");
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(res.into_body(), 1024)
+        .await
+        .expect("body");
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("\"listeners_bound\":false"), "{text}");
+}
+
+/// Liveness is unconditional: /healthz answers 200 even with no routes
+/// and no bound listeners.
+#[tokio::test]
+async fn healthz_stays_ok_when_not_ready() {
+    let empty = Arc::new(RouteRouter::new());
+    let res = app_with(empty, false, None)
+        .oneshot(
+            Request::get("/healthz")
+                .body(Body::empty())
+                .expect("valid request"),
+        )
+        .await
+        .expect("test");
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+/// With a token configured: no / wrong Authorization → 401.
+#[tokio::test]
+async fn auth_rejects_missing_and_wrong_tokens() {
+    let app = app_with(test_router(), true, Some("s3cret"));
+
+    for auth in [
+        None,
+        Some("Bearer wrong"),
+        Some("s3cret"),
+        Some("Basic s3cret"),
+    ] {
+        let mut req = Request::get("/healthz").body(Body::empty()).expect("valid");
+        if let Some(v) = auth {
+            req.headers_mut()
+                .insert(axum::http::header::AUTHORIZATION, v.parse().expect("hdr"));
+        }
+        let res = app.clone().oneshot(req).await.expect("oneshot");
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "auth: {auth:?}");
+    }
+}
+
+/// With a token configured: the correct bearer passes and the handler
+/// answers normally.
+#[tokio::test]
+async fn auth_accepts_correct_token() {
+    let app = app_with(test_router(), true, Some("s3cret"));
+    let res = app
+        .oneshot(
+            Request::get("/healthz")
+                .header("authorization", "Bearer s3cret")
+                .body(Body::empty())
+                .expect("valid request"),
+        )
+        .await
+        .expect("oneshot");
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), 1024)
+        .await
+        .expect("body");
+    assert_eq!(&body[..], b"ok\n");
+}
+
+/// The mutating xDS endpoint is gated too: a snapshot POST without the
+/// token must be refused before it can reconfigure the router.
+#[tokio::test]
+async fn auth_gates_xds_snapshot() {
+    let app = app_with(test_router(), true, Some("s3cret"));
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/xds/snapshot")
+                .body(Body::from(
+                    "{\"version\":\"v\",\"clusters\":{},\"routes\":[]}",
+                ))
+                .expect("valid request"),
+        )
+        .await
+        .expect("oneshot");
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    let res = app
+        .oneshot(
+            Request::post("/xds/snapshot")
+                .header("authorization", "Bearer s3cret")
+                .body(Body::from(
+                    "{\"version\":\"v\",\"clusters\":{},\"routes\":[]}",
+                ))
+                .expect("valid request"),
+        )
+        .await
+        .expect("oneshot");
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
 #[tokio::test]
 async fn health_dumps_backend_states() {
     let res = app()
@@ -107,6 +257,8 @@ async fn metrics_render_prometheus() {
         Arc::new(registry),
         Arc::new(vane_control::HealthMap::new()),
         vane_control::xds::shared_state(),
+        Arc::new(AtomicBool::new(true)),
+        None,
     );
     let res = app
         .oneshot(
@@ -157,6 +309,8 @@ async fn serve_binds_and_answers() {
         Arc::new(Registry::new()),
         Arc::new(vane_control::HealthMap::new()),
         vane_control::xds::shared_state(),
+        Arc::new(AtomicBool::new(true)),
+        None,
     );
     // Bind first to pick a free port, then hand the listener over.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -269,6 +423,8 @@ async fn xds_snapshot_applies_and_replaces() {
         Arc::clone(&registry),
         Arc::clone(&health),
         vane_control::xds::shared_state(),
+        Arc::new(AtomicBool::new(true)),
+        None,
     );
 
     // Apply a snapshot routing /dyn/* to a live upstream.

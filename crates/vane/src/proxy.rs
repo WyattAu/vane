@@ -620,7 +620,6 @@ impl HttpProxy {
     #[cfg(feature = "h2")]
     fn h2up_intake(&mut self, io: &mut SessionIo<'_>, data: &[u8]) {
         let slot = io.slot_index();
-        eprintln!("H2UPDBG intake {} bytes", data.len());
         let mut events = Vec::new();
         {
             let Some(h2up) = self.conn(slot).h2up.as_mut() else {
@@ -922,7 +921,11 @@ impl HttpProxy {
             Parsed::Error(e) => {
                 let status = match e {
                     vane_proto::request::ParseError::TooLarge => Status::PayloadTooLarge,
-                    vane_proto::request::ParseError::Malformed => Status::BadRequest,
+                    // Ambiguous framing (CL+TE, duplicate CL, non-chunked
+                    // TE): refused before any upstream dial — smuggling
+                    // guard, surfaced as a plain 400.
+                    vane_proto::request::ParseError::Malformed
+                    | vane_proto::request::ParseError::ConflictingFraming => Status::BadRequest,
                 };
                 self.respond_full(io, status, "bad request\n");
                 io.close();
@@ -1056,13 +1059,34 @@ impl HttpProxy {
         for h in view.headers {
             let name = h.name;
             let lname = name.to_ascii_lowercase();
-            if lname == "connection" || lname == "keep-alive" || lname == "proxy-connection" {
-                continue; // hop-by-hop; we manage it
+            // Hop-by-hop (we manage `Connection` framing ourselves) and
+            // `Transfer-Encoding` (re-emitted below from the validated
+            // framing decision — never trusted from the wire).
+            if lname == "connection"
+                || lname == "keep-alive"
+                || lname == "proxy-connection"
+                || lname == "transfer-encoding"
+            {
+                continue;
+            }
+            // X-Forwarded-* are untrusted: strip inbound values so the
+            // only ones the upstream sees are the ones we appended.
+            if lname == "x-forwarded-for"
+                || lname == "x-forwarded-proto"
+                || lname == "x-forwarded-host"
+            {
+                continue;
             }
             out.extend_from_slice(name.as_bytes());
             out.extend_from_slice(b": ");
             out.extend_from_slice(h.value);
             out.extend_from_slice(b"\r\n");
+        }
+        // Framing re-emission: the parser guarantees exactly one of
+        // Content-Length (passed through above) or a final-chunked
+        // Transfer-Encoding (re-emitted here, normalized).
+        if view.is_chunked() {
+            out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
         }
         for (name, value) in inject {
             out.extend_from_slice(name.as_bytes());
@@ -1684,6 +1708,17 @@ impl HttpProxy {
             let mut ctx = RequestCtx::new(view.method, &mut path_mut, peer, host_only);
             ctx.cluster = Some(&route.cluster);
             ctx.inject("X-Forwarded-For", &peer.ip().to_string());
+            // Scheme as this edge saw it: TLS-terminating listeners report
+            // https (the h2 edge path does the same). Never trust an
+            // inbound X-Forwarded-Proto — build_upstream_head strips it.
+            ctx.inject(
+                "X-Forwarded-Proto",
+                if self.config.tls.is_some() {
+                    "https"
+                } else {
+                    "http"
+                },
+            );
             let outcome = self.pipeline.run(&mut ctx);
             let rejected = outcome != Outcome::Continue
                 || matches!(self.breaker.run(&mut ctx), Outcome::Reject(503, _));
@@ -1962,7 +1997,6 @@ impl HttpProxy {
     /// Upstream unusable: fail over to another backend while the request
     /// is still unsent, otherwise answer 502/504.
     fn upstream_failed(&mut self, io: &mut SessionIo<'_>) {
-        eprintln!("UFDBG upstream_failed sent={}", io.request_sent_upstream());
         if io.request_sent_upstream() {
             if self
                 .conns

@@ -343,6 +343,138 @@ workers = 1
     assert!(out.contains("hello-vane"), "tls body: {out:?}");
 }
 
+/// Upstream that echoes the raw request head back as the response body
+/// (lets a test assert exactly which headers reached the backend).
+fn spawn_reflecting_upstream() -> std::net::SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut s = stream;
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match s.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let body = String::from_utf8_lossy(&buf).into_owned();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            });
+        }
+    });
+    addr
+}
+
+/// X-Forwarded-Proto must reflect the terminating listener: a TLS
+/// listener stamps `https`, and a client-supplied spoofed value is
+/// stripped, never relayed.
+#[test]
+fn tls_listener_stamps_https_forwarded_proto() {
+    let _serial = lock_serial();
+    let dir = tempfile::tempdir().expect("dir");
+    let cert_path = dir.path().join("cert.pem");
+    let key_path = dir.path().join("key.pem");
+    let certs = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
+    std::fs::write(&cert_path, certs.cert.pem()).expect("cert");
+    std::fs::write(&key_path, certs.signing_key.serialize_pem()).expect("key");
+
+    let upstream = spawn_reflecting_upstream();
+    let port = free_port();
+    let toml = format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[listeners.tls]
+cert = "{}"
+key = "{}"
+
+[clusters.up]
+backends = ["{upstream}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = true
+workers = 1
+"#,
+        cert_path.display(),
+        key_path.display()
+    );
+    let path = dir.path().join("vane.toml");
+    std::fs::write(&path, toml).expect("write");
+    let cfg = path.to_str().expect("utf8").to_owned();
+    let _cert_dir_guard = dir;
+
+    spawn_proxy(cfg);
+
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    let roots = rustls::RootCertStore::empty();
+    use rustls::pki_types::pem::PemObject as _;
+    let der = rustls::pki_types::CertificateDer::from_pem_file(&cert_path).expect("cert der");
+    let mut roots = roots;
+    roots.add(der).expect("add");
+    let client_cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server_name =
+        rustls::pki_types::ServerName::try_from("localhost".to_string()).expect("sni");
+    let mut conn = rustls::ClientConnection::new(std::sync::Arc::new(client_cfg), server_name)
+        .expect("client conn");
+    let mut sock = std::net::TcpStream::connect(proxy).expect("tcp");
+    sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+    // Spoofed inbound XFP must not survive the hop.
+    tls.write_all(
+        b"GET /tls HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-Proto: http\r\nConnection: close\r\n\r\n",
+    )
+    .expect("tls write");
+    let mut out = String::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match tls.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => out.push_str(&String::from_utf8_lossy(&buf[..n])),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(_) => break,
+        }
+    }
+    assert!(out.contains("200 OK"), "tls response: {out:?}");
+    let lowered = out.to_ascii_lowercase();
+    assert_eq!(
+        lowered.matches("x-forwarded-proto:").count(),
+        1,
+        "exactly one XFP: {out:?}"
+    );
+    assert!(
+        lowered.contains("x-forwarded-proto: https"),
+        "TLS listener must stamp https: {out:?}"
+    );
+    assert!(
+        !lowered.contains("x-forwarded-proto: http\r\n"),
+        "spoofed plaintext proto must not survive: {out:?}"
+    );
+}
+
 /// Dead upstream → 502; mixed dead+live cluster still serves (failover).
 #[test]
 fn upstream_failure_paths() {

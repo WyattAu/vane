@@ -68,10 +68,13 @@ providers, ACME) publish additional routes into the same lock-free table.
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `enabled` | bool | `true` | |
-| `address` | string | `127.0.0.1:9100` | bind address |
+| `address` | string | `127.0.0.1:9100` | bind address (loopback default; expose deliberately) |
+| `auth_token_file` | string | unset | file containing the admin bearer token; when set, every admin request needs `Authorization: Bearer <token>` (constant-time compare) or gets `401`. `VANE_ADMIN_TOKEN` env var overrides the file |
 
-Endpoints: `/healthz` + `/readyz` (probes), `/health` (backend states),
-`/metrics` (Prometheus exposition), `/config` (route records).
+Endpoints: `/healthz` + `/readyz` (probes — `/readyz` answers `503` until
+routes are loaded and listeners are bound), `/health` (backend states),
+`/metrics` (Prometheus exposition), `/config` (route records). When a
+token is configured it gates the entire plane, probes included.
 
 ## Providers
 
