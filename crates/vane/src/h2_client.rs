@@ -93,7 +93,9 @@ impl H2Upstream {
         let headers = Self::translate_request_head(h1_head);
         let id = self.conn.alloc_stream_id();
         self.stream = Some(id);
-        let end_stream = !matches!(remaining, Some(n) if n > 0);
+        // Some(0): empty body, END_STREAM now. Some(n>0): CL-delimited
+        // body follows. None: CL-less body follows, END_STREAM delimits.
+        let end_stream = matches!(remaining, Some(0));
         self.req_remaining = remaining.filter(|n| *n > 0);
         self.conn.send_headers(id, &headers, end_stream);
     }
@@ -172,6 +174,22 @@ impl H2Upstream {
         if take < data.len() {
             // Beyond the declared Content-Length: drop (defensive).
             let _ = &data[take..];
+        }
+        let _ = &mut sent;
+        self.pending_writes()
+    }
+
+    /// Sends a CL-less request body chunk terminated by END_STREAM.
+    /// h2 delimits bodies without Content-Length by END_STREAM; the
+    /// proxy re-frames these as chunked toward h1 upstreams.
+    pub fn request_body_eof(&mut self, data: &[u8]) -> Vec<u8> {
+        let Some(stream) = self.stream else {
+            return Vec::new();
+        };
+        let mut sent = self.conn.send_data(stream, data, true);
+        if sent < data.len() {
+            self.req_held.extend_from_slice(&data[sent..]);
+            self.req_end_pending = true;
         }
         let _ = &mut sent;
         self.pending_writes()

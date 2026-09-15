@@ -61,6 +61,10 @@ pub struct H2Server {
     pub slot: u32,
     /// The sans-io connection state machine.
     conn: Connection,
+    /// The active request lacks Content-Length: the body is relayed to
+    /// the h1 upstream with shim-manufactured chunk framing (h2 has no
+    /// chunked encoding; END_STREAM delimits).
+    req_chunked: bool,
     /// Bytes received but not yet consumed (partial frames).
     backlog: Vec<u8>,
     /// Stream with an in-flight transaction.
@@ -108,6 +112,7 @@ impl H2Server {
             conn: Connection::new(Role::Server, cfg),
             backlog: Vec::new(),
             active_stream: None,
+            req_chunked: false,
             body_remaining: None,
             translator: None,
             held: Vec::new(),
@@ -197,17 +202,19 @@ impl H2Server {
                     );
                     return;
                 }
-                // v0.2 relays bodies with a declared Content-Length
-                // only: h1 upstreams would need chunked re-framing for
-                // anything else. END_STREAM requests (GET etc.) carry
-                // no body and are always accepted; a streamed body
-                // without Content-Length is refused with
-                // REFUSED_STREAM (retryable and honest).
-                let accepted = end_stream || Self::request_content_length(&headers).is_some();
+                // Bodies with Content-Length relay verbatim; bodies
+                // without one are chunk-re-framed toward the h1
+                // upstream (END_STREAM delimits in h2). END_STREAM
+                // requests (GET etc.) carry no body and are always
+                // accepted; a streamed CL-less body used to be refused
+                // with REFUSED_STREAM.
+                let accepted = true;
+                let chunked_req = !end_stream && Self::request_content_length(&headers).is_none();
 
                 if accepted {
-                    if let Some(head) = Self::translate_head(&headers) {
+                    if let Some(head) = Self::translate_head(&headers, chunked_req) {
                         self.active_stream = Some(stream_id);
+                        self.req_chunked = chunked_req;
                         self.body_remaining = match Self::request_content_length(&headers) {
                             Some(len) if !end_stream => Some(len),
                             _ => None,
@@ -239,21 +246,43 @@ impl H2Server {
                     return; // unsolicited data on unknown stream
                 }
                 self.conn.release_capacity(stream_id, data.len());
-                let take = match self.body_remaining {
-                    Some(rem) => (data.len() as u64).min(rem) as usize,
-                    None => 0,
-                };
-                if take > 0 {
-                    if let Some(rem) = &mut self.body_remaining {
-                        *rem -= take as u64;
+                if self.req_chunked {
+                    // CL-less body: re-frame as h1 chunks; the terminal
+                    // chunk closes the upstream's chunked framing.
+                    eprintln!(
+                        "SHIMDBG chunk-relay {} bytes eom={}",
+                        data.len(),
+                        end_stream
+                    );
+                    let mut framed = Vec::with_capacity(data.len() + 20);
+                    framed.extend_from_slice(format!("{:x}\r\n", data.len()).as_bytes());
+                    framed.extend_from_slice(&data);
+                    framed.extend_from_slice(b"\r\n");
+                    events.push(H2Event::RequestBody { data: framed });
+                    if end_stream {
+                        self.req_chunked = false;
+                        events.push(H2Event::RequestBody {
+                            data: b"0\r\n\r\n".to_vec(),
+                        });
+                        events.push(H2Event::RequestComplete);
                     }
-                    events.push(H2Event::RequestBody {
-                        data: data[..take].to_vec(),
-                    });
-                }
-                if end_stream {
-                    self.body_remaining = None;
-                    events.push(H2Event::RequestComplete);
+                } else {
+                    let take = match self.body_remaining {
+                        Some(rem) => (data.len() as u64).min(rem) as usize,
+                        None => 0,
+                    };
+                    if take > 0 {
+                        if let Some(rem) = &mut self.body_remaining {
+                            *rem -= take as u64;
+                        }
+                        events.push(H2Event::RequestBody {
+                            data: data[..take].to_vec(),
+                        });
+                    }
+                    if end_stream {
+                        self.body_remaining = None;
+                        events.push(H2Event::RequestComplete);
+                    }
                 }
             }
             Event::Trailers { stream_id, .. } => {
@@ -262,6 +291,12 @@ impl H2Server {
                 // completion semantics only; the trailer fields are
                 // dropped (v0.2 relays CL'd bodies, documented).
                 if self.active_stream == Some(stream_id) {
+                    if self.req_chunked {
+                        self.req_chunked = false;
+                        events.push(H2Event::RequestBody {
+                            data: b"0\r\n\r\n".to_vec(),
+                        });
+                    }
                     self.body_remaining = None;
                     events.push(H2Event::RequestComplete);
                 }
@@ -287,7 +322,7 @@ impl H2Server {
     }
 
     /// Translates HPACK-decoded request headers to an HTTP/1.1 head.
-    fn translate_head(headers: &[vane_core::h2::hpack::Header]) -> Option<Vec<u8>> {
+    fn translate_head(headers: &[vane_core::h2::hpack::Header], chunked: bool) -> Option<Vec<u8>> {
         let mut method: Option<&[u8]> = None;
         let mut path: Option<&[u8]> = None;
         let mut authority: Option<&[u8]> = None;
@@ -329,6 +364,11 @@ impl H2Server {
             head.extend_from_slice(v);
             head.extend_from_slice(b"\r\n");
         }
+        if chunked {
+            // CL-less h2 body: declare chunked framing to the h1
+            // upstream; the shim manufactures the chunk boundaries.
+            head.extend_from_slice(b"transfer-encoding: chunked\r\n");
+        }
         head.extend_from_slice(b"\r\n");
         Some(head)
     }
@@ -336,12 +376,6 @@ impl H2Server {
     /// Feeds upstream response bytes; returns h2 frames to emit plus
     /// whether the response is fully emitted (END_STREAM sent).
     pub fn response_bytes(&mut self, data: &[u8]) -> (Vec<Vec<u8>>, bool) {
-        eprintln!(
-            "RSPBDBG response_bytes active={:?} done={} resp_done={}",
-            self.active_stream,
-            self.translator.is_some(),
-            self.resp_done
-        );
         // Response already complete: further upstream bytes exceed the
         // declared framing — drop them (the driver logs at EOF).
         if self.resp_done {

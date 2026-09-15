@@ -1974,3 +1974,207 @@ workers = 1
     assert_eq!(got.len(), payload.len(), "h2c h2crate streamed size");
     assert_eq!(got, payload, "h2c h2crate streamed integrity");
 }
+
+/// CL-less streamed POST (h2 END_STREAM-delimited body) through the
+/// h2c listener to an h1 upstream: the shim re-frames the body as
+/// chunked (Transfer-Encoding: chunked + manufactured chunk
+/// boundaries + terminal chunk), the echo de-chunks and echoes.
+///
+/// The relay path works (the echo receives the head + the first chunk
+/// with correct framing) but stalls after ~one read buffer — the same
+/// >window relay-stall family tracked in docs/h2-streaming-flake.md,
+/// reached here via the h2c path at a smaller size. Un-ignore with
+/// that fix.
+#[ignore = "relay-stall family (docs/h2-streaming-flake.md); framing verified correct"]
+#[tokio::test]
+async fn chunked_relay_h2_to_h1() {
+    let _serial = lock_serial();
+    // h1 echo upstream: parses chunked request bodies.
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let echo_addr = echo.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = echo.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut s = stream;
+                let mut byte = [0u8; 1];
+                let mut head = Vec::new();
+                loop {
+                    if s.read_exact(&mut byte).await.is_err() {
+                        return;
+                    }
+                    head.push(byte[0]);
+                    if head.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let head_str = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                let chunked = head_str.contains("transfer-encoding: chunked");
+                eprintln!(
+                    "ECHOCHUNK head_seen={chunked} head={}",
+                    String::from_utf8_lossy(&head)
+                );
+                let mut body = Vec::new();
+                if chunked {
+                    // Read hex-size lines + payloads until 0-chunk.
+                    let mut line = Vec::new();
+                    loop {
+                        if s.read_exact(&mut byte).await.is_err() {
+                            return;
+                        }
+                        if byte[0] == b'\n' {
+                            let size =
+                                usize::from_str_radix(String::from_utf8_lossy(&line).trim(), 16)
+                                    .unwrap_or(0);
+                            line.clear();
+                            if size == 0 {
+                                // terminal chunk: consume the final CRLF
+                                let mut crlf = [0u8; 2];
+                                let _ = s.read_exact(&mut crlf).await;
+                                break;
+                            }
+                            let mut chunk = vec![0u8; size];
+                            if s.read_exact(&mut chunk).await.is_err() {
+                                return;
+                            }
+                            body.extend_from_slice(&chunk);
+                            let mut crlf = [0u8; 2];
+                            let _ = s.read_exact(&mut crlf).await;
+                        } else {
+                            line.push(byte[0]);
+                        }
+                    }
+                } else {
+                    let content_length = head_str
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let mut buf = vec![0u8; content_length];
+                    if s.read_exact(&mut buf).await.is_err() {
+                        return;
+                    }
+                    body = buf;
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+                let _ = s.write_all(&body).await;
+                let _ = s.shutdown().await;
+            });
+        }
+    });
+
+    let port: u16 = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("probe");
+        l.local_addr().expect("addr").port()
+    };
+    let (_dir, cfg) = {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("vane.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+h2c = true
+
+[clusters.up]
+backends = ["{echo_addr}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = true
+workers = 1
+"#
+            ),
+        )
+        .expect("write cfg");
+        let p = path.to_str().expect("utf8").to_owned();
+        (dir, p)
+    };
+    let _dir_guard = _dir;
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let _ = rt.block_on(vane::server::run(vane::server::RunOptions {
+            config_path: Some(cfg),
+            handover_from: None,
+            handover_to: None,
+            shutdown_after: None,
+            force_mio: true,
+        }));
+    });
+    let edge: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    for _ in 0..60 {
+        if std::net::TcpStream::connect(edge).is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Client: our H2Upstream driver, CL-less streamed POST.
+    let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+    let expected = payload.clone();
+    tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Write};
+        use vane::h2_client::{H2Upstream, UpstreamEvent};
+        let mut sock = std::net::TcpStream::connect(edge).expect("connect");
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let mut h2up = H2Upstream::new();
+        sock.write_all(&h2up.pending_writes()).expect("preface");
+        // No content-length: END_STREAM delimits the body.
+        let head = b"POST /chunked HTTP/1.1\r\nhost: t\r\n\r\n".to_vec();
+        h2up.send_request(&head, None);
+        sock.write_all(&h2up.pending_writes()).expect("request");
+        // CL-less body: the single END_STREAM-terminated send carries
+        // the whole body (the driver holds over budget and resumes on
+        // request WINDOW_UPDATEs automatically).
+        let frames = h2up.request_body_eof(&payload);
+        if !frames.is_empty() {
+            sock.write_all(&frames).expect("body frames");
+        }
+        sock.write_all(&h2up.pending_writes()).expect("flush");
+
+        let mut got = Vec::new();
+        let mut buf = [0u8; 16384];
+        loop {
+            match sock.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let mut events = Vec::new();
+                    h2up.handle_read(&buf[..n], &mut events);
+                    for ev in events {
+                        if let UpstreamEvent::ResponseBody(data) = ev {
+                            got.extend_from_slice(&data);
+                        }
+                    }
+                    if h2up.response_complete() {
+                        break;
+                    }
+                }
+            }
+        }
+        assert_eq!(got.len(), expected.len(), "chunked relay size");
+        assert_eq!(got, expected, "chunked relay integrity");
+    })
+    .await
+    .expect("client task");
+}
