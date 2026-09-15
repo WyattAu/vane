@@ -340,3 +340,48 @@ impl TableEditor {
 fn shared_trie_clone<T>(t: &PathTrie<T>) -> PathTrie<T> {
     t.clone()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn builder(pattern: &str) -> RouteBuilder {
+        RouteBuilder {
+            host: None,
+            pattern: pattern.to_owned(),
+            methods: Vec::new(),
+            cluster: "c".to_owned(),
+            strip_prefix: None,
+            timeout_ms: None,
+            backends: vec![Backend::new("127.0.0.1:9".parse().expect("addr"), 1)],
+            upstream_h2: false,
+            compression: false,
+            outlier: None,
+            policy: Policy::P2C,
+            priority: 0,
+        }
+    }
+
+    #[test]
+    fn new_router_table_is_empty() {
+        let router = Router::default();
+        assert!(router.load().table().is_empty());
+    }
+
+    #[test]
+    fn empty_pattern_is_rejected_at_compile() {
+        let err = builder("").compile().expect_err("empty pattern");
+        assert!(err.to_string().contains("empty pattern"), "{err}");
+    }
+
+    #[test]
+    fn compiled_entry_lands_in_the_table() {
+        let router = Router::new();
+        router.update(|editor| {
+            editor.insert(builder("/*rest").compile().expect("valid route"));
+        });
+        let guard = router.load();
+        assert_eq!(guard.table().len(), 1);
+        assert!(guard.table().lookup(None, "/anything").is_some());
+    }
+}

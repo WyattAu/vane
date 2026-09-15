@@ -254,4 +254,86 @@ mod tests {
             vec!["shop-svc.app.svc:8080".to_string()]
         );
     }
+
+    const GATEWAYS: &str = r#"{
+        "apiVersion": "gateway.networking.k8s.io/v1",
+        "kind": "GatewayList",
+        "items": [
+            {
+                "metadata": { "name": "edge", "namespace": "ingress" },
+                "spec": {
+                    "listeners": [
+                        {
+                            "port": 8443,
+                            "protocol": "HTTPS",
+                            "tls": {
+                                "certificateRefs": [{ "name": "edge-cert" }],
+                                "keyRefs": [{ "name": "edge-key" }]
+                            }
+                        },
+                        { "port": 8080, "protocol": "HTTP" }
+                    ]
+                }
+            },
+            {
+                "metadata": { "name": "bare", "namespace": "other" },
+                "spec": {}
+            }
+        ]
+    }"#;
+
+    /// Gateway-API list JSON maps to gateways with secret-mount
+    /// convention TLS paths; listeners without TLS carry no hint and a
+    /// gateway without listeners maps empty.
+    #[test]
+    fn maps_gateway_api_json_with_tls_hints() {
+        let gateways = map_gateways(GATEWAYS).expect("map");
+        assert_eq!(gateways.len(), 2);
+
+        assert_eq!(gateways[0].name, "ingress/edge");
+        assert_eq!(gateways[0].listeners.len(), 2);
+        let tls = gateways[0].listeners[0]
+            .tls
+            .as_ref()
+            .expect("tls hint present");
+        assert_eq!(tls.cert, "/etc/vane/certs/edge-cert");
+        assert_eq!(tls.key, "/etc/vane/certs/edge-key");
+        assert!(gateways[0].listeners[1].tls.is_none(), "plain listener");
+
+        assert_eq!(gateways[1].name, "other/bare");
+        assert!(gateways[1].listeners.is_empty());
+    }
+
+    #[test]
+    fn gateway_json_parse_error_is_mapped() {
+        let err = map_gateways("{not json").expect_err("parse failure surfaces");
+        assert!(err.contains("gateways:"), "{err}");
+    }
+
+    /// A backendRef without `weight` defaults to 1 and a namespaced
+    /// route without a namespace falls back to the caller's default.
+    #[test]
+    fn httproutes_default_namespace_and_weight() {
+        let json = r#"{
+            "kind": "HTTPRouteList",
+            "items": [
+                {
+                    "metadata": { "name": "anon" },
+                    "spec": {
+                        "hostnames": ["anon.example.com"],
+                        "rules": [
+                            { "backendRefs": [{ "name": "anon-svc", "port": 80 }] }
+                        ]
+                    }
+                }
+            ]
+        }"#;
+        let routes = map_httproutes(json, "team-a").expect("map");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].name, "team-a/anon");
+        let backend = &routes[0].rules[0].backend_refs[0];
+        assert_eq!(backend.host, "anon-svc.team-a.svc");
+        assert_eq!(backend.port, 80);
+        assert_eq!(backend.weight, 1, "weight defaults to 1");
+    }
 }

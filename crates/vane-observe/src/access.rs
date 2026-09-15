@@ -350,4 +350,38 @@ mod tests {
         }
         assert_eq!(drained, pushed);
     }
+
+    /// True IPv6 peers (not v4-mapped) render in long form; control
+    /// bytes escape as JSON `\n`/`\r`/`\t`/`\uXXXX`, DEL and C1 as
+    /// `\u00xx`, Latin-1 stays raw.
+    #[test]
+    fn ipv6_peer_and_control_bytes_escape_json_safely() {
+        let mut v6 = [0u8; 16];
+        v6[0] = 0x20;
+        v6[1] = 0x01;
+        v6[2] = 0x0d;
+        v6[3] = 0xb8;
+        v6[15] = 1;
+        let rec = AccessRecord::now(
+            0,
+            200,
+            1,
+            0,
+            (v6, 443),
+            None,
+            b"GET",
+            b"h",
+            b"/a\nb\rc\td\x01e\x7f\xe9",
+            b"",
+        );
+        let mut out = String::new();
+        rec.render_json(&mut out);
+        assert!(out.contains("\"client\":\"2001:db8::1:443\""), "{out}");
+        assert!(out.contains("\\n"), "{out}");
+        assert!(out.contains("\\r"), "{out}");
+        assert!(out.contains("\\t"), "{out}");
+        assert!(out.contains("\\u0001"), "{out}");
+        assert!(out.contains("\\u007f"), "{out}");
+        assert!(out.contains("\u{e9}"), "{out}");
+    }
 }

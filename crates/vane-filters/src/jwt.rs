@@ -351,4 +351,33 @@ mod tests {
         use base64::Engine as _;
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     }
+
+    /// Auth errors render human-readable messages (log/operator paths).
+    #[test]
+    fn auth_error_display_is_readable() {
+        assert_eq!(AuthError::Missing.to_string(), "missing bearer token");
+        assert_eq!(AuthError::Invalid.to_string(), "invalid token");
+        assert_eq!(
+            AuthError::Unavailable.to_string(),
+            "auth material unavailable"
+        );
+    }
+
+    /// A secret file's single trailing newline (conventional secret
+    /// files) is stripped before use as HMAC material.
+    #[test]
+    fn secret_file_trailing_newline_is_trimmed() {
+        let dir = tempfile::tempdir().expect("dir");
+        let secret_path = dir.path().join("secret");
+        std::fs::write(&secret_path, b"trimmed-secret\n").expect("write");
+        let v = JwtValidator::new(None, Some(&secret_path), None, None).expect("validator");
+        let claims = serde_json::json!({"sub": "u1", "exp": 4102444800u64});
+        let token = sign_hs256(&claims, b"trimmed-secret");
+        assert!(v.verify(&token).is_ok(), "newline-stripped secret verifies");
+    }
+
+    #[test]
+    fn validator_without_any_material_is_a_configuration_error() {
+        assert!(JwtValidator::new(None, None, None, None).is_err());
+    }
 }

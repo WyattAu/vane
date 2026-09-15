@@ -569,6 +569,119 @@ mod tests {
     }
 
     #[test]
+    fn goaway_requires_at_least_8_bytes() {
+        let raw = header_bytes(4, FrameKind::GoAway, FrameFlags::EMPTY, 0);
+        let hdr = parse_header(&raw).expect("parse");
+        assert!(matches!(
+            validate_payload(&hdr, &[0u8; 4], DEFAULT_MAX_FRAME_SIZE),
+            Err(FrameError::InvalidPayloadLength)
+        ));
+        let raw = header_bytes(8, FrameKind::GoAway, FrameFlags::EMPTY, 0);
+        let hdr = parse_header(&raw).expect("parse");
+        assert!(validate_payload(&hdr, &[0u8; 8], DEFAULT_MAX_FRAME_SIZE).is_ok());
+    }
+
+    #[test]
+    fn window_update_requires_4_bytes() {
+        let raw = header_bytes(5, FrameKind::WindowUpdate, FrameFlags::EMPTY, 1);
+        let hdr = parse_header(&raw).expect("parse");
+        assert!(matches!(
+            validate_payload(&hdr, &[0u8; 5], DEFAULT_MAX_FRAME_SIZE),
+            Err(FrameError::InvalidPayloadLength)
+        ));
+    }
+
+    #[test]
+    fn priority_requires_5_bytes() {
+        let raw = header_bytes(4, FrameKind::Priority, FrameFlags::EMPTY, 1);
+        let hdr = parse_header(&raw).expect("parse");
+        assert!(matches!(
+            validate_payload(&hdr, &[0u8; 4], DEFAULT_MAX_FRAME_SIZE),
+            Err(FrameError::InvalidPayloadLength)
+        ));
+        let raw = header_bytes(5, FrameKind::Priority, FrameFlags::EMPTY, 1);
+        let hdr = parse_header(&raw).expect("parse");
+        assert!(validate_payload(&hdr, &[0u8; 5], DEFAULT_MAX_FRAME_SIZE).is_ok());
+    }
+
+    #[test]
+    fn push_promise_padding_splits_like_data() {
+        // payload: pad_len=1, one content byte, 1 pad byte → length 3.
+        let payload = [1, b'x', 0];
+        let raw = header_bytes(
+            payload.len() as u32,
+            FrameKind::PushPromise,
+            FrameFlags::from_u8(0x08),
+            3,
+        );
+        let hdr = parse_header(&raw).expect("parse");
+        let split = validate_payload(&hdr, &payload, DEFAULT_MAX_FRAME_SIZE).expect("valid");
+        assert_eq!(split.pad_len, Some(1));
+        assert_eq!(&payload[split.content_start..split.content_end], b"x");
+    }
+
+    #[test]
+    fn padded_frame_with_empty_payload_truncated() {
+        let raw = header_bytes(0, FrameKind::Data, FrameFlags::from_u8(0x08), 1);
+        let hdr = parse_header(&raw).expect("parse");
+        assert!(matches!(
+            validate_payload(&hdr, &[], DEFAULT_MAX_FRAME_SIZE),
+            Err(FrameError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn spec_hard_frame_cap_rejected_even_with_matching_payload() {
+        // The length check precedes the payload match, so the payload
+        // must be materialized at the declared (over-cap) size. The
+        // header is built directly: cap+1 is not expressible in the
+        // 24-bit wire field (the cap IS that limit), so it can only
+        // arise from an in-process bug — exactly what this guards.
+        let len = MAX_ALLOWED_FRAME_SIZE + 1;
+        let hdr = FrameHeader {
+            length: len,
+            kind: FrameKind::Data,
+            flags: FrameFlags::EMPTY,
+            stream_id: 1,
+        };
+        let payload = vec![0u8; len as usize];
+        assert!(matches!(
+            validate_payload(&hdr, &payload, DEFAULT_MAX_FRAME_SIZE),
+            Err(FrameError::InvalidPayloadLength)
+        ));
+    }
+
+    #[test]
+    fn parse_settings_rejects_non_multiple_of_six() {
+        assert_eq!(parse_settings(&[0u8; 7]), Err(FrameError::InvalidSettings));
+    }
+
+    #[test]
+    fn parse_settings_maps_all_known_ids() {
+        let mut payload = Vec::new();
+        write_setting(&mut payload, 0x2, 1);
+        write_setting(&mut payload, 0x5, 16_384);
+        write_setting(&mut payload, 0x6, 4096);
+        let settings = parse_settings(&payload).expect("parse settings");
+        assert_eq!(settings[0], Setting::EnablePush(true));
+        assert_eq!(settings[1], Setting::MaxFrameSize(16_384));
+        assert_eq!(settings[2], Setting::MaxHeaderListSize(4096));
+    }
+
+    #[test]
+    fn parse_window_update_and_rst_reject_bad_lengths() {
+        assert_eq!(
+            parse_window_update(&[0u8; 3]),
+            Err(FrameError::InvalidPayloadLength)
+        );
+        assert_eq!(parse_window_update(&[0, 0, 0, 9]), Ok(9));
+        assert_eq!(
+            parse_rst_stream(&[0u8; 5]),
+            Err(FrameError::InvalidPayloadLength)
+        );
+    }
+
+    #[test]
     fn garbage_never_panics() {
         let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
         for len in 0..400u64 {

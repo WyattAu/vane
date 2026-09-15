@@ -215,12 +215,45 @@ mod status_tests {
     #[test]
     fn status_roundtrips_all_codes() {
         for code in [
-            200, 201, 204, 301, 304, 400, 401, 403, 404, 405, 413, 500, 502, 503, 504,
+            200, 201, 204, 301, 302, 304, 400, 401, 403, 404, 405, 408, 413, 429, 500, 502, 503,
+            504,
         ] {
             let s = Status::from_code(code);
             assert_eq!(s.code(), code, "code {code}");
             assert!(!s.reason().is_empty());
         }
+    }
+
+    #[test]
+    fn redirect_and_throttle_codes_keep_reason_phrases() {
+        assert_eq!(Status::from_code(302).reason(), "Found");
+        assert_eq!(Status::from_code(408).reason(), "Request Timeout");
+        assert_eq!(Status::from_code(429).reason(), "Too Many Requests");
+    }
+
+    /// `write_full` with extra headers exercises the header-slot fill
+    /// loop; a body that does not fit behind the head is a clean error.
+    #[test]
+    fn write_full_extra_headers_and_body_overflow() {
+        let date = DateCache::new();
+
+        let mut buf = [0u8; 512];
+        let extras = [
+            ("x-a", b"1".as_slice()),
+            ("x-b", b"2".as_slice()),
+            ("x-c", b"3".as_slice()),
+        ];
+        let n = write_full(&mut buf, Status::Ok, b"payload", &extras, &date).expect("fits");
+        let s = std::str::from_utf8(&buf[..n]).expect("utf8");
+        assert!(s.contains("x-a: 1\r\n"));
+        assert!(s.contains("x-c: 3\r\n"));
+        assert!(s.ends_with("\r\n\r\npayload"));
+
+        // Head fits in 96 bytes but head + body does not.
+        let mut probe = [0u8; 512];
+        let head_len = write_head(&mut probe, Status::Ok, &[], &date, Some(64)).expect("fits");
+        let mut tight = vec![0u8; head_len + 63];
+        assert!(write_full(&mut tight, Status::Ok, &[0u8; 64], &[], &date).is_err());
     }
 
     #[test]

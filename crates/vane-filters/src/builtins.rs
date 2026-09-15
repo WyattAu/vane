@@ -435,4 +435,22 @@ mod edge_tests {
         // ctx.cluster unset (pre-route): gate must pass through.
         assert!(matches!(gate.run(&mut c), Outcome::Continue));
     }
+
+    /// `Filter::name` is part of the observable contract (pipeline
+    /// diagnostics); every builtin reports its configured name, and the
+    /// `Default` impls match `new`.
+    #[test]
+    fn builtins_report_stable_names() {
+        use crate::pipeline::Filter;
+        let registry = std::sync::Arc::new(Registry::new());
+        assert_eq!(Filter::name(&RateLimit::new(registry, 8, 8)), "rate_limit");
+        assert_eq!(
+            Filter::name(&BreakerGate::new(std::sync::Arc::new(Registry::new()))),
+            "breaker"
+        );
+        assert_eq!(Filter::name(&ForwardedHeaders::new("https")), "forwarded");
+        assert_eq!(Filter::name(&ForwardedHeaders::default()), "forwarded");
+        assert_eq!(Filter::name(&AccessLog::new()), "access_log");
+        assert_eq!(Filter::name(&AccessLog::default()), "access_log");
+    }
 }

@@ -593,6 +593,97 @@ address = "127.0.0.1:9100"
         cfg.listeners[0].address = "not-an-addr".to_owned();
         assert!(cfg.validate().is_err());
     }
+
+    /// Non-default LB policies parse (kebab-case) and map onto the
+    /// router's policy set.
+    #[test]
+    fn round_robin_and_least_conn_policies_parse() {
+        for (name, expect) in [("round-robin", "round-robin"), ("least-conn", "least-conn")] {
+            let toml = format!(
+                r#"
+[[listeners]]
+address = "127.0.0.1:8081"
+
+[clusters.api]
+backends = ["127.0.0.1:9001"]
+policy = "{name}"
+
+[[routes]]
+pattern = "/*rest"
+cluster = "api"
+"#
+            );
+            let cfg = VaneConfig::parse_toml(&toml).expect("parses");
+            cfg.validate().expect("valid");
+            let policy = vane_router::Policy::from(cfg.clusters["api"].policy);
+            let rendered = match policy {
+                vane_router::Policy::RoundRobin => "round-robin",
+                vane_router::Policy::LeastConn => "least-conn",
+                _ => panic!("unexpected policy {policy:?}"),
+            };
+            assert_eq!(rendered, expect);
+        }
+    }
+
+    /// Outlier section with omitted fields and a rate limit without a
+    /// burst both fall back to their serde defaults.
+    #[test]
+    fn omitted_numeric_fields_take_defaults() {
+        let toml = r#"
+[[listeners]]
+address = "127.0.0.1:8082"
+
+[clusters.api]
+backends = ["127.0.0.1:9001"]
+
+[clusters.api.outlier]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "api"
+
+[rate_limit]
+rps = 100
+"#;
+        let cfg = VaneConfig::parse_toml(toml).expect("parses");
+        let outlier = cfg.clusters["api"].outlier.as_ref().expect("outlier");
+        assert_eq!(outlier.consecutive_failures, 5);
+        assert_eq!(outlier.ejection_ms, 30_000);
+        let rl = cfg.rate_limit.as_ref().expect("rate limit");
+        assert_eq!(rl.burst, 100);
+        assert_eq!(rl.rps, 100);
+    }
+
+    /// tls-alpn-01 is documented as unsupported: config load rejects it
+    /// before any ACME machinery starts.
+    #[test]
+    fn tls_alpn_01_challenge_is_rejected() {
+        let toml = r#"
+[[listeners]]
+address = "127.0.0.1:8083"
+
+[clusters.api]
+backends = ["127.0.0.1:9001"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "api"
+
+[acme]
+directory_url = "https://acme.example/dir"
+emails = ["ops@example.com"]
+
+[[acme.domains]]
+domain = "edge.example.com"
+challenge = "tls-alpn01"
+"#;
+        let cfg = VaneConfig::parse_toml(toml).expect("parses");
+        let err = cfg.validate().expect_err("alpn-01 rejected");
+        assert!(
+            err.to_string().contains("tls-alpn-01"),
+            "unexpected error: {err}"
+        );
+    }
 }
 
 #[cfg(test)]

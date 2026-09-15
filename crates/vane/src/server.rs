@@ -970,6 +970,113 @@ cluster = "up"
         assert_eq!(records[0].cluster, "c");
         assert_eq!(records[0].backends, vec!["127.0.0.1:5".to_string()]);
     }
+
+    #[test]
+    fn vane_workers_env_overrides_all_listeners() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        // SAFETY: env mutation serialized by ENV_LOCK within this binary.
+        unsafe {
+            std::env::set_var("VANE_WORKERS", "3");
+        }
+        let dir = tempfile::tempdir().expect("dir");
+        let path = write_cfg(dir.path(), "workers.toml", BASE);
+        let cfg = load_config(Some(&path)).expect("load");
+        // SAFETY: restore.
+        unsafe {
+            std::env::remove_var("VANE_WORKERS");
+        }
+        assert!(cfg.listeners.iter().all(|l| l.workers == 3));
+    }
+
+    /// OTEL_* and RUST_LOG env overrides merge over the file config
+    /// before telemetry init; a bogus sample rate is clamped, not fatal.
+    #[test]
+    fn init_telemetry_applies_env_overrides() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        // SAFETY: env mutation serialized by ENV_LOCK within this binary.
+        unsafe {
+            std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:14317");
+            std::env::set_var("OTEL_SERVICE_NAME", "vane-unittest");
+            std::env::set_var("OTEL_SAMPLE_RATE", "1.7");
+            std::env::set_var("RUST_LOG", "debug");
+        }
+        let cfg = vane_control::TelemetryConfig::default();
+        // The guard may legitimately be None (unreachable OTLP endpoint
+        // → falls back to stderr logging); the env-merge must not fail.
+        let _guard = init_telemetry(&cfg);
+        // SAFETY: restore.
+        unsafe {
+            std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+            std::env::remove_var("OTEL_SERVICE_NAME");
+            std::env::remove_var("OTEL_SAMPLE_RATE");
+            std::env::remove_var("RUST_LOG");
+        }
+    }
+
+    /// `VANE_ADMIN_TOKEN` wins over `[admin] auth_token_file`; the file
+    /// must exist and be non-empty; contents are whitespace-trimmed.
+    #[test]
+    fn resolve_admin_token_env_file_and_errors() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let dir = tempfile::tempdir().expect("dir");
+
+        // Env token wins even when a file is configured.
+        // SAFETY: env mutation serialized by ENV_LOCK within this binary.
+        unsafe {
+            std::env::set_var("VANE_ADMIN_TOKEN", "  env-tok  ");
+        }
+        let cfg_with_file = vane_control::config::AdminConfig {
+            auth_token_file: Some("/nonexistent/token".into()),
+            ..vane_control::config::AdminConfig::default()
+        };
+        let tok = resolve_admin_token(&cfg_with_file)
+            .expect("env path ok")
+            .expect("env token present");
+        // SAFETY: restore.
+        unsafe {
+            std::env::remove_var("VANE_ADMIN_TOKEN");
+        }
+        assert_eq!(&*tok, "env-tok", "env token is trimmed");
+
+        // Whitespace-only env falls through to the file.
+        // SAFETY: serialized by ENV_LOCK.
+        unsafe {
+            std::env::set_var("VANE_ADMIN_TOKEN", "   ");
+        }
+        let missing = resolve_admin_token(&cfg_with_file)
+            .map_err(|e| e.to_string())
+            .unwrap_err();
+        // SAFETY: restore; serialized by ENV_LOCK.
+        unsafe {
+            std::env::remove_var("VANE_ADMIN_TOKEN");
+        }
+        assert!(missing.contains("auth_token_file"), "{missing}");
+
+        // Empty file errors.
+        let empty = dir.path().join("empty.token");
+        std::fs::write(&empty, "  \n\t").expect("write");
+        let cfg_empty = vane_control::config::AdminConfig {
+            auth_token_file: Some(empty.to_str().expect("utf8").into()),
+            ..vane_control::config::AdminConfig::default()
+        };
+        let err = resolve_admin_token(&cfg_empty).unwrap_err();
+        assert!(err.contains("is empty"), "{err}");
+
+        // Valid file is trimmed; no config at all disables auth.
+        let file = dir.path().join("token");
+        std::fs::write(&file, "  file-tok\n").expect("write");
+        let cfg_file = vane_control::config::AdminConfig {
+            auth_token_file: Some(file.to_str().expect("utf8").into()),
+            ..vane_control::config::AdminConfig::default()
+        };
+        let tok = resolve_admin_token(&cfg_file)
+            .expect("file path ok")
+            .expect("file token present");
+        assert_eq!(&*tok, "file-tok");
+
+        let cfg_none = vane_control::config::AdminConfig::default();
+        assert!(resolve_admin_token(&cfg_none).expect("no auth").is_none());
+    }
 }
 
 #[cfg(test)]
