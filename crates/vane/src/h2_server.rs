@@ -739,11 +739,6 @@ mod flow_tests {
             f
         };
         h2s.handle_read(&frame_head, &mut events);
-        eprintln!(
-            "FTDBG events={} conn_err={:?}",
-            events.len(),
-            h2s.conn_error_code()
-        );
         assert!(matches!(events[0], H2Event::RequestHead { .. }));
 
         // Simulate the upstream feeding the response head + full body
@@ -797,10 +792,6 @@ mod flow_tests {
                 // Only DATA frames consume the flow window.
                 let ftype = f[3];
                 if ftype != 0x00 {
-                    eprintln!(
-                        "TYPDBG non-data frame type={ftype:#04x} len={}",
-                        f.len() - 9
-                    );
                     continue;
                 }
                 let len = u32::from_be_bytes([0, f[0], f[1], f[2]]) as u64;
@@ -812,8 +803,9 @@ mod flow_tests {
                 granted_total += len;
             }
             let (cw, sw) = h2s.conn_debug_windows();
+            let budget_after = h2s.conn.send_budget(1);
             eprintln!(
-                "FLWDBG it={guard} emitted_delta={granted_this_iter} emitted_total={emitted_total} granted_total={granted_total} cw={cw} sw={sw} held={} fed={fed}",
+                "FLWDBG it={guard} delta={granted_this_iter} emitted={emitted_total} granted={granted_total} cw={cw} sw={sw} budget_after={budget_after} held={} fed={fed}",
                 h2s.held.len()
             );
             assert!(

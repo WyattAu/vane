@@ -329,9 +329,9 @@ impl HttpProxy {
         };
         let _ = tls.writer().write_all(bytes); // io::Write via import
         // Flush the TLS record layer out in one batch.
-        let mut out = Vec::with_capacity(16 * 1024);
+        let mut out = Vec::with_capacity(17 * 1024);
         loop {
-            let mut buf = [0u8; 16 * 1024];
+            let mut buf = [0u8; 17 * 1024];
             let n = tls.write_tls(&mut buf.as_mut_slice()).unwrap_or(0);
             if n == 0 {
                 break;
@@ -376,7 +376,7 @@ impl HttpProxy {
                 return;
             }
             let mut n_total = 0usize;
-            let mut buf = [0u8; 16 * 1024];
+            let mut buf = [0u8; 17 * 1024];
             loop {
                 let n = tls.reader().read(&mut buf[..]).unwrap_or(0);
                 if n == 0 {
@@ -436,7 +436,7 @@ impl HttpProxy {
         let Some(tls) = &mut conn.tls else { return };
         let mut out = Vec::new();
         loop {
-            let mut buf = [0u8; 16 * 1024];
+            let mut buf = [0u8; 17 * 1024];
             let n = tls.write_tls(&mut buf.as_mut_slice()).unwrap_or(0);
             if n == 0 {
                 break;
@@ -812,9 +812,9 @@ impl HttpProxy {
         };
         use std::io::Write as _;
         let _ = tls.writer().write_all(bytes);
-        let mut out = Vec::with_capacity(16 * 1024);
+        let mut out = Vec::with_capacity(17 * 1024);
         loop {
-            let mut buf = [0u8; 16 * 1024];
+            let mut buf = [0u8; 17 * 1024];
             let n = tls.write_tls(&mut buf.as_mut_slice()).unwrap_or(0);
             if n == 0 {
                 break;
