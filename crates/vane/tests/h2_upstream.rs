@@ -9,6 +9,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod wireproxy;
+
 use vane_observe::metrics::Registry;
 use vane_router::table::{RouteEntry, Router};
 
@@ -1057,11 +1059,33 @@ workers = 1
     client_cfg.alpn_protocols = vec![b"h2".to_vec()];
     let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_cfg));
     let server_name = rustls::pki_types::ServerName::try_from("localhost".to_owned()).expect("sni");
-    let tcp = tokio::net::TcpStream::connect(edge)
+    // Wire-capture proxy mode (VANE_WIREPROXY=1): route through the
+    // decrypting proxy and record both plaintext directions.
+    let dial = if std::env::var("VANE_WIREPROXY").is_ok() {
+        let proxy = wireproxy::spawn(edge, &cert_path, &key_path)
+            .await
+            .expect("wireproxy");
+        eprintln!("WIRE capturing through {}", proxy.addr);
+        proxy.addr
+    } else {
+        edge
+    };
+    let tcp = tokio::net::TcpStream::connect(dial)
         .await
         .expect("tcp connect");
     let tls = connector.connect(server_name, tcp).await.expect("tls");
     assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+
+    // Passive tee mode (VANE_WIRETEE=1): record the client's decrypted
+    // read stream — exactly what the h2 parser consumes — without
+    // altering the connection path.
+    let tls = if std::env::var("VANE_WIRETEE").is_ok() {
+        let log =
+            std::fs::File::create("/tmp/opencode/wire/client_view.bin").expect("client view log");
+        wireproxy::TeeStream::new(tls, log)
+    } else {
+        tls
+    };
 
     let (mut send, connection) = h2::client::handshake(tls).await.expect("h2");
     tokio::spawn(async move {
