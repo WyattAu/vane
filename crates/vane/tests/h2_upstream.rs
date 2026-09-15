@@ -1084,7 +1084,8 @@ workers = 1
             std::fs::File::create("/tmp/opencode/wire/client_view.bin").expect("client view log");
         wireproxy::TeeStream::new(tls, log)
     } else {
-        tls
+        let log = std::fs::File::create("/dev/null").expect("devnull");
+        wireproxy::TeeStream::new(tls, log)
     };
 
     let (mut send, connection) = h2::client::handshake(tls).await.expect("h2");
