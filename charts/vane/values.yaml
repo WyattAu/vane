@@ -80,6 +80,10 @@ gatewayOperator:
   enabled: false
   apiServer: https://kubernetes.default.svc
   namespace: default
+  # Cover every namespace the RBAC grants (cluster-scoped list/watch).
+  allNamespaces: true
+  # Watch mode: push snapshots on every change instead of polling.
+  watch: true
   admin: http://vane-admin:7900
   pollSecs: 5
   rbac:

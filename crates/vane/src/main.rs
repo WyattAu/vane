@@ -60,9 +60,17 @@ enum Cmd {
         /// vane admin plane base URL (receives xDS snapshots).
         #[arg(long, default_value = "http://127.0.0.1:7900")]
         admin: String,
-        /// Poll interval seconds (v0.2: poll, not watch).
+        /// Poll interval seconds (poll mode).
         #[arg(long, default_value = "5")]
         poll_secs: u64,
+        /// Watch mode: consume the API server's ?watch=true streams and
+        /// push a snapshot on every change (replaces polling).
+        #[arg(long, default_value_t = false)]
+        watch: bool,
+        /// Cover every namespace the RBAC grants (cluster-scoped
+        /// list/watch paths) instead of one namespace.
+        #[arg(long, default_value_t = false)]
+        all_namespaces: bool,
     },
 }
 
@@ -87,7 +95,17 @@ fn main() {
             token_path,
             admin,
             poll_secs,
-        } => cmd_gateway_operator(api_server, namespace, token_path, admin, poll_secs),
+            watch,
+            all_namespaces,
+        } => cmd_gateway_operator(
+            api_server,
+            namespace,
+            token_path,
+            admin,
+            poll_secs,
+            watch,
+            all_namespaces,
+        ),
     };
     std::process::exit(code);
 }
@@ -361,8 +379,14 @@ fn cmd_gateway_operator(
     token_path: String,
     admin: String,
     poll_secs: u64,
+    watch: bool,
+    all_namespaces: bool,
 ) -> i32 {
-    use vane_control::gateway::{GatewayState, compile};
+    use std::io::BufRead as _;
+    use std::sync::Mutex as StdMutex;
+    use vane_control::gateway::GatewayState;
+    use vane_control::gateway::compile;
+    use vane_control::operator::{ResourceKind, WatchCache};
 
     let token = std::fs::read_to_string(&token_path)
         .map(|t| t.trim().to_owned())
@@ -374,15 +398,111 @@ fn cmd_gateway_operator(
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .expect("http client");
-    let routes_url = format!(
-        "{api_server}{}/namespaces/{namespace}/httproutes",
-        vane_control::operator::HTTPROUTES_PATH
-    );
-    let gateways_url = format!(
-        "{api_server}{}/namespaces/{namespace}/gateways",
-        vane_control::operator::GATEWAYS_PATH
-    );
+    let scope = |path: &str| {
+        if all_namespaces {
+            format!("{api_server}{path}")
+        } else {
+            format!("{api_server}/namespaces/{namespace}{path}")
+        }
+    };
+    let routes_url = scope(vane_control::operator::HTTPROUTES_PATH);
+    let gateways_url = scope(vane_control::operator::GATEWAYS_PATH);
     let snapshot_url = format!("{admin}/xds/snapshot");
+
+    if watch {
+        eprintln!(
+            "gateway-operator: watch mode ns={namespace}{} api={api_server} admin={admin}",
+            if all_namespaces { " (all)" } else { "" },
+        );
+        let cache = std::sync::Arc::new(std::sync::Mutex::new(WatchCache::default()));
+        let dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut handles = Vec::new();
+        for (kind, url) in [
+            (
+                ResourceKind::HttpRoute,
+                scope(vane_control::operator::HTTPROUTES_WATCH_PATH),
+            ),
+            (
+                ResourceKind::Gateway,
+                scope(vane_control::operator::GATEWAYS_WATCH_PATH),
+            ),
+        ] {
+            let client = client.clone();
+            let token = token.clone();
+            let cache = std::sync::Arc::clone(&cache);
+            let dirty = std::sync::Arc::clone(&dirty);
+            handles.push(std::thread::spawn(move || {
+                loop {
+                    let resp = client
+                        .get(&url)
+                        .header("Authorization", format!("Bearer {token}"))
+                        .send();
+                    let Ok(resp) = resp else {
+                        eprintln!("gateway-operator: watch connect failed; retrying");
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        continue;
+                    };
+                    if !resp.status().is_success() {
+                        eprintln!(
+                            "gateway-operator: watch rejected: {} (RBAC?); retrying",
+                            resp.status()
+                        );
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        continue;
+                    }
+                    let mut reader = std::io::BufReader::new(resp);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line) {
+                            Ok(0) | Err(_) => break, // stream ended: reconnect
+                            Ok(_) => {
+                                let changed = match StdMutex::lock(&cache) {
+                                    Ok(mut c) => c.apply(kind, line.trim()).unwrap_or(false),
+                                    Err(_) => false,
+                                };
+                                if changed {
+                                    dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
+                    eprintln!("gateway-operator: watch stream ended; reconnecting");
+                }
+            }));
+        }
+        // Snapshot poster: push on change, at most once per second.
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            if !dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
+            let body = match StdMutex::lock(&cache) {
+                Ok(c) => serde_json::to_string(&compile(&c.state())).map_err(|e| e.to_string()),
+                Err(_) => Err("cache poisoned".to_string()),
+            };
+            match body {
+                Ok(body) => match client
+                    .post(&snapshot_url)
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .send()
+                {
+                    Ok(r) if r.status().is_success() => {
+                        eprintln!("gateway-operator: snapshot applied");
+                    }
+                    Ok(r) => {
+                        eprintln!("gateway-operator: snapshot rejected: {}", r.status());
+                    }
+                    Err(e) => {
+                        eprintln!("gateway-operator: admin unreachable: {e}");
+                        dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                },
+                _ => eprintln!("gateway-operator: compile failed"),
+            }
+        }
+    }
 
     eprintln!("gateway-operator: ns={namespace} api={api_server} admin={admin} poll={poll_secs}s");
     loop {

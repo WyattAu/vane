@@ -59,8 +59,15 @@ spec:
             - gateway-operator
             - --api-server
             - {{ .Values.gatewayOperator.apiServer }}
+            {{- if .Values.gatewayOperator.allNamespaces }}
+            - --all-namespaces
+            {{- else }}
             - --namespace
             - {{ .Values.gatewayOperator.namespace }}
+            {{- end }}
+            {{- if .Values.gatewayOperator.watch }}
+            - --watch
+            {{- end }}
             - --admin
             - {{ .Values.gatewayOperator.admin }}
             - --poll-secs

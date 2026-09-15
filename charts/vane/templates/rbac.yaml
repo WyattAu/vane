@@ -13,9 +13,9 @@ metadata:
   labels:
     {{- include "vane.labels" . | nindent 4 }}
 rules:
-  # Gateway API route discovery (list + watch).
+  # Gateway API route discovery (list + watch, all namespaces).
   - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["httproutes"]
+    resources: ["httproutes", "gateways"]
     verbs: ["get", "list", "watch"]
   # Endpoint resolution for backend_refs → ready pod IPs.
   - apiGroups: [""]

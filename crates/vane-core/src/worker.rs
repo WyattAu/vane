@@ -620,10 +620,15 @@ impl WorkerState {
             return;
         };
         if s.read_inflight || s.splice {
+            eprintln!(
+                "ARMDbg skip slot={slot} inflight={} splice={}",
+                s.read_inflight, s.splice
+            );
             return;
         }
         if s.rslot.is_none() {
             let Some(rs) = self.pool.take() else {
+                eprintln!("ARMDbg pool-exhausted slot={slot}");
                 return;
             }; // backpressure
             s.rslot = Some(rs);

@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::xds::{XdsCluster, XdsRoute, XdsSnapshot};
 
 /// A Gateway resource: listeners the operator should materialize.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Gateway {
     /// Resource name.
     pub name: String,
@@ -30,7 +30,7 @@ pub struct Gateway {
 }
 
 /// One listener hint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GatewayListener {
     /// Bind port.
     pub port: u16,
@@ -43,7 +43,7 @@ pub struct GatewayListener {
 }
 
 /// TLS material hint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ListenerTlsHint {
     /// Certificate path (secret-mounted).
     pub cert: String,
@@ -53,7 +53,7 @@ pub struct ListenerTlsHint {
 
 /// An HTTPRoute resource. Field names follow the Kubernetes Gateway
 /// API JSON (`backendRefs`, `httproutes`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HttpRoute {
     /// Resource name (namespace-qualified by the operator).
     pub name: String,
@@ -66,7 +66,7 @@ pub struct HttpRoute {
 }
 
 /// One rule: matches + weighted backends.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HttpRouteRule {
     /// Path/method matches (empty = match all).
     #[serde(default)]
@@ -77,7 +77,7 @@ pub struct HttpRouteRule {
 }
 
 /// One match.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RouteMatch {
     /// Path match (`PathPrefix` semantics).
     #[serde(default)]
@@ -88,7 +88,7 @@ pub struct RouteMatch {
 }
 
 /// A weighted backend reference.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BackendRef {
     /// Backend host (`service.namespace.svc` or IP).
     pub host: String,

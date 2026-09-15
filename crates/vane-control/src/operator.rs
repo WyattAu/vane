@@ -3,6 +3,14 @@
 //! [`GatewayState`](crate::gateway::GatewayState), and hands it to the
 //! compiler. The HTTP fetcher is injected — tests use canned JSON, the
 //! binary wires an authenticated client (service-account token).
+//!
+//! Watch mode: instead of polling, the binary consumes the API
+//! server's `?watch=true` stream (`[`WatchCache`] applies each event
+//! and yields a fresh state per event, multi-namespace by default —
+//! the cluster-scoped list/watch paths cover every namespace the RBAC
+//! grants; namespace-scoped path helpers exist for restricted roles).
+
+use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
@@ -198,6 +206,120 @@ pub fn map_httproutes(api_json: &str, default_namespace: &str) -> Result<Vec<Htt
 pub const HTTPROUTES_PATH: &str = "/apis/gateway.networking.k8s.io/v1/httproutes";
 /// The URL path for Gateway lists, relative to the API server.
 pub const GATEWAYS_PATH: &str = "/apis/gateway.networking.k8s.io/v1/gateways";
+/// The URL path for the HTTPRoute watch stream.
+pub const HTTPROUTES_WATCH_PATH: &str = "/apis/gateway.networking.k8s.io/v1/httproutes?watch=true";
+/// The URL path for the Gateway watch stream.
+pub const GATEWAYS_WATCH_PATH: &str = "/apis/gateway.networking.k8s.io/v1/gateways?watch=true";
+
+/// The URL path for HTTPRoutes in one namespace (restricted RBAC).
+#[must_use]
+pub fn httproutes_path_in(namespace: &str) -> String {
+    format!("/apis/gateway.networking.k8s.io/v1/namespaces/{namespace}/httproutes")
+}
+
+/// The URL path for Gateways in one namespace (restricted RBAC).
+#[must_use]
+pub fn gateways_path_in(namespace: &str) -> String {
+    format!("/apis/gateway.networking.k8s.io/v1/namespaces/{namespace}/gateways")
+}
+
+/// Which resource a watch event carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceKind {
+    /// `gateways.gateway.networking.k8s.io`.
+    Gateway,
+    /// `httproutes.gateway.networking.k8s.io`.
+    HttpRoute,
+}
+
+/// A per-resource incremental state cache fed by `?watch=true` event
+/// streams. Each applied event upserts or removes one object; the
+/// full [`GatewayState`] recompiles from the cache on demand. Keys
+/// are `namespace/name`, so multiple namespaces coexist.
+#[derive(Debug, Default)]
+pub struct WatchCache {
+    gateways: BTreeMap<String, Gateway>,
+    httproutes: BTreeMap<String, HttpRoute>,
+}
+
+/// A K8s watch-stream line.
+#[derive(Debug, Deserialize)]
+struct K8sWatchEvent {
+    #[serde(rename = "type")]
+    kind: String,
+    object: serde_json::Value,
+}
+
+impl WatchCache {
+    /// Applies one watch-stream event line. Returns whether the cache
+    /// changed (NOOP events and unparseable lines report `false` with
+    /// the parse error surfaced).
+    ///
+    /// # Errors
+    /// JSON parse failure of the event or its object.
+    pub fn apply(&mut self, kind: ResourceKind, event_json: &str) -> Result<bool, String> {
+        let ev: K8sWatchEvent =
+            serde_json::from_str(event_json).map_err(|e| format!("watch event: {e}"))?;
+        let deleted = ev.kind == "DELETED";
+        let object = serde_json::to_string(&ev.object).map_err(|e| e.to_string())?;
+        let changed = match kind {
+            ResourceKind::Gateway => {
+                let list = format!(r#"{{"items": [{object}]}}"#);
+                let mapped = map_gateways(&list)?;
+                let Some(gw) = mapped.into_iter().next() else {
+                    return Ok(false);
+                };
+                let key = gw.name.clone();
+                if deleted {
+                    self.gateways.remove(&key).is_some()
+                } else {
+                    // An upsert counts as a change only when the object
+                    // is new or its mapped form differs.
+                    self.gateways
+                        .insert(key, gw.clone())
+                        .is_none_or(|old| old != gw)
+                }
+            }
+            ResourceKind::HttpRoute => {
+                let list = format!(r#"{{"items": [{object}]}}"#);
+                let mapped = map_httproutes(&list, "")?;
+                let Some(route) = mapped.into_iter().next() else {
+                    return Ok(false);
+                };
+                let key = route.name.clone();
+                if deleted {
+                    self.httproutes.remove(&key).is_some()
+                } else {
+                    self.httproutes
+                        .insert(key, route.clone())
+                        .is_none_or(|old| old != route)
+                }
+            }
+        };
+        Ok(changed)
+    }
+
+    /// Snapshots the cache as a compilable state.
+    #[must_use]
+    pub fn state(&self) -> crate::gateway::GatewayState {
+        crate::gateway::GatewayState {
+            gateways: self.gateways.values().cloned().collect(),
+            httproutes: self.httproutes.values().cloned().collect(),
+        }
+    }
+
+    /// Number of cached objects across both resources.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.gateways.len() + self.httproutes.len()
+    }
+
+    /// Whether the cache holds no objects.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -335,5 +457,119 @@ mod tests {
         assert_eq!(backend.host, "anon-svc.team-a.svc");
         assert_eq!(backend.port, 80);
         assert_eq!(backend.weight, 1, "weight defaults to 1");
+    }
+
+    /// Watch events upsert and delete; the cache compiles across
+    /// namespaces and `is_none()` change reporting works.
+    #[test]
+    fn watch_cache_upsert_delete_and_compile() {
+        const ADDED: &str = r#"{"type":"ADDED","object":{
+            "metadata": { "name": "shop", "namespace": "app" },
+            "spec": {
+                "hostnames": ["shop.example.com"],
+                "rules": [{ "backendRefs": [{ "name": "shop-svc", "port": 8080 }] }]
+            }
+        }}"#;
+        const MODIFIED: &str = r#"{"type":"MODIFIED","object":{
+            "metadata": { "name": "shop", "namespace": "app" },
+            "spec": {
+                "hostnames": ["shop2.example.com"],
+                "rules": [{ "backendRefs": [{ "name": "shop-svc", "port": 9090 }] }]
+            }
+        }}"#;
+        const DELETED: &str = r#"{"type":"DELETED","object":{
+            "metadata": { "name": "shop", "namespace": "app" }
+        }}"#;
+
+        let mut cache = WatchCache::default();
+        assert!(cache.is_empty());
+
+        assert!(
+            cache
+                .apply(ResourceKind::HttpRoute, ADDED)
+                .expect("apply added")
+        );
+        assert_eq!(cache.len(), 1);
+        assert_eq!(
+            cache.state().httproutes[0].hostnames,
+            vec!["shop.example.com"]
+        );
+
+        // Second namespace coexists.
+        const ADDED_B: &str = r#"{"type":"ADDED","object":{
+            "metadata": { "name": "shop", "namespace": "team-b" },
+            "spec": { "rules": [{ "backendRefs": [{ "name": "b-svc", "port": 80 }] }] }
+        }}"#;
+        assert!(
+            cache
+                .apply(ResourceKind::HttpRoute, ADDED_B)
+                .expect("apply added b")
+        );
+        assert_eq!(cache.len(), 2);
+
+        assert!(
+            cache
+                .apply(ResourceKind::HttpRoute, MODIFIED)
+                .expect("apply modified")
+        );
+        let state = cache.state();
+        assert_eq!(state.httproutes.len(), 2);
+        let shop = state
+            .httproutes
+            .iter()
+            .find(|r| r.name == "app/shop")
+            .expect("app/shop");
+        assert_eq!(shop.hostnames, vec!["shop2.example.com"]);
+        assert_eq!(shop.rules[0].backend_refs[0].port, 9090);
+
+        assert!(
+            cache
+                .apply(ResourceKind::HttpRoute, DELETED)
+                .expect("apply deleted")
+        );
+        assert_eq!(cache.len(), 1);
+        assert!(
+            cache
+                .apply(ResourceKind::HttpRoute, DELETED)
+                .expect("apply deleted again")
+                == false,
+            "deleting an absent key reports no change"
+        );
+
+        // Snapshots compile.
+        let snap = crate::gateway::compile(&cache.state()).expect("compile");
+        assert_eq!(snap.routes.len(), 1, "only team-b route remains");
+    }
+
+    /// Gateway watch events land in the cache with TLS hints intact.
+    #[test]
+    fn watch_cache_gateways() {
+        const ADDED: &str = r#"{"type":"ADDED","object":{
+            "metadata": { "name": "edge", "namespace": "ingress" },
+            "spec": { "listeners": [{ "port": 8443, "protocol": "HTTPS",
+                "tls": { "certificateRefs": [{ "name": "edge-cert" }] } }] }
+        }}"#;
+        let mut cache = WatchCache::default();
+        assert!(cache.apply(ResourceKind::Gateway, ADDED).expect("apply"));
+        let gws = cache.state().gateways;
+        assert_eq!(gws.len(), 1);
+        assert_eq!(gws[0].name, "ingress/edge");
+        assert_eq!(
+            gws[0].listeners[0].tls.as_ref().expect("tls").cert,
+            "/etc/vane/certs/edge-cert"
+        );
+    }
+
+    /// Namespace-scoped path helpers.
+    #[test]
+    fn namespace_scoped_paths() {
+        assert_eq!(
+            httproutes_path_in("team-a"),
+            "/apis/gateway.networking.k8s.io/v1/namespaces/team-a/httproutes"
+        );
+        assert_eq!(
+            gateways_path_in("team-a"),
+            "/apis/gateway.networking.k8s.io/v1/namespaces/team-a/gateways"
+        );
     }
 }
