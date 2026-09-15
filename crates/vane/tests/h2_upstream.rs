@@ -955,9 +955,7 @@ async fn large_body_streams_native_engine() {
                     .unwrap_or(0);
                 #[allow(clippy::vec_init_then_push)] // test echo: explicit zero-fill
                 let mut buf = vec![0u8; content_length];
-                eprintln!("ECHODBG head CL={content_length}");
                 if s.read_exact(&mut buf).await.is_err() {
-                    eprintln!("ECHODBG body read failed at CL={content_length}");
                     return;
                 }
                 eprintln!("ECHODBG body complete ({content_length} bytes)");
@@ -1290,7 +1288,6 @@ async fn h2c_native_engine_large_body() {
                     .unwrap_or(0);
                 let mut buf = vec![0u8; content_length];
                 if s.read_exact(&mut buf).await.is_err() {
-                    eprintln!("ECHODBG body read failed at CL={content_length}");
                     return;
                 }
                 eprintln!("ECHODBG got head+{content_length} body bytes");
@@ -1398,9 +1395,7 @@ workers = 1
                 Ok(0) => {
                     break;
                 }
-                Err(_) => {
-                    break;
-                }
+                Err(_) => break,
                 Ok(n) => n,
             };
             let mut events = Vec::new();

@@ -208,10 +208,13 @@ impl WorkerState {
         if !self.valid(slot, generation) || bytes.is_empty() {
             return;
         }
+        // Direct write requires the full queue to be idle: pending_down
+        // may hold OLDER bytes (pool exhaustion defers them), and
+        // writing the new batch first would reorder the stream.
         let can_direct = self
             .slab
             .get(slot)
-            .is_some_and(|s| !s.write_inflight && s.wq.is_empty());
+            .is_some_and(|s| !s.write_inflight && s.wq.is_empty() && s.pending_down.is_empty());
         if can_direct {
             if let Some(ws) = self.pool.take() {
                 let Some(s) = self.slab.get_mut(slot) else {
@@ -248,8 +251,13 @@ impl WorkerState {
         if !self.valid(slot, generation) || bytes.is_empty() {
             return;
         }
+        // Same queue-jump guard as downstream_write: pending_up may
+        // hold older deferred bytes.
         let can_direct = self.slab.get(slot).is_some_and(|s| {
-            s.upstream.is_some() && !s.upstream_write_inflight && s.uwq.is_empty()
+            s.upstream.is_some()
+                && !s.upstream_write_inflight
+                && s.uwq.is_empty()
+                && s.pending_up.is_empty()
         });
         if can_direct {
             if let Some(ws) = self.pool.take() {
