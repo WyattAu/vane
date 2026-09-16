@@ -284,3 +284,228 @@ mod tests {
         assert!(!certs.is_empty());
     }
 }
+
+/// Mesh mTLS: SPIFFE-verified upstream transport (design:
+/// docs/mesh-mtls-design.md).
+pub mod mesh {
+    use super::{TlsError, load_cert_key};
+    use rustls::pki_types::CertificateDer;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    /// Mesh identity + trust material (file-based SVIDs, phase 1 of
+    /// the mesh design).
+    #[derive(Debug, Clone)]
+    pub struct MeshIdentity {
+        /// Client SVID certificate chain (PEM).
+        pub cert_path: String,
+        /// Client SVID private key (PEM).
+        pub key_path: String,
+        /// Mesh CA bundle the upstream's cert must chain to (PEM).
+        pub ca_path: String,
+        /// Required SPIFFE ID prefix, e.g.
+        /// `spiffe://example.org/vane/`.
+        pub spiffe_prefix: String,
+    }
+
+    /// Builds the mTLS client config: client SVID + CA roots + ALPN
+    /// `vane-mesh`.
+    ///
+    /// # Errors
+    /// Material load or rustls config failure.
+    pub fn client_config(identity: &MeshIdentity) -> Result<rustls::ClientConfig, TlsError> {
+        let (certs, key) = load_cert_key(
+            Path::new(&identity.cert_path),
+            Path::new(&identity.key_path),
+        )?;
+        let cas: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(
+            std::fs::File::open(&identity.ca_path)
+                .map_err(|e| TlsError::Material(format!("{}: {e}", identity.ca_path)))?,
+        ))
+        .collect::<Result<_, _>>()
+        .map_err(|e| TlsError::Material(e.to_string()))?;
+        let mut roots = rustls::RootCertStore::empty();
+        for ca in cas {
+            roots
+                .add(ca)
+                .map_err(|e| TlsError::Material(format!("ca: {e}")))?;
+        }
+        let mut cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(certs, key)
+            .map_err(TlsError::from)?;
+        cfg.alpn_protocols = vec![b"vane-mesh".to_vec()];
+        Ok(cfg)
+    }
+
+    /// Extracts the SPIFFE ID (URI SAN) from a DER leaf certificate:
+    /// scans for the SubjectAlternativeName extension OID
+    /// (2.5.29.17 = `55 1D 11`) and returns the first
+    /// `uniformResourceIdentifier` (context tag 0x86) inside it.
+    #[must_use]
+    pub fn spiffe_id(der: &CertificateDer<'_>) -> Option<String> {
+        let bytes = der.as_ref();
+        let oid = [0x06, 0x03, 0x55, 0x1D, 0x11];
+        let mut pos = 0;
+        // Locate the extension OID.
+        while let Some(found) = bytes[pos..].windows(oid.len()).position(|w| w == oid) {
+            pos += found + oid.len();
+            // Extension OCTET STRING (tag 0x04) wraps the DER SAN
+            // SEQUENCE. Find it, then walk the GeneralNames.
+            while pos < bytes.len() && bytes[pos] != 0x04 {
+                pos += 1;
+            }
+            if pos >= bytes.len() {
+                return None;
+            }
+            let Some((hdr, clen, _, _, _)) = der_header(&bytes[pos..]) else {
+                return None;
+            };
+            // The octet string wraps the DER SEQUENCE of GeneralNames;
+            // step into its content before walking the names.
+            let sans = bytes.get(pos + hdr..pos + hdr + clen)?;
+            let (shdr, sclen, _, _, _) = der_header(sans)?;
+            let names = sans.get(shdr..shdr + sclen)?;
+            let mut spos = 0;
+            while spos < names.len() {
+                let Some((ghdr, gclen, gtotal, _, gtag)) = der_header(&names[spos..]) else {
+                    break;
+                };
+                if gtag == 0x86 {
+                    return String::from_utf8(names[spos + ghdr..spos + ghdr + gclen].to_vec())
+                        .ok();
+                }
+                spos += gtotal;
+            }
+            return None;
+        }
+        None
+    }
+
+    /// Verifies the peer certificate's SPIFFE ID against `prefix`.
+    /// Returns the verified ID.
+    ///
+    /// # Errors
+    /// No certificate, no SPIFFE SAN, or prefix mismatch.
+    pub fn verify_spiffe(peer: &[CertificateDer<'_>], prefix: &str) -> Result<String, TlsError> {
+        let leaf = peer
+            .first()
+            .ok_or_else(|| TlsError::Material("mesh: peer presented no certificate".into()))?;
+        let id = spiffe_id(leaf)
+            .ok_or_else(|| TlsError::Material("mesh: peer has no SPIFFE SAN".into()))?;
+        if id.starts_with(prefix) {
+            Ok(id)
+        } else {
+            Err(TlsError::Material(format!(
+                "mesh: spiffe id {id} does not match prefix {prefix}"
+            )))
+        }
+    }
+
+    /// Parses one DER TLV header at `buf[0..]`; returns (header length,
+    /// content length, total, constructed flag, tag byte).
+    fn der_header(buf: &[u8]) -> Option<(usize, usize, usize, bool, u8)> {
+        if buf.len() < 2 {
+            return None;
+        }
+        let tag = buf[0];
+        let constructed = tag & 0x20 != 0;
+        let first = buf[1];
+        if first & 0x80 == 0 {
+            Some((2, first as usize, 2 + first as usize, constructed, tag))
+        } else {
+            let n = (first & 0x7f) as usize;
+            if n == 0 || n > 4 || buf.len() < 2 + n {
+                return None;
+            }
+            let mut len = 0usize;
+            for b in &buf[2..2 + n] {
+                len = (len << 8) | *b as usize;
+            }
+            Some((2 + n, len, 2 + n + len, constructed, tag))
+        }
+    }
+
+    /// Returns the content of the `index`-th constructed child of the
+    /// TLV at `buf[0..]` (the TLV itself must be constructed).
+    fn der_child<'a>(buf: &'a [u8], expect_tag: u8) -> Option<&'a [u8]> {
+        let (hdr, clen, _, constructed, tag) = der_header(buf)?;
+        if tag != expect_tag || !constructed {
+            return None;
+        }
+        buf.get(hdr..hdr + clen)
+    }
+
+    /// Convenience: builds the client config and returns a connector
+    /// (Arc-wrapped) ready for tokio-rustls.
+    ///
+    /// # Errors
+    /// See [`client_config`].
+    pub fn connector(identity: &MeshIdentity) -> Result<Arc<rustls::ClientConfig>, TlsError> {
+        Ok(Arc::new(client_config(identity)?))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Generates a mesh CA + SVID with a SPIFFE URI SAN, builds the
+        /// client config, and verifies the SPIFFE ID round-trips
+        /// through the DER walk.
+        #[test]
+        fn spiffe_id_roundtrips_through_der() {
+            let ca_key = rcgen::KeyPair::generate().expect("ca key");
+            let mut ca_params =
+                rcgen::CertificateParams::new(vec!["mesh-ca".into()]).expect("ca params");
+            ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            let ca = ca_params.self_signed(&ca_key).expect("ca");
+
+            let spiffe = "spiffe://example.org/vane/sidecar";
+            let mut svid_params =
+                rcgen::CertificateParams::new(vec!["sidecar".into()]).expect("svid params");
+            let uri = rcgen::string::Ia5String::try_from(spiffe).expect("ia5 uri");
+            let san = rcgen::SanType::URI(uri);
+            svid_params.subject_alt_names = vec![san];
+            let svid_key = rcgen::KeyPair::generate().expect("svid key");
+            let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
+            let svid = svid_params.signed_by(&svid_key, &issuer).expect("svid");
+
+            let dir = tempfile::TempDir::new().expect("dir");
+            let cert_path = dir.path().join("svid.pem");
+            let key_path = dir.path().join("svid-key.pem");
+            let ca_path = dir.path().join("ca.pem");
+            std::fs::write(&cert_path, svid.pem()).expect("cert");
+            std::fs::write(&key_path, svid_key.serialize_pem()).expect("key");
+            std::fs::write(&ca_path, ca.pem()).expect("ca");
+
+            let identity = MeshIdentity {
+                cert_path: cert_path.display().to_string(),
+                key_path: key_path.display().to_string(),
+                ca_path: ca_path.display().to_string(),
+                spiffe_prefix: "spiffe://example.org/vane/".into(),
+            };
+            let cfg = client_config(&identity).expect("client config");
+            let _ = cfg;
+
+            // The DER walk extracts the SPIFFE ID from the SVID cert.
+            use rustls::pki_types::pem::PemObject as _;
+            let der = CertificateDer::from_pem_file(&cert_path).expect("der");
+            let bytes = der.as_ref();
+            let oid = [0x06, 0x03, 0x55, 0x1D, 0x11];
+            eprintln!(
+                "SPIDEBG der len={} oid at {:?}",
+                bytes.len(),
+                bytes.windows(5).position(|w| w == oid)
+            );
+            let id = spiffe_id(&der).expect("spiffe id");
+            assert_eq!(id, spiffe);
+
+            // Verification: prefix match passes, mismatch fails.
+            assert_eq!(
+                verify_spiffe(&[der.clone()], "spiffe://example.org/vane/").expect("verify"),
+                spiffe
+            );
+            assert!(verify_spiffe(&[der], "spiffe://other.org/").is_err());
+        }
+    }
+}
