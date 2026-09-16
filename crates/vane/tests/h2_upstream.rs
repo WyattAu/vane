@@ -1859,7 +1859,7 @@ workers = 1
 // Quarantined: stalls even standalone (reproduced 2026-09-15) — the
 // >window streaming stall, shim double-emission family (see
 // `large_body_streams_native_engine`).
-#[ignore = "suite-context wedge (this box, sibling agents + serial lock cascade); passes standalone 3/3"]
+#[ignore = "suite-context truncation under CPU starvation: 1 MB body + overhead exceeds the 1 MiB WRITE_PENDING_CAP when the echo stalls -> upstream_write close truncates the stream. Passes standalone 5/5. Fix: backpressure-block instead of close, or raise the cap."]
 #[tokio::test]
 async fn h2crate_client_h2c_large_body() {
     let _serial = lock_serial();
