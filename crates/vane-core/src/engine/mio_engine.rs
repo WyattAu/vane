@@ -119,6 +119,10 @@ impl MioEngine {
         // worker does not touch it until the CQE lands.
         let res = unsafe { libc::read(fd, ptr.cast(), self.buf_size) };
         if res >= 0 {
+            eprintln!(
+                "RDNOW fd={fd} n={res}{}",
+                if res == 0 { " (EOF?)" } else { "" }
+            );
             self.cqes.push(Cqe {
                 token: *token,
                 result: Ok(res as u32),
@@ -127,6 +131,7 @@ impl MioEngine {
         } else {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::WouldBlock {
+                eprintln!("RDPARK fd={fd}");
                 self.push(
                     fd,
                     Pending::Read {

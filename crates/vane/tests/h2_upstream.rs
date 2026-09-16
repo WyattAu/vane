@@ -438,7 +438,10 @@ fn lock_serial() -> std::fs::File {
     // run block FOREVER (silently). Retry non-blocking for 30s, then
     // fail loudly naming the likely holder instead of hanging.
     let fd = file.as_raw_fd();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    // 120s: concurrent checkouts of this repo (other agents, coverage
+    // runs) share the binary-path lock; their instrumented serial tests
+    // hold it in slow motion — wait and interleave rather than fail.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
         // SAFETY: flock on a regular file.
         let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
@@ -455,8 +458,9 @@ fn lock_serial() -> std::fs::File {
                 })
                 .unwrap_or_default();
             panic!(
-                "serial test lock held for >30s by a stale test process \
-                 (kill leftover target/debug/deps/h2_upstream-* processes). {holders}"
+                "serial test lock held for >120s by a stale or concurrent \
+                 test process (kill leftover target/debug/deps/h2_upstream-* \
+                 processes). {holders}"
             );
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1681,13 +1685,6 @@ workers = 1
 /// DATA + HEADERS(trailers, END_STREAM) — the grpc-status pattern.
 /// Verifies the engine's Event::Trailers surfacing end-to-end through
 /// the proxy with an h2 upstream (route `upstream_h2 = true`).
-// REGRESSION at 4f2db09 (bisected via worktrees; 81d716d passes 3/3,
-// 4f2db09 fails 3/3): response never relays — 10s client timeout. The
-// commit is test-only + server admin-token/readiness plumbing; the
-// stall mechanism is unidentified. Bisect worktrees were removed with
-// /tmp space pressure; recreate at both commits and diff server startup
-// sequencing first.
-#[ignore = "regression at 4f2db09 (bisected); response relay stalls"]
 #[tokio::test]
 async fn grpc_trailers_relay_h2_to_h2() {
     let _serial = lock_serial();
@@ -2026,12 +2023,6 @@ workers = 1
 /// >window relay-stall family tracked in docs/h2-streaming-flake.md,
 /// reached here via the h2c path at a smaller size. Un-ignore with
 /// that fix.
-// The framing is correct end-to-end (echo receives head + first chunk
-// with TE:chunked) but the relay stalls after ~one read buffer: the
-// parked downstream read never resumes though ~49 KB sit in the socket
-// buffer (ARMD trace: dispatches cease). Same lost-wakeup family as
-// docs/h2-streaming-flake.md.
-#[ignore = "relay lost-wakeup family (docs/h2-streaming-flake.md)"]
 #[tokio::test]
 async fn chunked_relay_h2_to_h1() {
     let _serial = lock_serial();
@@ -2186,10 +2177,12 @@ workers = 1
             .expect("timeout");
         let mut h2up = H2Upstream::new();
         sock.write_all(&h2up.pending_writes()).expect("preface");
+        eprintln!("CLI written preface");
         // No content-length: END_STREAM delimits the body.
         let head = b"POST /chunked HTTP/1.1\r\nhost: t\r\n\r\n".to_vec();
         h2up.send_request(&head, None);
         sock.write_all(&h2up.pending_writes()).expect("request");
+        eprintln!("CLI written request");
         // CL-less body: the single END_STREAM-terminated send carries
         // the whole body (the driver holds over budget and resumes on
         // request WINDOW_UPDATEs automatically).
@@ -2197,7 +2190,9 @@ workers = 1
         if !frames.is_empty() {
             sock.write_all(&frames).expect("body frames");
         }
+        eprintln!("CLI written body ({} bytes)", frames.len());
         sock.write_all(&h2up.pending_writes()).expect("flush");
+        eprintln!("CLI written flush");
 
         let mut got = Vec::new();
         let mut buf = [0u8; 16384];
@@ -2207,6 +2202,12 @@ workers = 1
                 Ok(n) => {
                     let mut events = Vec::new();
                     h2up.handle_read(&buf[..n], &mut events);
+                    // Credit arrivals queue frames in pending_writes;
+                    // flush them or the held body bytes never go out.
+                    let out = h2up.pending_writes();
+                    if !out.is_empty() {
+                        sock.write_all(&out).expect("credit flush");
+                    }
                     for ev in events {
                         if let UpstreamEvent::ResponseBody(data) = ev {
                             got.extend_from_slice(&data);
