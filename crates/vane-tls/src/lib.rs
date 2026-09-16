@@ -346,10 +346,9 @@ pub mod mesh {
     pub fn spiffe_id(der: &CertificateDer<'_>) -> Option<String> {
         let bytes = der.as_ref();
         let oid = [0x06, 0x03, 0x55, 0x1D, 0x11];
-        let mut pos = 0;
         // Locate the extension OID.
-        while let Some(found) = bytes[pos..].windows(oid.len()).position(|w| w == oid) {
-            pos += found + oid.len();
+        if let Some(found) = bytes.windows(oid.len()).position(|w| w == oid) {
+            let mut pos = found + oid.len();
             // Extension OCTET STRING (tag 0x04) wraps the DER SAN
             // SEQUENCE. Find it, then walk the GeneralNames.
             while pos < bytes.len() && bytes[pos] != 0x04 {
@@ -358,9 +357,7 @@ pub mod mesh {
             if pos >= bytes.len() {
                 return None;
             }
-            let Some((hdr, clen, _, _, _)) = der_header(&bytes[pos..]) else {
-                return None;
-            };
+            let (hdr, clen, _, _, _) = der_header(&bytes[pos..])?;
             // The octet string wraps the DER SEQUENCE of GeneralNames;
             // step into its content before walking the names.
             let sans = bytes.get(pos + hdr..pos + hdr + clen)?;
@@ -424,16 +421,6 @@ pub mod mesh {
             }
             Some((2 + n, len, 2 + n + len, constructed, tag))
         }
-    }
-
-    /// Returns the content of the `index`-th constructed child of the
-    /// TLV at `buf[0..]` (the TLV itself must be constructed).
-    fn der_child<'a>(buf: &'a [u8], expect_tag: u8) -> Option<&'a [u8]> {
-        let (hdr, clen, _, constructed, tag) = der_header(buf)?;
-        if tag != expect_tag || !constructed {
-            return None;
-        }
-        buf.get(hdr..hdr + clen)
     }
 
     /// Convenience: builds the client config and returns a connector
@@ -502,7 +489,8 @@ pub mod mesh {
 
             // Verification: prefix match passes, mismatch fails.
             assert_eq!(
-                verify_spiffe(&[der.clone()], "spiffe://example.org/vane/").expect("verify"),
+                verify_spiffe(std::slice::from_ref(&der), "spiffe://example.org/vane/")
+                    .expect("verify"),
                 spiffe
             );
             assert!(verify_spiffe(&[der], "spiffe://other.org/").is_err());
