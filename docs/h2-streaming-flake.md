@@ -1,12 +1,11 @@
 # TLS h2 streaming flake — evidence dossier
 
-Status: **RESOLVED** (9b76d6d). The corruption family (invalid-size +
-the >window stalls) was a silent plaintext drop in the TLS write path;
-details below. Remaining quarantines: `grpc_trailers_relay_h2_to_h2`
-(regression bisected to 4f2db09, mechanism unidentified) and
-`chunked_relay_h2_to_h1` (relay lost-wakeup after ~one read buffer —
-the ARMD trace shows downstream dispatches cease while data sits in
-the socket buffer).
+Status: **FULLY RESOLVED**. 9b76d6d fixed the corruption (rustls
+writer backpressure silently dropping plaintext); 2746ad2 un-
+quarantined the last two tests — the gRPC relay regression was the
+c8edae3 send_request(None) semantics change (fixed by the h2up
+Some(0) bodyless repair), and chunked_relay's client never flushed
+credit-driven pending_writes (a test bug; the relay was correct).
 
 ## Signature
 
