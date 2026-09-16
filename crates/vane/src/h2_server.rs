@@ -734,7 +734,6 @@ mod flow_tests {
     /// exceed the client's total granted window (initial 65535 + all
     /// simulated WINDOW_UPDATE grants), for a 1 MiB response fed in
     /// 4096-byte upstream chunks with a 65535-initial-window client.
-    #[ignore = "DETERMINISTIC reproducer of the TLS streaming stall: shim trickles to a stop after the initial window (budget fragmentation cascade). Fix + un-ignore next session."]
     #[test]
     fn emitted_bytes_never_exceed_granted_window() {
         const BODY: usize = 1024 * 1024;

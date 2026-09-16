@@ -529,10 +529,9 @@ mod tests {
         );
         assert_eq!(cache.len(), 1);
         assert!(
-            cache
+            !cache
                 .apply(ResourceKind::HttpRoute, DELETED)
-                .expect("apply deleted again")
-                == false,
+                .expect("apply deleted again"),
             "deleting an absent key reports no change"
         );
 

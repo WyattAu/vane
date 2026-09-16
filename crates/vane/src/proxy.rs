@@ -3,7 +3,7 @@
 //! upstreams with keep-alive, and short-circuits errors.
 
 use std::collections::HashMap;
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, Read as _};
 use std::net::SocketAddr;
 use std::os::fd::RawFd;
 use std::sync::Arc;
@@ -327,23 +327,30 @@ impl HttpProxy {
             io.respond(bytes);
             return;
         };
-        let _ = tls.writer().write_all(bytes); // io::Write via import
-        // Flush the TLS record layer out in one batch.
-        let mut out = Vec::with_capacity(17 * 1024);
-        loop {
-            let mut buf = [0u8; 17 * 1024];
-            let n = tls.write_tls(&mut buf.as_mut_slice()).unwrap_or(0);
-            if n == 0 {
-                break;
+        use std::io::Write as _;
+        // Bounded plaintext pieces + eager ciphertext drain: rustls'
+        // writer applies backpressure (Ok(0)) when its send buffer
+        // fills, and a blind write_all on a large batch fails with
+        // WriteZero after a partial consume. Any error is fatal — a
+        // half-written stream must never continue silently.
+        let mut buf = [0u8; 17 * 1024];
+        for piece in bytes.chunks(16 * 1024) {
+            if tls.writer().write_all(piece).is_err() {
+                self.log(LogLevel::Error, "tls writer rejected plaintext");
+                io.close();
+                return;
             }
-            out.extend_from_slice(&buf[..n]);
-            if out.len() > 512 * 1024 {
-                io.respond(&out);
-                out.clear();
+            loop {
+                match tls.write_tls(&mut buf.as_mut_slice()) {
+                    Ok(0) => break,
+                    Ok(n) => io.respond(&buf[..n]),
+                    Err(e) => {
+                        self.log(LogLevel::Error, &format!("tls write_tls: {e}"));
+                        io.close();
+                        return;
+                    }
+                }
             }
-        }
-        if !out.is_empty() {
-            io.respond(&out);
         }
     }
 
@@ -434,17 +441,17 @@ impl HttpProxy {
             return;
         };
         let Some(tls) = &mut conn.tls else { return };
-        let mut out = Vec::new();
+        let mut buf = [0u8; 17 * 1024];
         loop {
-            let mut buf = [0u8; 17 * 1024];
-            let n = tls.write_tls(&mut buf.as_mut_slice()).unwrap_or(0);
-            if n == 0 {
-                break;
+            match tls.write_tls(&mut buf.as_mut_slice()) {
+                Ok(0) => break,
+                Ok(n) => io.respond(&buf[..n]),
+                Err(e) => {
+                    self.log(LogLevel::Error, &format!("tls write_tls: {e}"));
+                    io.close();
+                    return;
+                }
             }
-            out.extend_from_slice(&buf[..n]);
-        }
-        if !out.is_empty() {
-            io.respond(&out);
         }
     }
 
@@ -810,18 +817,37 @@ impl HttpProxy {
             return;
         };
         use std::io::Write as _;
-        let _ = tls.writer().write_all(bytes);
+        // rustls' writer applies backpressure (write() -> Ok(0)) once its
+        // send buffer fills; a blind write_all on a large batch fails with
+        // WriteZero after a PARTIAL consume, and ignoring that remainder
+        // silently corrupted the stream (observed as h2 "frame with
+        // invalid size" at the client). Feed record-sized plaintext
+        // pieces, drain ciphertext as produced, and treat any error as
+        // fatal — a half-written stream must never continue silently.
         let mut out = Vec::with_capacity(17 * 1024);
-        loop {
-            let mut buf = [0u8; 17 * 1024];
-            let n = tls.write_tls(&mut buf.as_mut_slice()).unwrap_or(0);
-            if n == 0 {
-                break;
+        let mut buf = [0u8; 17 * 1024];
+        for piece in bytes.chunks(16 * 1024) {
+            if tls.writer().write_all(piece).is_err() {
+                self.log(LogLevel::Error, "tls writer rejected plaintext");
+                io.close();
+                return;
             }
-            out.extend_from_slice(&buf[..n]);
-            if out.len() > 512 * 1024 {
-                io.respond(&out);
-                out.clear();
+            loop {
+                match tls.write_tls(&mut buf.as_mut_slice()) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        out.extend_from_slice(&buf[..n]);
+                        if out.len() > 512 * 1024 {
+                            io.respond(&out);
+                            out.clear();
+                        }
+                    }
+                    Err(e) => {
+                        self.log(LogLevel::Error, &format!("tls write_tls: {e}"));
+                        io.close();
+                        return;
+                    }
+                }
             }
         }
         if !out.is_empty() {
@@ -885,6 +911,11 @@ impl HttpProxy {
                         }
                     }
                     ReqFraming::Chunked { seen_zero } => {
+                        eprintln!(
+                            "CHDBG h1-chunked relay {}B seen_zero={}",
+                            data.len(),
+                            seen_zero
+                        );
                         if !*seen_zero && data.windows(5).any(|w| w == b"0\r\n\r\n") {
                             *seen_zero = true;
                         }
@@ -1327,7 +1358,14 @@ impl Handler for HttpProxy {
                     return;
                 }
                 let mut h2up = Box::new(crate::h2_client::H2Upstream::new());
-                let remaining = view.content_length().flatten().filter(|n| *n > 0);
+                // Some(n>0): CL-delimited body follows. Anything else
+                // (CL=0 or CL-absent — h1 only sends CL-less bodies via
+                // chunked, declined above) is a bodyless request: END_
+                // STREAM rides the HEADERS.
+                let remaining = match view.content_length().flatten() {
+                    Some(n) if n > 0 => Some(n),
+                    _ => Some(0),
+                };
                 h2up.send_request(&buf, remaining);
                 io.write_upstream(&h2up.pending_writes());
                 io.mark_request_sent();
