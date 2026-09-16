@@ -7,16 +7,21 @@ c8edae3 send_request(None) semantics change (fixed by the h2up
 Some(0) bodyless repair), and chunked_relay's client never flushed
 credit-driven pending_writes (a test bug; the relay was correct).
 
-## Residual known issue: WRITE_PENDING_CAP starvation truncation
+## Residual known issue: WRITE_PENDING_CAP starvation truncation — FIXED
 
-Under heavy CPU contention (sibling agents building on the same box),
-a 1 MB h2c streaming body + h1 overhead can exceed the 1 MiB
-`WRITE_PENDING_CAP` while the echo upstream stalls → `upstream_write`
-closes the session mid-stream (client sees a truncated body). The
-correct fix is to make `upstream_write` apply backpressure (block/
-queue indefinitely) instead of close-on-overflow, or make the cap
-per-cluster. Tracked via the quarantined `h2crate_client_h2c_large_
-body`; standalone runs pass 5/5.
+The final close path (worker close-on-overflow at 1 MiB under CPU
+starvation) is fixed by handler-side backpressure: upstream-bound
+bytes defer in `Conn::up_buf` and flush in 512 KiB chunks gated on
+`on_upstream_flushed` (worker queue fully drained), so the worker's
+close-on-overflow can no longer trip; a 16 MiB runaway guard still
+kills stuck streams. `h2crate_client_h2c_large_body` passes 5/5
+including under load. `large_body_streams_through_edge` remains
+retired (REUSEPORT edge removed by design).
+
+Suite-sequence note: running the full streaming family sequentially
+on a box with concurrent sibling cargo/coverage runs can still wedge
+tests through CPU/lock contention — standalone runs are the reliable
+gate.
 
 ## Signature
 

@@ -102,6 +102,11 @@ struct Conn {
     tls: Option<rustls::ServerConnection>,
     /// Mesh mTLS upstream state (cluster `mesh` configured).
     tls_up: Option<rustls::ClientConnection>,
+    /// Upstream-bound bytes deferred behind flow control (flushed on
+    /// upstream-write completion).
+    up_buf: Vec<u8>,
+    /// A chunk of upstream-bound bytes is in flight.
+    up_write_out: bool,
     /// Unconsumed ciphertext tail (partial TLS records between reads).
     tls_up_backlog: Vec<u8>,
     /// Required SPIFFE ID prefix for the mesh upstream.
@@ -390,30 +395,62 @@ impl HttpProxy {
 
     fn upstream_send(&mut self, io: &mut SessionIo<'_>, plaintext: &[u8]) {
         let slot = io.slot_index();
-        let Some(tls) = self.conns.get_mut(&slot).and_then(|c| c.tls_up.as_mut()) else {
-            io.write_upstream(plaintext);
-            return;
-        };
-        use std::io::Write as _;
-        if tls.writer().write_all(plaintext).is_err() {
-            io.close();
-            return;
-        }
-        let mut ciphertext = Vec::with_capacity(17 * 1024);
-        let mut buf = [0u8; 17 * 1024];
-        loop {
-            match tls.write_tls(&mut buf.as_mut_slice()) {
-                Ok(0) => break,
-                Ok(n) => ciphertext.extend_from_slice(&buf[..n]),
-                Err(_) => {
-                    io.close();
-                    return;
+        let ready = if let Some(tls) = self.conns.get_mut(&slot).and_then(|c| c.tls_up.as_mut()) {
+            use std::io::Write as _;
+            if tls.writer().write_all(plaintext).is_err() {
+                io.close();
+                return;
+            }
+            let mut ciphertext = Vec::with_capacity(17 * 1024);
+            let mut buf = [0u8; 17 * 1024];
+            loop {
+                match tls.write_tls(&mut buf.as_mut_slice()) {
+                    Ok(0) => break,
+                    Ok(n) => ciphertext.extend_from_slice(&buf[..n]),
+                    Err(_) => {
+                        io.close();
+                        return;
+                    }
                 }
             }
+            ciphertext
+        } else {
+            plaintext.to_vec()
+        };
+        {
+            let conn = self.conn(slot);
+            conn.up_buf.extend_from_slice(&ready);
+            // Runaway guard: deferral is bounded (the old close-on-
+            // overflow only tripped at 1 MiB; this allows deep bursts
+            // but still kills truly stuck streams).
+            if conn.up_buf.len() > 16 * 1024 * 1024 {
+                self.log(LogLevel::Error, "upstream defer overflow");
+                io.close();
+                return;
+            }
         }
-        if !ciphertext.is_empty() {
-            io.write_upstream(&ciphertext);
+        self.upstream_flush(io);
+    }
+
+    /// Issues the next upstream write chunk when none is outstanding
+    /// (chunk <= half the worker's pending cap, so the worker never
+    /// trips its own close-on-overflow).
+    fn upstream_flush(&mut self, io: &mut SessionIo<'_>) {
+        const UP_CHUNK: usize = 512 * 1024;
+        let slot = io.slot_index();
+        if self.conn(slot).up_write_out {
+            return;
         }
+        let chunk = {
+            let conn = self.conn(slot);
+            if conn.up_buf.is_empty() {
+                return;
+            }
+            let n = conn.up_buf.len().min(UP_CHUNK);
+            conn.up_buf.drain(..n).collect::<Vec<u8>>()
+        };
+        self.conn(slot).up_write_out = true;
+        io.write_upstream(&chunk);
     }
 
     /// Feeds upstream ciphertext into the mesh TLS state; returns the
@@ -1686,6 +1723,16 @@ impl Handler for HttpProxy {
             self.respond_full(io, Status::BadGateway, "bad request\n");
             io.close();
         }
+    }
+
+    fn on_upstream_flushed(&mut self, io: &mut SessionIo<'_>) {
+        // The worker's upstream write queue fully drained: the deferred
+        // upstream bytes may proceed.
+        let slot = io.slot_index();
+        if let Some(conn) = self.conns.get_mut(&slot) {
+            conn.up_write_out = false;
+        }
+        self.upstream_flush(io);
     }
 
     fn on_upstream_data(&mut self, io: &mut SessionIo<'_>, data: &[u8]) {

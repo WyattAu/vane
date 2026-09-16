@@ -962,7 +962,6 @@ async fn large_body_streams_through_edge() {
 /// budget holds unbounded data safely). H2C path (cleartext, our
 /// driver) is green at 1 MiB and is the documented production mode
 /// for containers/meshes.
-#[ignore = "suite-sequence wedge (in-suite only; standalone 3/3 green): 8 live server threads interact — debug health-probe/thread interaction next"]
 #[tokio::test]
 async fn large_body_streams_native_engine() {
     let _serial = lock_serial();
@@ -1859,7 +1858,6 @@ workers = 1
 // Quarantined: stalls even standalone (reproduced 2026-09-15) — the
 // >window streaming stall, shim double-emission family (see
 // `large_body_streams_native_engine`).
-#[ignore = "suite-context truncation under CPU starvation: 1 MB body + overhead exceeds the 1 MiB WRITE_PENDING_CAP when the echo stalls -> upstream_write close truncates the stream. Passes standalone 5/5. Fix: backpressure-block instead of close, or raise the cap."]
 #[tokio::test]
 async fn h2crate_client_h2c_large_body() {
     let _serial = lock_serial();
