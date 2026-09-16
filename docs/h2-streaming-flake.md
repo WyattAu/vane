@@ -1,7 +1,12 @@
 # TLS h2 streaming flake — evidence dossier
 
-Status: quarantined (`large_body_streams_native_engine` and siblings, c089c9c).
-All tooling needed to resume the hunt is committed (16b67f4).
+Status: **RESOLVED** (9b76d6d). The corruption family (invalid-size +
+the >window stalls) was a silent plaintext drop in the TLS write path;
+details below. Remaining quarantines: `grpc_trailers_relay_h2_to_h2`
+(regression bisected to 4f2db09, mechanism unidentified) and
+`chunked_relay_h2_to_h1` (relay lost-wakeup after ~one read buffer —
+the ARMD trace shows downstream dispatches cease while data sits in
+the socket buffer).
 
 ## Signature
 
@@ -37,7 +42,22 @@ misaligned or oversized byte stream.
   client stream is an exact in-order subset of shim output; in the corrupted
   run the divergence is inside a single DATA frame's payload.
 
-## Interpretation
+## RESOLUTION (9b76d6d)
+
+`tls.writer().write_all(batch)` with batch > rustls' send buffer:
+rustls' Writer applies backpressure (write() -> Ok(0)) once its send
+buffer fills, so write_all failed with WriteZero **after a partial
+consume**, and the ignored `let _ =` silently dropped the remaining
+plaintext. Captured failing runs show exact-byte skips (69 B / 35 B)
+with stall-probe PING records landing inside the skipped gap — the
+client parsed a misaligned stream as FRAME_SIZE_ERROR. The all-inline
+write-queue trace (zero parks/resumes) exonerated the engine write
+queue.
+
+Fix: feed plaintext in 16 KiB pieces, drain ciphertext between pieces,
+treat any writer error as fatal. All three TLS write sites fixed.
+
+## Original interpretation (superseded)
 
 The corruption exists in the server's TLS plaintext (TLS cannot lose or
 splice bytes silently), assembled between the shim's per-frame `Vec<u8>`
