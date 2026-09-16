@@ -35,6 +35,7 @@ fn make_proxy(
             shared_rate_limit: None,
             h2c: false,
             l4_splice: false,
+            mesh: Default::default(),
         },
         0,
     )

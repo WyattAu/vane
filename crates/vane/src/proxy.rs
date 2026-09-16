@@ -74,6 +74,9 @@ pub struct ProxyConfig {
     /// passthrough to the first matching route's cluster — no HTTP
     /// parsing on the data path.
     pub l4_splice: bool,
+    /// Mesh mTLS identities by cluster name (absent entry = plaintext
+    /// upstream).
+    pub mesh: Arc<HashMap<String, vane_control::config::MeshUpstreamConfig>>,
 }
 
 /// Per-connection state.
@@ -97,6 +100,12 @@ struct Conn {
     trace: Option<vane_observe::trace::TraceContext>,
     /// TLS termination state (TLS listeners only).
     tls: Option<rustls::ServerConnection>,
+    /// Mesh mTLS upstream state (cluster `mesh` configured).
+    tls_up: Option<rustls::ClientConnection>,
+    /// Unconsumed ciphertext tail (partial TLS records between reads).
+    tls_up_backlog: Vec<u8>,
+    /// Required SPIFFE ID prefix for the mesh upstream.
+    mesh_prefix: String,
     /// Upstream established (connect finished / pooled attach).
     upstream_ready: bool,
     /// Where the current upstream dial went.
@@ -232,6 +241,15 @@ impl ClusterMetric {
     }
 }
 
+/// Result of feeding mesh upstream ciphertext.
+#[derive(Default)]
+struct MeshIntake {
+    /// Decrypted application bytes (empty during handshake).
+    plaintext: Vec<u8>,
+    /// Handshake frames to write to the raw upstream socket.
+    ciphertext: Vec<u8>,
+}
+
 impl HttpProxy {
     /// Builds a handler for one worker.
     ///
@@ -356,6 +374,147 @@ impl HttpProxy {
 
     /// Feeds ciphertext into the TLS state machine; returns decrypted
     /// application bytes (empty during handshake).
+    /// Sends plaintext to the upstream, encrypting when mesh is on.
+    /// Plaintext upstream bytes (post-decryption when mesh is on).
+    fn on_upstream_data_plain(&mut self, io: &mut SessionIo<'_>, data: &[u8]) {
+        #[cfg(feature = "h2")]
+        {
+            let slot = io.slot_index();
+            if self.conns.get(&slot).is_some_and(|c| c.h2up.is_some()) {
+                self.h2up_intake(io, data);
+                return;
+            }
+        }
+        self.on_upstream_data_h1(io, data);
+    }
+
+    fn upstream_send(&mut self, io: &mut SessionIo<'_>, plaintext: &[u8]) {
+        let slot = io.slot_index();
+        let Some(tls) = self.conns.get_mut(&slot).and_then(|c| c.tls_up.as_mut()) else {
+            io.write_upstream(plaintext);
+            return;
+        };
+        use std::io::Write as _;
+        if tls.writer().write_all(plaintext).is_err() {
+            io.close();
+            return;
+        }
+        let mut ciphertext = Vec::with_capacity(17 * 1024);
+        let mut buf = [0u8; 17 * 1024];
+        loop {
+            match tls.write_tls(&mut buf.as_mut_slice()) {
+                Ok(0) => break,
+                Ok(n) => ciphertext.extend_from_slice(&buf[..n]),
+                Err(_) => {
+                    io.close();
+                    return;
+                }
+            }
+        }
+        if !ciphertext.is_empty() {
+            io.write_upstream(&ciphertext);
+        }
+    }
+
+    /// Feeds upstream ciphertext into the mesh TLS state; returns the
+    /// decrypted plaintext (empty during the handshake), any handshake
+    /// ciphertext to write, and handshake completion. On completion the
+    /// peer's SPIFFE ID prefix is verified.
+    fn upstream_tls_intake(&mut self, slot: u32, data: &[u8]) -> Result<MeshIntake, String> {
+        use std::io::Read as _;
+        let mut backlog = self
+            .conns
+            .get_mut(&slot)
+            .map(|c| std::mem::take(&mut c.tls_up_backlog))
+            .unwrap_or_default();
+        backlog.extend_from_slice(data);
+        let mut handshake_done = false;
+        let mut consumed_total = 0usize;
+        if let Some(tls) = self.conns.get_mut(&slot).and_then(|c| c.tls_up.as_mut()) {
+            let mut cursor = std::io::Cursor::new(&backlog[..]);
+            while cursor.position() < backlog.len() as u64 {
+                match tls.read_tls(&mut cursor) {
+                    Ok(0) => break,
+                    Ok(_) => consumed_total = cursor.position() as usize,
+                    Err(e) => {
+                        backlog.drain(..consumed_total);
+                        if let Some(conn) = self.conns.get_mut(&slot) {
+                            conn.tls_up_backlog = backlog;
+                        }
+                        return Err(format!("tls record: {e}"));
+                    }
+                }
+                if let Err(e) = tls.process_new_packets() {
+                    backlog.drain(..consumed_total);
+                    if let Some(conn) = self.conns.get_mut(&slot) {
+                        conn.tls_up_backlog = backlog;
+                    }
+                    return Err(format!("tls handshake: {e}"));
+                }
+                handshake_done = handshake_done || !tls.is_handshaking();
+            }
+        }
+        backlog.drain(..consumed_total);
+        if let Some(conn) = self.conns.get_mut(&slot) {
+            conn.tls_up_backlog = std::mem::take(&mut backlog);
+        }
+        let mut ciphertext = Vec::new();
+        if let Some(tls) = self.conns.get_mut(&slot).and_then(|c| c.tls_up.as_mut()) {
+            let mut tmp = [0u8; 17 * 1024];
+            loop {
+                match tls.write_tls(&mut tmp.as_mut_slice()) {
+                    Ok(0) => break,
+                    Ok(n) => ciphertext.extend_from_slice(&tmp[..n]),
+                    Err(e) => return Err(format!("tls write_tls: {e}")),
+                }
+            }
+        }
+        if !handshake_done {
+            return Ok(MeshIntake {
+                plaintext: Vec::new(),
+                ciphertext,
+            });
+        }
+        // SPIFFE verification (once, at handshake completion).
+        if handshake_done {
+            let peer_certs: Vec<rustls::pki_types::CertificateDer<'_>> = self
+                .conns
+                .get(&slot)
+                .and_then(|c| c.tls_up.as_ref())
+                .and_then(|t| t.peer_certificates())
+                .map(|c| c.to_vec())
+                .unwrap_or_default();
+            let prefix = self
+                .conns
+                .get(&slot)
+                .map(|c| c.mesh_prefix.clone())
+                .unwrap_or_default();
+            if !prefix.is_empty() {
+                vane_tls::mesh::verify_spiffe(&peer_certs, &prefix).map_err(|e| e.to_string())?;
+            }
+            let mut plaintext = Vec::new();
+            if let Some(tls) = self.conns.get_mut(&slot).and_then(|c| c.tls_up.as_mut()) {
+                let mut rbuf = [0u8; 16 * 1024];
+                loop {
+                    match tls.reader().read(&mut rbuf) {
+                        Ok(0) => break,
+                        Ok(n) => plaintext.extend_from_slice(&rbuf[..n]),
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(e) => return Err(format!("tls read: {e}")),
+                    }
+                }
+            }
+            return Ok(MeshIntake {
+                plaintext,
+                ciphertext,
+            });
+        }
+        Ok(MeshIntake {
+            plaintext: Vec::new(),
+            ciphertext,
+        })
+    }
+
     fn tls_read(&mut self, io: &mut SessionIo<'_>, data: &[u8]) {
         let slot = io.slot_index();
         let Some(conn) = self.conns.get_mut(&slot) else {
@@ -721,7 +880,7 @@ impl HttpProxy {
             .map(|h| h.pending_writes())
             .unwrap_or_default();
         if !pending.is_empty() {
-            io.write_upstream(&pending);
+            self.upstream_send(io, &pending);
         }
     }
 
@@ -918,7 +1077,7 @@ impl HttpProxy {
                         let n = (data.len() as u64).min(*remaining) as usize;
                         *remaining -= n as u64;
                         if upstream_ready {
-                            io.write_upstream(&data[..n]);
+                            self.upstream_send(io, &data[..n]);
                         } else {
                             conn.req_pending.extend_from_slice(&data[..n]);
                             if conn.req_pending.len() > REQ_PENDING_CAP {
@@ -939,7 +1098,7 @@ impl HttpProxy {
                             *seen_zero = true;
                         }
                         if upstream_ready {
-                            io.write_upstream(data);
+                            self.upstream_send(io, data);
                         } else {
                             conn.req_pending.extend_from_slice(data);
                             if conn.req_pending.len() > REQ_PENDING_CAP {
@@ -1309,7 +1468,7 @@ impl Handler for HttpProxy {
         // L4 splice: raw bytes toward the upstream (pre-splice only —
         // once spliced the kernel pumps without the handler).
         if self.conns.get(&slot).is_some_and(|c| c.l4) {
-            io.write_upstream(data);
+            self.upstream_send(io, data);
             return;
         }
         // WebSocket tunnel: raw bidirectional relay, no parsing.
@@ -1317,7 +1476,7 @@ impl Handler for HttpProxy {
             self.metrics
                 .bytes_in
                 .add(&self.config.registry, data.len() as u64);
-            io.write_upstream(data);
+            self.upstream_send(io, data);
             return;
         }
         // Every downstream byte on a TLS listener is ciphertext: route
@@ -1349,6 +1508,66 @@ impl Handler for HttpProxy {
             }
             io.close();
             return;
+        }
+        // Mesh mTLS upstream: build the client connection (SVID + mesh
+        // CA), send the ClientHello, and defer plaintext until the
+        // handshake completes.
+        let mesh = self
+            .conn(slot)
+            .route
+            .clone()
+            .and_then(|r| self.config.mesh.get(&r.cluster).cloned());
+        if let Some(mesh) = mesh {
+            match vane_tls::mesh::connector(&vane_tls::mesh::MeshIdentity {
+                cert_path: mesh.cert.clone(),
+                key_path: mesh.key.clone(),
+                ca_path: mesh.ca.clone(),
+                spiffe_prefix: mesh.spiffe_prefix.clone(),
+            }) {
+                Ok(cfg) => {
+                    let server_name = mesh
+                        .server_name
+                        .clone()
+                        .try_into()
+                        .unwrap_or_else(|_| "mesh.local".try_into().expect("static name"));
+                    match rustls::ClientConnection::new(cfg, server_name) {
+                        Ok(mut tls) => {
+                            let mut hello = Vec::with_capacity(17 * 1024);
+                            let mut tmp = [0u8; 17 * 1024];
+                            loop {
+                                match tls.write_tls(&mut tmp.as_mut_slice()) {
+                                    Ok(0) => break,
+                                    Ok(n) => hello.extend_from_slice(&tmp[..n]),
+                                    Err(e) => {
+                                        self.log(
+                                            LogLevel::Error,
+                                            &format!("mesh client hello: {e}"),
+                                        );
+                                        io.close();
+                                        return;
+                                    }
+                                }
+                            }
+                            let conn = self.conn(slot);
+                            conn.tls_up = Some(tls);
+                            conn.mesh_prefix = mesh.spiffe_prefix.clone();
+                            if !hello.is_empty() {
+                                io.write_upstream(&hello);
+                            }
+                        }
+                        Err(e) => {
+                            self.log(LogLevel::Error, &format!("mesh tls: {e}"));
+                            self.respond_full(io, Status::BadGateway, "mesh tls error\n");
+                            io.close();
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.log(LogLevel::Error, &format!("mesh identity: {e}"));
+                    self.respond_full(io, Status::BadGateway, "mesh identity error\n");
+                    io.close();
+                }
+            }
         }
         self.conn(slot).upstream_ready = true;
         let (route, upstream_path, inject) = {
@@ -1386,7 +1605,7 @@ impl Handler for HttpProxy {
                     _ => Some(0),
                 };
                 h2up.send_request(&buf, remaining);
-                io.write_upstream(&h2up.pending_writes());
+                self.upstream_send(io, &h2up.pending_writes());
                 io.mark_request_sent();
                 let body = &buf[head_len..];
                 {
@@ -1398,7 +1617,7 @@ impl Handler for HttpProxy {
                 if !body.is_empty() {
                     let frames = h2up.request_body(body);
                     if !frames.is_empty() {
-                        io.write_upstream(&frames);
+                        self.upstream_send(io, &frames);
                     }
                 }
                 // Pre-connect queue behind the inline bytes.
@@ -1406,13 +1625,13 @@ impl Handler for HttpProxy {
                 if !pending.is_empty() {
                     let frames = h2up.request_body(&pending);
                     if !frames.is_empty() {
-                        io.write_upstream(&frames);
+                        self.upstream_send(io, &frames);
                     }
                 }
                 let out = h2up.pending_writes();
                 self.conn(slot).h2up = Some(h2up);
                 if !out.is_empty() {
-                    io.write_upstream(&out);
+                    self.upstream_send(io, &out);
                 }
                 self.conn(slot).head_buf.drain(..head_len + body.len());
                 io.set_deadline(
@@ -1431,7 +1650,7 @@ impl Handler for HttpProxy {
         let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
         if let Parsed::Complete(view, head_len) = RequestView::parse_in(&buf, &mut storage) {
             let head = self.build_upstream_head(&view, &route, &upstream_path, &inject, false, 0);
-            io.write_upstream(&head);
+            self.upstream_send(io, &head);
             io.mark_request_sent();
             // Forward any body bytes that arrived with the head, then
             // the pre-connect queue (ordering preserved).
@@ -1448,12 +1667,12 @@ impl Handler for HttpProxy {
                 }
             }
             if !body.is_empty() {
-                io.write_upstream(body);
+                self.upstream_send(io, body);
             }
             // Pre-connect queue behind the inline bytes.
             let pending = std::mem::take(&mut self.conn(slot).req_pending);
             if !pending.is_empty() {
-                io.write_upstream(&pending);
+                self.upstream_send(io, &pending);
             }
             // Trim the forwarded head+inline body: the buffer must not
             // re-parse old bytes on the next keep-alive transaction.
@@ -1470,15 +1689,30 @@ impl Handler for HttpProxy {
     }
 
     fn on_upstream_data(&mut self, io: &mut SessionIo<'_>, data: &[u8]) {
-        #[cfg(feature = "h2")]
+        // Mesh mTLS upstream: decrypt first; handshake progress flushes
+        // its own frames. Plaintext then flows through the normal path.
+        if self
+            .conns
+            .get(&io.slot_index())
+            .is_some_and(|c| c.tls_up.is_some())
         {
-            let slot = io.slot_index();
-            if self.conns.get(&slot).is_some_and(|c| c.h2up.is_some()) {
-                self.h2up_intake(io, data);
+            let intake = match self.upstream_tls_intake(io.slot_index(), data) {
+                Ok(intake) => intake,
+                Err(e) => {
+                    self.log(LogLevel::Warn, &format!("mesh upstream: {e}"));
+                    io.close();
+                    return;
+                }
+            };
+            if !intake.ciphertext.is_empty() {
+                io.write_upstream(&intake.ciphertext);
+            }
+            if intake.plaintext.is_empty() {
                 return;
             }
+            return self.on_upstream_data_plain(io, &intake.plaintext);
         }
-        self.on_upstream_data_h1(io, data);
+        self.on_upstream_data_plain(io, data);
     }
 
     fn on_upstream_eof(&mut self, io: &mut SessionIo<'_>) {

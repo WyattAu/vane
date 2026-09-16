@@ -411,7 +411,7 @@ async fn post_body_roundtrip() {
 }
 
 /// Cross-process serial lock shared with the proxy-spawning suites.
-fn lock_serial() -> std::fs::File {
+pub fn lock_serial() -> std::fs::File {
     use std::os::unix::io::AsRawFd as _;
     // Per-checkout lock: sibling worktrees/coverage checkouts of this
     // repo run concurrently on this machine; a global /tmp lock made

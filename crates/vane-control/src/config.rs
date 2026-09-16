@@ -131,6 +131,29 @@ pub struct ClusterConfig {
     /// Honored by the h2 edge; the engine's h1 pool ignores it.
     #[serde(default)]
     pub http2: bool,
+    /// Mesh mTLS upstream (SPIFFE-verified). Absent = plaintext.
+    #[serde(default)]
+    pub mesh: Option<MeshUpstreamConfig>,
+}
+
+/// Mesh mTLS upstream identity for a cluster (design:
+/// docs/mesh-mtls-design.md): the sidecar presents its SVID, verifies
+/// the backend's SVID chains to the mesh CA, and enforces the SPIFFE
+/// ID prefix.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct MeshUpstreamConfig {
+    /// Client SVID certificate chain (PEM).
+    pub cert: String,
+    /// Client SVID private key (PEM).
+    pub key: String,
+    /// Mesh CA bundle (PEM) the backend's certificate must chain to.
+    pub ca: String,
+    /// SNI name for the upstream connection.
+    pub server_name: String,
+    /// Required SPIFFE ID prefix for the backend's URI SAN
+    /// (e.g. `spiffe://example.org/vane/`).
+    #[serde(default)]
+    pub spiffe_prefix: String,
 }
 
 /// Load balancing policy.

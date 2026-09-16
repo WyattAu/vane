@@ -367,6 +367,15 @@ pub async fn run(opts: RunOptions) -> i32 {
             None
         };
 
+    // Mesh mTLS identities by cluster name.
+    let mesh_identities: Arc<HashMap<String, vane_control::config::MeshUpstreamConfig>> = Arc::new(
+        config
+            .clusters
+            .iter()
+            .filter_map(|(name, c)| c.mesh.clone().map(|m| (name.clone(), m)))
+            .collect(),
+    );
+
     // Static routes + health probe paths.
     reconciler.publish_static(&config);
     let mut checker = vane_control::HealthChecker::new(Arc::clone(&health), Duration::from_secs(5));
@@ -595,6 +604,7 @@ pub async fn run(opts: RunOptions) -> i32 {
                 jwt,
                 shared_rate_limit: shared_rate_limit.clone(),
                 h2c: config.listeners.get(li).is_some_and(|l| l.h2c),
+                mesh: Arc::clone(&mesh_identities),
             };
             match spawn_worker(
                 li * workers_per_listener + w,
@@ -802,6 +812,8 @@ struct WorkerFactory {
     jwt: Option<Arc<vane_filters::jwt::JwtValidator>>,
     /// Process-wide GCRA bucket (`None` = unlimited).
     shared_rate_limit: Option<Arc<vane_shm::ratelimit::SharedGcra>>,
+    /// Mesh mTLS identities by cluster name.
+    mesh: Arc<HashMap<String, vane_control::config::MeshUpstreamConfig>>,
     /// Serve h2c on this plain listener (feature `h2`).
     h2c: bool,
 }
@@ -830,6 +842,7 @@ impl vane_core::HandlerFactory for WorkerFactory {
                 access: self.access.clone(),
                 jwt: self.jwt.clone(),
                 l4_splice: self.mode == CoreMode::L4,
+                mesh: self.mesh.clone(),
             },
             self.worker_id,
         ))
