@@ -7,6 +7,17 @@ c8edae3 send_request(None) semantics change (fixed by the h2up
 Some(0) bodyless repair), and chunked_relay's client never flushed
 credit-driven pending_writes (a test bug; the relay was correct).
 
+## Residual known issue: WRITE_PENDING_CAP starvation truncation
+
+Under heavy CPU contention (sibling agents building on the same box),
+a 1 MB h2c streaming body + h1 overhead can exceed the 1 MiB
+`WRITE_PENDING_CAP` while the echo upstream stalls → `upstream_write`
+closes the session mid-stream (client sees a truncated body). The
+correct fix is to make `upstream_write` apply backpressure (block/
+queue indefinitely) instead of close-on-overflow, or make the cap
+per-cluster. Tracked via the quarantined `h2crate_client_h2c_large_
+body`; standalone runs pass 5/5.
+
 ## Signature
 
 ~1-in-6 runs of `large_body_streams_native_engine` (TLS + h2-crate client,
