@@ -46,7 +46,7 @@ impl FakeAdsServer {
         }
     }
 
-    fn react(&mut self, ev: vane_core::h2::connection::Event, out: &mut Vec<u8>) {
+    fn react(&mut self, ev: vane_core::h2::connection::Event) {
         match ev {
             vane_core::h2::connection::Event::Headers { stream_id, .. } => {
                 self.saw_request = true;
@@ -70,59 +70,54 @@ impl FakeAdsServer {
                         self.ack_nonce = Some(nonce);
                     }
                 }
-                let _ = out;
             }
             _ => {}
         }
     }
 
     fn drive(&mut self, sock: &mut TcpStream, backlog: &mut Vec<u8>, buf: &mut [u8]) -> bool {
-        let pending = self.conn.take_pending_writes();
-        if !pending.is_empty() && sock.write_all(&pending).is_err() {
-            eprintln!("ADSSRV write failed at entry");
-            return false;
-        }
-        match sock.read(buf) {
-            Ok(0) | Err(_) => {
+        loop {
+            let pending = self.conn.take_pending_writes();
+            if !pending.is_empty() && sock.write_all(&pending).is_err() {
                 eprintln!(
-                    "ADSSRV read end: err={:?} connerr={:?}",
-                    std::io::Error::last_os_error().kind(),
+                    "ADSSRV write failed; connerr={:?}",
                     self.conn.connection_error()
                 );
-                false
+                return false;
             }
-            Ok(n) => {
-                backlog.extend_from_slice(&buf[..n]);
-                loop {
-                    let mut events = Vec::new();
-                    let consumed = self.conn.handle_read(backlog, &mut events);
-                    if consumed == 0 {
-                        break;
-                    }
-                    backlog.drain(..consumed);
-                    let mut sink = Vec::new();
-                    for ev in events {
-                        self.react(ev, &mut sink);
-                    }
-                    let pending = self.conn.take_pending_writes();
-                    if !pending.is_empty() && sock.write_all(&pending).is_err() {
-                        return false;
+            if let Some(err) = self.conn.connection_error() {
+                eprintln!("ADSSRV conn error: code={}", err.code);
+                return false;
+            }
+            match sock.read(buf) {
+                Ok(0) | Err(_) => {
+                    eprintln!("ADSSRV peer EOF/err");
+                    return false;
+                }
+                Ok(n) => {
+                    eprintln!("ADSSRV read {n}");
+                    backlog.extend_from_slice(&buf[..n]);
+                    loop {
+                        let mut events = Vec::new();
+                        let consumed = self.conn.handle_read(backlog, &mut events);
+                        if consumed == 0 {
+                            break;
+                        }
+                        backlog.drain(..consumed);
+                        for ev in events {
+                            self.react(ev);
+                        }
+                        let pending = self.conn.take_pending_writes();
+                        if !pending.is_empty() && sock.write_all(&pending).is_err() {
+                            return false;
+                        }
                     }
                 }
-                true
             }
         }
     }
 }
 
-// Harness quirk: the client's third poll read gets ECONNRESET within
-// milliseconds while the engine-based server sits blocked in read()
-// (server trace: SETTINGS written, then blocking read — never exits).
-// The client-side state machine is unit-tested (xds_grpc tests); the
-// e2e needs a fresh harness look — likely the server's response write
-// path racing the client's poll loop, or an RST source in the engine's
-// END_STREAM handling of this half-open request pattern.
-#[ignore = "harness RST quirk (see comment); client unit-tested"]
 #[tokio::test]
 async fn ads_client_acks_management_response() {
     // Management plane: engine-based h2 server.
