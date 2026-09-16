@@ -16,8 +16,10 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 pub mod compression;
 pub mod date;
+pub mod pb;
 pub mod request;
 pub mod response;
+pub mod xds;
 
 pub use request::RequestView;
 pub use response::{Status, UpstreamHead, parse_upstream_head, write_full, write_head};
