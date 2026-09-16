@@ -12,6 +12,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 pub mod acme;
 pub mod config;
+pub mod envoy;
 pub mod gateway;
 pub mod health;
 pub mod operator;
