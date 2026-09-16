@@ -15,6 +15,7 @@ docker-provider = []
 k8s = []
 
 [dependencies]
+vane-proto = { path = "../vane-proto", version = "0.2.0" }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

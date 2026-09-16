@@ -20,7 +20,7 @@ pub enum WireType {
 
 /// Encodes a field tag (field number + wire type).
 pub fn tag(out: &mut Vec<u8>, field: u32, wire: WireType) {
-    varint(out, ((u64::from(field) << 3) | wire as u64) as u64);
+    varint(out, (u64::from(field) << 3) | wire as u64);
 }
 
 /// Appends a base-128 varint.

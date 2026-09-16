@@ -19,6 +19,7 @@ pub mod providers;
 pub mod reconcile;
 pub mod routes;
 pub mod xds;
+pub mod xds_grpc;
 
 pub use acme::{AcmeConfig, AcmeManager};
 pub use config::{
