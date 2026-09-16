@@ -556,7 +556,27 @@ impl HttpProxy {
                 #[cfg(feature = "h2")]
                 if is_h2 {
                     // The shim re-parses the head from `data` and
-                    // flow-controls the body portion.
+                    // flow-controls the body portion. Gzip relay:
+                    // rewrite the head (CL out, encoding in), compress
+                    // the body through the relay — DATA framing needs
+                    // no chunk wrapper.
+                    let compressing = self.conns.get(&slot).is_some_and(|c| c.gzip.is_some());
+                    if compressing {
+                        let head_len = data
+                            .windows(4)
+                            .position(|w| w == b"\r\n\r\n")
+                            .map_or(0, |p| p + 4);
+                        let (head, rest) = data.split_at(head_len);
+                        let rewritten = vane_proto::compression::rewrite_head_for_gzip_h2(head);
+                        if let Some(rewritten) = rewritten {
+                            self.h2_write(io, &rewritten);
+                            if !rest.is_empty() {
+                                let compressed = self.gzip_feed(slot, rest);
+                                self.h2_write(io, &compressed);
+                            }
+                            return;
+                        }
+                    }
                     self.h2_write(io, data);
                     return;
                 }
@@ -599,19 +619,18 @@ impl HttpProxy {
                 self.check_done(io);
             }
             BodyFraming::ContentLength | BodyFraming::Chunked { .. } => {
-                #[cfg(feature = "h2")]
+                // Both framings relay through relay_body: it owns CL
+                // accounting, the gzip relay, and routes the output
+                // through write_downstream (h2 sessions translate to
+                // DATA frames there). h2 transactions complete via
+                // upstream EOF (response_eof), not check_done — the
+                // extra check_done wedged streaming relays.
                 if is_h2 {
-                    self.h2_write(io, data);
-                } else {
                     self.relay_body(io, data);
-                    self.check_done(io);
+                    return;
                 }
-                #[cfg(not(feature = "h2"))]
-                {
-                    let _ = is_h2;
-                    self.relay_body(io, data);
-                    self.check_done(io);
-                }
+                self.relay_body(io, data);
+                self.check_done(io);
             }
             BodyFraming::Tunnel => {
                 // Tunnel: relay raw both directions.
@@ -1825,17 +1844,15 @@ impl HttpProxy {
         let cluster_requests = self.cluster_metric(&route.cluster).requests;
         cluster_requests.inc(&self.config.registry);
 
-        // Compression decision: route opt-in + client Accept-Encoding +
-        // h1 downstream only (the h2 shim frame path is excluded).
+        // Compression decision: route opt-in + client Accept-Encoding.
+        // Applies to both downstream framings: h1 rewrites the head to
+        // chunked+gzip; h2 strips Content-Length (END_STREAM delimits)
+        // and feeds compressed bytes through DATA frames.
         let accepts_gzip = {
             let ae = view.header("accept-encoding");
             vane_proto::compression::accepts_gzip(ae)
         };
-        #[cfg(feature = "h2")]
-        let is_h2_conn = self.conns.get(&slot).is_some_and(|c| c.h2.is_some());
-        #[cfg(not(feature = "h2"))]
-        let is_h2_conn = false;
-        let want_gzip = route.compression && accepts_gzip && !is_h2_conn;
+        let want_gzip = route.compression && accepts_gzip;
 
         // Stash transaction state.
         {
@@ -1917,19 +1934,28 @@ impl HttpProxy {
         };
         if let Some(n) = take {
             let bytes = &data[..n];
-            // Gzip relay: compress the accepted bytes, frame as chunks.
+            // Gzip relay: compress the accepted bytes. h1 frames the
+            // compressed output as chunks; h2 writes it raw (DATA
+            // framing delimits).
+            #[cfg(feature = "h2")]
+            let is_h2 = self.conns.get(&slot).is_some_and(|c| c.h2.is_some());
+            #[cfg(not(feature = "h2"))]
+            let is_h2 = false;
             let compressing = self.conns.get(&slot).is_some_and(|c| c.gzip.is_some());
             let out = if compressing {
                 let mut gz = self.conn(slot).gzip.take();
-                if let Some(relay) = gz.as_mut() {
-                    let compressed = relay.stream.feed(bytes).unwrap_or_else(|_| bytes.to_vec());
-                    self.conn(slot).gzip = gz;
-                    let mut out = Vec::with_capacity(compressed.len() + 18);
-                    out.extend_from_slice(&vane_proto::compression::chunk(&compressed));
-                    out
+                let compressed = gz
+                    .as_mut()
+                    .and_then(|relay| relay.stream.feed(bytes).ok())
+                    .unwrap_or_else(|| bytes.to_vec());
+                self.conn(slot).gzip = gz;
+                let mut out = Vec::with_capacity(compressed.len() + 18);
+                if is_h2 {
+                    out.extend_from_slice(&compressed);
                 } else {
-                    bytes.to_vec()
+                    out.extend_from_slice(&vane_proto::compression::chunk(&compressed));
                 }
+                out
             } else {
                 bytes.to_vec()
             };
@@ -1941,17 +1967,39 @@ impl HttpProxy {
         }
     }
 
-    /// Flushes the gzip trailer + terminal chunk when compressing.
+    /// Flushes the gzip trailer when compressing. h1 adds the terminal
+    /// chunk; h2 writes the trailer raw (END_STREAM comes from the
+    /// shim's completion path).
     fn finish_gzip(&mut self, io: &mut SessionIo<'_>) {
         let slot = io.slot_index();
         let Some(relay) = self.conn(slot).gzip.take() else {
             return;
         };
         let tail = relay.stream.finish().unwrap_or_default();
+        #[cfg(feature = "h2")]
+        let is_h2 = self.conns.get(&slot).is_some_and(|c| c.h2.is_some());
+        #[cfg(not(feature = "h2"))]
+        let is_h2 = false;
         let mut out = Vec::with_capacity(tail.len() + 18);
-        out.extend_from_slice(&vane_proto::compression::chunk(&tail));
-        out.extend_from_slice(&vane_proto::compression::final_chunk());
+        if is_h2 {
+            out.extend_from_slice(&tail);
+        } else {
+            out.extend_from_slice(&vane_proto::compression::chunk(&tail));
+            out.extend_from_slice(&vane_proto::compression::final_chunk());
+        }
         self.write_downstream(io, &out);
+    }
+
+    /// Feeds body bytes through the session's gzip relay (h2 path).
+    #[cfg(feature = "h2")]
+    fn gzip_feed(&mut self, slot: u32, bytes: &[u8]) -> Vec<u8> {
+        let mut gz = self.conn(slot).gzip.take();
+        let compressed = gz
+            .as_mut()
+            .and_then(|relay| relay.stream.feed(bytes).ok())
+            .unwrap_or_else(|| bytes.to_vec());
+        self.conn(slot).gzip = gz;
+        compressed
     }
 
     fn check_done(&mut self, io: &mut SessionIo<'_>) {

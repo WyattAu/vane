@@ -1727,3 +1727,121 @@ workers = 1
         "over-budget requests must be limited (limited={limited})"
     );
 }
+
+/// h2 downstream compression: a `compression = true` cluster gzips a
+/// compressible response for an h2c client — head carries
+/// content-encoding: gzip with NO content-length (END_STREAM
+/// delimits), the body arrives gzip-framed in DATA payloads.
+#[cfg(feature = "h2")]
+#[tokio::test]
+async fn gzip_compression_roundtrip_h2() {
+    let _serial = lock_serial();
+    let body = r#"{"message":"compress me please","pad":"#;
+    let body = format!("{body}{}", "x".repeat(2000));
+    let body = format!("{}}}", &body[..body.len() - 1]);
+    let payload = body.into_bytes();
+    let expected = payload.clone();
+    let upstream = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let upstream_addr = upstream.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len()
+        )
+        .into_bytes();
+        for stream in upstream.incoming().flatten() {
+            let mut s = stream;
+            let mut buf = [0u8; 8192];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(&head);
+            let _ = s.write_all(&payload);
+        }
+    });
+
+    let port = free_port();
+    let (_dir, cfg) = temp_config(format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+h2c = true
+
+[clusters.up]
+backends = ["{upstream_addr}"]
+compression = true
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = true
+workers = 1
+"#
+    ));
+    spawn_proxy(cfg);
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    // h2c prior-knowledge client via our H2Upstream driver.
+    tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Write};
+        use vane::h2_client::{H2Upstream, UpstreamEvent};
+        let mut sock = std::net::TcpStream::connect(proxy).expect("connect");
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let mut h2up = H2Upstream::new();
+        sock.write_all(&h2up.pending_writes()).expect("preface");
+        let head = b"GET /api/data HTTP/1.1\r\nhost: t\r\naccept-encoding: gzip\r\n\r\n".to_vec();
+        h2up.send_request(&head, Some(0));
+        sock.write_all(&h2up.pending_writes()).expect("request");
+
+        let mut got_head: Option<Vec<u8>> = None;
+        let mut got = Vec::new();
+        let mut buf = [0u8; 16384];
+        loop {
+            match sock.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let mut events = Vec::new();
+                    h2up.handle_read(&buf[..n], &mut events);
+                    for ev in events {
+                        match ev {
+                            UpstreamEvent::ResponseHead(h) => got_head = Some(h),
+                            UpstreamEvent::ResponseBody(b) => got.extend_from_slice(&b),
+                            UpstreamEvent::ResponseComplete => {}
+                            _ => {}
+                        }
+                    }
+                    if h2up.response_complete() {
+                        break;
+                    }
+                }
+            }
+        }
+        let head = String::from_utf8_lossy(&got_head.expect("response head")).into_owned();
+        assert!(
+            head.to_lowercase().contains("content-encoding: gzip"),
+            "{head}"
+        );
+        assert!(
+            !head.to_lowercase().contains("content-length"),
+            "CL must be stripped for gzipped h2 responses: {head}"
+        );
+        // Decompress and compare.
+        eprintln!(
+            "H2GZ body first8={:02x?} len={}",
+            &got[..got.len().min(8)],
+            got.len()
+        );
+        let mut decoder = flate2::read::GzDecoder::new(&got[..]);
+        let mut plain = Vec::new();
+        std::io::Read::read_to_end(&mut decoder, &mut plain).expect("gzip decode");
+        assert_eq!(plain.len(), expected.len(), "h2 gzip roundtrip size");
+        assert_eq!(plain, expected, "h2 gzip roundtrip integrity");
+    })
+    .await
+    .expect("client task");
+}

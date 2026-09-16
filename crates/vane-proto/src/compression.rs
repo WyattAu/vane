@@ -168,6 +168,7 @@ pub fn rewrite_head_for_gzip(head: &[u8]) -> Option<Vec<u8>> {
     let (lines, _) = head.split_at(split);
     let mut out = Vec::with_capacity(head.len() + 64);
     for (i, line) in lines.split(|b| *b == b'\n').enumerate() {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
         if i == 0 {
             // Status line.
             out.extend_from_slice(line);
@@ -185,9 +186,49 @@ pub fn rewrite_head_for_gzip(head: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// h2 variant of [`rewrite_head_for_gzip`]: strips Content-Length and
+/// Transfer-Encoding (h2 bodies delimit via END_STREAM — no chunked
+/// framing) and appends the gzip content-encoding.
+#[must_use]
+pub fn rewrite_head_for_gzip_h2(head: &[u8]) -> Option<Vec<u8>> {
+    let split = head.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let (lines, _) = head.split_at(split);
+    let mut out = Vec::with_capacity(head.len() + 40);
+    for (i, line) in lines.split(|b| *b == b'\n').enumerate() {
+        // Lines carry their original CR; strip it before re-appending
+        // CRLF (a doubled CR breaks strict head parsers downstream).
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if i == 0 {
+            out.extend_from_slice(line);
+            out.extend_from_slice(b"\r\n");
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with(b"content-length") || lower.starts_with(b"transfer-encoding") {
+            continue;
+        }
+        out.extend_from_slice(line);
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"content-encoding: gzip\r\n\r\n");
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The h2 variant strips CL/TE and appends the encoding without
+    /// chunked framing.
+    #[test]
+    fn h2_head_rewrite_strips_framing_and_adds_encoding() {
+        let head = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\n";
+        let rewritten = rewrite_head_for_gzip_h2(head).expect("rewrite");
+        let s = String::from_utf8_lossy(&rewritten);
+        assert!(s.contains("content-encoding: gzip"), "{s}");
+        assert!(!s.contains("content-length"), "{s}");
+        assert!(!s.to_ascii_lowercase().contains("transfer-encoding"), "{s}");
+    }
 
     fn roundtrip(data: &[u8]) -> Vec<u8> {
         let mut gz = GzipStream::new();

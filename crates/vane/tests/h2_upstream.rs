@@ -413,7 +413,21 @@ async fn post_body_roundtrip() {
 /// Cross-process serial lock shared with the proxy-spawning suites.
 fn lock_serial() -> std::fs::File {
     use std::os::unix::io::AsRawFd as _;
-    let path = std::env::temp_dir().join("vane-tests-serial.lock");
+    // Per-checkout lock: sibling worktrees/coverage checkouts of this
+    // repo run concurrently on this machine; a global /tmp lock made
+    // their (slow, instrumented) serial tests starve ours.
+    // Key on the test binary's target directory: concurrent checkouts
+    // of this repo (coverage runs, other worktrees) build into
+    // different target dirs and must not share the serial lock.
+    let key = {
+        let exe = std::env::current_exe().unwrap_or_default();
+        let mut h: u64 = 5381;
+        for b in exe.to_string_lossy().as_bytes() {
+            h = h.wrapping_mul(33).wrapping_add(u64::from(*b));
+        }
+        format!("{h:016x}")
+    };
+    let path = std::env::temp_dir().join(format!("vane-tests-serial-{key}.lock"));
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
