@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/vane-core",
+    "crates/vane-kernel",
     "crates/vane-observe",
     "crates/vane-proto",
     "crates/vane-router",
@@ -39,7 +39,7 @@ expect_used = "allow"
 
 [workspace.dependencies]
 # Internal
-vane-core = { version = "0.2.0", path = "crates/vane-core" }
+vane-kernel = { version = "0.2.0", path = "crates/vane-kernel" }
 vane-observe = { version = "0.2.0", path = "crates/vane-observe" }
 vane-proto = { version = "0.2.0", path = "crates/vane-proto" }
 vane-router = { version = "0.2.0", path = "crates/vane-router" }

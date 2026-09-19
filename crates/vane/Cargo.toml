@@ -1,5 +1,5 @@
 [package]
-name = "vane"
+name = "vane-proxy"
 description = "Deterministic, zero-copy L4/L7 reverse proxy, edge gateway, and micro sidecar"
 version.workspace = true
 edition.workspace = true
@@ -17,8 +17,8 @@ name = "vane"
 path = "src/main.rs"
 
 [features]
-default = ["vane-core/io-uring"]
-vane_dbg = ["vane-core/vane_dbg"]
+default = ["vane-kernel/io-uring"]
+vane_dbg = ["vane-kernel/vane_dbg"]
 file-provider = ["vane-control/file-provider"]
 docker-provider = ["vane-control/docker-provider"]
 h2 = ["dep:h2", "dep:tokio-rustls"]
@@ -28,7 +28,7 @@ k8s = ["vane-control/k8s"]
 acme-pebble = []
 
 [dependencies]
-vane-core = { workspace = true }
+vane-kernel = { workspace = true }
 vane-proto = { workspace = true }
 vane-router = { workspace = true }
 vane-filters = { workspace = true }

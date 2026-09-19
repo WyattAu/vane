@@ -32,7 +32,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run proxy integration tests
-        run: cargo test -p vane --test e2e -- --test-threads=1
+        run: cargo test -p vane-proxy --test e2e -- --test-threads=1
 
   h2spec:
     name: h2 conformance (h2spec generic)
@@ -55,7 +55,7 @@ jobs:
       - name: Run h2spec generic suite against the sans-io engine
         env:
           H2SPEC: /usr/local/bin/h2spec
-        run: cargo test -p vane-core --test h2spec -- --nocapture
+        run: cargo test -p vane-kernel --test h2spec -- --nocapture
 
   loom:
     name: loom model checking
@@ -65,7 +65,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Loom (SPSC ring)
-        run: cargo test -p vane-core --features loom --test loom_spsc
+        run: cargo test -p vane-kernel --features loom --test loom_spsc
       - name: Loom (event ring)
         run: cargo test -p vane-observe --features loom --test loom_ring
 
@@ -80,8 +80,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Miri (session slab + token packing)
         run: |
-          cargo +nightly miri test -p vane-core --lib slab::
-          cargo +nightly miri test -p vane-core --lib token::
+          cargo +nightly miri test -p vane-kernel --lib slab::
+          cargo +nightly miri test -p vane-kernel --lib token::
 
   feature-matrix:
     name: feature matrix
@@ -115,7 +115,7 @@ jobs:
             --output-path lcov.info -- \
             --include-ignored --test-threads=2 -- --skip hot_upgrade
       - name: Chaos suite
-        run: cargo test -p vane --test chaos -- --test-threads=1
+        run: cargo test -p vane-proxy --test chaos -- --test-threads=1
       - name: Enforce Tier A threshold
         run: |
           cargo llvm-cov --workspace --features vane-plugins/wasm,acme-pebble --lcov \

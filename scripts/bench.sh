@@ -15,7 +15,7 @@ PORT_UP=$(python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0));
 PORT_PROXY=$(python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1])")
 
 echo "== building (release) =="
-cargo build --release -p vane
+cargo build --release -p vane-proxy
 
 echo "== upstream on :$PORT_UP =="
 python3 - <<PY &

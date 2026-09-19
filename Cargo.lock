@@ -3929,7 +3929,113 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
-name = "vane"
+name = "vane-client-sdk"
+version = "0.2.0"
+dependencies = [
+ "tempfile",
+ "vane-shm",
+ "workspace-hack",
+]
+
+[[package]]
+name = "vane-control"
+version = "0.2.0"
+dependencies = [
+ "base64",
+ "envstack",
+ "loop-retry",
+ "notify",
+ "rand 0.9.5",
+ "rcgen",
+ "reqwest",
+ "ring",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "toml 0.9.12+spec-1.1.0",
+ "tracing",
+ "validkit",
+ "vane-observe",
+ "vane-proto",
+ "vane-router",
+ "workspace-hack",
+]
+
+[[package]]
+name = "vane-filters"
+version = "0.2.0"
+dependencies = [
+ "base64",
+ "breaker",
+ "jsonwebtoken",
+ "rsa",
+ "serde_json",
+ "tempfile",
+ "throttle-kit",
+ "tokio",
+ "vane-observe",
+ "workspace-hack",
+]
+
+[[package]]
+name = "vane-kernel"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "core_affinity",
+ "io-uring",
+ "libc",
+ "loom",
+ "mio",
+ "slab-pool",
+ "socket2",
+ "tempfile",
+ "thiserror 2.0.20",
+ "vane-observe",
+ "workspace-hack",
+]
+
+[[package]]
+name = "vane-observe"
+version = "0.2.0"
+dependencies = [
+ "loom",
+ "rand 0.9.5",
+ "tracing",
+ "workspace-hack",
+]
+
+[[package]]
+name = "vane-plugins"
+version = "0.2.0"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
+ "vane-observe",
+ "wasmtime",
+ "workspace-hack",
+]
+
+[[package]]
+name = "vane-proto"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "criterion",
+ "flate2",
+ "httparse",
+ "thiserror 2.0.20",
+ "vane-observe",
+ "workspace-hack",
+]
+
+[[package]]
+name = "vane-proxy"
 version = "0.2.0"
 dependencies = [
  "axum",
@@ -3969,120 +4075,14 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "vane-control",
- "vane-core",
  "vane-filters",
+ "vane-kernel",
  "vane-observe",
  "vane-plugins",
  "vane-proto",
  "vane-router",
  "vane-shm",
  "vane-tls",
- "workspace-hack",
-]
-
-[[package]]
-name = "vane-client-sdk"
-version = "0.2.0"
-dependencies = [
- "tempfile",
- "vane-shm",
- "workspace-hack",
-]
-
-[[package]]
-name = "vane-control"
-version = "0.2.0"
-dependencies = [
- "base64",
- "envstack",
- "loop-retry",
- "notify",
- "rand 0.9.5",
- "rcgen",
- "reqwest",
- "ring",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "toml 0.9.12+spec-1.1.0",
- "tracing",
- "validkit",
- "vane-observe",
- "vane-proto",
- "vane-router",
- "workspace-hack",
-]
-
-[[package]]
-name = "vane-core"
-version = "0.2.0"
-dependencies = [
- "bytes",
- "core_affinity",
- "io-uring",
- "libc",
- "loom",
- "mio",
- "slab-pool",
- "socket2",
- "tempfile",
- "thiserror 2.0.20",
- "vane-observe",
- "workspace-hack",
-]
-
-[[package]]
-name = "vane-filters"
-version = "0.2.0"
-dependencies = [
- "base64",
- "breaker",
- "jsonwebtoken",
- "rsa",
- "serde_json",
- "tempfile",
- "throttle-kit",
- "tokio",
- "vane-observe",
- "workspace-hack",
-]
-
-[[package]]
-name = "vane-observe"
-version = "0.2.0"
-dependencies = [
- "loom",
- "rand 0.9.5",
- "tracing",
- "workspace-hack",
-]
-
-[[package]]
-name = "vane-plugins"
-version = "0.2.0"
-dependencies = [
- "tempfile",
- "thiserror 2.0.20",
- "tracing",
- "vane-observe",
- "wasmtime",
- "workspace-hack",
-]
-
-[[package]]
-name = "vane-proto"
-version = "0.2.0"
-dependencies = [
- "bytes",
- "criterion",
- "flate2",
- "httparse",
- "thiserror 2.0.20",
- "vane-observe",
  "workspace-hack",
 ]
 

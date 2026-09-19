@@ -1,5 +1,5 @@
 [package]
-name = "vane-core"
+name = "vane-kernel"
 description = "io_uring/mio dual-backend, thread-per-core transport engine for Vane"
 version.workspace = true
 edition.workspace = true
@@ -13,6 +13,10 @@ vane_dbg = []
 default = ["io-uring"]
 io-uring = ["dep:io-uring"]
 loom = ["dep:loom"]
+
+[lib]
+name = "vane_core"
+path = "src/lib.rs"
 
 [dependencies]
 io-uring = { workspace = true, optional = true }
