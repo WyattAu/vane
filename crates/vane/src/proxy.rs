@@ -120,6 +120,9 @@ impl ConnMap {
 #[derive(Default)]
 struct Conn {
     head_buf: Vec<u8>,
+    /// Recycled scratch for the serialized upstream request head
+    /// (take → build → send → put back; one alloc per connection).
+    head_out: Vec<u8>,
     /// Matched route for the in-flight request.
     route: Option<Arc<RouteEntry>>,
     /// Rewritten request path.
@@ -1345,16 +1348,24 @@ impl HttpProxy {
     /// Serializes the upstream request head from the parsed view + pipeline
     /// mutations.
     #[allow(clippy::too_many_lines)]
+    // One call site; the argument list mirrors the head's natural
+    // inputs (view fields + route + framing knobs).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "single call site mirrors the serialized head's inputs"
+    )]
     fn build_upstream_head(
         &mut self,
+        out: &mut Vec<u8>,
         view: &RequestView<'_>,
         route: &RouteEntry,
         path: &str,
         inject: &[(String, String)],
         close: bool,
         inline_body_len: usize,
-    ) -> Vec<u8> {
-        let mut out = Vec::with_capacity(512);
+    ) {
+        out.clear();
+        out.reserve(512);
         out.extend_from_slice(view.method.as_bytes());
         out.push(b' ');
         out.extend_from_slice(path.as_bytes());
@@ -1368,23 +1379,15 @@ impl HttpProxy {
         }
         for h in view.headers {
             let name = h.name;
-            let lname = name.to_ascii_lowercase();
             // Hop-by-hop (we manage `Connection` framing ourselves) and
             // `Transfer-Encoding` (re-emitted below from the validated
             // framing decision — never trusted from the wire).
-            if lname == "connection"
-                || lname == "keep-alive"
-                || lname == "proxy-connection"
-                || lname == "transfer-encoding"
-            {
+            if is_hop_by_hop(name) {
                 continue;
             }
             // X-Forwarded-* are untrusted: strip inbound values so the
             // only ones the upstream sees are the ones we appended.
-            if lname == "x-forwarded-for"
-                || lname == "x-forwarded-proto"
-                || lname == "x-forwarded-host"
-            {
+            if is_x_forwarded(name) {
                 continue;
             }
             out.extend_from_slice(name.as_bytes());
@@ -1412,7 +1415,6 @@ impl HttpProxy {
             out.extend_from_slice(b"Connection: close\r\n");
         }
         out.extend_from_slice(b"\r\n");
-        out
     }
 
     /// Parses the upstream response head and decides body framing.
@@ -1459,6 +1461,22 @@ impl HttpProxy {
 /// Handler-side cap for body bytes arriving before the upstream
 /// connects. The window is one dial; anything beyond this is abusive.
 const REQ_PENDING_CAP: usize = 1024 * 1024;
+
+/// Hop-by-hop headers the proxy manages itself (ASCII-case-insensitive).
+fn is_hop_by_hop(name: &str) -> bool {
+    name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("keep-alive")
+        || name.eq_ignore_ascii_case("proxy-connection")
+        || name.eq_ignore_ascii_case("transfer-encoding")
+}
+
+/// Inbound `X-Forwarded-*` are untrusted and stripped (ASCII-case-
+/// insensitive).
+fn is_x_forwarded(name: &str) -> bool {
+    name.eq_ignore_ascii_case("x-forwarded-for")
+        || name.eq_ignore_ascii_case("x-forwarded-proto")
+        || name.eq_ignore_ascii_case("x-forwarded-host")
+}
 
 /// Inserts `name: value` into a response head before the final
 /// header-line terminator. Idempotent: no-op when `name` already
@@ -1768,9 +1786,13 @@ impl Handler for HttpProxy {
         let buf = self.conn(slot).head_buf.clone();
         let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
         if let Parsed::Complete(view, head_len) = RequestView::parse_in(&buf, &mut storage) {
-            let head = self.build_upstream_head(&view, &route, &upstream_path, &inject, false, 0);
+            // Recycled scratch: one allocation for the connection's
+            // lifetime instead of one per request.
+            let mut head = std::mem::take(&mut self.conn(slot).head_out);
+            self.build_upstream_head(&mut head, &view, &route, &upstream_path, &inject, false, 0);
             self.upstream_send(io, &head);
             io.mark_request_sent();
+            self.conn(slot).head_out = head;
             // Forward any body bytes that arrived with the head, then
             // the pre-connect queue (ordering preserved).
             let body = &buf[head_len..];
