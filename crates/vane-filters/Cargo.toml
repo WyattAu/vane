@@ -14,6 +14,7 @@ serde_json = { workspace = true }
 throttle-kit = { workspace = true }
 breaker = { workspace = true }
 vane-observe = { workspace = true }
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
 base64 = "0.22"

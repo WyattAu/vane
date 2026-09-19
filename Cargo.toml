@@ -12,6 +12,7 @@ members = [
     "crates/vane-tls",
     "crates/vane-plugins",
     "crates/vane",
+    "workspace-hack",
 ]
 
 [workspace.package]
