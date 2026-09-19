@@ -13,7 +13,7 @@ COPY crates ./crates
 # source copy is required for the workspace to resolve — keep the copy
 # before any source edit so dependency churn stays cache-friendly.
 
-RUN cargo build --release -p vane --features h2,file-provider,docker-provider,k8s
+RUN cargo build --release -p vane-proxy --features h2,file-provider,docker-provider,k8s
 
 # ---- runtime ----
 FROM debian:bookworm-slim
