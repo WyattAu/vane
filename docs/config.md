@@ -50,9 +50,27 @@ Clusters with no resolvable backends contribute no routes (no fatal error).
 
 ## `[[routes]]` — static routes
 
+```toml
+[[routes]]
+pattern = "/api/*rest"
+cluster = "api"
+host = "api.example.com"       # optional host match
+methods = ["GET", "POST"]      # optional method filter
+strip_prefix = "/api"          # optional prefix strip
+priority = 10                  # lower wins on conflicts
+allowed_spiffe_prefixes = ["spiffe://example.org/vane/"]
+```
+
+`allowed_spiffe_prefixes` enables per-route caller authorization for
+mTLS listeners (`listeners.tls.client_ca` set): the request is
+answered **403** unless the client certificate's SPIFFE URI SAN
+starts with one of the prefixes. Cert-less callers fail at the TLS
+handshake (`certificate_required`).
+
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `host` | string | any host | exact match, no port |
+| `allowed_spiffe_prefixes` | string list | `[]` | caller SPIFFE URI SAN prefixes (mTLS listener only) |
 | `pattern` | string | required | `/api/:id`, `/files/*rest` catch-alls |
 | `methods` | list | all | uppercased; unmatched method → **405** |
 | `cluster` | string | required | target cluster |

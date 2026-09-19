@@ -103,6 +103,7 @@ fn router_with(upstream: SocketAddr, h2_upstream: bool) -> Arc<Router> {
             policy: vane_router::Policy::P2C,
             gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
             priority: 0,
+            allowed_spiffe_prefixes: Vec::new(),
         });
     });
     Arc::new(r)
@@ -244,6 +245,7 @@ async fn disallowed_method_yields_405() {
             policy: vane_router::Policy::P2C,
             gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
             priority: 0,
+            allowed_spiffe_prefixes: Vec::new(),
         });
     });
     // POST on a GET-only route.
@@ -350,6 +352,7 @@ async fn post_body_roundtrip() {
             policy: vane_router::Policy::P2C,
             gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
             priority: 0,
+            allowed_spiffe_prefixes: Vec::new(),
         });
     });
     let edge = Arc::new(
@@ -644,6 +647,7 @@ async fn no_healthy_backend_yields_503() {
             policy: vane_router::Policy::P2C,
             gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
             priority: 0,
+            allowed_spiffe_prefixes: Vec::new(),
         });
     });
     let (status, _, _) = request_via_edge(Arc::new(r), "/x").await;
@@ -674,6 +678,7 @@ async fn breaker_open_yields_503() {
             policy: vane_router::Policy::P2C,
             gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
             priority: 0,
+            allowed_spiffe_prefixes: Vec::new(),
         });
     });
     // Construct the edge with the SAME breaker instance so it is open.
@@ -851,6 +856,7 @@ async fn large_body_streams_through_edge() {
             policy: vane_router::Policy::P2C,
             gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
             priority: 0,
+            allowed_spiffe_prefixes: Vec::new(),
         });
     });
     let edge = Arc::new(

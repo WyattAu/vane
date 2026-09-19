@@ -74,6 +74,7 @@ fn make_router(routes: &[(&str, &str)]) -> Arc<Router> {
                     outlier: None,
                     policy: Policy::P2C,
                     priority: 0,
+                    allowed_spiffe_prefixes: Vec::new(),
                 }
                 .compile()
                 .expect("valid route"),

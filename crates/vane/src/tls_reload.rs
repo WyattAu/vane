@@ -16,7 +16,8 @@ use std::time::Duration;
 /// A swappable TLS configuration slot shared with workers.
 pub type TlsSlot = Arc<std::sync::RwLock<Arc<rustls::ServerConfig>>>;
 
-/// Loads cert + key and builds a server config with the given ALPN set.
+/// Loads cert + key (and an optional client-auth CA) and builds a
+/// server config with the given ALPN set.
 ///
 /// # Errors
 /// Material load failure (missing/unparsable files).
@@ -24,8 +25,9 @@ pub fn load_config(
     cert: &Path,
     key: &Path,
     alpn: &[Vec<u8>],
+    client_ca: Option<&Path>,
 ) -> Result<rustls::ServerConfig, String> {
-    let mut cfg = vane_tls::server_config(cert, key).map_err(|e| e.to_string())?;
+    let mut cfg = vane_tls::server_config_mtls(cert, key, client_ca).map_err(|e| e.to_string())?;
     cfg.alpn_protocols = alpn.to_vec();
     Ok(cfg)
 }
@@ -37,6 +39,7 @@ pub fn load_config(
 pub fn spawn_reloader(
     cert: PathBuf,
     key: PathBuf,
+    client_ca: Option<PathBuf>,
     alpn: Vec<Vec<u8>>,
     slot: TlsSlot,
 ) -> tokio::task::JoinHandle<()> {
@@ -47,13 +50,19 @@ pub fn spawn_reloader(
             let tx = tx.clone();
             let cert = cert.clone();
             let key = key.clone();
+            let watch_paths: Vec<PathBuf> = client_ca
+                .iter()
+                .chain(std::iter::once(&cert))
+                .cloned()
+                .chain(std::iter::once(key))
+                .collect();
             std::thread::spawn(move || {
                 let (ntx, nrx) = std::sync::mpsc::channel();
                 let mut watcher = match notify::recommended_watcher(ntx) {
                     Ok(w) => w,
                     Err(_) => return,
                 };
-                for p in [&cert, &key] {
+                for p in &watch_paths {
                     let _ = watcher.watch(p, notify::RecursiveMode::NonRecursive);
                 }
                 for res in nrx {
@@ -67,11 +76,14 @@ pub fn spawn_reloader(
 
         // mtime fingerprint: skip reloads when nothing actually changed
         // (editors emit multiple events per save).
-        let fingerprint = || -> Option<(std::time::SystemTime, std::time::SystemTime)> {
-            Some((
-                std::fs::metadata(&cert).ok()?.modified().ok()?,
-                std::fs::metadata(&key).ok()?.modified().ok()?,
-            ))
+        let fingerprint = || -> Option<Vec<std::time::SystemTime>> {
+            let mut times: Vec<std::time::SystemTime> = client_ca
+                .iter()
+                .filter_map(|p| std::fs::metadata(p).ok()?.modified().ok())
+                .collect();
+            times.push(std::fs::metadata(&cert).ok()?.modified().ok()?);
+            times.push(std::fs::metadata(&key).ok()?.modified().ok()?);
+            Some(times)
         };
         let mut last_fp = fingerprint();
 
@@ -85,7 +97,7 @@ pub fn spawn_reloader(
             if fp == last_fp {
                 continue;
             }
-            match load_config(&cert, &key, &alpn) {
+            match load_config(&cert, &key, &alpn, client_ca.as_deref()) {
                 Ok(cfg) => {
                     let mut w = slot.write().expect("tls slot");
                     *w = Arc::new(cfg);
@@ -117,7 +129,7 @@ mod reload_tests {
     fn load_config_reads_pair() {
         let dir = tempfile::tempdir().expect("dir");
         let (cert, key) = test_certpair(dir.path());
-        let cfg = load_config(&cert, &key, &[b"h2".to_vec()]).expect("load");
+        let cfg = load_config(&cert, &key, &[b"h2".to_vec()], None).expect("load");
         assert_eq!(cfg.alpn_protocols, vec![b"h2".to_vec()]);
     }
 
@@ -125,16 +137,16 @@ mod reload_tests {
     fn load_config_rejects_missing() {
         let dir = tempfile::tempdir().expect("dir");
         let missing = dir.path().join("nope.pem");
-        assert!(load_config(&missing, &missing, &[]).is_err());
+        assert!(load_config(&missing, &missing, &[], None).is_err());
     }
 
     #[tokio::test]
     async fn reloader_swaps_slot_on_change() {
         let dir = tempfile::tempdir().expect("dir");
         let (cert, key) = test_certpair(dir.path());
-        let initial = load_config(&cert, &key, &[]).expect("load");
+        let initial = load_config(&cert, &key, &[], None).expect("load");
         let slot: TlsSlot = Arc::new(std::sync::RwLock::new(Arc::new(initial)));
-        let _handle = spawn_reloader(cert.clone(), key.clone(), vec![], Arc::clone(&slot));
+        let _handle = spawn_reloader(cert.clone(), key.clone(), None, vec![], Arc::clone(&slot));
 
         // Rewrite the cert with a fresh keypair: the watcher must swap.
         tokio::time::sleep(Duration::from_millis(200)).await;

@@ -80,6 +80,7 @@ pub fn build_route(spec: ProviderRouteSpec, health: &crate::health::HealthMap) -
         outlier,
         policy: vane_router::Policy::P2C,
         priority: spec.priority,
+        allowed_spiffe_prefixes: Vec::new(),
     }
 }
 

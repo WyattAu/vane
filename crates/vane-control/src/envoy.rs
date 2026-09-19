@@ -282,6 +282,7 @@ pub fn map_snapshot(clusters: &[EnvoyCluster], route_config: &EnvoyRouteConfig) 
                 methods: Vec::new(),
                 strip_prefix: None,
                 priority: 0,
+                allowed_spiffe_prefixes: Vec::new(),
             });
         }
     }

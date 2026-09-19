@@ -58,4 +58,8 @@ on_connected:
    at startup and a watcher re-materializes the PEM cache on every
    agent push; the per-dial file read picks rotations up with no
    restarts.
-4. Authorization: per-route `allowed_spiffe_prefixes`.
+4. ✅ Authorization: per-route `allowed_spiffe_prefixes` — listeners
+   with `tls.client_ca` require downstream client certs (missing cert
+   → `certificate_required` alert, flushed before close); matched
+   routes with prefixes answer 403 unless the caller's SPIFFE URI SAN
+   starts with one of them (`spiffe_auth.rs`).

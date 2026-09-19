@@ -574,7 +574,17 @@ impl HttpProxy {
         let mut first = true;
         loop {
             if let Err(e) = tls.process_new_packets() {
-                self.log(LogLevel::Warn, &format!("tls handshake error: {e}"));
+                let reason = e.to_string();
+                // Flush any queued failure alert (e.g.
+                // certificate_required for a cert-less mTLS client) so
+                // the peer sees the real reason instead of a silent
+                // timeout.
+                let mut alert = [0u8; 512];
+                let n = tls.write_tls(&mut alert.as_mut_slice()).unwrap_or(0);
+                self.log(LogLevel::Warn, &format!("tls handshake error: {reason}"));
+                if n > 0 {
+                    io.respond(&alert[..n]);
+                }
                 io.close();
                 return;
             }
@@ -2003,7 +2013,41 @@ impl HttpProxy {
                 .any(|m| m.eq_ignore_ascii_case(view.method))
         {
             self.respond_full(io, Status::MethodNotAllowed, "method not allowed\n");
+            io.close();
             return;
+        }
+
+        // Inbound caller identity authorization: routes with
+        // `allowed_spiffe_prefixes` require an mTLS peer whose SPIFFE
+        // URI SAN matches at least one prefix
+        // (docs/mesh-mtls-design.md, milestone 4). Plain-TLS or
+        // cert-less callers have no identity → 403.
+        if !route.allowed_spiffe_prefixes.is_empty() {
+            let peer_id = self
+                .conns
+                .get(&slot)
+                .and_then(|c| c.tls.as_ref())
+                .and_then(|tls| tls.peer_certificates())
+                .and_then(|certs| certs.first())
+                .and_then(|leaf| vane_tls::mesh::spiffe_id(leaf));
+            let allowed = peer_id.as_ref().is_some_and(|id| {
+                route
+                    .allowed_spiffe_prefixes
+                    .iter()
+                    .any(|p| id.starts_with(p))
+            });
+            if !allowed {
+                self.log(
+                    LogLevel::Warn,
+                    &format!(
+                        "caller identity rejected: {}",
+                        peer_id.as_deref().unwrap_or("<none>")
+                    ),
+                );
+                self.respond_full(io, Status::Forbidden, "caller identity not allowed\n");
+                io.close();
+                return;
+            }
         }
 
         // Request span (after the error exits so 404/405 stay spanless

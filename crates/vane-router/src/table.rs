@@ -38,6 +38,9 @@ pub struct RouteEntry {
     pub gauges: Arc<ConnGauges>,
     /// Route priority (lower wins on pattern conflicts).
     pub priority: u32,
+    /// SPIFFE ID prefixes an inbound mTLS caller's URI SAN must match
+    /// (empty = no caller-identity authorization).
+    pub allowed_spiffe_prefixes: Vec<String>,
 }
 
 impl RouteEntry {
@@ -175,6 +178,9 @@ pub struct RouteBuilder {
     pub outlier: Option<Arc<crate::outlier::OutlierSet>>,
     /// Priority.
     pub priority: u32,
+    /// SPIFFE ID prefixes an inbound mTLS caller must match (empty =
+    /// unrestricted).
+    pub allowed_spiffe_prefixes: Vec<String>,
 }
 
 impl RouteBuilder {
@@ -208,6 +214,7 @@ impl RouteBuilder {
             policy: self.policy,
             gauges,
             priority: self.priority,
+            allowed_spiffe_prefixes: self.allowed_spiffe_prefixes,
         })
     }
 }
@@ -359,6 +366,7 @@ mod tests {
             outlier: None,
             policy: Policy::P2C,
             priority: 0,
+            allowed_spiffe_prefixes: Vec::new(),
         }
     }
 

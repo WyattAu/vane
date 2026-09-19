@@ -81,9 +81,44 @@ pub fn server_config(
     cert_path: &std::path::Path,
     key_path: &std::path::Path,
 ) -> Result<rustls::ServerConfig, TlsError> {
+    server_config_mtls(cert_path, key_path, None)
+}
+
+/// Builds the server config requiring client certificates signed by
+/// `ca_path` (inbound mesh mTLS). Callers read the peer identity off
+/// the session (`peer_certificates` → [`mesh::spiffe_id`]).
+///
+/// # Errors
+/// Material load or rustls config failure.
+pub fn server_config_mtls(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+    client_ca: Option<&std::path::Path>,
+) -> Result<rustls::ServerConfig, TlsError> {
     let (certs, key) = load_cert_key(cert_path, key_path)?;
-    let mut cfg = rustls::ServerConfig::builder()
-        .with_no_client_auth()
+    let builder = rustls::ServerConfig::builder();
+    let builder = match client_ca {
+        Some(ca) => {
+            let cas: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(
+                std::fs::File::open(ca)
+                    .map_err(|e| TlsError::Material(format!("{}: {e}", ca.display())))?,
+            ))
+            .collect::<Result<_, _>>()
+            .map_err(|e| TlsError::Material(e.to_string()))?;
+            let mut roots = rustls::RootCertStore::empty();
+            for c in cas {
+                roots
+                    .add(c)
+                    .map_err(|e| TlsError::Material(format!("ca: {e}")))?;
+            }
+            let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+                .build()
+                .map_err(|e| TlsError::Material(format!("client verifier: {e}")))?;
+            builder.with_client_cert_verifier(verifier)
+        }
+        None => builder.with_no_client_auth(),
+    };
+    let mut cfg = builder
         .with_single_cert(certs, key)
         .map_err(TlsError::from)?;
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];

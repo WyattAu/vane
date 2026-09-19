@@ -189,6 +189,7 @@ pub fn compile(state: &GatewayState) -> Result<XdsSnapshot, String> {
                         methods,
                         strip_prefix: None,
                         priority: route_priority(rule_idx),
+                        allowed_spiffe_prefixes: Vec::new(),
                     });
                     version_hash = version_hash.wrapping_add(1);
                 }

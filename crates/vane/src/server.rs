@@ -96,6 +96,7 @@ pub fn receive_inherited(
                 outlier: None,
                 policy: vane_router::Policy::P2C,
                 priority: 20,
+                allowed_spiffe_prefixes: Vec::new(),
             };
             match builder.compile() {
                 Ok(entry) => editor.insert(entry),
@@ -180,6 +181,7 @@ pub fn load_config(path: Option<&str>) -> Result<VaneConfig, String> {
                 cert,
                 key,
                 alpn_h2: false,
+                client_ca: None,
             });
         }
     }
@@ -561,9 +563,11 @@ pub async fn run(opts: RunOptions) -> i32 {
         let tls_cfg: Option<Arc<std::sync::RwLock<Arc<rustls::ServerConfig>>>> =
             match config.listeners.get(li).and_then(|l| l.tls.as_ref()) {
                 Some(t) if mode == CoreMode::Http => {
-                    match vane_tls::server_config(
+                    let client_ca = t.client_ca.as_deref().map(std::path::Path::new);
+                    match vane_tls::server_config_mtls(
                         std::path::Path::new(&t.cert),
                         std::path::Path::new(&t.key),
+                        client_ca,
                     ) {
                         Ok(mut cfg) => {
                             // ALPN: h2 + http/1.1 when enabled — the
@@ -775,6 +779,7 @@ pub async fn run(opts: RunOptions) -> i32 {
             crate::tls_reload::spawn_reloader(
                 PathBuf::from(&t.cert),
                 PathBuf::from(&t.key),
+                t.client_ca.clone().map(PathBuf::from),
                 if cfg!(feature = "h2") && t.alpn_h2 {
                     vec![b"h2".to_vec()]
                 } else {
@@ -1018,6 +1023,7 @@ cluster = "up"
                 policy: vane_router::Policy::P2C,
                 gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
                 priority: 0,
+                allowed_spiffe_prefixes: Vec::new(),
             });
         });
         let records = crate::proxy::flatten_routes(&router);
@@ -1167,6 +1173,7 @@ mod handover_helper_tests {
                 policy: vane_router::Policy::P2C,
                 gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
                 priority: 0,
+                allowed_spiffe_prefixes: Vec::new(),
             });
         });
         let health = Arc::new(vane_control::HealthMap::new());

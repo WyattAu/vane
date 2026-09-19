@@ -29,6 +29,7 @@ fn test_router() -> Arc<RouteRouter> {
             policy: vane_router::Policy::P2C,
             gauges: Arc::new(vane_router::balancer::ConnGauges::new(0)),
             priority: 0,
+            allowed_spiffe_prefixes: Vec::new(),
         });
     });
     Arc::new(r)
@@ -495,6 +496,7 @@ fn test_router_keepalive() -> std::sync::Arc<RouteRouter> {
             policy: vane_router::Policy::P2C,
             gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
             priority: 0,
+            allowed_spiffe_prefixes: Vec::new(),
         });
     });
     Arc::new(r)

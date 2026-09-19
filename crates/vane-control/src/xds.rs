@@ -53,6 +53,10 @@ pub struct XdsRoute {
     /// Route priority (lower wins).
     #[serde(default)]
     pub priority: u32,
+    /// SPIFFE ID prefixes an inbound mTLS caller must match (empty =
+    /// unrestricted).
+    #[serde(default)]
+    pub allowed_spiffe_prefixes: Vec<String>,
 }
 
 /// A full-state configuration snapshot: replace-everything semantics.
@@ -149,6 +153,7 @@ pub fn apply_snapshot(
             outlier,
             policy: cluster_cfg.policy.into(),
             priority: route.priority,
+            allowed_spiffe_prefixes: route.allowed_spiffe_prefixes.clone(),
         });
     }
 

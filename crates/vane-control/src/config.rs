@@ -92,6 +92,13 @@ pub struct ListenerTls {
     /// handles h2 connections while engine workers keep http/1.1).
     #[serde(default)]
     pub alpn_h2: bool,
+    /// PEM of the CA that must sign downstream client certificates.
+    /// When set the listener REQUIRES mTLS: handshakes without a
+    /// client cert fail, and per-route `allowed_spiffe_prefixes`
+    /// authorize the caller's SPIFFE ID (docs/mesh-mtls-design.md,
+    /// milestone 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ca: Option<String>,
 }
 
 /// Listener protocol mode.
@@ -207,6 +214,11 @@ pub struct RouteConfig {
     /// Priority (lower wins).
     #[serde(default)]
     pub priority: u32,
+    /// SPIFFE ID prefixes an inbound mTLS caller's URI SAN must match
+    /// (empty = any caller). Requires a listener with `client_ca` set;
+    /// requests without a verified SPIFFE ID are answered 403.
+    #[serde(default)]
+    pub allowed_spiffe_prefixes: Vec<String>,
 }
 
 /// Admin server configuration.

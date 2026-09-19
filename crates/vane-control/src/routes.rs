@@ -37,6 +37,7 @@ pub fn static_routes(cfg: &VaneConfig, health: &HealthMap) -> Vec<RouteBuilder> 
             outlier,
             policy: cluster.policy.into(),
             priority: r.priority,
+            allowed_spiffe_prefixes: r.allowed_spiffe_prefixes.clone(),
         });
     }
     out
