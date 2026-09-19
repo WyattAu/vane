@@ -18,7 +18,20 @@ kills stuck streams. `h2crate_client_h2c_large_body` passes 5/5
 including under load. `large_body_streams_through_edge` remains
 retired (REUSEPORT edge removed by design).
 
-## Suite-sequence wedge — RE-QUARANTINED (2026-09-19), root cause open
+## Suite-sequence wedge — FIXED (2026-09-19, subprocess isolation)
+
+The streaming family now runs the proxy as a **subprocess**
+(`spawn_server_subprocess` in tests/h2_upstream.rs, killed on drop):
+a leaked in-process server cannot interact with the next test
+because nothing leaks. `--test-threads=1` and `=2` both green 2×
+consecutively with the family un-quarantined (16 passed / 2
+ignored — the remaining ignore is the retired REUSEPORT probe).
+
+The following section records the pre-fix investigation; kept for
+the mechanism notes (empty kernel queues, trickle signature) which
+still explain WHY leaked servers starve successors.
+
+## Suite-sequence wedge — pre-fix investigation (superseded)
 
 `h2crate_client_h2c_large_body` passes standalone (0.11 s, repeated)
 but wedges in-suite, and 7b3994c's backpressure fix did **not**
@@ -50,8 +63,10 @@ in-process server tests `shutdown_after` + a join guard, (b) move
 the streaming family to subprocess servers, (c) make `run()`
 cancellable via a shutdown handle and drop leaked runtimes.
 
-Quarantine: `#[ignore]` on `h2crate_client_h2c_large_body` (in-suite
-only). The standalone streaming family remains the release gate.
+Quarantine: LIFTED for `h2crate_client_h2c_large_body` and
+`large_body_streams_native_engine` (and `engine_h2_client_to_h2_upstream`)
+via the subprocess fix above. The standalone streaming family remains
+a fast additional gate.
 
 Legacy note (superseded context): running the full streaming family
 sequentially on a box with concurrent sibling cargo/coverage runs

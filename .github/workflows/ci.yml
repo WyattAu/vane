@@ -120,16 +120,13 @@ jobs:
         run: |
           cargo llvm-cov --workspace --features vane-plugins/wasm,acme-pebble --lcov \
             --output-path /dev/null --fail-under-lines 90 -- \
-            --include-ignored --test-threads=2 --skip hot_upgrade --skip large_body_streams_through_edge \
-            --skip h2c_native_engine_large_body --skip tls_h2upstream_large_body \
-            --skip h2crate_client_h2c_large_body
-        # The last three skips cover the renamed >window streaming-stall
-        # quarantine (formerly the large_body_streams_through_edge
-        # family). They are also #[ignore]d (harmless here); listing
-        # them keeps this --include-ignored run honest if the feature
-        # set ever compiles the h2 suites in, and documents the
-        # quarantine for the shared Tier-A coverage job, which runs
-        # `--all-features` without a skip passthrough.
+            --include-ignored --test-threads=2 --skip hot_upgrade --skip large_body_streams_through_edge
+        # The streaming-family tests run as subprocess servers now
+        # (2026-09-19) — the suite-sequence wedge is fixed, no skips
+        # needed beyond the retired REUSEPORT-edge probe (kept: it is
+        # #[ignore]d and --include-ignored would otherwise run it).
+        # The shared Tier-A coverage job runs `--all-features` without
+        # a skip passthrough.
 
   helm:
     name: helm lint + template

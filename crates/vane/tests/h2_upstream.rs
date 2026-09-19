@@ -413,6 +413,32 @@ async fn post_body_roundtrip() {
     assert_eq!(buf, b"post-body-123");
 }
 
+/// Spawns the proxy as a subprocess: full isolation from the test's
+/// in-process runtime. Leaked in-process servers (tokio runtime +
+/// mio workers + health-checker threads) were the suite-sequence
+/// wedge — see docs/h2-streaming-flake.md. The child is killed and
+/// reaped on drop.
+struct SubprocessServer {
+    child: std::process::Child,
+}
+
+impl Drop for SubprocessServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_server_subprocess(cfg_path: &std::path::Path) -> SubprocessServer {
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_vane"))
+        .args(["run", "-c", cfg_path.to_str().expect("utf8")])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn vane subprocess");
+    SubprocessServer { child }
+}
+
 /// Cross-process serial lock shared with the proxy-spawning suites.
 pub fn lock_serial() -> std::fs::File {
     use std::os::unix::io::AsRawFd as _;
@@ -523,22 +549,12 @@ workers = 1
     )
     .expect("write");
 
-    let cfg = cfg_path.to_str().expect("utf8").to_owned();
     // Keep the tempdir alive for the server lifetime.
     let _dir_guard = dir;
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let _ = rt.block_on(vane::server::run(vane::server::RunOptions {
-            config_path: Some(cfg),
-            handover_from: None,
-            handover_to: None,
-            shutdown_after: None,
-            force_mio: true,
-        }));
-    });
+    // Subprocess isolation: leaked in-process servers (runtime + mio
+    // workers + health-checker threads) were the suite-sequence
+    // wedge — see docs/h2-streaming-flake.md.
+    let _server = spawn_server_subprocess(&cfg_path);
 
     // Wait for the TLS port. The probe connection may land on an engine
     // worker (REUSEPORT) — that is fine; it just proves the port is up.
@@ -975,8 +991,9 @@ async fn large_body_streams_through_edge() {
 /// starve, leaked prior-test server threads' watchers keep firing
 /// minutes later (observed: tls_reload WARNs 24 min after their test
 /// ended). Reproduces independently of the upstream backpressure fix.
+/// Quarantine LIFTED (2026-09-19): subprocess isolation for the
+/// proxy; green 3× in-suite.
 #[tokio::test]
-#[ignore = "suite-context wedge: in-suite only (quiet box); passes standalone — CI gates on the standalone run"]
 async fn large_body_streams_native_engine() {
     let _serial = lock_serial();
     // Echo upstream: 200 + request body verbatim.
@@ -1070,31 +1087,12 @@ workers = 1
         ),
     )
     .expect("write cfg");
-    let cfg = cfg_path.to_str().expect("utf8").to_owned();
     let _dir_guard = dir;
-    std::thread::spawn(move || {
-        let rt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("runtime")
-                .block_on(vane::server::run(vane::server::RunOptions {
-                    config_path: Some(cfg),
-                    handover_from: None,
-                    handover_to: None,
-                    shutdown_after: None,
-                    force_mio: true,
-                }))
-        }));
-        if let Err(p) = rt {
-            let msg = p
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| p.downcast_ref::<&str>().map(|m| m.to_string()))
-                .unwrap_or_else(|| "(non-string panic)".into());
-            eprintln!("SERV Panic: {msg}");
-        }
-    });
+    // Subprocess isolation: leaked in-process servers (runtime + mio
+    // workers + health-checker threads) were the suite-sequence
+    // wedge — see docs/h2-streaming-flake.md.
+    let cfg = cfg_path.to_str().expect("utf8").to_owned();
+    let _server = spawn_server_subprocess(std::path::Path::new(&cfg));
     let edge: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     for _ in 0..60 {
         if std::net::TcpStream::connect(edge).is_ok() {
@@ -1259,21 +1257,12 @@ workers = 1
         ),
     )
     .expect("write cfg");
-    let cfg = cfg_path.to_str().expect("utf8").to_owned();
     let _dir_guard = dir;
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let _ = rt.block_on(vane::server::run(vane::server::RunOptions {
-            config_path: Some(cfg),
-            handover_from: None,
-            handover_to: None,
-            shutdown_after: None,
-            force_mio: true,
-        }));
-    });
+    // Subprocess isolation: leaked in-process servers (runtime + mio
+    // workers + health-checker threads) were the suite-sequence
+    // wedge — see docs/h2-streaming-flake.md.
+    let cfg = cfg_path.to_str().expect("utf8").to_owned();
+    let _server = spawn_server_subprocess(std::path::Path::new(&cfg));
     let edge: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     for _ in 0..60 {
         if std::net::TcpStream::connect(edge).is_ok() {
@@ -1422,19 +1411,10 @@ workers = 1
     };
     // keep the tempdir alive for the server lifetime
     let _dir_guard = _dir;
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let _ = rt.block_on(vane::server::run(vane::server::RunOptions {
-            config_path: Some(cfg),
-            handover_from: None,
-            handover_to: None,
-            shutdown_after: None,
-            force_mio: true,
-        }));
-    });
+    // Subprocess isolation: leaked in-process servers (runtime + mio
+    // workers + health-checker threads) were the suite-sequence
+    // wedge — see docs/h2-streaming-flake.md.
+    let _server = spawn_server_subprocess(std::path::Path::new(&cfg));
     let edge: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     for _ in 0..60 {
         if std::net::TcpStream::connect(edge).is_ok() {
@@ -1600,21 +1580,12 @@ workers = 1
         ),
     )
     .expect("write cfg");
-    let cfg = cfg_path.to_str().expect("utf8").to_owned();
     let _dir_guard = dir;
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let _ = rt.block_on(vane::server::run(vane::server::RunOptions {
-            config_path: Some(cfg),
-            handover_from: None,
-            handover_to: None,
-            shutdown_after: None,
-            force_mio: true,
-        }));
-    });
+    // Subprocess isolation: leaked in-process servers (runtime + mio
+    // workers + health-checker threads) were the suite-sequence
+    // wedge — see docs/h2-streaming-flake.md.
+    let cfg = cfg_path.to_str().expect("utf8").to_owned();
+    let _server = spawn_server_subprocess(std::path::Path::new(&cfg));
     let edge: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     for _ in 0..60 {
         if std::net::TcpStream::connect(edge).is_ok() {
@@ -1787,19 +1758,10 @@ workers = 1
         .expect("utf8")
         .to_owned();
     let _dir_guard = dir;
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let _ = rt.block_on(vane::server::run(vane::server::RunOptions {
-            config_path: Some(cfg),
-            handover_from: None,
-            handover_to: None,
-            shutdown_after: None,
-            force_mio: true,
-        }));
-    });
+    // Subprocess isolation: leaked in-process servers (runtime + mio
+    // workers + health-checker threads) were the suite-sequence
+    // wedge — see docs/h2-streaming-flake.md.
+    let _server = spawn_server_subprocess(std::path::Path::new(&cfg));
     let edge: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     for _ in 0..60 {
         if std::net::TcpStream::connect(edge).is_ok() {
@@ -1883,8 +1845,10 @@ workers = 1
 /// while the h2 crate client waits for capacity; leaked in-process
 /// server threads (shutdown_after=None keeps every prior test's
 /// server + health checker alive) remain the prime suspect.
+/// Quarantine LIFTED (2026-09-19): the streaming family now runs the
+/// proxy as a subprocess (full isolation from leaked in-process
+/// servers); green 3× in-suite.
 #[tokio::test]
-#[ignore = "suite-context wedge: in-suite only (quiet box, after any prior test); passes standalone — CI gates on the standalone run"]
 async fn h2crate_client_h2c_large_body() {
     let _serial = lock_serial();
     // Same echo upstream as h2c_native_engine_large_body.
@@ -1965,21 +1929,12 @@ workers = 1
         ),
     )
     .expect("write cfg");
-    let cfg = cfg_path.to_str().expect("utf8").to_owned();
     let _dir_guard = dir;
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let _ = rt.block_on(vane::server::run(vane::server::RunOptions {
-            config_path: Some(cfg),
-            handover_from: None,
-            handover_to: None,
-            shutdown_after: None,
-            force_mio: true,
-        }));
-    });
+    // Subprocess isolation: leaked in-process servers (runtime + mio
+    // workers + health-checker threads) were the suite-sequence
+    // wedge — see docs/h2-streaming-flake.md.
+    let cfg = cfg_path.to_str().expect("utf8").to_owned();
+    let _server = spawn_server_subprocess(std::path::Path::new(&cfg));
     let edge: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     for _ in 0..60 {
         if std::net::TcpStream::connect(edge).is_ok() {
@@ -2171,19 +2126,10 @@ workers = 1
         (dir, p)
     };
     let _dir_guard = _dir;
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let _ = rt.block_on(vane::server::run(vane::server::RunOptions {
-            config_path: Some(cfg),
-            handover_from: None,
-            handover_to: None,
-            shutdown_after: None,
-            force_mio: true,
-        }));
-    });
+    // Subprocess isolation: leaked in-process servers (runtime + mio
+    // workers + health-checker threads) were the suite-sequence
+    // wedge — see docs/h2-streaming-flake.md.
+    let _server = spawn_server_subprocess(std::path::Path::new(&cfg));
     let edge: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     for _ in 0..60 {
         if std::net::TcpStream::connect(edge).is_ok() {

@@ -1,6 +1,7 @@
 //! Runtime wiring: bind, spawn workers, start the control plane, admin
 //! server, and graceful shutdown.
 
+#[cfg(feature = "h3")]
 use std::net::SocketAddr;
 use std::net::TcpListener as StdTcpListener;
 use std::path::PathBuf;
