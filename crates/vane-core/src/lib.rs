@@ -21,6 +21,24 @@
 //! kernel on io_uring), and cross-thread signaling is lock-free.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+/// Forensic trace print. Compiles to NOTHING unless the `vane_dbg`
+/// feature is enabled — every call is a stderr write(2) syscall, and
+/// on the request hot path (read completions, read-arm skips, dials)
+/// that cost dominated the benchmark profile until it was gated.
+#[cfg(feature = "vane_dbg")]
+#[macro_export]
+macro_rules! dbg_trace {
+    ($($arg:tt)*) => { eprintln!($($arg)*) };
+}
+
+/// Forensic trace print (no-op build).
+#[cfg(not(feature = "vane_dbg"))]
+#[macro_export]
+macro_rules! dbg_trace {
+    ($($arg:tt)*) => {};
+}
+
 pub mod buffer;
 pub mod engine;
 pub mod h2;

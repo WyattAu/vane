@@ -142,11 +142,19 @@ pub fn head_header<'a>(head: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
             continue;
         }
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let lower = line.to_ascii_lowercase();
-        let Some(colon) = lower.iter().position(|b| *b == b':') else {
+        let Some(colon) = line.iter().position(|b| *b == b':') else {
             continue;
         };
-        if trim_ascii(&lower[..colon]) == name {
+        // Case-insensitive name compare in place — the previous
+        // `to_ascii_lowercase` copy allocated per header line and
+        // showed at ~4% of proxy throughput.
+        let name_part = trim_ascii(&line[..colon]);
+        if name_part.len() == name.len()
+            && name_part
+                .iter()
+                .zip(name.iter())
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+        {
             return Some(trim_ascii(&line[colon + 1..]));
         }
     }

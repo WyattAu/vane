@@ -119,7 +119,7 @@ impl MioEngine {
         // worker does not touch it until the CQE lands.
         let res = unsafe { libc::read(fd, ptr.cast(), self.buf_size) };
         if res >= 0 {
-            eprintln!(
+            crate::dbg_trace!(
                 "RDNOW fd={fd} n={res}{}",
                 if res == 0 { " (EOF?)" } else { "" }
             );
@@ -131,7 +131,7 @@ impl MioEngine {
         } else {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::WouldBlock {
-                eprintln!("RDPARK fd={fd}");
+                crate::dbg_trace!("RDPARK fd={fd}");
                 self.push(
                     fd,
                     Pending::Read {

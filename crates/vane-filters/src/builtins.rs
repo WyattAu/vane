@@ -53,14 +53,48 @@ impl Filter for RateLimit {
     }
 
     fn run(&self, ctx: &mut RequestCtx<'_>) -> Outcome {
-        let key = ctx.client.ip().to_string();
-        let result = self.limiter.check_sync(&key);
+        // Stack-format the client IP: a heap String per request showed
+        // up in the flame profile (malloc/free ≈ 8% under `ab`).
+        let mut buf = [0u8; 46]; // max IPv6 text length
+        let mut w = StackStr::new(&mut buf);
+        core::fmt::write(&mut w, format_args!("{}", ctx.client.ip())).ok();
+        let key = w.as_str();
+        let result = self.limiter.check_sync(key);
         if result.allowed {
             Outcome::Continue
         } else {
             self.rejected.inc(&self.registry);
             Outcome::Reject(429, "rate limited")
         }
+    }
+}
+
+/// A `core::fmt::Write` adapter over a stack byte buffer: formats
+/// without touching the heap.
+struct StackStr<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+}
+
+impl<'a> StackStr<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, len: 0 }
+    }
+
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
+
+impl core::fmt::Write for StackStr<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let rest = &mut self.buf[self.len..];
+        if s.len() > rest.len() {
+            return Err(core::fmt::Error);
+        }
+        rest[..s.len()].copy_from_slice(s.as_bytes());
+        self.len += s.len();
+        Ok(())
     }
 }
 
@@ -93,6 +127,17 @@ impl BreakerGate {
 
     /// Gets or creates the breaker for a cluster.
     pub fn cluster_breaker(&self, cluster: &str) -> std::sync::Arc<CircuitBreaker> {
+        // Double-checked read: the request path calls this several
+        // times per request, and `entry` would allocate a key String
+        // even on every hit.
+        if let Some(b) = self
+            .breakers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(cluster)
+        {
+            return std::sync::Arc::clone(b);
+        }
         let mut map = self.breakers.lock().unwrap_or_else(|e| e.into_inner());
         map.entry(cluster.to_owned())
             .or_insert_with(|| {

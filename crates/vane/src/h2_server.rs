@@ -165,7 +165,7 @@ impl H2Server {
     /// Feeds decrypted h2 bytes; emits driver events. Callers must
     /// flush [`Self::pending_writes`] and honor [`Self::failed`].
     pub fn handle_read(&mut self, data: &[u8], events: &mut Vec<H2Event>) {
-        eprintln!("SHIMDBG intake {}", data.len());
+        vane_core::dbg_trace!("SHIMDBG intake {}", data.len());
         self.backlog.extend_from_slice(data);
         loop {
             let mut engine_events = Vec::new();
@@ -249,7 +249,7 @@ impl H2Server {
                 if self.req_chunked {
                     // CL-less body: re-frame as h1 chunks; the terminal
                     // chunk closes the upstream's chunked framing.
-                    eprintln!(
+                    vane_core::dbg_trace!(
                         "SHIMDBG chunk-relay {} bytes eom={}",
                         data.len(),
                         end_stream
@@ -466,7 +466,7 @@ impl H2Server {
         }
         // EOF-delimited body: the upstream EOF IS the end.
         let stream_id = self.active_stream.unwrap_or(0);
-        eprintln!("EMITDBG eof-end sid={stream_id}");
+        vane_core::dbg_trace!("EMITDBG eof-end sid={stream_id}");
         let mut out = Vec::new();
         if !t.done {
             // Empty DATA with END_STREAM.
@@ -499,7 +499,7 @@ impl H2Server {
             let room = max_frame;
             // Debit the engine's windows for driver-emitted frames.
             let take = self.conn.consume_send_budget(stream_id, room.min(want));
-            eprintln!(
+            vane_core::dbg_trace!(
                 "QBBDBG take={take} conn={} stream={}",
                 self.conn.conn_send_window_probe(),
                 self.conn.stream_send_window_probe(stream_id)

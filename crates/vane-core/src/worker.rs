@@ -306,7 +306,7 @@ impl WorkerState {
                 let Some(s) = self.slab.get_mut(slot) else {
                     return false;
                 };
-                eprintln!("DIAL fd={fd} slot={slot}");
+                crate::dbg_trace!("DIAL fd={fd} slot={slot}");
                 s.upstream = Some(StreamFd(fd));
                 if poll == crate::engine::Poll::Done(0) {
                     self.do_upstream_connected(slot, generation);
@@ -333,7 +333,7 @@ impl WorkerState {
                 let Some(s) = self.slab.get_mut(slot) else {
                     return false;
                 };
-                eprintln!("DIAL fd={fd} slot={slot}");
+                crate::dbg_trace!("DIAL fd={fd} slot={slot}");
                 s.upstream = Some(StreamFd(fd));
                 if poll == crate::engine::Poll::Done(0) {
                     self.do_upstream_connected(slot, generation);
@@ -542,7 +542,7 @@ impl WorkerState {
         let Some(s) = self.slab.get_mut(slot) else {
             return false;
         };
-        eprintln!("DIAL fd={fd} slot={slot}");
+        crate::dbg_trace!("DIAL fd={fd} slot={slot}");
         s.upstream = Some(StreamFd(fd));
         if s.urslot.is_none() {
             if let Some(uslot) = self.pool.take() {
@@ -623,15 +623,16 @@ impl WorkerState {
             return;
         };
         if s.read_inflight || s.splice {
-            eprintln!(
+            crate::dbg_trace!(
                 "ARMDbg skip slot={slot} inflight={} splice={}",
-                s.read_inflight, s.splice
+                s.read_inflight,
+                s.splice
             );
             return;
         }
         if s.rslot.is_none() {
             let Some(rs) = self.pool.take() else {
-                eprintln!("ARMDbg pool-exhausted slot={slot}");
+                crate::dbg_trace!("ARMDbg pool-exhausted slot={slot}");
                 return;
             }; // backpressure
             s.rslot = Some(rs);
@@ -1175,7 +1176,7 @@ impl WorkerState {
     }
 
     fn accept_connection(&mut self, fd: i32, peer: SocketAddr, h: &mut dyn Handler) {
-        eprintln!("ACCEPT fd={fd} peer={peer}");
+        crate::dbg_trace!("ACCEPT fd={fd} peer={peer}");
         let _ = set_nodelay(fd);
         self.ctx.connections.inc(&self.ctx.registry);
         if self.draining || self.slab.live().len() >= self.ctx.config.max_sessions {

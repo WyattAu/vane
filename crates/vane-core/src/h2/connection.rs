@@ -359,7 +359,7 @@ impl Connection {
         if let Some(st) = self.streams.get_mut(&stream_id) {
             st.send_window += i64::from(n);
         } else {
-            eprintln!("GRANTDBG grant({n}) dropped: stream {stream_id} missing");
+            crate::dbg_trace!("GRANTDBG grant({n}) dropped: stream {stream_id} missing");
         }
     }
 

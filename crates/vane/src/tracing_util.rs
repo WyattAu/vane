@@ -29,6 +29,25 @@ pub fn serve_span(
     span
 }
 
+/// Whether per-request spans are worth creating: true only when trace
+/// export is configured (`[telemetry] otlp_endpoint`). Without export,
+/// the fmt subscriber formats each span's fields (ANSI color writes)
+/// and then discards them — measured at ~4% of proxy throughput under
+/// `ab`, so the request path skips span creation entirely.
+static REQUEST_SPANS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Records whether trace export is configured. Called once at startup
+/// from [`crate::server::init_telemetry`].
+pub fn set_request_spans(enabled: bool) {
+    REQUEST_SPANS.store(enabled, std::sync::atomic::Ordering::Release);
+}
+
+/// Hot-path check: should this request build a tracing span?
+#[must_use]
+pub fn request_spans_enabled() -> bool {
+    REQUEST_SPANS.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Deterministic sampling: keep the trace iff the first 4 id bytes as a
 /// fraction fall under `rate`. `rate >= 1.0` keeps everything.
 #[must_use]

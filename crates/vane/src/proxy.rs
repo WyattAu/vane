@@ -79,6 +79,39 @@ pub struct ProxyConfig {
     pub mesh: Arc<HashMap<String, vane_control::config::MeshUpstreamConfig>>,
 }
 
+/// Worker-side per-slot connection state. Slots are dense worker
+/// indices, so a Vec of Options beats a hashed map on the hot path —
+/// every request does dozens of `conns` lookups and SipHash on a u32
+/// measured ~6% of proxy throughput.
+#[derive(Default)]
+struct ConnMap(Vec<Option<Conn>>);
+
+impl ConnMap {
+    fn get(&self, slot: &u32) -> Option<&Conn> {
+        self.0.get(*slot as usize).and_then(Option::as_ref)
+    }
+
+    fn get_mut(&mut self, slot: &u32) -> Option<&mut Conn> {
+        self.0.get_mut(*slot as usize).and_then(Option::as_mut)
+    }
+
+    fn entry_or_default(&mut self, slot: u32) -> &mut Conn {
+        let idx = slot as usize;
+        if self.0.len() <= idx {
+            self.0.resize_with(idx + 1, Default::default);
+        }
+        self.0[idx].get_or_insert_with(Conn::default)
+    }
+
+    fn insert(&mut self, slot: u32, conn: Conn) {
+        let idx = slot as usize;
+        if self.0.len() <= idx {
+            self.0.resize_with(idx + 1, Default::default);
+        }
+        self.0[idx] = Some(conn);
+    }
+}
+
 /// Per-connection state.
 #[derive(Default)]
 struct Conn {
@@ -194,7 +227,7 @@ pub struct HttpProxy {
         vane_filters::pipeline::Chain<vane_filters::RateLimit, vane_filters::pipeline::Nil>,
     >,
     breaker: Arc<BreakerGate>,
-    conns: HashMap<u32, Conn>,
+    conns: ConnMap,
     /// Per-worker date cache (one refresh/second, zero alloc otherwise).
     date: vane_proto::date::DateCache,
     /// Idle upstream connection pool (per backend, worker-local).
@@ -317,7 +350,7 @@ impl HttpProxy {
             config,
             pipeline,
             breaker,
-            conns: HashMap::new(),
+            conns: ConnMap::default(),
             date: vane_proto::date::DateCache::new(),
             pool: HashMap::new(),
             cluster_metrics: HashMap::new(),
@@ -788,18 +821,22 @@ impl HttpProxy {
                 }
                 #[cfg(not(feature = "h2"))]
                 let _ = is_h2;
-                let head = data[..head_len].to_vec();
-                // Gzip relay: compressible type, not already encoded,
-                // and a body actually follows.
-                let ct = vane_proto::compression::head_header(&head, b"content-type");
-                let compressible = vane_proto::compression::is_compressible(ct)
-                    && !vane_proto::compression::head_already_encoded(&head)
-                    && !matches!(framing, BodyFraming::Done);
-                let use_gzip =
-                    self.conns.get(&slot).is_some_and(|c| c.gzip.is_some()) && compressible;
+                // Gzip relay: only worth parsing the head when this
+                // route actually compresses — the scan is pure
+                // overhead otherwise (head_header alone measured ~4%
+                // of throughput under `ab`).
+                let gzip_on = self.conns.get(&slot).is_some_and(|c| c.gzip.is_some());
+                let use_gzip = gzip_on && {
+                    let head = &data[..head_len];
+                    let ct = vane_proto::compression::head_header(head, b"content-type");
+                    vane_proto::compression::is_compressible(ct)
+                        && !vane_proto::compression::head_already_encoded(head)
+                        && !matches!(framing, BodyFraming::Done)
+                };
                 if use_gzip {
                     // Rewrite the head: CL out, gzip + chunked in. The
                     // body relay then compresses through GzipRelay.
+                    let head = data[..head_len].to_vec();
                     if let Some(rewritten) = vane_proto::compression::rewrite_head_for_gzip(&head) {
                         self.write_downstream(io, &rewritten);
                     } else {
@@ -810,7 +847,7 @@ impl HttpProxy {
                     if let Some(c) = self.conns.get_mut(&slot) {
                         c.gzip = None;
                     }
-                    self.write_downstream(io, &head);
+                    self.write_downstream(io, &data[..head_len]);
                 }
                 if self.conns.get(&slot).is_some_and(|c| c.tunnel) {
                     // 101 switch: the transaction is complete at upgrade;
@@ -1136,7 +1173,7 @@ impl HttpProxy {
                         }
                     }
                     ReqFraming::Chunked { seen_zero } => {
-                        eprintln!(
+                        vane_core::dbg_trace!(
                             "CHDBG h1-chunked relay {}B seen_zero={}",
                             data.len(),
                             seen_zero
@@ -1203,7 +1240,7 @@ impl HttpProxy {
     }
 
     fn conn(&mut self, slot: u32) -> &mut Conn {
-        self.conns.entry(slot).or_default()
+        self.conns.entry_or_default(slot)
     }
 
     /// Lazily registers and returns a cluster's metric handles. First sight
@@ -1407,7 +1444,7 @@ impl HttpProxy {
 const REQ_PENDING_CAP: usize = 1024 * 1024;
 
 /// Sets the request-body framing from the parsed view.
-fn conn_set_framing(conns: &mut HashMap<u32, Conn>, slot: u32, view: &RequestView<'_>) {
+fn conn_set_framing(conns: &mut ConnMap, slot: u32, view: &RequestView<'_>) {
     if let Some(c) = conns.get_mut(&slot) {
         c.req_framing = if view.is_chunked() {
             ReqFraming::Chunked { seen_zero: false }
@@ -2052,17 +2089,21 @@ impl HttpProxy {
 
         // Request span (after the error exits so 404/405 stay spanless
         // and cheap). Closed with status at response completion.
-        if let Some(conn) = self.conns.get_mut(&slot) {
-            let tp = view
-                .header("traceparent")
-                .and_then(|h| std::str::from_utf8(h).ok());
-            conn.span = Some(crate::tracing_util::serve_span(
-                view.method,
-                view.path,
-                view.header("host")
-                    .and_then(|h| std::str::from_utf8(h).ok()),
-                tp,
-            ));
+        // Skipped entirely when trace export is not configured — the
+        // fmt subscriber would format (and discard) every span.
+        if crate::tracing_util::request_spans_enabled() {
+            if let Some(conn) = self.conns.get_mut(&slot) {
+                let tp = view
+                    .header("traceparent")
+                    .and_then(|h| std::str::from_utf8(h).ok());
+                conn.span = Some(crate::tracing_util::serve_span(
+                    view.method,
+                    view.path,
+                    view.header("host")
+                        .and_then(|h| std::str::from_utf8(h).ok()),
+                    tp,
+                ));
+            }
         }
 
         // Request-body framing (set BEFORE dialing so late client bytes

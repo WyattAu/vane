@@ -21,29 +21,48 @@ in proxy benchmarks. Both configurations are reported:
 
 | Scenario | vane (1 worker) | vane (4 workers) | nginx 2 workers, upstream keepalive 64 | nginx stock (no upstream keepalive) |
 |---|---|---|---|---|
-| keep-alive c=64 | 46–48k rps | 103k rps | 50–51k rps | 9–10k rps |
-| keep-alive c=256 | 33.7k rps | — | 47k rps | — |
+| keep-alive c=64 | **56–60k rps** | **125k rps** | 50–51k rps | 9–10k rps |
+| keep-alive c=256 | — | — | 47k rps | — |
 | short connections c=64 | 6.1k rps | — | 10.5k rps | — |
 | direct upstream (no proxy) | 65–72k rps | — | — | — |
 
-(46–48k / 103k measured on v0.2.0 with the native h2 engine, GCRA
-pass-through, and the M2 pipeline additions — ab, 8 s, keep-alive.
-The older 33–35k single-worker figure predates the native engine;
-4-worker scaling is superlinear on this host because the benchmark's
-Python upstream is the bottleneck for 1 worker.)
+(56–60k / 125k measured on v0.2.0 after the hyper-optimization pass —
+ab, 10 s, keep-alive. Earlier checkpoints on the same code base and
+host: 46–48k / 103k before the pass, and 25k single-worker when
+forensic stderr prints still fired per event.)
+
+### What the optimization pass changed (profiling-led)
+
+1. **Forensic `eprintln!`s gated behind the `vane_dbg` feature**
+   (`dbg_trace!`): `RDNOW`/`ARMDbg`/`DIAL`/`ACCEPT`/shim prints fired
+   per engine event — each a stderr `write(2)`. 25k → 49k rps.
+2. **Per-request tracing spans skipped unless trace export is
+   configured** (`[telemetry] otlp_endpoint`): the fmt subscriber
+   formats every span's fields (ANSI writes) then discards them.
+   ~49k → ~53k rps.
+3. **`conns: HashMap<u32, Conn>` → dense `Vec<Option<Conn>>`**
+   (`ConnMap`): dozens of per-request lookups, each a SipHash of a
+   small integer — the #1 profile symbol (6.6%). ~53k → ~56k rps.
+4. **Allocation-free hot-path scans**: `head_header` lowercased every
+   header line into a fresh `Vec` (in-place ASCII-case compare now);
+   the gzip head scan only runs when the route actually compresses;
+   the rate-limit key formats into a stack buffer; the breaker gate
+   double-checks its map before allocating a key String. ~56k → ~59k.
+
+Remaining profile (diminishing returns): allocator (~8% spread over
+per-request head construction), httparse, `clock_gettime` (deadlines +
+date cache). Next candidates: response-head construction pooling,
+`io_uring` multishot accept tuning, and short-connection accept cost.
 
 Honest reading:
 
-- **vane (4 workers) beats tuned nginx ~2×** — 103k vs 50–51k rps.
-  Single-worker vane (46–48k) sits at rough parity with tuned nginx
-  (50–51k): the per-request parse + route + filter pipeline now
-  amortizes well against nginx's C loop.
-- **vane beats stock nginx ~3.5×** — stock `proxy_pass` opens a fresh
-  upstream connection per request, which is the default most
-  deployments run.
-- Short connections are accept-bound; nginx's mature accept path wins.
-- The keep-alive proxy loop remains the main optimization target for
-  the hyper-optimization phase (planned after feature work).
+- **vane (1 worker) now beats tuned nginx ~15%** — 56–60k vs 50–51k,
+  and 4-worker vane reaches **125k (~2.4× tuned nginx)**.
+- Single-worker throughput is ~83% of the shared `ab` client ceiling
+  (65–72k); ratios across hosts remain more meaningful than absolute
+  numbers.
+- Short connections are accept-bound; nginx's mature accept path still
+  wins there.
 
 ## Reproduce
 

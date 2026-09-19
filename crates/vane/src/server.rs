@@ -242,6 +242,7 @@ pub fn init_telemetry(cfg: &vane_control::TelemetryConfig) -> Option<otelkit::Te
             merged.log_level = level;
         }
     }
+    let spans_enabled = merged.otlp_endpoint.is_some();
     let otel_cfg = otelkit::TelemetryConfig {
         service_name: merged.service_name,
         service_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -251,6 +252,9 @@ pub fn init_telemetry(cfg: &vane_control::TelemetryConfig) -> Option<otelkit::Te
         sentry_dsn: None,
         sample_rate: merged.sample_rate.clamp(0.0, 1.0),
     };
+    // Per-request tracing spans are only worth their fmt-layer cost
+    // when there is a trace exporter to receive them.
+    crate::tracing_util::set_request_spans(spans_enabled);
     match otelkit::init(otel_cfg) {
         Ok(guard) => Some(guard),
         Err(e) => {
