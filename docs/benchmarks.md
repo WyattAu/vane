@@ -49,10 +49,13 @@ forensic stderr prints still fired per event.)
    the rate-limit key formats into a stack buffer; the breaker gate
    double-checks its map before allocating a key String. ~56k → ~59k.
 
-Remaining profile (diminishing returns): allocator (~8% spread over
-per-request head construction), httparse, `clock_gettime` (deadlines +
-date cache). Next candidates: response-head construction pooling,
-`io_uring` multishot accept tuning, and short-connection accept cost.
+Remaining profile (round 2, post-optimization): flat — httparse
+parsing, core relay logic, the allocator spread, and timer reads
+each sit at 2–5% with no dominant hot spot; head-building
+allocations were pooled (recycled per-connection scratch) and
+throughput held at ~59.5k. Next candidates: response-head
+construction pooling on the response side, `io_uring` multishot
+accept tuning, and short-connection accept cost.
 
 Honest reading:
 
