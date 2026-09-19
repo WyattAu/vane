@@ -46,6 +46,8 @@ QuinnEndpoint (worker-owned)
    balancer + reqwest upstream clients, mirroring `h2_edge`);
    roundtrip e2e in `tests/h3_edge.rs` (quinn+h3 client → edge → h1
    upstream). h2spec-h3 parity remains open.
-3. Alt-Svc advertisement + h3→h1/h2 route parity tests — parity e2e
-   landed; Alt-Svc header injection pending.
+3. ✅ Alt-Svc advertisement: `tls.h3 = true` listeners inject
+   `alt-svc: h3=":port"; ma=86400` into h1 response heads
+   (`insert_header_once`, idempotent); route parity e2e asserts the
+   advertised endpoint serves h3. h2spec-h3 parity remains open.
 4. Client-side h3 (H3Upstream) for mesh east-west.

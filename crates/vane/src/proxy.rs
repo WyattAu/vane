@@ -70,6 +70,10 @@ pub struct ProxyConfig {
     pub shared_rate_limit: Option<std::sync::Arc<vane_shm::ratelimit::SharedGcra>>,
     /// Serve h2c (prior-knowledge HTTP/2) on this plain listener.
     pub h2c: bool,
+    /// RFC 7838 `Alt-Svc` header value injected into every response
+    /// head (e.g. `h3=":8443"; ma=86400` when the h3 edge shares the
+    /// TLS listener's port). `None` = no advertisement.
+    pub alt_svc: Option<String>,
     /// L4 splice mode (`mode = "tcp"` listeners): kernel zero-copy
     /// passthrough to the first matching route's cluster — no HTTP
     /// parsing on the data path.
@@ -847,7 +851,20 @@ impl HttpProxy {
                     if let Some(c) = self.conns.get_mut(&slot) {
                         c.gzip = None;
                     }
-                    self.write_downstream(io, &data[..head_len]);
+                    // RFC 7838: advertise the h3 endpoint when the h3
+                    // edge shares this listener's port. The body
+                    // portion after the head is relayed below as usual.
+                    let alt = self.config.alt_svc.clone();
+                    if let Some(alt) = alt.filter(|a| !a.is_empty()) {
+                        let mut head = data[..head_len].to_vec();
+                        if insert_header_once(&mut head, b"alt-svc", alt.as_bytes()) {
+                            self.write_downstream(io, &head);
+                        } else {
+                            self.write_downstream(io, &data[..head_len]);
+                        }
+                    } else {
+                        self.write_downstream(io, &data[..head_len]);
+                    }
                 }
                 if self.conns.get(&slot).is_some_and(|c| c.tunnel) {
                     // 101 switch: the transaction is complete at upgrade;
@@ -1442,6 +1459,24 @@ impl HttpProxy {
 /// Handler-side cap for body bytes arriving before the upstream
 /// connects. The window is one dial; anything beyond this is abusive.
 const REQ_PENDING_CAP: usize = 1024 * 1024;
+
+/// Inserts `name: value` into a response head before the final
+/// header-line terminator. Idempotent: no-op when `name` already
+/// exists. Returns whether the head was modified.
+fn insert_header_once(head: &mut Vec<u8>, name: &[u8], value: &[u8]) -> bool {
+    if vane_proto::compression::head_header(head, name).is_some() {
+        return false;
+    }
+    let Some(pos) = head.windows(2).rposition(|w| w == b"\r\n") else {
+        return false;
+    };
+    let mut line = name.to_vec();
+    line.extend_from_slice(b": ");
+    line.extend_from_slice(value);
+    line.extend_from_slice(b"\r\n");
+    head.splice(pos + 2..pos + 2, line);
+    true
+}
 
 /// Sets the request-body framing from the parsed view.
 fn conn_set_framing(conns: &mut ConnMap, slot: u32, view: &RequestView<'_>) {

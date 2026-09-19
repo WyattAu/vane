@@ -242,8 +242,9 @@ Requires building vane with the `h3` feature. When enabled, vane
 binds a UDP socket on the same port number as the TCP TLS listener
 and serves HTTP/3 (RFC 9114) over QUIC: the request shares the same
 route table, filter chain, and upstream clients as the TCP path.
-Status: experimental — settings/flow-control parity with h2 is not
-yet exhaustive.
+TCP responses advertise the endpoint via `alt-svc: h3=":port";
+ma=86400` (RFC 7838). Status: experimental — settings/flow-control
+parity with h2 is not yet exhaustive.
 
 ## `vane gateway-operator` — Gateway API dynamic config
 

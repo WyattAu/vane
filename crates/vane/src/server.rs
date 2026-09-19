@@ -644,6 +644,24 @@ pub async fn run(opts: RunOptions) -> i32 {
             });
             let jwt = jwt.flatten();
             tls_cfg_slots.push(tls_cfg.clone());
+            // RFC 7838 Alt-Svc: TLS listeners with h3 = true advertise
+            // the h3 endpoint on the same port (feature `h3`).
+            #[cfg(feature = "h3")]
+            let alt_svc = config
+                .listeners
+                .get(li)
+                .and_then(|l| l.tls.as_ref())
+                .is_some_and(|t| t.h3)
+                .then(|| {
+                    let port = config.listeners[li]
+                        .address
+                        .rsplit(':')
+                        .next()
+                        .unwrap_or("443");
+                    format!("h3=\":{port}\"; ma=86400")
+                });
+            #[cfg(not(feature = "h3"))]
+            let alt_svc: Option<String> = None;
             let factory = WorkerFactory {
                 mode,
                 router: Arc::clone(&router),
@@ -658,6 +676,7 @@ pub async fn run(opts: RunOptions) -> i32 {
                 jwt,
                 shared_rate_limit: shared_rate_limit.clone(),
                 h2c: config.listeners.get(li).is_some_and(|l| l.h2c),
+                alt_svc: alt_svc.clone(),
                 mesh: Arc::clone(&mesh_identities),
             };
             match spawn_worker(
@@ -921,6 +940,8 @@ struct WorkerFactory {
     mesh: Arc<HashMap<String, vane_control::config::MeshUpstreamConfig>>,
     /// Serve h2c on this plain listener (feature `h2`).
     h2c: bool,
+    /// RFC 7838 Alt-Svc value injected into responses (h3 listeners).
+    alt_svc: Option<String>,
 }
 
 impl vane_core::HandlerFactory for WorkerFactory {
@@ -937,6 +958,7 @@ impl vane_core::HandlerFactory for WorkerFactory {
                 rate_limit_rps: None,
                 shared_rate_limit: self.shared_rate_limit.clone(),
                 h2c: self.h2c,
+                alt_svc: self.alt_svc.clone(),
                 connect_timeout_ms: self.runtime.connect_timeout_ms,
                 idle_timeout_ms: self.runtime.idle_timeout_ms,
                 first_byte_timeout_ms: self.runtime.first_byte_timeout_ms,
