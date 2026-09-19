@@ -103,6 +103,7 @@ jsonwebtoken = "9"
 rsa = { version = "0.9", features = ["sha2"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
+pem-rfc7468 = { version = "0.7", features = ["std"] }
 # Pin ring: the tokio-rustls default pulls `rustls/aws_lc_rs`, which —
 # combined with our direct rustls `ring` pin — makes the process-level
 # CryptoProvider ambiguous (rustls refuses to auto-select, reqwest panics).

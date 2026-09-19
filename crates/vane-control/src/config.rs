@@ -154,6 +154,12 @@ pub struct MeshUpstreamConfig {
     /// (e.g. `spiffe://example.org/vane/`).
     #[serde(default)]
     pub spiffe_prefix: String,
+    /// SPIFFE Workload API Unix socket (docs/mesh-mtls-design.md,
+    /// milestone 3). When set, vane fetches the SVID from the agent at
+    /// startup and re-materializes `cert`/`key`/`ca` on every rotation
+    /// — the files are the local cache, not the source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub svid_socket: Option<String>,
 }
 
 /// Load balancing policy.

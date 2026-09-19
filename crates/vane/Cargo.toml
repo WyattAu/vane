@@ -68,6 +68,7 @@ h2 = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 reqwest = { workspace = true }
 rustls-pemfile = { workspace = true }
+pem-rfc7468 = { workspace = true }
 quinn = { workspace = true, optional = true }
 h3 = { workspace = true, optional = true }
 h3-quinn = { workspace = true, optional = true }

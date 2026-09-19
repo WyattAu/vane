@@ -138,7 +138,6 @@ impl AdsClient {
             // the peer cannot proceed without them.
             let acks = self.conn.take_pending_writes();
             if !acks.is_empty() {
-                eprintln!("ADSCFG flushing {} ack bytes", acks.len());
                 self.sock.write_all(&acks)?;
             }
         }

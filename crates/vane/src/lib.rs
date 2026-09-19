@@ -12,6 +12,7 @@ pub mod h2_edge;
 pub mod h2_server;
 #[cfg(feature = "h3")]
 pub mod h3_edge;
+pub mod workload;
 pub mod xds_client;
 
 pub mod proxy;

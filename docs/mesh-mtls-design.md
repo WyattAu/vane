@@ -47,9 +47,15 @@ on_connected:
 
 ## Milestones
 
-1. vane-tls: client-cert connector + SPIFFE SAN verification (unit
+1. ✅ vane-tls: client-cert connector + SPIFFE SAN verification (unit
    tested with in-test-generated CA/SVIDs, like the JWT RS256 tests).
-2. Cluster `upstream_tls` + SPIFFE config surface; e2e: two vanes, mTLS,
-   identity asserted in access logs.
-3. Workload API source (Unix socket watch) + rotation e2e.
+2. ✅ Cluster `upstream_tls` + SPIFFE config surface; e2e: two vanes, mTLS,
+   identity asserted in access logs. Verification failure (identity
+   mismatch, TLS error) answers 502 while the response is unsent —
+   TLS-or-nothing.
+3. ✅ Workload API source (Unix socket watch) + rotation e2e
+   (`workload_svid.rs`): `svid_socket` config; vane fetches the SVID
+   at startup and a watcher re-materializes the PEM cache on every
+   agent push; the per-dial file read picks rotations up with no
+   restarts.
 4. Authorization: per-route `allowed_spiffe_prefixes`.

@@ -17,6 +17,7 @@ use vane_observe::ring::EventRing;
 use vane_router::Router;
 
 use crate::proxy::HttpProxy;
+use crate::workload;
 
 /// Options for [`run`].
 pub struct RunOptions {
@@ -367,14 +368,57 @@ pub async fn run(opts: RunOptions) -> i32 {
             None
         };
 
-    // Mesh mTLS identities by cluster name.
-    let mesh_identities: Arc<HashMap<String, vane_control::config::MeshUpstreamConfig>> = Arc::new(
-        config
-            .clusters
-            .iter()
-            .filter_map(|(name, c)| c.mesh.clone().map(|m| (name.clone(), m)))
-            .collect(),
-    );
+    // Mesh mTLS identities by cluster name. Workload-API-sourced
+    // identities (svid_socket) materialize to their configured PEM
+    // paths first — the per-dial file read stays the single identity
+    // mechanism — and a watcher thread re-materializes on rotation.
+    let mesh_map: HashMap<String, vane_control::config::MeshUpstreamConfig> = config
+        .clusters
+        .iter()
+        .filter_map(|(name, c)| c.mesh.clone().map(|m| (name.clone(), m)))
+        .collect();
+    for (name, m) in &mesh_map {
+        let Some(socket) = &m.svid_socket else {
+            continue;
+        };
+        let (cert, key, ca) = (
+            std::path::Path::new(&m.cert),
+            std::path::Path::new(&m.key),
+            std::path::Path::new(&m.ca),
+        );
+        // Synchronous first fetch: mesh is TLS-or-nothing, so startup
+        // fails when the agent is unreachable.
+        let svid = match workload::fetch_first(
+            socket,
+            std::time::Instant::now() + Duration::from_secs(15),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("vane: mesh cluster `{name}`: {e}");
+                return 1;
+            }
+        };
+        if let Err(e) = workload::materialize(&svid, cert, key, ca) {
+            eprintln!("vane: mesh cluster `{name}`: {e}");
+            return 1;
+        }
+        tracing::info!(
+            "mesh: SVID {} materialized for cluster `{name}` (watching {socket})",
+            svid.spiffe_id
+        );
+        let (socket, name) = (socket.clone(), name.clone());
+        let (cert, key, ca) = (m.cert.clone(), m.key.clone(), m.ca.clone());
+        if std::thread::Builder::new()
+            .name(format!("svid-watch-{name}"))
+            .spawn(move || workload::watch(&socket, cert.as_ref(), key.as_ref(), ca.as_ref()))
+            .is_err()
+        {
+            eprintln!("vane: mesh cluster `{name}`: svid watcher spawn failed");
+            return 1;
+        }
+    }
+    let mesh_identities: Arc<HashMap<String, vane_control::config::MeshUpstreamConfig>> =
+        Arc::new(mesh_map);
 
     // Static routes + health probe paths.
     reconciler.publish_static(&config);

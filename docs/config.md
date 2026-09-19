@@ -230,3 +230,45 @@ Weighted refs become weighted backends. TLS listeners map to secret-
 mount convention paths (`/etc/vane/certs/{secret}`). v0.2 is
 poll-based (no watch API) and single-namespace; the Helm chart ships
 a `gatewayOperator.enabled=true` deployment + read-only RBAC.
+
+## cluster `mesh` — mTLS upstreams with SPIFFE identities
+
+```toml
+[clusters.mesh-up]
+backends = ["10.0.4.7:8080"]
+
+[clusters.mesh-up.mesh]
+cert = "/etc/vane/spiffe/cert.pem"     # client SVID chain
+key = "/etc/vane/spiffe/key.pem"       # client SVID key
+ca = "/etc/vane/spiffe/bundle.pem"     # mesh CA bundle
+server_name = "mesh.local"             # SNI for the upstream
+spiffe_prefix = "spiffe://example.org/vane/"
+```
+
+Upstream connections dial with mutual TLS (ALPN `vane-mesh`): the
+proxy presents its SVID, requires the backend's certificate to chain
+to `ca`, and enforces the backend's SPIFFE URI SAN against
+`spiffe_prefix` after the handshake. Verification failure (or any TLS
+error) answers **502** while the response is still unsent — mesh is
+TLS-or-nothing, never a plaintext fallback. Identities are re-read
+from disk per dial, so rotation is: replace the files (atomically),
+next dial presents the new SVID.
+
+### Workload API source (SPIRE)
+
+```toml
+[clusters.mesh-up.mesh]
+svid_socket = "/run/spire/agent-sockets/workload_api.spiffe.io"
+cert = "/var/lib/vane/svid/cert.pem"   # materialized by vane
+key = "/var/lib/vane/svid/key.pem"
+ca = "/var/lib/vane/svid/ca.pem"
+server_name = "mesh.local"
+spiffe_prefix = "spiffe://example.org/vane/"
+```
+
+With `svid_socket` set, the files become the local cache, not the
+source: at startup vane fetches the X.509 SVID from the agent
+(`FetchX509SVID` over the Unix socket) and writes `cert`/`key`/`ca`;
+a watcher re-materializes on every SVID push from the agent, so
+rotation happens with zero restarts. The first fetch is synchronous —
+startup fails when the agent is unreachable (mesh is TLS-or-nothing).
