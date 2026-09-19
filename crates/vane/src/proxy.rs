@@ -1747,7 +1747,10 @@ impl Handler for HttpProxy {
                 Ok(intake) => intake,
                 Err(e) => {
                     self.log(LogLevel::Warn, &format!("mesh upstream: {e}"));
-                    io.close();
+                    // Identity failure (or TLS error) after the request
+                    // was relayed: answer 502 while the response is still
+                    // unsent, otherwise just drop the session.
+                    self.upstream_failed(io);
                     return;
                 }
             };

@@ -7,14 +7,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-fn gen_mesh_materials(dir: &std::path::Path) -> MeshPaths {
+fn gen_mesh_materials(dir: &std::path::Path, upstream_spiffe: &str) -> MeshPaths {
     use rcgen::{CertificateParams, KeyPair, SanType};
     let ca_key = KeyPair::generate().expect("ca key");
     let mut ca_params = CertificateParams::new(vec!["mesh-ca".into()]).expect("params");
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     let ca = ca_params.self_signed(&ca_key).expect("ca");
 
-    let spiffe = "spiffe://example.org/vane/upstream";
+    let spiffe = upstream_spiffe;
     // Upstream server cert: DNS "mesh.local" + SPIFFE URI SAN.
     let mut srv_params = CertificateParams::new(vec!["mesh.local".into()]).expect("params");
     srv_params.subject_alt_names = vec![
@@ -177,17 +177,13 @@ fn lock_serial() -> std::fs::File {
     file
 }
 
-// IN PROGRESS: the mTLS handshake with the upstream completes (790B
-// flight processed, no intake errors) but the downstream closes before
-// the response relays. Trace: DIAL fd=62 → RDNOW 790 → RDNOW 24 →
-// client EOF. Next: probe the post-handshake intake branch (ciphertext
-// flush + plaintext dispatch) and the h1 head send ordering (the head
-// is rustls-buffered pre-handshake and drained with the Finished).
+/// The proxy presents its SVID, verifies the upstream's SPIFFE SAN
+/// against the configured prefix, and relays.
 #[test]
 fn mesh_mtls_upstream_roundtrip() {
     let _serial = lock_serial();
     let dir = tempfile::TempDir::new().expect("dir");
-    let m = gen_mesh_materials(dir.path());
+    let m = gen_mesh_materials(dir.path(), "spiffe://example.org/vane/upstream");
 
     let upstream = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let upstream_addr: SocketAddr = upstream.local_addr().expect("addr");
@@ -292,4 +288,110 @@ workers = 1
         }
     }
     assert!(saw_request, "upstream never saw the request");
+}
+
+/// Wrong SPIFFE prefix: the upstream chains to the mesh CA but its
+/// URI SAN does not match the proxy's configured prefix. The mTLS
+/// handshake completes; the proxy must refuse the connection at
+/// identity-verification time and answer 502 (the request was
+/// already relayed).
+#[test]
+fn mesh_mtls_spiffe_mismatch_502() {
+    let _serial = lock_serial();
+    let dir = tempfile::TempDir::new().expect("dir");
+    let m = gen_mesh_materials(dir.path(), "spiffe://example.org/attacker/upstream");
+
+    let upstream = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let upstream_addr: SocketAddr = upstream.local_addr().expect("addr");
+    // Kept alive so the upstream thread never hits a dead channel.
+    let _rx = spawn_mtls_upstream(
+        upstream,
+        m.srv_cert.clone(),
+        m.srv_key.clone(),
+        m.ca.clone(),
+    );
+
+    let proxy_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let proxy_addr: SocketAddr = proxy_listener.local_addr().expect("addr");
+    drop(proxy_listener);
+
+    let (dir2, cfg) = {
+        let d = tempfile::TempDir::new().expect("dir");
+        let path = d.path().join("vane.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+[[listeners]]
+address = "127.0.0.1:{proxy}"
+
+[clusters.mesh-up]
+backends = ["{upstream}"]
+
+[clusters.mesh-up.mesh]
+cert = "{cli_cert}"
+key = "{cli_key}"
+ca = "{ca}"
+server_name = "mesh.local"
+spiffe_prefix = "spiffe://example.org/vane/"
+
+[[routes]]
+pattern = "/*rest"
+cluster = "mesh-up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = true
+workers = 1
+"#,
+                proxy = proxy_addr.port(),
+                upstream = upstream_addr,
+                cli_cert = m.cli_cert,
+                cli_key = m.cli_key,
+                ca = m.ca,
+            ),
+        )
+        .expect("write");
+        let p = path.to_str().expect("utf8").to_owned();
+        (d, p)
+    };
+    let _cfg_guard = dir2;
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let _ = rt.block_on(vane::server::run(vane::server::RunOptions {
+            config_path: Some(cfg),
+            handover_from: None,
+            handover_to: None,
+            shutdown_after: None,
+            force_mio: true,
+        }));
+    });
+    for _ in 0..60 {
+        if std::net::TcpStream::connect(proxy_addr).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let mut sock = std::net::TcpStream::connect(proxy_addr).expect("connect");
+    sock.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    sock.write_all(b"GET /mesh/data HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n")
+        .expect("write");
+    let mut bytes = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut sock, &mut bytes);
+    let head = String::from_utf8_lossy(&bytes);
+    assert!(
+        head.contains("502"),
+        "expected 502 on SPIFFE mismatch, got: {head}"
+    );
+    // NOTE: whether the upstream observed the relayed request head is
+    // inherently racy here — the proxy rejects the identity as soon as
+    // the server flight completes and closes the upstream socket; the
+    // RST can discard still-unread request bytes. The 502 is the
+    // contract; the roundtrip test proves the relay path itself.
 }
