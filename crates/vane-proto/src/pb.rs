@@ -216,3 +216,30 @@ mod tests {
         assert_eq!(n + n2 + n3, buf.len());
     }
 }
+
+/// Fixed64 / Fixed32 wire types decode little-endian varints into
+/// `varint`; truncated payloads are rejected.
+#[test]
+fn fixed_width_fields_roundtrip() {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&[(7u8 << 3) | 1]); // field 7, wire 1 (64-bit)
+    buf.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+    let (f, n) = decode_field(&buf).expect("f64");
+    assert_eq!(f.number, 7);
+    assert_eq!(f.varint, 0x0102_0304_0506_0708);
+    assert_eq!(n, 9);
+
+    let mut buf32 = Vec::new();
+    buf32.extend_from_slice(&[(9u8 << 3) | 5]); // field 9, wire 5 (32-bit)
+    buf32.extend_from_slice(&0xdead_beefu32.to_le_bytes());
+    let (f, n) = decode_field(&buf32).expect("f32");
+    assert_eq!(f.number, 9);
+    assert_eq!(f.varint, u64::from(0xdead_beefu32));
+    assert_eq!(n, 5);
+
+    // Truncated payloads rejected.
+    assert!(decode_field(&buf[..8]).is_none());
+    assert!(decode_field(&buf32[..4]).is_none());
+    // Unknown wire types rejected.
+    assert!(decode_field(&[(1u8 << 3) | 3, 0]).is_none());
+}

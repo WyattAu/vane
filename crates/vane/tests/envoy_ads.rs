@@ -7,6 +7,7 @@
 
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener as StdListener, TcpStream};
+use std::sync::Arc;
 use std::time::Duration;
 
 use vane_control::envoy;
@@ -176,35 +177,50 @@ impl FakeAdsServer {
         }
     }
 
-    fn drive(&mut self, sock: &mut TcpStream, backlog: &mut Vec<u8>, buf: &mut [u8]) -> bool {
-        loop {
-            let pending = self.conn.take_pending_writes();
-            if !pending.is_empty() && sock.write_all(&pending).is_err() {
-                return false;
-            }
-            if self.conn.connection_error().is_some() {
-                return false;
-            }
-            match sock.read(buf) {
-                Ok(0) | Err(_) => return false,
-                Ok(n) => {
-                    backlog.extend_from_slice(&buf[..n]);
-                    loop {
-                        let mut events = Vec::new();
-                        let consumed = self.conn.handle_read(backlog, &mut events);
-                        if consumed == 0 {
-                            break;
-                        }
-                        backlog.drain(..consumed);
-                        for ev in events {
-                            self.react(ev);
-                        }
-                        let pending = self.conn.take_pending_writes();
-                        if !pending.is_empty() && sock.write_all(&pending).is_err() {
-                            return false;
-                        }
+    /// `true` once both canned responses have been ACKed (the
+    /// subcommand-loop test closes the plane here).
+    fn both_acked(&self) -> bool {
+        self.ack_nonces.contains_key(xds::type_url::CLUSTER)
+            && self.ack_nonces.contains_key(xds::type_url::ROUTE)
+    }
+
+    /// One read/flush cycle; `false` = connection over.
+    fn drive_once(&mut self, sock: &mut TcpStream, backlog: &mut Vec<u8>, buf: &mut [u8]) -> bool {
+        let pending = self.conn.take_pending_writes();
+        if !pending.is_empty() && sock.write_all(&pending).is_err() {
+            return false;
+        }
+        if self.conn.connection_error().is_some() {
+            return false;
+        }
+        match sock.read(buf) {
+            Ok(0) | Err(_) => false,
+            Ok(n) => {
+                backlog.extend_from_slice(&buf[..n]);
+                loop {
+                    let mut events = Vec::new();
+                    let consumed = self.conn.handle_read(backlog, &mut events);
+                    if consumed == 0 {
+                        break;
+                    }
+                    backlog.drain(..consumed);
+                    for ev in events {
+                        self.react(ev);
+                    }
+                    let pending = self.conn.take_pending_writes();
+                    if !pending.is_empty() && sock.write_all(&pending).is_err() {
+                        return false;
                     }
                 }
+                true
+            }
+        }
+    }
+
+    fn drive(&mut self, sock: &mut TcpStream, backlog: &mut Vec<u8>, buf: &mut [u8]) -> bool {
+        loop {
+            if !self.drive_once(sock, backlog, buf) {
+                return false;
             }
         }
     }
@@ -526,4 +542,84 @@ workers = 1
         Some(ROUTE_NONCE),
         "RDS ACK nonce"
     );
+}
+
+/// Drives the REAL `vane xds-client` loop (`xds_client_loop`) against
+/// the fake plane: subscribe → decode Envoy resources → ACK → map →
+/// POST to the admin sink → management closes the stream → the loop
+/// exits with the transport-failure code.
+#[test]
+fn xds_client_subcommand_loop_publishes_snapshot() {
+    let shop_up = spawn_upstream("shop-from-xds");
+
+    let cluster_proto = encode_envoy_cluster("shop", "127.0.0.1", shop_up.port());
+    let cluster_any = encode_any(xds::type_url::CLUSTER, &cluster_proto);
+    let route_proto = encode_envoy_route_config("shop.example.com", "/api", "shop");
+    let route_any = encode_any(xds::type_url::ROUTE, &route_proto);
+
+    let mgmt_listener = StdListener::bind("127.0.0.1:0").expect("bind");
+    let mgmt: SocketAddr = mgmt_listener.local_addr().expect("addr");
+    let server = std::thread::spawn(move || {
+        let mut server = FakeAdsServer::new(cluster_any, route_any);
+        let (mut sock, _) = mgmt_listener.accept().expect("accept");
+        let mut backlog = Vec::new();
+        let mut buf = [0u8; 16 * 1024];
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            if server.both_acked() {
+                // Both generations accepted: close the stream — the
+                // subcommand loop treats this as transport failure and
+                // exits (code 1).
+                break;
+            }
+            if !server.drive_once(&mut sock, &mut backlog, &mut buf) {
+                break;
+            }
+        }
+        // Dropping `sock` closes the stream.
+    });
+
+    // Admin sink: accepts the snapshot POST and answers 200.
+    let sink_listener = StdListener::bind("127.0.0.1:0").expect("bind");
+    let sink: SocketAddr = sink_listener.local_addr().expect("addr");
+    let sink_body = Arc::new(std::sync::Mutex::new(String::new()));
+    let body_for_assert = std::sync::Arc::clone(&sink_body);
+    let body_for_test = std::sync::Arc::clone(&sink_body);
+    std::thread::spawn(move || {
+        for stream in sink_listener.incoming().flatten() {
+            let mut s = stream;
+            let mut req = Vec::new();
+            let _ = s.read_to_end(&mut req);
+            let text = String::from_utf8_lossy(&req).into_owned();
+            *body_for_assert.lock().expect("sink") = text.clone();
+            let _ =
+                s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    });
+
+    let code = vane::xds_client::xds_client_loop(
+        &format!("127.0.0.1:{}", mgmt.port()),
+        "vane-envoy-e2e",
+        &format!("http://127.0.0.1:{}", sink.port()),
+    );
+    // The management plane closed the stream after both ACKs: the
+    // subcommand reports the transport failure.
+    assert_eq!(code, 1, "loop exit code after mgmt close");
+
+    let body = body_for_test.lock().expect("sink").clone();
+    assert!(
+        body.contains("POST /xds/snapshot"),
+        "sink saw the POST: {body}"
+    );
+    assert!(
+        body.contains("\"shop\""),
+        "snapshot carries the cluster: {body}"
+    );
+    assert!(
+        body.contains("/api/*rest"),
+        "snapshot carries the envoy prefix route: {body}"
+    );
+
+    server.join().expect("server thread");
 }
