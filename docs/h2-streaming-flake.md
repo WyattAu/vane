@@ -18,10 +18,45 @@ kills stuck streams. `h2crate_client_h2c_large_body` passes 5/5
 including under load. `large_body_streams_through_edge` remains
 retired (REUSEPORT edge removed by design).
 
-Suite-sequence note: running the full streaming family sequentially
-on a box with concurrent sibling cargo/coverage runs can still wedge
-tests through CPU/lock contention — standalone runs are the reliable
-gate.
+## Suite-sequence wedge — RE-QUARANTINED (2026-09-19), root cause open
+
+`h2crate_client_h2c_large_body` passes standalone (0.11 s, repeated)
+but wedges in-suite, and 7b3994c's backpressure fix did **not**
+change that (its quarantine removal was premature; standalone
+truncation was the part it fixed). Re-verified today:
+
+* Reproduces on a **quiet** box (load 0.2, zero sibling agents) —
+  this is not the sibling-coverage contention seen in September.
+* Reproduces with a **two-test pair** (`h1_upstream_default_still_works`
+  then the wedge target, `--test-threads=1`): fails after ~330 s;
+  standalone passes in 0.11 s.
+* Reproduces **identically at f7715c1** (pre-backpressure): 429 s
+  failure, same pair. The wedge is orthogonal to the truncation.
+* At the stall every TCP socket shows **empty kernel queues**
+  (`ss -itm`: Recv-Q/Send-Q 0) — the stall is userspace scheduling,
+  not TCP zero-window or loss.
+* Proxy-side forensics: the h2 server's response send budget
+  trickles (`QBBDBG take=8193 conn=36863 … take=4096 … take=13`),
+  i.e. the client's flow-control window stops opening while the
+  shim intake trickles 13–17-byte reads.
+
+Prime suspect (unchanged from f7715c1's hypothesis, refined):
+in-process server tests spawn `server::run` on their own thread with
+`shutdown_after=None`, so **every prior test leaks a full server**
+(runtime, mio workers, health-checker thread, listeners). The leaked
+health checkers keep probing leaked shims (observed: ~10 piling
+ESTAB probe connections). Test isolation fix candidates: (a) give
+in-process server tests `shutdown_after` + a join guard, (b) move
+the streaming family to subprocess servers, (c) make `run()`
+cancellable via a shutdown handle and drop leaked runtimes.
+
+Quarantine: `#[ignore]` on `h2crate_client_h2c_large_body` (in-suite
+only). The standalone streaming family remains the release gate.
+
+Legacy note (superseded context): running the full streaming family
+sequentially on a box with concurrent sibling cargo/coverage runs
+can also wedge tests through CPU/lock contention — standalone runs
+are the reliable gate.
 
 ## Signature
 
