@@ -6,6 +6,14 @@ semver.
 
 ## [Unreleased]
 
+### Renamed (crates.io)
+
+- `vane-core` → **`vane-kernel`** and the installable package
+  `vane` → **`vane-proxy`**: the crates.io names `vane`/`vane-core`
+  are owned by an unrelated project. Library and binary names are
+  unchanged (`cargo install vane-proxy` installs `vane`); published
+  on crates.io as 0.2.0 alongside the rest of the workspace.
+
 ### Security
 
 - Request-smuggling hardening: ambiguous request framing is rejected
