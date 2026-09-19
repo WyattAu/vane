@@ -29,6 +29,62 @@ semver.
   loaded and listeners are bound); `/healthz` liveness is unchanged.
 - Added `SECURITY.md` and `THREAT-MODEL.md` (STRIDE per surface).
 
+### Added
+
+- **Mesh mTLS (docs/mesh-mtls-design.md)**: cluster `mesh` upstream
+  identities — the proxy presents a SVID, requires the backend to
+  chain to the mesh CA (ALPN `vane-mesh`), and enforces the backend's
+  SPIFFE URI SAN prefix after the handshake; verification failure
+  answers `502` while the response is unsent (TLS-or-nothing).
+- **SPIFFE Workload API source**: cluster `mesh.svid_socket` fetches
+  the X.509 SVID from the agent at startup and a watcher
+  re-materializes the PEM cache on every agent push — rotation with
+  no restarts. First fetch is fail-closed.
+- **Per-route caller authorization**: routes gain
+  `allowed_spiffe_prefixes`; with `listeners.tls.client_ca` set the
+  listener requires client certificates and non-matching callers get
+  `403` (missing certs fail the handshake with
+  `certificate_required`).
+- **xDS control plane (docs/xds-grpc-transport.md)**: hand-rolled
+  gRPC/protobuf wire codecs (no prost/tonic), ADS session state
+  machine with per-type ACK/NACK, a blocking ADS client over the
+  engine's h2, Envoy `Cluster`/`RouteConfiguration` decoding into
+  router snapshots, and the `vane xds-client` subcommand publishing
+  snapshots to the admin plane. E2E-verified against a fake
+  management plane: hand-encoded Envoy resources drive live
+  host-scoped routing.
+- **Kubernetes**: watch mode and a multi-namespace Gateway API
+  operator (`vane gateway-operator`).
+- **Compression**: downstream gzip on h2 edges (cluster
+  `compression`).
+- **Chunked upstreams**: `Transfer-Encoding: chunked` request bodies
+  are re-framed and relayed to h2 upstreams.
+
+### Fixed
+
+- TLS streaming corruption: rustls' writer backpressure silently
+  dropped plaintext on partial writes (16 KiB record-sized pieces +
+  eager ciphertext drain + fatal errors at all TLS write sites).
+- Upstream write backpressure: overflow under CPU starvation closed
+  sessions mid-stream; upstream-bound bytes now defer and flush in
+  512 KiB chunks gated on queue-drain (16 MiB runaway guard).
+- h2 upstream: bodyless requests (no/zero `Content-Length`) set
+  END_STREAM on HEADERS — gRPC trailer relays complete again.
+- TLS listeners: handshake failures now flush rustls' queued alert
+  before close (a cert-less mTLS client sees `certificate_required`
+  instead of hanging), and early-exit replies (405) close the session
+  instead of holding sockets until the idle deadline.
+
+### Documentation
+
+- `docs/h2-streaming-flake.md`: full evidence dossier for the
+  streaming corruption + the remaining suite-sequence wedge
+  (quiet-box forensics; fix candidates listed).
+- `docs/xds-grpc-transport.md`, `docs/mesh-mtls-design.md`,
+  `docs/h3-design.md`: designs with milestone status.
+- `docs/config.md`: `mesh` (incl. `svid_socket`), `compression`,
+  `outlier`, `h2c`, and route `allowed_spiffe_prefixes` reference.
+
 ## [0.1.0] — 2026-09-09
 
 First tagged release of the full implementation.
