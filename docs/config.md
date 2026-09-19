@@ -226,6 +226,25 @@ Plain listeners with `h2c = true` speak prior-knowledge HTTP/2
 containers and service meshes that terminate TLS elsewhere. Requires
 no TLS material; coexists with plain HTTP/1.1 on other listeners.
 
+## Listener `tls.h3` — HTTP/3 over QUIC (experimental)
+
+```toml
+[[listeners]]
+address = "0.0.0.0:8443"
+
+[listeners.tls]
+cert = "/etc/vane/certs/tls.pem"
+key = "/etc/vane/certs/tls.key"
+h3 = true
+```
+
+Requires building vane with the `h3` feature. When enabled, vane
+binds a UDP socket on the same port number as the TCP TLS listener
+and serves HTTP/3 (RFC 9114) over QUIC: the request shares the same
+route table, filter chain, and upstream clients as the TCP path.
+Status: experimental — settings/flow-control parity with h2 is not
+yet exhaustive.
+
 ## `vane gateway-operator` — Gateway API dynamic config
 
 Watches Kubernetes Gateway API resources (Gateways + HTTPRoutes,

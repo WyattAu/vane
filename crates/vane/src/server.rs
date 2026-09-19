@@ -1,6 +1,7 @@
 //! Runtime wiring: bind, spawn workers, start the control plane, admin
 //! server, and graceful shutdown.
 
+use std::net::SocketAddr;
 use std::net::TcpListener as StdTcpListener;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -182,6 +183,7 @@ pub fn load_config(path: Option<&str>) -> Result<VaneConfig, String> {
                 key,
                 alpn_h2: false,
                 client_ca: None,
+                h3: false,
             });
         }
     }
@@ -736,6 +738,56 @@ pub async fn run(opts: RunOptions) -> i32 {
     // HTTP/2 (feature `h2`) is served on the engine data path via
     // ALPN negotiation (crates/vane/src/h2_server.rs) — the former
     // REUSEPORT tokio edge is retired.
+
+    // ---- HTTP/3 edge (experimental; feature `h3`) ------------------------
+    // QUIC rides the same port number as the TCP TLS listener; the
+    // access log is drained by the pump spawned below.
+    #[cfg(feature = "h3")]
+    for (li, l) in config.listeners.iter().enumerate() {
+        if !l.tls.as_ref().is_some_and(|t| t.h3) {
+            continue;
+        }
+        let Some(tls_cfg) = tls_cfg_slots.get(li).and_then(Option::as_ref) else {
+            continue;
+        };
+        let tcp_addr: SocketAddr = match l.address.parse() {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("vane: h3 listener `{}`: {e}", l.address);
+                continue;
+            }
+        };
+        let udp = match std::net::UdpSocket::bind(crate::h3_edge::quinn_addr(tcp_addr)) {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("vane: h3 udp bind {tcp_addr}: {e}");
+                continue;
+            }
+        };
+        let access = if config.access_log.enabled {
+            let a = Arc::new(vane_observe::access::AccessLog::new());
+            access_logs.push(Arc::clone(&a));
+            Some(a)
+        } else {
+            None
+        };
+        let edge = Arc::new(crate::h3_edge::H3Edge::new(
+            Arc::clone(&router),
+            Arc::clone(&registry),
+            access,
+        ));
+        let snapshot = Arc::clone(tls_cfg);
+        let tls_now = snapshot.read().expect("tls slot").clone();
+        crate::h3_edge::spawn(udp, tls_now, edge);
+    }
+    #[cfg(not(feature = "h3"))]
+    if config
+        .listeners
+        .iter()
+        .any(|l| l.tls.as_ref().is_some_and(|t| t.h3))
+    {
+        eprintln!("vane: listener tls.h3 = true requires the `h3` feature; ignoring");
+    }
 
     // ---- Access-log drain: render one JSON line per transaction into
     // the configured sink (stderr by default). Dropping on a full ring

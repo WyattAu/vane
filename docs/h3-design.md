@@ -39,7 +39,13 @@ QuinnEndpoint (worker-owned)
 
 ## Milestones
 
-1. QUIC transport bridge (quinn endpoint on a worker thread, CQE bridge).
-2. h3 server on the shim, h2spec-h3 green, `h3 = true` listener.
-3. Alt-Svc advertisement + h3→h1/h2 route parity tests.
+1. ✅ QUIC transport bridge: quinn endpoint on the tokio control
+   plane (`h3_edge::spawn`), UDP socket sharing the TLS listener's
+   port number, h3 ALPN from the same rustls material.
+2. ✅ h3 server on the shared edge context (route snapshot + filters +
+   balancer + reqwest upstream clients, mirroring `h2_edge`);
+   roundtrip e2e in `tests/h3_edge.rs` (quinn+h3 client → edge → h1
+   upstream). h2spec-h3 parity remains open.
+3. Alt-Svc advertisement + h3→h1/h2 route parity tests — parity e2e
+   landed; Alt-Svc header injection pending.
 4. Client-side h3 (H3Upstream) for mesh east-west.

@@ -92,6 +92,11 @@ pub struct ListenerTls {
     /// handles h2 connections while engine workers keep http/1.1).
     #[serde(default)]
     pub alpn_h2: bool,
+    /// Serve HTTP/3 over QUIC on a UDP socket with the same port
+    /// number as this TCP listener (experimental; requires building
+    /// vane with the `h3` feature).
+    #[serde(default)]
+    pub h3: bool,
     /// PEM of the CA that must sign downstream client certificates.
     /// When set the listener REQUIRES mTLS: handshakes without a
     /// client cert fail, and per-route `allowed_spiffe_prefixes`
