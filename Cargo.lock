@@ -3952,6 +3952,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
  "otelkit",
+ "pem-rfc7468",
  "quinn",
  "rcgen",
  "reqwest",

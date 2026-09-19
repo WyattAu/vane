@@ -39,7 +39,13 @@ connect → StreamAggregatedResources(open)
 
 ## Milestones
 
-1. GrpcFrame + protobuf wire encoders in vane-proto (fuzz target).
-2. `vane-control::xds::grpc` client driver over `H2Upstream` (blocking
-   first, engine-native later).
+1. ✅ GrpcFrame + protobuf wire encoders in vane-proto (fuzz target).
+2. ✅ Blocking ADS client driver (`vane::xds_client`) over the engine's
+   h2 + ADS session state machine (`vane-control::xds_grpc`); Envoy
+   resource decoding + `map_snapshot` (vane-control::envoy);
+   `vane xds-client` subcommand publishing snapshots to the admin
+   plane; e2e: fake management plane (ACK/nonce verification,
+   `ads_client.rs`) and full mapping e2e — hand-encoded Envoy Cluster
+   + RouteConfiguration → driver → snapshot → live host-scoped route
+   (`envoy_ads.rs`).
 3. Interop test against envoy's `sample ADS server` in CI (kind job).
