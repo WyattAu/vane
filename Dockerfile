@@ -9,6 +9,7 @@ WORKDIR /build
 # Layer cache: manifests first.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY workspace-hack ./workspace-hack
 # Workspace members declare their own Cargo.tomls via crates/; a full
 # source copy is required for the workspace to resolve — keep the copy
 # before any source edit so dependency churn stays cache-friendly.
