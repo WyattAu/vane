@@ -110,6 +110,7 @@ force_mio = true
             handover_to: Some(old_sock_str),
             shutdown_after: Some(Duration::from_millis(900)),
             force_mio: true,
+            shutdown: None,
         }))
     });
 
@@ -174,6 +175,7 @@ force_mio = true
             handover_to: None,
             shutdown_after: None,
             force_mio: true,
+            shutdown: None,
         }))
     });
 

@@ -92,7 +92,20 @@ fn spawn_upstream() -> std::net::SocketAddr {
 }
 
 fn request(proxy: std::net::SocketAddr, req: &[u8]) -> String {
-    let mut s = std::net::TcpStream::connect(proxy).expect("connect");
+    // Retry connect: a just-reaped-and-rebound listener can briefly
+    // refuse while SO_REUSEPORT sockets churn (see the suite-sequence
+    // notes in docs/h2-streaming-flake.md).
+    let mut s = None;
+    for _ in 0..20 {
+        match std::net::TcpStream::connect(proxy) {
+            Ok(s_) => {
+                s = Some(s_);
+                break;
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    let mut s = s.expect("connect after retries");
     s.set_read_timeout(Some(Duration::from_secs(5))).ok();
     s.write_all(req).expect("write");
     let mut out = String::new();
@@ -115,6 +128,7 @@ fn spawn_proxy(cfg_path: String) {
             handover_to: None,
             shutdown_after: None,
             force_mio: true,
+            shutdown: None,
         }));
         assert_eq!(code, 0);
     });
@@ -162,7 +176,7 @@ workers = 1
 "#
     ));
 
-    spawn_proxy(cfg);
+    let _server_guard_1 = spawn_proxy(cfg);
 
     // Wait for the listener.
     let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
@@ -246,7 +260,7 @@ workers = 1
 "#
     ));
 
-    spawn_proxy(cfg);
+    let _server_guard_2 = spawn_proxy(cfg);
 
     let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     wait_bound(proxy);
@@ -306,7 +320,7 @@ workers = 1
     let cfg = path.to_str().expect("utf8").to_owned();
     let _cert_dir_guard = dir;
 
-    spawn_proxy(cfg);
+    let _server_guard_3 = spawn_proxy(cfg);
 
     let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     wait_bound(proxy);
@@ -423,7 +437,7 @@ workers = 1
     let cfg = path.to_str().expect("utf8").to_owned();
     let _cert_dir_guard = dir;
 
-    spawn_proxy(cfg);
+    let _server_guard_4 = spawn_proxy(cfg);
 
     let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     wait_bound(proxy);
@@ -513,7 +527,7 @@ workers = 1
 pool_per_backend = 0
 "#
     ));
-    spawn_proxy(cfg);
+    let _server_guard_5 = spawn_proxy(cfg);
     let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     wait_bound(proxy);
 
@@ -590,7 +604,7 @@ force_mio = true
 workers = 1
 "#
     ));
-    spawn_proxy(cfg);
+    let _server_guard_6 = spawn_proxy(cfg);
     let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     wait_bound(proxy);
 
@@ -630,7 +644,7 @@ force_mio = true
 workers = 1
 "#
     ));
-    spawn_proxy(cfg);
+    let _server_guard_7 = spawn_proxy(cfg);
     let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     wait_bound(proxy);
 
@@ -687,7 +701,7 @@ force_mio = true
 workers = 1
 "#
     ));
-    spawn_proxy(cfg);
+    let _server_guard_8 = spawn_proxy(cfg);
     let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     wait_bound(proxy);
 
@@ -744,7 +758,7 @@ workers = 1
 first_byte_timeout_ms = 400
 "#
     ));
-    spawn_proxy(cfg);
+    let _server_guard_9 = spawn_proxy(cfg);
     let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     wait_bound(proxy);
 
@@ -790,7 +804,7 @@ workers = 1
 idle_timeout_ms = 300
 "#
     ));
-    spawn_proxy(cfg);
+    let _server_guard_10 = spawn_proxy(cfg);
     let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     wait_bound(proxy);
 
@@ -856,7 +870,7 @@ workers = 1
     ));
     // Keep the storage dir alive for the proxy lifetime.
     let _storage_guard = dir;
-    spawn_proxy(cfg);
+    let _server_guard_11 = spawn_proxy(cfg);
     let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     wait_bound(proxy);
 
@@ -920,7 +934,7 @@ force_mio = true
 workers = 1
 "#
     ));
-    spawn_proxy(cfg);
+    let _server_guard_12 = spawn_proxy(cfg);
     let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     wait_bound(proxy);
 
@@ -959,7 +973,7 @@ workers = 1
 connect_timeout_ms = 400
 "#
     ));
-    spawn_proxy(cfg);
+    let _server_guard_13 = spawn_proxy(cfg);
     let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     wait_bound(proxy);
 
@@ -1010,7 +1024,7 @@ force_mio = true
 workers = 1
 "#
     ));
-    spawn_proxy(cfg);
+    let _server_guard_14 = spawn_proxy(cfg);
     let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     wait_bound(proxy);
 
@@ -1100,7 +1114,7 @@ force_mio = true
 workers = 1
 "#
     ));
-    spawn_proxy(cfg);
+    let _server_guard_15 = spawn_proxy(cfg);
     let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     wait_bound(proxy);
 
@@ -1215,7 +1229,7 @@ force_mio = true
 workers = 1
 "#
     ));
-    spawn_proxy(cfg);
+    let _server_guard_16 = spawn_proxy(cfg);
     let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     wait_bound(proxy);
 
@@ -1461,7 +1475,7 @@ workers = 1
 "#
     ));
 
-    spawn_proxy(cfg);
+    let _server_guard_17 = spawn_proxy(cfg);
     let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     wait_bound(proxy);
 
@@ -1533,7 +1547,7 @@ force_mio = true
 workers = 1
 "#
     ));
-    spawn_proxy(cfg);
+    let _server_guard_18 = spawn_proxy(cfg);
     let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     wait_bound(proxy);
 
@@ -1647,7 +1661,7 @@ workers = 1
 "#
     ));
 
-    spawn_proxy(cfg);
+    let _server_guard_19 = spawn_proxy(cfg);
     let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     wait_bound(proxy);
 
@@ -1702,7 +1716,7 @@ force_mio = true
 workers = 1
 "#
     ));
-    spawn_proxy(cfg);
+    let _server_guard_20 = spawn_proxy(cfg);
     let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     wait_bound(proxy);
 
@@ -1781,7 +1795,7 @@ force_mio = true
 workers = 1
 "#
     ));
-    spawn_proxy(cfg);
+    let _server_guard_21 = spawn_proxy(cfg);
     let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     wait_bound(proxy);
 

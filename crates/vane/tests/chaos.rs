@@ -49,6 +49,7 @@ fn spawn_proxy(cfg_path: String) {
             handover_to: None,
             shutdown_after: None,
             force_mio: true,
+            shutdown: None,
         }));
     });
 }

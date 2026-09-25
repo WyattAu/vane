@@ -429,6 +429,7 @@ workers = 1
             handover_to: None,
             shutdown_after: None,
             force_mio: true,
+            shutdown: None,
         }));
     });
     let cert_pem_path = cache.join("cert.pem");

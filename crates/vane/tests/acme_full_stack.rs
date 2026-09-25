@@ -278,6 +278,7 @@ force_mio = true
             handover_to: None,
             shutdown_after: None,
             force_mio: true,
+            shutdown: None,
         }));
         let _ = code;
     });

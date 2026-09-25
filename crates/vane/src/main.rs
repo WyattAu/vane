@@ -157,6 +157,7 @@ fn cmd_run_with_shutdown(
             handover_from,
             handover_to,
             shutdown_after,
+            shutdown: None,
             force_mio,
         })
         .await

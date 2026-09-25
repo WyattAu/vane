@@ -84,6 +84,7 @@ fn spawn_proxy(config: String) -> SocketAddr {
             handover_to: None,
             shutdown_after: None,
             force_mio: true,
+            shutdown: None,
         }));
         assert_eq!(code, 0);
     });

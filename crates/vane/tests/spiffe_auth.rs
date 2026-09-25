@@ -223,6 +223,7 @@ workers = 1
             handover_to: None,
             shutdown_after: None,
             force_mio: true,
+            shutdown: None,
         }));
     });
     for _ in 0..60 {

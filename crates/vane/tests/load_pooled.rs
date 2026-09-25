@@ -99,6 +99,7 @@ pool_per_backend = 4
             handover_from: None,
             handover_to: None,
             shutdown_after: Some(Duration::from_secs(20)),
+            shutdown: None,
             force_mio,
         }));
         assert_eq!(code, 0);

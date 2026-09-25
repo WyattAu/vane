@@ -33,6 +33,10 @@ pub struct RunOptions {
     pub handover_to: Option<String>,
     /// Test hook: trigger the shutdown path after this delay.
     pub shutdown_after: Option<Duration>,
+    /// Test/harness hook: resolving this channel triggers an immediate
+    /// graceful shutdown — deterministic server reaping for in-process
+    /// harnesses (drop the paired sender when the test finishes).
+    pub shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
     /// Force the mio engine.
     pub force_mio: bool,
 }
@@ -46,6 +50,7 @@ impl RunOptions {
             handover_from: None,
             handover_to: None,
             shutdown_after: None,
+            shutdown: None,
             force_mio: true,
         }
     }
@@ -885,12 +890,21 @@ pub async fn run(opts: RunOptions) -> i32 {
     // ---- Shutdown ---------------------------------------------------------
     // SIGTERM/SIGINT (or the test hook) -> optional hot handover, then
     // drain workers with a 30 s hard deadline.
+    let mut opts = opts;
+    let ext = opts.shutdown.take();
+    let mut ext = ext.map(Box::pin);
     let mut shutdown = Box::pin(wait_for_signal());
-    match opts.shutdown_after {
-        Some(d) => {
-            let _ = tokio::time::timeout(d, shutdown.as_mut()).await;
+    let ext_fut = async {
+        if let Some(rx) = ext.as_mut() {
+            let _ = rx.as_mut().await;
+        } else {
+            std::future::pending::<()>().await;
         }
-        None => shutdown.as_mut().await,
+    };
+    tokio::pin!(ext_fut);
+    tokio::select! {
+        _ = shutdown.as_mut() => {}
+        _ = ext_fut => {}
     }
 
     if let Some(sock) = &opts.handover_to {

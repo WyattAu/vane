@@ -104,6 +104,7 @@ enabled = false
             handover_from: None,
             handover_to: None,
             shutdown_after: None,
+            shutdown: None,
             force_mio,
         }));
         assert_eq!(code, 0);
