@@ -41,7 +41,7 @@
 
 | Crate | Role |
 |---|---|
-| `vane-core` | io_uring/mio engines, pinned workers, session slab, SPSC, splice |
+| `vane-kernel` (crate `vane_core`) | io_uring/mio engines, pinned workers, session slab, SPSC, splice |
 | `vane-proto` | zero-copy HTTP/1.1 (httparse), date cache, response writer |
 | `vane-router` | EBR-published radix trie, P2C/RR/least-conn balancers |
 | `vane-filters` | compile-time pipelines + GCRA/breaker/forwarded built-ins |
@@ -50,7 +50,7 @@
 | `vane-tls` | rustls termination, ALPN, ChaCha20 session-ticket cache |
 | `vane-plugins` | wasmtime sandbox (feature `wasm`) |
 | `vane-client-sdk` | Rust SDK + `include/vane_sidecar.h` for C/C++ |
-| `vane` | the binary: CLI, proxy handler, admin plane |
+| `vane-proxy` (installs `vane`) | the binary: CLI, proxy handler, admin plane |
 
 ## Quick start
 
@@ -76,7 +76,8 @@ address = "127.0.0.1:9100"
 EOF
 
 # 3. run
-cargo run -p vane -- run -c vane.toml
+cargo run -p vane-proxy -- run -c vane.toml
+# (or install from crates.io: cargo install vane-proxy → `vane` on PATH)
 
 # 4. verify
 curl -v localhost:8080/anything
