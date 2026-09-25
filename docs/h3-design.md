@@ -55,6 +55,15 @@ QuinnEndpoint (worker-owned)
    H3_CLOSED_CRITICAL_STREAM, ...). Worklist: wire the h3 crate's
    stream/connection errors to connection termination with the
    reported code. Harness: `scripts/h3spec_run.sh`.
+
+   Root cause narrowed (wire-traced): the control-stream violations
+   surface via `accept()`/resolve errors carrying an h3 `Code`, but
+   `serve_request` returns silently on request-stream errors instead
+   of resetting the stream (RequestStream::stop_sending) or closing
+   the connection with the code; `h3` 0.0.8's `Code` exposes no
+   numeric getter, so the close path needs a Code→u64 mapping table
+   (or the `i-implement-a-third-party-backend-and-opt-into-breaking-
+   changes` feature). ~1 focused session.
 3. ✅ Alt-Svc advertisement: `tls.h3 = true` listeners inject
    `alt-svc: h3=":port"; ma=86400` into h1 response heads
    (`insert_header_once`, idempotent); route parity e2e asserts the
