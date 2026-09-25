@@ -44,7 +44,7 @@ vane-observe = { version = "0.2.0", path = "crates/vane-observe" }
 vane-proto = { version = "0.2.0", path = "crates/vane-proto" }
 vane-router = { version = "0.2.0", path = "crates/vane-router" }
 vane-filters = { version = "0.2.0", path = "crates/vane-filters" }
-vane-control = { version = "0.2.0", path = "crates/vane-control" }
+vane-control = { version = "0.2.2", path = "crates/vane-control" }
 vane-shm = { version = "0.2.0", path = "crates/vane-shm" }
 vane-client-sdk = { version = "0.2.0", path = "crates/vane-client-sdk" }
 vane-tls = { version = "0.2.0", path = "crates/vane-tls" }
