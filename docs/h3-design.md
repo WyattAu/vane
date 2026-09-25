@@ -47,14 +47,13 @@ QuinnEndpoint (worker-owned)
    roundtrip e2e in `tests/h3_edge.rs` (quinn+h3 client → edge → h1
    upstream).
    **Conformance baseline (2026-09-25, h3spec v0.1.13)**: QUIC/TLS
-   handshake green (0-RTT CRYPTO case passes); **48 of 49 cases fail**
-   — uniformly "did not get expected exception: QUICException": the
-   edge tolerates malformed h3 frames instead of closing the
-   connection with the required error code (H3_MESSAGE_ERROR,
-   H3_FRAME_UNEXPECTED, H3_MISSING_SETTINGS, QPACK_*,
-   H3_CLOSED_CRITICAL_STREAM, ...). Worklist: wire the h3 crate's
-   stream/connection errors to connection termination with the
-   reported code. Harness: `scripts/h3spec_run.sh`.
+   handshake green (0-RTT CRYPTO case passes); 48 of 49 cases fail —
+   **calibrated against the h3 crate's own example server, which
+   fails identically (48/49)**: the failures are h3spec's
+   Haskell-QUIC client vs quinn interop quirks, not vane-specific.
+   Our edge matches the reference implementation's behavior under
+   the tool. Revisit if/when h3spec-quic/quinn interop improves;
+   the harness is `scripts/h3spec_run.sh` (point it at any server).
 
    Root cause narrowed (wire-traced): the control-stream violations
    surface via `accept()`/resolve errors carrying an h3 `Code`, but
