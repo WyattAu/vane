@@ -1,0 +1,26 @@
+# Envoy-protocol interop: vane xds-client against a go-control-plane
+# ADS management server, asserting the decoded snapshot routes traffic.
+name: interop (xds)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  xds-interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Build the ADS fixture
+        working-directory: interop/ads
+        run: go build -o ads-server .
+      - name: Build vane
+        run: cargo build -p vane-proxy
+      - name: Interop drive (xds-client -> go-control-plane -> vane route)
+        run: bash scripts/xds_interop_test.sh

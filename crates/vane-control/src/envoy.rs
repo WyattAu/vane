@@ -30,7 +30,9 @@ pub fn decode_cluster(buf: &[u8]) -> Option<EnvoyCluster> {
             // cluster_type = 2 (group STANDARD=1); http2_protocol_options
             // = 20 (message, present ⇒ http2 upstream).
             20 => out.http2 = !f.bytes.is_empty(),
-            4 => decode_load_assignment(f.bytes, &mut out.backends),
+            // load_assignment = 33 in the current v3 API (connect_timeout
+            // occupies field 4).
+            33 => decode_load_assignment(f.bytes, &mut out.backends),
             _ => {}
         }
     }
@@ -61,7 +63,9 @@ fn decode_locality(buf: &[u8], backends: &mut Vec<String>) {
             None => break,
         };
         pos += n;
-        if f.number == 1 {
+        // LocalityLbEndpoints.lb_endpoints = 2 (locality = 1, metadata
+        // = 9, proximity = 6 are ignored).
+        if f.number == 2 {
             decode_lb_endpoint(f.bytes, backends);
         }
     }
@@ -103,14 +107,15 @@ fn decode_address(buf: &[u8], backends: &mut Vec<String>) {
             None => break,
         };
         pos += n;
-        if f.number == 2 {
+        // Address.socket_address = 1 (the address oneof; pipe = 2).
+        if f.number == 1 {
             decode_socket_address(f.bytes, backends);
         }
     }
 }
 
-/// `SocketAddress`: address = 2 (string), port_value = 4 (uint32) or
-/// named_port = 5.
+/// `SocketAddress`: address = 2 (string), port_value = 3 (the
+/// port_specifier oneof) or named_port = 4.
 fn decode_socket_address(buf: &[u8], backends: &mut Vec<String>) {
     let mut address = String::new();
     let mut port = 0u16;
@@ -123,7 +128,9 @@ fn decode_socket_address(buf: &[u8], backends: &mut Vec<String>) {
         pos += n;
         match f.number {
             2 => address = String::from_utf8_lossy(f.bytes).into_owned(),
-            4 => port = f.varint as u16,
+            // SocketAddress.port_value = 3 (the port_specifier oneof);
+            // named_port = 4 is a string alternative.
+            3 => port = f.varint as u16,
             5 => port = String::from_utf8_lossy(f.bytes).parse().unwrap_or(0),
             _ => {}
         }
@@ -304,18 +311,21 @@ mod tests {
         // port_value=4 }.
         let mut sock = Vec::new();
         pb::string_field(&mut sock, 2, "10.0.0.7");
-        pb::varint_field(&mut sock, 4, 8080);
+        // SocketAddress.port_value = 3 per envoy/config/core/v3/address.proto.
+        pb::varint_field(&mut sock, 3, 8080);
         let mut address = Vec::new();
-        pb::message_field(&mut address, 2, &sock);
+        // Address.socket_address = 1 (the address oneof).
+        pb::message_field(&mut address, 1, &sock);
         let mut endpoint = Vec::new();
         pb::message_field(&mut endpoint, 1, &address);
         let mut lb = Vec::new();
         pb::message_field(&mut lb, 1, &endpoint);
         let mut locality = Vec::new();
-        pb::message_field(&mut locality, 1, &lb);
+        // LocalityLbEndpoints.lb_endpoints = 2.
+        pb::message_field(&mut locality, 2, &lb);
         let mut cla = Vec::new();
         pb::message_field(&mut cla, 2, &locality);
-        pb::message_field(&mut cluster, 4, &cla);
+        pb::message_field(&mut cluster, 33, &cla); // load_assignment = 33
         let mut http2 = Vec::new();
         pb::bool_field(&mut http2, 1, true);
         pb::message_field(&mut cluster, 20, &http2);
@@ -384,5 +394,53 @@ mod tests {
         assert_eq!(snap.routes[0].pattern, "/api/*rest");
         assert_eq!(snap.routes[0].cluster, "shop");
         assert_eq!(snap.routes[0].host.as_deref(), Some("shop.example.com"));
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    /// The exact bytes go-control-plane v0.14 sent on the wire.
+    #[test]
+    fn decodes_real_gcpx_cluster() {
+        let wire: Vec<u8> = vec![
+            0x0a, 0x04, 0x73, 0x68, 0x6f, 0x70, 0x22, 0x02, 0x08, 0x02, 0x8a, 0x02, 0x1f, 0x0a,
+            0x04, 0x73, 0x68, 0x6f, 0x70, 0x12, 0x17, 0x12, 0x15, 0x0a, 0x13, 0x0a, 0x11, 0x0a,
+            0x0f, 0x12, 0x09, 0x31, 0x32, 0x37, 0x2e, 0x30, 0x2e, 0x30, 0x2e, 0x31, 0x18, 0xa1,
+            0x8d, 0x01,
+        ];
+        let c = decode_cluster(&wire).expect("decode");
+        assert_eq!(c.name, "shop");
+        assert_eq!(c.backends, vec!["127.0.0.1:18081"]);
+    }
+}
+
+#[cfg(test)]
+mod cla_trace {
+    use super::*;
+    #[test]
+    fn decode_cla_direct() {
+        let cla: Vec<u8> = vec![
+            0x0a, 0x04, 0x73, 0x68, 0x6f, 0x70, 0x12, 0x17, 0x12, 0x15, 0x0a, 0x13, 0x0a, 0x11,
+            0x0a, 0x0f, 0x12, 0x09, 0x31, 0x32, 0x37, 0x2e, 0x30, 0x2e, 0x30, 0x2e, 0x31, 0x18,
+            0xa1, 0x8d, 0x01,
+        ];
+        let mut backends = Vec::new();
+        decode_load_assignment(&cla, &mut backends);
+        eprintln!("CLA backends: {backends:?}");
+        assert_eq!(backends, vec!["127.0.0.1:18081"]);
+
+        let mut wire: Vec<u8> = vec![
+            0x0a, 0x04, 0x73, 0x68, 0x6f, 0x70, 0x22, 0x02, 0x08, 0x02, 0x8a, 0x02, 0x1f,
+        ];
+        wire.extend_from_slice(&cla);
+        let mut pos = 0;
+        while pos < wire.len() {
+            let (f, n) = pb::decode_field(&wire[pos..]).expect("field");
+            pos += n;
+            eprintln!("field {} wire {:?} len {}", f.number, f.wire, f.bytes.len());
+        }
+        assert_eq!(pos, wire.len());
     }
 }

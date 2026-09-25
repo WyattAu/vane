@@ -30,18 +30,22 @@ fn encode_envoy_cluster(name: &str, host: &str, port: u16) -> Vec<u8> {
     pb::string_field(&mut cluster, 1, name);
     let mut sock = Vec::new();
     pb::string_field(&mut sock, 2, host);
-    pb::varint_field(&mut sock, 4, u64::from(port));
+    // SocketAddress.port_value = 3 per the real envoy proto.
+    pb::varint_field(&mut sock, 3, u64::from(port));
     let mut address = Vec::new();
-    pb::message_field(&mut address, 2, &sock);
+    // Address.socket_address = 1 (the address oneof).
+    pb::message_field(&mut address, 1, &sock);
     let mut endpoint = Vec::new();
     pb::message_field(&mut endpoint, 1, &address);
     let mut lb = Vec::new();
     pb::message_field(&mut lb, 1, &endpoint);
     let mut locality = Vec::new();
-    pb::message_field(&mut locality, 1, &lb);
+    // LocalityLbEndpoints.lb_endpoints = 2.
+    pb::message_field(&mut locality, 2, &lb);
     let mut cla = Vec::new();
+    // ClusterLoadAssignment.endpoints = 2.
     pb::message_field(&mut cla, 2, &locality);
-    pb::message_field(&mut cluster, 4, &cla);
+    pb::message_field(&mut cluster, 33, &cla); // load_assignment = 33
     cluster
 }
 

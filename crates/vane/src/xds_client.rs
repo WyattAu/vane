@@ -244,7 +244,16 @@ pub fn xds_client_loop(management: &str, node_id: &str, admin: &str) -> i32 {
     let mut session = AdsSession::new(node_id, "vane");
     let mut clusters: Vec<envoy::EnvoyCluster> = Vec::new();
     let mut route_config: Option<envoy::EnvoyRouteConfig> = None;
+    // Standard ADS bootstrapping: subscribe LDS + CDS + EDS up front,
+    // and hold the RDS subscription until the Cluster set is ACKed —
+    // real management planes answer watches independently, so an RDS
+    // response can arrive before CDS and would be mapped with an
+    // empty cluster set (the snapshot would be rejected).
+    let mut route_subscribed = false;
     for t in SUBSCRIBED_TYPES {
+        if t == vane_proto::xds::type_url::ROUTE {
+            continue;
+        }
         if let Err(e) = client.send_message(&session.initial_request(t)) {
             eprintln!("xds-client: subscribe {t}: {e}");
             return 1;
@@ -283,6 +292,10 @@ pub fn xds_client_loop(management: &str, node_id: &str, admin: &str) -> i32 {
                     for any in res {
                         let (_, value) = vane_control::xds_grpc::any_value(any)
                             .ok_or_else(|| "cluster Any".to_string())?;
+                        eprintln!(
+                            "xds-client DBG cluster wire: {:02x?}",
+                            &value[..value.len().min(120)]
+                        );
                         decoded.push(
                             envoy::decode_cluster(&value)
                                 .ok_or_else(|| "cluster proto".to_string())?,
@@ -330,6 +343,17 @@ pub fn xds_client_loop(management: &str, node_id: &str, admin: &str) -> i32 {
             if let Err(e) = client.send_message(&ack) {
                 eprintln!("xds-client: ack send: {e}");
                 return 1;
+            }
+            // The Cluster set is accepted: now subscribe RDS (see the
+            // held-back subscription above).
+            if !route_subscribed && type_url == vane_proto::xds::type_url::CLUSTER {
+                if let Err(e) =
+                    client.send_message(&session.initial_request(vane_proto::xds::type_url::ROUTE))
+                {
+                    eprintln!("xds-client: subscribe RDS: {e}");
+                    return 1;
+                }
+                route_subscribed = true;
             }
             // CDS + RDS both accepted: publish the snapshot.
             if type_url == vane_proto::xds::type_url::ROUTE {

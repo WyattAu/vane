@@ -6,6 +6,33 @@ semver.
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-09-21
+
+### Fixed — xDS interop (found by the go-control-plane interop test)
+
+- `DiscoveryRequest` wire fields were swapped: `version_info` is field
+  1 and `node` is field 2 (envoy/service/discovery/v3/discovery.proto).
+  Real management planes saw `node` as empty and never matched the
+  snapshot; NACK `error_detail.message` also corrected (field 2 of
+  google.rpc.Status, was 3).
+- Envoy `Cluster` endpoint decoding: `load_assignment` is field 33 in
+  the current v3 API (field 4 is `connect_timeout`),
+  `ClusterLoadAssignment.endpoints` = 2,
+  `LocalityLbEndpoints.lb_endpoints` = 2, `Address.socket_address` = 1,
+  and `SocketAddress.port_value` = 3. The decoder previously only
+  worked against self-encoded fixtures with invented field numbers —
+  backends decoded as empty against go-control-plane.
+- `vane xds-client` now subscribes RDS only after the CDS ACK: real
+  management planes answer watches independently, and an RDS response
+  arriving before CDS was mapped into a snapshot with an empty cluster
+  set that the admin plane rejected.
+
+### Added
+
+- `interop/ads`: a go-control-plane-based ADS management-server
+  fixture + local test driving `vane xds-client` against it end to
+  end (route live in ~1 s).
+
 ### Renamed (crates.io)
 
 - `vane-core` → **`vane-kernel`** and the installable package

@@ -3930,7 +3930,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vane-client-sdk"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "tempfile",
  "vane-shm",
@@ -3939,7 +3939,7 @@ dependencies = [
 
 [[package]]
 name = "vane-control"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64",
  "envstack",
@@ -3967,7 +3967,7 @@ dependencies = [
 
 [[package]]
 name = "vane-filters"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64",
  "breaker",
@@ -3983,7 +3983,7 @@ dependencies = [
 
 [[package]]
 name = "vane-kernel"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "core_affinity",
@@ -4001,7 +4001,7 @@ dependencies = [
 
 [[package]]
 name = "vane-observe"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "loom",
  "rand 0.9.5",
@@ -4011,7 +4011,7 @@ dependencies = [
 
 [[package]]
 name = "vane-plugins"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "tempfile",
  "thiserror 2.0.20",
@@ -4023,7 +4023,7 @@ dependencies = [
 
 [[package]]
 name = "vane-proto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "criterion",
@@ -4036,7 +4036,7 @@ dependencies = [
 
 [[package]]
 name = "vane-proxy"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "axum-stack",
@@ -4088,7 +4088,7 @@ dependencies = [
 
 [[package]]
 name = "vane-router"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "criterion",
  "crossbeam-epoch",
@@ -4102,7 +4102,7 @@ dependencies = [
 
 [[package]]
 name = "vane-shm"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "criterion",
  "libc",
@@ -4120,7 +4120,7 @@ dependencies = [
 
 [[package]]
 name = "vane-tls"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "rcgen",
  "ring",

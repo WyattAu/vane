@@ -68,13 +68,16 @@ impl DiscoveryRequest<'_> {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(128);
-        // field 1: Node { id = 1 (string), cluster = 2 (string) }
+        // Field numbers per envoy/service/discovery/v3/discovery.proto:
+        // version_info = 1, node = 2, resource_names = 3, type_url = 4,
+        // response_nonce = 5, error_detail = 6.
+        // field 2: Node { id = 1 (string), cluster = 2 (string) }
         let mut node = Vec::with_capacity(32);
         pb::string_field(&mut node, 1, self.node_id);
         pb::string_field(&mut node, 2, self.node_cluster);
-        pb::message_field(&mut out, 1, &node);
-        // field 2: version_info
-        pb::string_field(&mut out, 2, self.version_info);
+        pb::message_field(&mut out, 2, &node);
+        // field 1: version_info
+        pb::string_field(&mut out, 1, self.version_info);
         // field 3: resource_names (repeated string)
         for name in self.resource_names {
             pb::string_field(&mut out, 3, name);
@@ -83,10 +86,10 @@ impl DiscoveryRequest<'_> {
         pb::string_field(&mut out, 4, self.type_url);
         // field 5: response_nonce
         pb::string_field(&mut out, 5, self.response_nonce);
-        // field 6: error_detail { message = 3 } — NACKs only
+        // field 6: error_detail — google.rpc.Status { message = 2 } — NACKs only
         if let Some(msg) = self.error_message {
             let mut status = Vec::with_capacity(32);
-            pb::string_field(&mut status, 3, msg);
+            pb::string_field(&mut status, 2, msg);
             pb::message_field(&mut out, 6, &status);
         }
         out
@@ -187,11 +190,12 @@ mod tests {
             let (f, n) = pb::decode_field(&buf[pos..]).expect("field");
             pos += n;
             match f.number {
-                1 => saw_node = true,
-                2 => {
+                // version_info = 1, node = 2 per the v3 DiscoveryRequest.
+                1 => {
                     assert_eq!(f.bytes, b"v1");
                     saw_version = true;
                 }
+                2 => saw_node = true,
                 3 => names.push(String::from_utf8_lossy(f.bytes).into_owned()),
                 4 => assert_eq!(f.bytes, type_url::CLUSTER.as_bytes()),
                 5 => assert_eq!(f.bytes, b"n-1"),

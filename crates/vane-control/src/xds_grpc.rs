@@ -205,7 +205,10 @@ pub fn decode_request_fields(buf: &[u8]) -> (String, String, String) {
             Some((f, n)) => {
                 pos += n;
                 match f.number {
-                    2 => version = String::from_utf8_lossy(f.bytes).into_owned(),
+                    // Field numbers per envoy/service/discovery/v3/
+                    // discovery.proto: version_info = 1, type_url = 4,
+                    // response_nonce = 5. Field 2 is the node message.
+                    1 => version = String::from_utf8_lossy(f.bytes).into_owned(),
                     4 => type_url = String::from_utf8_lossy(f.bytes).into_owned(),
                     5 => nonce = String::from_utf8_lossy(f.bytes).into_owned(),
                     _ => {}
