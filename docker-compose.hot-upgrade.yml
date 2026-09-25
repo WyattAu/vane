@@ -23,7 +23,7 @@ services:
 
   # Generation 1: owns the listener on :8080, hands it off on SIGTERM.
   vane-a:
-    image: ${VANE_IMAGE:-ghcr.io/wyattau/vane:0.2.2}
+    image: ${VANE_IMAGE:-ghcr.io/wyattau/vane:0.2.3}
     ports:
       - "8080:8080"
     volumes:
@@ -47,7 +47,7 @@ services:
 
   # Generation 2 (standby): takes the listener when vane-a drains.
   vane-b:
-    image: ${VANE_IMAGE:-ghcr.io/wyattau/vane:0.2.2}
+    image: ${VANE_IMAGE:-ghcr.io/wyattau/vane:0.2.3}
     volumes:
       - ./deploy/vane.hot.toml:/etc/vane/vane.toml:ro
       - handover:/run/vane

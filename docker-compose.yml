@@ -15,7 +15,7 @@ services:
       - vanenet
 
   vane:
-    image: ${VANE_IMAGE:-ghcr.io/wyattau/vane:0.2.2}
+    image: ${VANE_IMAGE:-ghcr.io/wyattau/vane:0.2.3}
     depends_on:
       - upstream
     ports:
