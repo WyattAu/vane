@@ -244,6 +244,10 @@ pub fn xds_client_loop(management: &str, node_id: &str, admin: &str) -> i32 {
     let mut session = AdsSession::new(node_id, "vane");
     let mut clusters: Vec<envoy::EnvoyCluster> = Vec::new();
     let mut route_config: Option<envoy::EnvoyRouteConfig> = None;
+    // EDS-driven endpoint sets by cluster name (override the inline
+    // CDS assignment when present).
+    let mut eds_backends: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
     // Standard ADS bootstrapping: subscribe LDS + CDS + EDS up front,
     // and hold the RDS subscription until the Cluster set is ACKed —
     // real management planes answer watches independently, so an RDS
@@ -292,10 +296,6 @@ pub fn xds_client_loop(management: &str, node_id: &str, admin: &str) -> i32 {
                     for any in res {
                         let (_, value) = vane_control::xds_grpc::any_value(any)
                             .ok_or_else(|| "cluster Any".to_string())?;
-                        eprintln!(
-                            "xds-client DBG cluster wire: {:02x?}",
-                            &value[..value.len().min(120)]
-                        );
                         decoded.push(
                             envoy::decode_cluster(&value)
                                 .ok_or_else(|| "cluster proto".to_string())?,
@@ -310,6 +310,14 @@ pub fn xds_client_loop(management: &str, node_id: &str, admin: &str) -> i32 {
                             envoy::decode_route_config(&value)
                                 .ok_or_else(|| "route proto".to_string())?,
                         );
+                    }
+                } else if type_url == vane_proto::xds::type_url::ENDPOINT {
+                    for any in res {
+                        let (_, value) = vane_control::xds_grpc::any_value(any)
+                            .ok_or_else(|| "endpoint Any".to_string())?;
+                        if let Some((name, backends)) = envoy::decode_cla(&value) {
+                            eds_backends.insert(name, backends);
+                        }
                     }
                 }
                 Ok(())
@@ -355,9 +363,25 @@ pub fn xds_client_loop(management: &str, node_id: &str, admin: &str) -> i32 {
                 }
                 route_subscribed = true;
             }
-            // CDS + RDS both accepted: publish the snapshot.
-            if type_url == vane_proto::xds::type_url::ROUTE {
+            // CDS + RDS both accepted → publish. An EDS update with a
+            // known route config also re-publishes (endpoint drift).
+            let should_publish = (type_url == vane_proto::xds::type_url::ROUTE
+                || type_url == vane_proto::xds::type_url::ENDPOINT)
+                && route_config.is_some();
+            if should_publish {
                 if let Some(rc) = &route_config {
+                    // EDS merge: EDS endpoint sets override the inline
+                    // CDS assignment per cluster name.
+                    let clusters: Vec<envoy::EnvoyCluster> = clusters
+                        .iter()
+                        .map(|c| {
+                            let mut c = c.clone();
+                            if let Some(b) = eds_backends.get(&c.name) {
+                                c.backends = b.clone();
+                            }
+                            c
+                        })
+                        .collect();
                     let snapshot = envoy::map_snapshot(&clusters, rc);
                     match serde_json::to_string(&snapshot) {
                         Ok(body) => match http

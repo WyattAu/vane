@@ -6,6 +6,17 @@ semver.
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-09-25 (vane-proxy only)
+
+### Added
+
+- **EDS endpoint merge** in `vane xds-client`: ClusterLoadAssignment
+  resources are decoded (`envoy::decode_cla`) and override the inline
+  CDS endpoint sets per cluster name; an EDS update re-publishes the
+  snapshot so endpoint drift applies without config changes.
+  (vane-proxy 0.2.1 carried only the RDS-after-CDS ordering fix.)
+- Stray xds-client debug prints removed.
+
 ## [0.2.1] — 2026-09-21
 
 ### Fixed — xDS interop (found by the go-control-plane interop test)

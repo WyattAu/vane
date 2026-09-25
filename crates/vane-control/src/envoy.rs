@@ -158,6 +158,29 @@ pub struct EnvoyVirtualHost {
     pub routes: Vec<(String, String)>,
 }
 
+/// Decodes a standalone `ClusterLoadAssignment` (an EDS resource):
+/// `cluster_name` = 1, `endpoints` = 2 → locality endpoints chain.
+/// Returns `(cluster_name, backends)`.
+#[must_use]
+pub fn decode_cla(buf: &[u8]) -> Option<(String, Vec<String>)> {
+    let mut name = String::new();
+    let mut backends = Vec::new();
+    let mut pos = 0;
+    while pos < buf.len() {
+        let (f, n) = pb::decode_field(&buf[pos..])?;
+        pos += n;
+        match f.number {
+            1 => name = String::from_utf8_lossy(f.bytes).into_owned(),
+            2 => decode_locality(f.bytes, &mut backends),
+            _ => {}
+        }
+    }
+    if name.is_empty() || backends.is_empty() {
+        return None;
+    }
+    Some((name, backends))
+}
+
 /// Decodes an Envoy `RouteConfiguration` message.
 #[must_use]
 pub fn decode_route_config(buf: &[u8]) -> Option<EnvoyRouteConfig> {

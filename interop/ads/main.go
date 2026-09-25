@@ -35,26 +35,33 @@ func main() {
 		c := cache.NewSnapshotCache(false, cache.IDHash{}, verboseLogger{})
 
 	host, portValue := splitHostPort(*upstream)
+	// EDS-driven: the endpoint set arrives as a separate
+	// ClusterLoadAssignment resource on the EDS watch.
 	shop := &cluster.Cluster{
 		Name:                 "shop",
-		ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_STATIC},
-		ConnectTimeout:       durationpb.New(2 * time.Second),
-		LoadAssignment: &endpoint.ClusterLoadAssignment{
-			ClusterName: "shop",
-			Endpoints: []*endpoint.LocalityLbEndpoints{{
-				LbEndpoints: []*endpoint.LbEndpoint{{
-					HostIdentifier: &endpoint.LbEndpoint_Endpoint{Endpoint: &endpoint.Endpoint{
-						Address: &core.Address{Address: &core.Address_SocketAddress{
-							SocketAddress: &core.SocketAddress{
-								Protocol:      core.SocketAddress_TCP,
-								Address:       host,
-								PortSpecifier: &core.SocketAddress_PortValue{PortValue: portValue},
-							},
-						}},
+		ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_EDS},
+		EdsClusterConfig: &cluster.Cluster_EdsClusterConfig{
+			EdsConfig: &core.ConfigSource{
+				ConfigSourceSpecifier: &core.ConfigSource_Ads{Ads: &core.AggregatedConfigSource{}},
+			},
+		},
+		ConnectTimeout: durationpb.New(2 * time.Second),
+	}
+	cla := &endpoint.ClusterLoadAssignment{
+		ClusterName: "shop",
+		Endpoints: []*endpoint.LocalityLbEndpoints{{
+			LbEndpoints: []*endpoint.LbEndpoint{{
+				HostIdentifier: &endpoint.LbEndpoint_Endpoint{Endpoint: &endpoint.Endpoint{
+					Address: &core.Address{Address: &core.Address_SocketAddress{
+						SocketAddress: &core.SocketAddress{
+							Protocol:      core.SocketAddress_TCP,
+							Address:       host,
+							PortSpecifier: &core.SocketAddress_PortValue{PortValue: portValue},
+						},
 					}},
 				}},
 			}},
-		},
+		}},
 	}
 
 	rc := &route.RouteConfiguration{
@@ -70,8 +77,9 @@ func main() {
 	}
 
 	snap, err := cache.NewSnapshot("1", map[resource.Type][]types.Resource{
-		resource.ClusterType: {shop},
-		resource.RouteType:   {rc},
+		resource.ClusterType:  {shop},
+		resource.RouteType:    {rc},
+		resource.EndpointType: {cla},
 	})
 	if err != nil {
 		log.Fatalf("snapshot: %v", err)

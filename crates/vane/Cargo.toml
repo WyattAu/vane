@@ -1,7 +1,9 @@
 [package]
 name = "vane-proxy"
 description = "Deterministic, zero-copy L4/L7 reverse proxy, edge gateway, and micro sidecar"
-version.workspace = true
+# Patched ahead of the workspace: 0.2.2 carries the EDS endpoint-merge
+# support (the workspace's other members publish from version.workspace).
+version = "0.2.2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

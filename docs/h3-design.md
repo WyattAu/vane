@@ -51,3 +51,35 @@ QuinnEndpoint (worker-owned)
    (`insert_header_once`, idempotent); route parity e2e asserts the
    advertised endpoint serves h3. h2spec-h3 parity remains open.
 4. Client-side h3 (H3Upstream) for mesh east-west.
+
+## Milestone 4 design: client-side H3Upstream (pending implementation)
+
+The upstream connector runs on the synchronous mio worker; quinn needs
+an async runtime. Three options were considered:
+
+| Option | Mechanism | Rejected/Chosen |
+|---|---|---|
+| A. quinn on the worker thread | `quinn::Endpoint` with a hand-rolled `quinn::Runtime` that parks the worker | Rejected: the worker's single-threaded completion loop cannot also drive QUIC timers/streams without an inversion of the engine's ownership model (the engine owns the fd set; quinn owns its own sockets) |
+| B. dedicated h3 runtime thread | One tokio current-thread runtime per process hosts a shared quinn Endpoint; workers hand requests to it over an SPSC ring, responses stream back over a second ring | Chosen for a first cut: mirrors the in-process SHM sidecar bridge (`sidecar::spawn_bridge`) and keeps workers synchronous; per-request state lives on the h3 thread, workers keep their slot model |
+| C. reqwest http3 (experimental feature) | reqwest's `http3` feature on the edge path | Rejected: pulls an unstable reqwest feature and hides the mesh connector (client certs/ALPN `vane-mesh`) behind an opaque stack |
+
+### Plan (option B)
+
+1. `h3_client` thread (tokio, current-thread): owns the quinn Endpoint
+   per cluster (`mesh.upstream_h3 = true`), dials with the mesh SVID +
+   ALPN `vane-mesh`, and multiplexes request streams.
+2. Worker handoff: `upstream_send` on an h3 upstream writes the
+   serialized head/body into a bounded SPSC ring keyed by session slot;
+   the h3 thread drains it, opens a bidi stream, relays; response bytes
+   come back over the response ring and re-enter the worker as
+   synthetic `on_upstream_data` events (same shape as the h2up shim).
+3. Backpressure: the request ring bound is the h3 upstream's
+   `WRITE_PENDING_CAP` analog; response flow control maps h3
+   `send_window` updates onto the existing credit path.
+4. Failure semantics: h3 dial/response timeout → `upstream_failed`
+   (502, failover rules identical to h1/h2 upstreams).
+5. Tests: h3-edge-to-h3-edge roundtrip (both directions over QUIC),
+   plus an mTLS variant asserting the SPIFFE identity of the h3 peer.
+
+Estimated: ~600–800 LOC for the bridge + client, after the ring
+handoff pattern is copied from the sidecar bridge.
