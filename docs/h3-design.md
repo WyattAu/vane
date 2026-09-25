@@ -45,7 +45,16 @@ QuinnEndpoint (worker-owned)
 2. ✅ h3 server on the shared edge context (route snapshot + filters +
    balancer + reqwest upstream clients, mirroring `h2_edge`);
    roundtrip e2e in `tests/h3_edge.rs` (quinn+h3 client → edge → h1
-   upstream). h2spec-h3 parity remains open.
+   upstream).
+   **Conformance baseline (2026-09-25, h3spec v0.1.13)**: QUIC/TLS
+   handshake green (0-RTT CRYPTO case passes); **48 of 49 cases fail**
+   — uniformly "did not get expected exception: QUICException": the
+   edge tolerates malformed h3 frames instead of closing the
+   connection with the required error code (H3_MESSAGE_ERROR,
+   H3_FRAME_UNEXPECTED, H3_MISSING_SETTINGS, QPACK_*,
+   H3_CLOSED_CRITICAL_STREAM, ...). Worklist: wire the h3 crate's
+   stream/connection errors to connection termination with the
+   reported code. Harness: `scripts/h3spec_run.sh`.
 3. ✅ Alt-Svc advertisement: `tls.h3 = true` listeners inject
    `alt-svc: h3=":port"; ma=86400` into h1 response heads
    (`insert_header_once`, idempotent); route parity e2e asserts the
