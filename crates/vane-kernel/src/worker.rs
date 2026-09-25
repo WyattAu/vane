@@ -863,6 +863,7 @@ impl WorkerState {
             Op::DownstreamRead => {
                 {
                     let Some(s) = self.slab.get_mut(slot) else {
+                        eprintln!("WRKDBG slot gone");
                         return;
                     };
                     s.read_inflight = false;

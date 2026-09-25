@@ -697,6 +697,15 @@ pub async fn run(opts: RunOptions) -> i32 {
         }
     }
 
+    #[cfg(not(feature = "h2"))]
+    if config.listeners.iter().any(|l| l.h2c) {
+        eprintln!(
+            "vane: listener h2c = true requires the `h2` feature (default); \
+             refusing to start with silent h2c listeners"
+        );
+        return 1;
+    }
+
     // ---- Access-log drain: workers push fixed-size events into their
     // rings; this task bridges them into `tracing` (never blocks workers).
     {

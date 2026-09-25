@@ -6,6 +6,21 @@ semver.
 
 ## [Unreleased]
 
+## [0.2.3] — 2026-09-26 (vane-proxy only)
+
+### Fixed
+
+- **HTTP/2 is now a default feature.** The 0.2.2 installable binary was
+  built without it, and `h2c = true` listeners silently hung: the h2
+  promotion code is feature-gated, so connections were accepted and
+  then never answered. h2c listeners now work out of the box, and
+  startup fails fast with a clear message if the feature is compiled
+  out while h2c is configured.
+- h2spec v2.6.0 run against the h2c listener: 112/138 pass. The 25
+  remaining failures are missing protocol validations (frame-size
+  limits, idle/closed-stream rules, pseudo-header rules,
+  content-length mismatch) — worklist in `docs/h2-conformance.md`.
+
 ## [0.2.2] — 2026-09-25 (vane-proxy only)
 
 ### Added

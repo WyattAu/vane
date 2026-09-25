@@ -1,9 +1,10 @@
 [package]
 name = "vane-proxy"
 description = "Deterministic, zero-copy L4/L7 reverse proxy, edge gateway, and micro sidecar"
-# Patched ahead of the workspace: 0.2.2 carries the EDS endpoint-merge
-# support (the workspace's other members publish from version.workspace).
-version = "0.2.2"
+# 0.2.3: h2 is a DEFAULT feature — the 0.2.2 binary silently hung on
+# h2c = true listeners (the promotion code was feature-gated out).
+# 0.2.2 carried the EDS endpoint-merge support.
+version = "0.2.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -19,7 +20,7 @@ name = "vane"
 path = "src/main.rs"
 
 [features]
-default = ["vane-kernel/io-uring"]
+default = ["vane-kernel/io-uring", "h2"]
 vane_dbg = ["vane-kernel/vane_dbg"]
 file-provider = ["vane-control/file-provider"]
 docker-provider = ["vane-control/docker-provider"]
