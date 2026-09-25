@@ -583,7 +583,9 @@ fn xds_client_subcommand_loop_publishes_snapshot() {
         // Dropping `sock` closes the stream.
     });
 
-    // Admin sink: accepts the snapshot POST and answers 200.
+    // Admin sink: accepts the snapshot POST, reads exactly
+    // head + content-length body (deterministic — the client keeps
+    // the connection alive), stores the request, answers 200.
     let sink_listener = StdListener::bind("127.0.0.1:0").expect("bind");
     let sink: SocketAddr = sink_listener.local_addr().expect("addr");
     let sink_body = Arc::new(std::sync::Mutex::new(String::new()));
@@ -592,12 +594,30 @@ fn xds_client_subcommand_loop_publishes_snapshot() {
     std::thread::spawn(move || {
         for stream in sink_listener.incoming().flatten() {
             let mut s = stream;
-            let mut req = Vec::new();
-            let _ = s.read_to_end(&mut req);
-            let text = String::from_utf8_lossy(&req).into_owned();
-            *body_for_assert.lock().expect("sink") = text.clone();
+            // Read to the head terminator.
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if s.read_exact(&mut byte).is_err() {
+                    break;
+                }
+                head.push(byte[0]);
+            }
+            let mut req = String::from_utf8_lossy(&head).into_owned();
+            // Body per content-length.
+            let head_str = String::from_utf8_lossy(&head).to_ascii_lowercase();
+            let len = head_str
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            if s.read_exact(&mut body).is_ok() {
+                req.push_str(&String::from_utf8_lossy(&body));
+            }
             let _ =
                 s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+            *body_for_assert.lock().expect("sink") = req;
             let _ = s.shutdown(std::net::Shutdown::Both);
         }
     });
