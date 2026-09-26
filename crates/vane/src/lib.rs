@@ -11,7 +11,9 @@ pub mod h2_edge;
 #[cfg(feature = "h2")]
 pub mod h2_server;
 #[cfg(feature = "h3")]
+#[cfg(feature = "h3")]
 pub mod h3_client;
+#[cfg(feature = "h3")]
 pub mod h3_edge;
 pub mod workload;
 pub mod xds_client;

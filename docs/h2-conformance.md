@@ -31,3 +31,14 @@ Also fixed 2026-09-26: the released binary built without the `h2`
 feature silently hung on `h2c = true` listeners (the promotion code is
 feature-gated) — `h2` is now a default feature and startup refuses
 h2c listeners without it.
+
+## Regression watch (2026-09-26): chunked_relay_h2_to_h1
+
+The h2 receive-path validations (this document's protocol work) regressed
+`chunked_relay_h2_to_h1` — CL-less chunked POST relay stalls after the
+head; the h2 crate client receives 0 of 65536 body bytes. Deterministic
+standalone (fails 3/3 at ~10 s), passed 3/3 at the pre-validation commit
+(a0955d68 worktree). The kernel has NO diff between those commits in
+connection.rs — the trigger is in the SHIM's interaction with the new
+window/CL accounting (h2_intake → handle_read path). Quarantined with a
+full note; next session: frame-level trace of the shim/kernel relay.

@@ -201,7 +201,10 @@ pub struct Connection {
     role: Role,
     cfg: ConnectionConfig,
     /// Send-window accumulators for retired (closed) streams.
-    retired_windows: std::collections::HashMap<u32, i64>,
+    /// WINDOW_UPDATE credit for streams not (yet) in the slab — early
+    /// grants before the head lands, and grants to retired streams.
+    /// Overflow beyond 2^31-1 → FLOW_CONTROL_ERROR.
+    pending_send_windows: std::collections::HashMap<u32, i64>,
     encoder: HpackEncoder,
     decoder: HpackDecoder,
 
@@ -247,7 +250,7 @@ impl Connection {
         let mut conn = Self {
             role,
             cfg: cfg.clone(),
-            retired_windows: std::collections::HashMap::new(),
+            pending_send_windows: std::collections::HashMap::new(),
             encoder: HpackEncoder::new(),
             decoder: HpackDecoder::new(cfg.header_table_size),
             out: Vec::new(),
@@ -722,6 +725,9 @@ impl Connection {
             }
         } else if let Some(st) = self.streams.get_mut(&hdr.stream_id) {
             st.send_window += inc;
+            if st.send_window > (1 << 31) - 1 {
+                return Err(error_code::FLOW_CONTROL_ERROR);
+            }
         } else {
             // Retired (closed) stream: keep a shadow accumulator so an
             // overflowing WINDOW_UPDATE still raises FLOW_CONTROL_ERROR
@@ -729,13 +735,9 @@ impl Connection {
             // ordinary updates).
             // The accumulator tracks only WINDOW_UPDATE increments —
             // the initial 65,535 window is not part of the sum.
-            let cur = self
-                .retired_windows
-                .get(&hdr.stream_id)
-                .copied()
-                .unwrap_or(0);
-            let updated = cur + inc;
-            if updated > (1 << 31) - 1 {
+            let entry = self.pending_send_windows.entry(hdr.stream_id).or_insert(0);
+            *entry += inc;
+            if *entry > (1 << 31) - 1 {
                 write_header(
                     &mut self.out,
                     4,
@@ -747,7 +749,6 @@ impl Connection {
                     .extend_from_slice(&error_code::FLOW_CONTROL_ERROR.to_be_bytes());
                 return Err(error_code::FLOW_CONTROL_ERROR);
             }
-            self.retired_windows.insert(hdr.stream_id, updated);
         }
         events.push(Event::WindowUpdate {
             stream_id: hdr.stream_id,
@@ -1096,15 +1097,22 @@ impl Connection {
     }
 
     fn ensure_stream(&mut self, id: u32, end_stream: bool) {
-        let entry = self.streams.entry(id).or_insert(Stream {
-            state: StreamState::Open,
-            recv_window: i64::from(self.cfg.initial_window_size),
-            send_window: self.peer_initial_window,
-            sent_end: false,
-            peer_data: false,
-            content_length: None,
-            content_received: 0,
-            head_done: false,
+        let entry = self.streams.entry(id).or_insert_with(|| {
+            // Merge any WINDOW_UPDATE credit that arrived before the
+            // stream was opened (the peer may grant early).
+            let extra = self.pending_send_windows.remove(&id).unwrap_or(0);
+            let mut st = Stream {
+                state: StreamState::Open,
+                recv_window: i64::from(self.cfg.initial_window_size),
+                send_window: self.peer_initial_window,
+                sent_end: false,
+                peer_data: false,
+                content_length: None,
+                content_received: 0,
+                head_done: false,
+            };
+            st.send_window += extra;
+            st
         });
         if end_stream {
             let retire = entry.sent_end;
