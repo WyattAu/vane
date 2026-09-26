@@ -4,6 +4,7 @@
 //! shipped library API.
 #![cfg(feature = "h3")]
 
+use std::io::{Read as _, Write as _};
 use std::sync::Arc;
 
 use vane_router::Router;
