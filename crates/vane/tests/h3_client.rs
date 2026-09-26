@@ -39,6 +39,7 @@ fn spawn_upstream() -> std::net::SocketAddr {
         for stream in listener.incoming().flatten() {
             let mut s = stream;
             std::thread::spawn(move || {
+                use std::io::Write as _;
                 let _ = s.write_all(
                     b"HTTP/1.1 200 OK\r\ncontent-length: 8\r\nconnection: keep-alive\r\n\r\nh3-works",
                 );
