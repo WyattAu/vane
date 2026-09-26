@@ -325,8 +325,9 @@ pub struct PayloadSplit {
 pub enum Setting {
     /// `SETTINGS_HEADER_TABLE_SIZE` (0x1).
     HeaderTableSize(u32),
-    /// `SETTINGS_ENABLE_PUSH` (0x2).
-    EnablePush(bool),
+    /// `SETTINGS_ENABLE_PUSH` (0x2). Raw value — the setting is
+    /// only valid as 0 or 1; receivers must PROTOCOL_ERROR otherwise.
+    EnablePush(u32),
     /// `SETTINGS_MAX_CONCURRENT_STREAMS` (0x3).
     MaxConcurrentStreams(u32),
     /// `SETTINGS_INITIAL_WINDOW_SIZE` (0x4).
@@ -355,7 +356,7 @@ pub fn parse_settings(data: &[u8]) -> Result<Vec<Setting>, FrameError> {
         let value = u32::from_be_bytes([pair[2], pair[3], pair[4], pair[5]]);
         out.push(match id {
             0x1 => Setting::HeaderTableSize(value),
-            0x2 => Setting::EnablePush(value == 1),
+            0x2 => Setting::EnablePush(value),
             0x3 => Setting::MaxConcurrentStreams(value),
             0x4 => Setting::InitialWindowSize(value),
             0x5 => Setting::MaxFrameSize(value),
@@ -663,7 +664,7 @@ mod tests {
         write_setting(&mut payload, 0x5, 16_384);
         write_setting(&mut payload, 0x6, 4096);
         let settings = parse_settings(&payload).expect("parse settings");
-        assert_eq!(settings[0], Setting::EnablePush(true));
+        assert_eq!(settings[0], Setting::EnablePush(1));
         assert_eq!(settings[1], Setting::MaxFrameSize(16_384));
         assert_eq!(settings[2], Setting::MaxHeaderListSize(4096));
     }

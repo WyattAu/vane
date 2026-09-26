@@ -426,6 +426,18 @@ impl WorkerState {
         for (ws, _, _) in s.uwq {
             self.pool.release(ws);
         }
+        // Drain unread downstream bytes before close: closing a socket
+        // with pending receive data sends RST, which wipes any frames
+        // we just wrote (e.g. GOAWAY/RST_STREAM error responses) before
+        // the peer reads them.
+        let dfd = s.downstream.fd();
+        let mut scratch = [0u8; 4096];
+        loop {
+            let n = unsafe { libc::read(dfd, scratch.as_mut_ptr().cast(), scratch.len()) };
+            if n <= 0 {
+                break;
+            }
+        }
         self.engine.remove(s.downstream.fd());
         if let Some(up) = &s.upstream {
             self.engine.remove(up.fd());

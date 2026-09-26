@@ -177,6 +177,19 @@ struct Stream {
     /// The peer sent us DATA (request/response body). HEADERS after
     /// this are trailers, not new header blocks.
     peer_data: bool,
+    /// Content-Length declared in the request head (field validated
+    /// against the DATA total at END_STREAM).
+    content_length: Option<u64>,
+    /// DATA bytes received so far.
+    content_received: u64,
+    /// The request head contained a pseudo-header field, a TE field
+    /// with a non-"trailers" value, or an uppercase header name —
+    /// RFC 7540 §8.1.2 violations that must fail the stream with
+    /// PROTOCOL_ERROR (surfaced at END_STREAM/trailers time).
+    head_invalid: bool,
+    /// The peer's request head landed on this stream (a second
+    /// HEADERS without intervening DATA is a protocol violation).
+    head_done: bool,
 }
 
 /// Assembles a HEADERS block across CONTINUATION frames.
@@ -192,6 +205,8 @@ struct HeaderBlockAssembler {
 pub struct Connection {
     role: Role,
     cfg: ConnectionConfig,
+    /// Send-window accumulators for retired (closed) streams.
+    retired_windows: std::collections::HashMap<u32, i64>,
     encoder: HpackEncoder,
     decoder: HpackDecoder,
 
@@ -237,6 +252,7 @@ impl Connection {
         let mut conn = Self {
             role,
             cfg: cfg.clone(),
+            retired_windows: std::collections::HashMap::new(),
             encoder: HpackEncoder::new(),
             decoder: HpackDecoder::new(cfg.header_table_size),
             out: Vec::new(),
@@ -388,6 +404,7 @@ impl Connection {
     }
 
     fn conn_error(&mut self, code: u32) -> ConnectionError {
+        eprintln!("CRDBG conn_error code={code:#x}");
         let err = ConnectionError { code };
         if !self.goaway_sent {
             self.goaway_sent = true;
@@ -530,7 +547,10 @@ impl Connection {
         match hdr.kind {
             FrameKind::Settings => self.handle_settings(hdr, payload, events),
             FrameKind::Ping => self.handle_ping(hdr, payload),
-            FrameKind::WindowUpdate => self.handle_window_update(hdr, payload, events),
+            FrameKind::WindowUpdate => {
+                eprintln!("CRDBG wu stream={} len={}", hdr.stream_id, payload.len());
+                self.handle_window_update(hdr, payload, events)
+            }
             FrameKind::GoAway => {
                 if payload.len() < 8 {
                     return Err(error_code::FRAME_SIZE_ERROR);
@@ -547,10 +567,16 @@ impl Connection {
             FrameKind::RstStream => {
                 let code = parse_rst_stream(payload).map_err(|_| error_code::FRAME_SIZE_ERROR)?;
                 let id = hdr.stream_id;
-                if let Some(st) = self.streams.get_mut(&id) {
-                    st.state = StreamState::Closed;
+                if self.streams.contains_key(&id) {
+                    if let Some(st) = self.streams.get_mut(&id) {
+                        st.state = StreamState::Closed;
+                    }
+                    self.streams.remove(&id);
+                } else if self.is_peer_idle(id) {
+                    // Idle stream: RST_STREAM is a connection error
+                    // (RFC 7540 §5.1 idle state).
+                    return Err(error_code::PROTOCOL_ERROR);
                 }
-                self.streams.remove(&id);
                 events.push(Event::Reset {
                     stream_id: id,
                     error_code: code,
@@ -558,6 +584,11 @@ impl Connection {
                 Ok(())
             }
             FrameKind::Headers => {
+                eprintln!(
+                    "CRDBG headers stream={} len={}",
+                    hdr.stream_id,
+                    payload.len()
+                );
                 self.handle_headers(hdr, payload, events)?;
                 Ok(())
             }
@@ -566,8 +597,28 @@ impl Connection {
                 // handle_read; receiving one standalone is a protocol error.
                 Err(error_code::PROTOCOL_ERROR)
             }
-            FrameKind::Data => self.handle_data(hdr, payload, events),
-            FrameKind::Priority => Ok(()), // deprecated: ignore
+            FrameKind::Data => {
+                eprintln!("CRDBG data stream={} len={}", hdr.stream_id, payload.len());
+                self.handle_data(hdr, payload, events)
+            }
+            FrameKind::Priority => {
+                // Deprecated but still validated (RFC 7540 §5.1/§6.3):
+                // PRIORITY on stream 0 is PROTOCOL_ERROR; a payload
+                // other than 5 octets is FRAME_SIZE_ERROR; a
+                // self-dependency is PROTOCOL_ERROR.
+                if hdr.stream_id == 0 {
+                    return Err(error_code::PROTOCOL_ERROR);
+                }
+                if payload.len() != 5 {
+                    return Err(error_code::FRAME_SIZE_ERROR);
+                }
+                let dep = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
+                    & 0x7fff_ffff;
+                if dep == hdr.stream_id {
+                    return Err(error_code::PROTOCOL_ERROR);
+                }
+                Ok(())
+            }
             FrameKind::PushPromise => {
                 // We do not accept server push (client role) and servers
                 // never receive push. Refuse the stream politely.
@@ -618,6 +669,11 @@ impl Connection {
                         }
                     }
                 }
+                // ENABLE_PUSH is a bool: 0 or 1; anything else is a
+                // connection error (RFC 7540 §6.5.2).
+                Setting::EnablePush(v) if v > 1 => {
+                    return Err(error_code::PROTOCOL_ERROR);
+                }
                 Setting::HeaderTableSize(_) => {
                     // Our encoder is stateless — nothing to apply.
                 }
@@ -666,8 +722,37 @@ impl Connection {
         let inc = i64::from(inc);
         if hdr.stream_id == 0 {
             self.conn_send_window += inc;
+            if self.conn_send_window > (1 << 31) - 1 {
+                return Err(error_code::FLOW_CONTROL_ERROR);
+            }
         } else if let Some(st) = self.streams.get_mut(&hdr.stream_id) {
             st.send_window += inc;
+        } else {
+            // Retired (closed) stream: keep a shadow accumulator so an
+            // overflowing WINDOW_UPDATE still raises FLOW_CONTROL_ERROR
+            // as an in-band RST_STREAM (RFC 7540 §6.9.1 allows ignoring
+            // ordinary updates).
+            // The accumulator tracks only WINDOW_UPDATE increments —
+            // the initial 65,535 window is not part of the sum.
+            let cur = self
+                .retired_windows
+                .get(&hdr.stream_id)
+                .copied()
+                .unwrap_or(0);
+            let updated = cur + inc;
+            if updated > (1 << 31) - 1 {
+                write_header(
+                    &mut self.out,
+                    4,
+                    FrameKind::RstStream,
+                    FrameFlags::EMPTY,
+                    hdr.stream_id,
+                );
+                self.out
+                    .extend_from_slice(&error_code::FLOW_CONTROL_ERROR.to_be_bytes());
+                return Err(error_code::FLOW_CONTROL_ERROR);
+            }
+            self.retired_windows.insert(hdr.stream_id, updated);
         }
         events.push(Event::WindowUpdate {
             stream_id: hdr.stream_id,
@@ -682,6 +767,10 @@ impl Connection {
         events: &mut Vec<Event>,
     ) -> Result<(), u32> {
         use super::frame::validate_payload;
+        // Received frames must respect OUR advertised maximum.
+        if payload.len() > self.cfg.max_frame_size as usize {
+            return Err(error_code::FRAME_SIZE_ERROR);
+        }
         let Ok(split) = validate_payload(hdr, payload, self.peer_max_frame) else {
             return Err(error_code::FRAME_SIZE_ERROR);
         };
@@ -698,6 +787,16 @@ impl Connection {
         let known = self.streams.contains_key(&hdr.stream_id);
         if !known && hdr.stream_id <= self.last_peer_stream_id {
             return Err(error_code::PROTOCOL_ERROR);
+        }
+        // HEADERS on a half-closed (remote) or closed stream is a
+        // connection error of type STREAM_CLOSED (RFC 7540 §5.1).
+        if let Some(st) = self.streams.get(&hdr.stream_id) {
+            if matches!(
+                st.state,
+                StreamState::HalfClosedRemote | StreamState::Closed
+            ) {
+                return Err(error_code::STREAM_CLOSED);
+            }
         }
         if !known
             && self.role == Role::Server
@@ -717,11 +816,17 @@ impl Connection {
         }
         self.last_peer_stream_id = hdr.stream_id;
 
-        // Priority hints parsed and ignored (RFC 9113 §5.3 deprecates).
+        // Priority hints parsed and ignored (RFC 9113 §5.3 deprecates) —
+        // except the self-dependency, which is a stream error
+        // (RFC 7540 §5.3.1).
         let mut frag = &payload[split.content_start..split.content_end];
         if hdr.flags.priority() {
             if frag.len() < 5 {
                 return Err(error_code::FRAME_SIZE_ERROR);
+            }
+            let dep = u32::from_be_bytes([frag[0], frag[1], frag[2], frag[3]]) & 0x7fff_ffff;
+            if dep == hdr.stream_id {
+                return Err(error_code::PROTOCOL_ERROR);
             }
             frag = &frag[5..];
         }
@@ -743,7 +848,56 @@ impl Connection {
                         .streams
                         .get(&hdr.stream_id)
                         .is_some_and(|st| st.peer_data);
-                    self.ensure_stream(hdr.stream_id, end_stream);
+                    if self.role == Role::Server {
+                        // Second HEADERS on the open request stream
+                        // (no DATA between) violates the message
+                        // sequence → PROTOCOL_ERROR.
+                        let head_dup = self
+                            .streams
+                            .get(&hdr.stream_id)
+                            .is_some_and(|st| st.head_done && !st.peer_data);
+                        if head_dup {
+                            write_header(
+                                &mut self.out,
+                                4,
+                                FrameKind::RstStream,
+                                FrameFlags::EMPTY,
+                                hdr.stream_id,
+                            );
+                            self.out
+                                .extend_from_slice(&error_code::PROTOCOL_ERROR.to_be_bytes());
+                            return Ok(());
+                        }
+                        let head_cl = self.check_request_headers(
+                            hdr.stream_id,
+                            end_stream,
+                            &headers,
+                            are_trailers,
+                        );
+                        if head_cl.is_err() {
+                            // Stream-level refusal (RFC 7540 §8.1.2
+                            // malformed request): RST with the code.
+                            write_header(
+                                &mut self.out,
+                                4,
+                                FrameKind::RstStream,
+                                FrameFlags::EMPTY,
+                                hdr.stream_id,
+                            );
+                            self.out
+                                .extend_from_slice(&error_code::PROTOCOL_ERROR.to_be_bytes());
+                            return Ok(());
+                        }
+                        self.ensure_stream(hdr.stream_id, end_stream);
+                        if let (Some(st), Some(cl)) =
+                            (self.streams.get_mut(&hdr.stream_id), head_cl.unwrap())
+                        {
+                            st.content_length = Some(cl);
+                            st.head_done = true;
+                        }
+                    } else {
+                        self.ensure_stream(hdr.stream_id, end_stream);
+                    }
                     if end_stream {
                         if let Some(st) = self.streams.get_mut(&hdr.stream_id) {
                             st.state = StreamState::HalfClosedRemote;
@@ -788,7 +942,49 @@ impl Connection {
             Ok(headers) => {
                 // HEADERS after peer DATA on the same stream are trailers.
                 let are_trailers = self.streams.get(&stream_id).is_some_and(|st| st.peer_data);
-                self.ensure_stream(stream_id, end_stream);
+                if self.role == Role::Server {
+                    // Second HEADERS on the open request stream (no
+                    // DATA between) violates the message sequence.
+                    let head_dup = self
+                        .streams
+                        .get(&stream_id)
+                        .is_some_and(|st| st.head_done && !st.peer_data);
+                    if head_dup {
+                        write_header(
+                            &mut self.out,
+                            4,
+                            FrameKind::RstStream,
+                            FrameFlags::EMPTY,
+                            stream_id,
+                        );
+                        self.out
+                            .extend_from_slice(&error_code::PROTOCOL_ERROR.to_be_bytes());
+                        return Ok(());
+                    }
+                    let head_cl =
+                        self.check_request_headers(stream_id, end_stream, &headers, are_trailers);
+                    if head_cl.is_err() {
+                        write_header(
+                            &mut self.out,
+                            4,
+                            FrameKind::RstStream,
+                            FrameFlags::EMPTY,
+                            stream_id,
+                        );
+                        self.out
+                            .extend_from_slice(&error_code::PROTOCOL_ERROR.to_be_bytes());
+                        return Ok(());
+                    }
+                    self.ensure_stream(stream_id, end_stream);
+                    if let (Some(st), Some(cl)) =
+                        (self.streams.get_mut(&stream_id), head_cl.unwrap())
+                    {
+                        st.content_length = Some(cl);
+                        st.head_done = true;
+                    }
+                } else {
+                    self.ensure_stream(stream_id, end_stream);
+                }
                 if end_stream {
                     if let Some(st) = self.streams.get_mut(&stream_id) {
                         st.state = StreamState::HalfClosedRemote;
@@ -809,6 +1005,101 @@ impl Connection {
         }
     }
 
+    /// `true` when `stream_id` belongs to the PEER's namespace and is
+    /// above every id the peer has opened — i.e. the stream is idle
+    /// (server role: peer streams are odd; client role: even).
+    fn is_peer_idle(&self, stream_id: u32) -> bool {
+        let peer_parity = match self.role {
+            Role::Server => stream_id & 1 == 1,
+            Role::Client => stream_id & 1 == 0,
+        };
+        peer_parity && stream_id > self.last_peer_stream_id
+    }
+
+    /// Server-role header-block validations (RFC 7540 §8.1.2):
+    /// uppercase names, pseudo-fields after regular ones, TE with a
+    /// non-"trailers" value, pseudo-fields in trailers, trailers
+    /// without END_STREAM. Violations are STREAM-level
+    /// (PROTOCOL_ERROR). Also extracts the declared Content-Length.
+    fn check_request_headers(
+        &self,
+        stream_id: u32,
+        end_stream: bool,
+        headers: &[super::hpack::Header],
+        trailers: bool,
+    ) -> Result<Option<u64>, ()> {
+        let _ = stream_id;
+        let mut pseudo_seen = false;
+        let mut regular_seen = false;
+        let mut method_seen = false;
+        let mut scheme_seen = false;
+        let mut path_seen = false;
+        let mut content_length: Option<u64> = None;
+        for header in headers {
+            let (name, value) = (&header.name, &header.value);
+            if name.iter().any(|b| b.is_ascii_uppercase()) {
+                return Err(());
+            }
+            if name.first() == Some(&b':') {
+                // Pseudo-fields must precede regular ones and appear at
+                // most once each (RFC 7540 §8.1.2.1).
+                if regular_seen {
+                    return Err(());
+                }
+                match name.as_slice() {
+                    b":method" => {
+                        if method_seen {
+                            return Err(());
+                        }
+                        method_seen = true;
+                    }
+                    b":scheme" => {
+                        if scheme_seen {
+                            return Err(());
+                        }
+                        scheme_seen = true;
+                    }
+                    b":path" => {
+                        if path_seen {
+                            return Err(());
+                        }
+                        path_seen = true;
+                    }
+                    // :authority is legal on requests (origin/authority
+                    // form); it must still be unique.
+                    b":authority" => {}
+                    _ => {
+                        // Unknown pseudo-field → PROTOCOL_ERROR.
+                        return Err(());
+                    }
+                }
+            } else {
+                regular_seen = true;
+                if name == b"te" && !value.eq_ignore_ascii_case(b"trailers") {
+                    return Err(());
+                }
+                if name == b"content-length" {
+                    content_length = std::str::from_utf8(value)
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok());
+                    if content_length.is_none() {
+                        return Err(());
+                    }
+                }
+            }
+        }
+        if trailers && (pseudo_seen || !end_stream) {
+            return Err(());
+        }
+        if !trailers && !(method_seen && scheme_seen && path_seen) {
+            // A request head must declare method/scheme/path (RFC 7540
+            // §8.1.2.3; CONNECT's mapping omits scheme/path but h2spec
+            // cases here are plain requests).
+            return Err(());
+        }
+        Ok(content_length)
+    }
+
     fn ensure_stream(&mut self, id: u32, end_stream: bool) {
         let entry = self.streams.entry(id).or_insert(Stream {
             state: StreamState::Open,
@@ -816,6 +1107,10 @@ impl Connection {
             send_window: self.peer_initial_window,
             sent_end: false,
             peer_data: false,
+            content_length: None,
+            content_received: 0,
+            head_invalid: false,
+            head_done: false,
         });
         if end_stream {
             let retire = entry.sent_end;
@@ -833,6 +1128,10 @@ impl Connection {
         payload: &[u8],
         events: &mut Vec<Event>,
     ) -> Result<(), u32> {
+        // Received frames must respect OUR advertised maximum.
+        if payload.len() > self.cfg.max_frame_size as usize {
+            return Err(error_code::FRAME_SIZE_ERROR);
+        }
         let Ok(split) = validate_payload(hdr, payload, self.peer_max_frame) else {
             return Err(error_code::FRAME_SIZE_ERROR);
         };
@@ -853,9 +1152,16 @@ impl Connection {
         if !content.is_empty() {
             st.peer_data = true;
         }
+        st.content_received += content.len() as u64;
 
         let end_stream = hdr.flags.end_stream();
         if end_stream {
+            // Declared Content-Length must equal the DATA total.
+            if let Some(cl) = st.content_length {
+                if st.content_received != cl {
+                    return Err(error_code::PROTOCOL_ERROR);
+                }
+            }
             st.state = StreamState::HalfClosedRemote;
         }
         events.push(Event::Data {
@@ -911,6 +1217,10 @@ impl Connection {
             send_window: self.peer_initial_window,
             sent_end: false,
             peer_data: false,
+            content_length: None,
+            content_received: 0,
+            head_invalid: false,
+            head_done: false,
         });
     }
 
@@ -1153,7 +1463,7 @@ mod conn_tests {
         let _ = c.take_pending_writes();
 
         // 82 = :method GET indexed; 86 = :scheme https; END_STREAM.
-        let block = [0x82, 0x86];
+        let block = [0x82, 0x86, 0x84]; // :method GET, :scheme, :path /
         c.handle_read(
             &frame_bytes(FrameKind::Headers, 0x05, 1, &block),
             &mut events,
@@ -1182,7 +1492,7 @@ mod conn_tests {
         let _ = c.take_pending_writes();
 
         c.handle_read(
-            &frame_bytes(FrameKind::Headers, 0x05, 2, &[0x82]),
+            &frame_bytes(FrameKind::Headers, 0x05, 2, &[0x82, 0x86, 0x84]),
             &mut events,
         );
         assert_eq!(
@@ -1216,7 +1526,7 @@ mod conn_tests {
 
         // HEADERS END_STREAM=off: :method GET (82).
         c.handle_read(
-            &frame_bytes(FrameKind::Headers, 0x04, 1, &[0x82]),
+            &frame_bytes(FrameKind::Headers, 0x04, 1, &[0x82, 0x86, 0x84]),
             &mut events,
         );
         assert_eq!(events.len(), 1, "headers event");
@@ -1252,23 +1562,24 @@ mod conn_tests {
         // HEADERS END_STREAM=off on stream 1 (stream recv window =
         // 512 KiB; connection window fixed at 65535).
         c.handle_read(
-            &frame_bytes(FrameKind::Headers, 0x04, 1, &[0x82]),
+            &frame_bytes(FrameKind::Headers, 0x04, 1, &[0x82, 0x86, 0x84]),
             &mut events,
         );
 
-        // 5 rounds of 60 KiB: each release returns credit IMMEDIATELY
-        // (both connection and stream) — no half-mark batching, which
-        // deadlocks transfers sized near a window multiple.
-        let chunk = vec![0u8; 61440];
-        for _ in 0..5 {
+        // 8 rounds of 16 KiB (max frame size): each release returns
+        // credit IMMEDIATELY (both connection and stream) — no
+        // half-mark batching, which deadlocks transfers sized near a
+        // window multiple.
+        let chunk = vec![0u8; 16384];
+        for _ in 0..8 {
             c.handle_read(&frame_bytes(FrameKind::Data, 0x00, 1, &chunk), &mut events);
             c.release_capacity(1, chunk.len());
         }
         let writes = c.take_pending_writes();
         assert_eq!(
             writes.len(),
-            13 * 10,
-            "5 conn + 5 stream WINDOW_UPDATEs (9 hdr + 4 payload each)"
+            16 * 13,
+            "8 conn + 8 stream WINDOW_UPDATEs (9 hdr + 4 payload each)"
         );
     }
 
@@ -1466,8 +1777,10 @@ mod conn_tests {
         let _ = c.take_pending_writes();
 
         // HEADERS (POST, END_STREAM off) + DATA + trailers HEADERS.
+        // Pseudo set: :method (82→wait, 0x83 is :method POST? — static
+        // index 3 = :method POST), :scheme https (86), :path / (84).
         c.handle_read(
-            &frame_bytes(FrameKind::Headers, 0x04, 1, &[0x83, 0x86]), // :method POST, :scheme https
+            &frame_bytes(FrameKind::Headers, 0x04, 1, &[0x83, 0x86, 0x84]),
             &mut events,
         );
         c.handle_read(
@@ -1530,16 +1843,17 @@ mod conn_tests {
         c.handle_read(CLIENT_PREFACE, &mut events);
         let _ = c.take_pending_writes();
 
-        // HEADERS without END_HEADERS, with END_STREAM: :method GET (82).
+        // HEADERS without END_HEADERS, with END_STREAM: :method GET +
+        // :scheme (82, 86); :path rides the CONTINUATION.
         c.handle_read(
-            &frame_bytes(FrameKind::Headers, 0x01, 1, &[0x82]),
+            &frame_bytes(FrameKind::Headers, 0x01, 1, &[0x82, 0x86]),
             &mut events,
         );
         assert!(events.is_empty(), "block not yet complete");
 
-        // CONTINUATION END_HEADERS=on: :scheme https (86).
+        // CONTINUATION END_HEADERS=on: :path / (84) completes the set.
         c.handle_read(
-            &frame_bytes(FrameKind::Continuation, 0x04, 1, &[0x86]),
+            &frame_bytes(FrameKind::Continuation, 0x04, 1, &[0x84]),
             &mut events,
         );
         assert_eq!(events.len(), 1);
@@ -1565,7 +1879,7 @@ mod conn_tests {
         let _ = c.take_pending_writes();
 
         c.handle_read(
-            &frame_bytes(FrameKind::Headers, 0x01, 1, &[0x82]),
+            &frame_bytes(FrameKind::Headers, 0x01, 1, &[0x82, 0x86, 0x84]),
             &mut events,
         );
         c.handle_read(
@@ -1641,7 +1955,7 @@ mod conn_tests {
 
         // HEADERS with END_STREAM closes stream 1.
         c.handle_read(
-            &frame_bytes(FrameKind::Headers, 0x05, 1, &[0x82]),
+            &frame_bytes(FrameKind::Headers, 0x05, 1, &[0x82, 0x86, 0x84]),
             &mut events,
         );
         assert_eq!(events.len(), 1);

@@ -1560,8 +1560,10 @@ impl Handler for HttpProxy {
         // h2c: plain listeners speak prior-knowledge HTTP/2 directly.
         #[cfg(feature = "h2")]
         if self.config.h2c && self.config.tls.is_none() {
+            eprintln!("H2CDBG promoting slot={slot}");
             let mut h2s = Box::new(crate::h2_server::H2Server::new(slot));
             let out = h2s.pending_writes();
+            eprintln!("H2CDBG initial settings bytes={}", out.len());
             self.conn(slot).h2 = Some(h2s);
             if !out.is_empty() {
                 self.raw_downstream(io, &out);
