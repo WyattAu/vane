@@ -182,11 +182,6 @@ struct Stream {
     content_length: Option<u64>,
     /// DATA bytes received so far.
     content_received: u64,
-    /// The request head contained a pseudo-header field, a TE field
-    /// with a non-"trailers" value, or an uppercase header name —
-    /// RFC 7540 §8.1.2 violations that must fail the stream with
-    /// PROTOCOL_ERROR (surfaced at END_STREAM/trailers time).
-    head_invalid: bool,
     /// The peer's request head landed on this stream (a second
     /// HEADERS without intervening DATA is a protocol violation).
     head_done: bool,
@@ -890,7 +885,7 @@ impl Connection {
                         }
                         self.ensure_stream(hdr.stream_id, end_stream);
                         if let (Some(st), Some(cl)) =
-                            (self.streams.get_mut(&hdr.stream_id), head_cl.unwrap())
+                            (self.streams.get_mut(&hdr.stream_id), head_cl.ok().flatten())
                         {
                             st.content_length = Some(cl);
                             st.head_done = true;
@@ -977,7 +972,7 @@ impl Connection {
                     }
                     self.ensure_stream(stream_id, end_stream);
                     if let (Some(st), Some(cl)) =
-                        (self.streams.get_mut(&stream_id), head_cl.unwrap())
+                        (self.streams.get_mut(&stream_id), head_cl.ok().flatten())
                     {
                         st.content_length = Some(cl);
                         st.head_done = true;
@@ -1029,7 +1024,7 @@ impl Connection {
         trailers: bool,
     ) -> Result<Option<u64>, ()> {
         let _ = stream_id;
-        let mut pseudo_seen = false;
+        let pseudo_seen = false;
         let mut regular_seen = false;
         let mut method_seen = false;
         let mut scheme_seen = false;
@@ -1109,7 +1104,6 @@ impl Connection {
             peer_data: false,
             content_length: None,
             content_received: 0,
-            head_invalid: false,
             head_done: false,
         });
         if end_stream {
@@ -1219,7 +1213,6 @@ impl Connection {
             peer_data: false,
             content_length: None,
             content_received: 0,
-            head_invalid: false,
             head_done: false,
         });
     }

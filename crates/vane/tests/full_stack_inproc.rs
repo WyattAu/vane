@@ -116,7 +116,25 @@ fn request(proxy: std::net::SocketAddr, req: &[u8]) -> String {
 /// Runs the proxy on a dedicated thread + runtime (mirrors production.rs
 /// — `run()` must not execute on the test's single-threaded runtime).
 /// Stderr goes to a per-config log file for post-failure diagnosis.
-fn spawn_proxy(cfg_path: String) {
+/// Reaps the scenario's server on drop: resolves the server's
+/// shutdown channel so `run()` drains and exits instead of leaking a
+/// full vane (runtime + workers + SO_REUSEPORT listeners) for the
+/// process lifetime — leaked listeners on reused ephemeral ports
+/// steal connections from later tests (docs/h2-streaming-flake.md).
+struct ServerGuard {
+    tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+fn spawn_proxy(cfg_path: String) -> ServerGuard {
+    let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -127,11 +145,12 @@ fn spawn_proxy(cfg_path: String) {
             handover_from: None,
             handover_to: None,
             shutdown_after: None,
+            shutdown: Some(rx),
             force_mio: true,
-            shutdown: None,
         }));
         assert_eq!(code, 0);
     });
+    ServerGuard { tx: Some(tx) }
 }
 
 fn wait_bound(proxy: std::net::SocketAddr) {

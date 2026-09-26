@@ -433,6 +433,8 @@ impl WorkerState {
         let dfd = s.downstream.fd();
         let mut scratch = [0u8; 4096];
         loop {
+            // SAFETY: dfd is an open, owned nonblocking socket; the
+            // buffer is stack-allocated and sized for the read.
             let n = unsafe { libc::read(dfd, scratch.as_mut_ptr().cast(), scratch.len()) };
             if n <= 0 {
                 break;
