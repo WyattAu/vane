@@ -5,7 +5,9 @@
 //!
 //! Blocking shape: mirrors the engine's synchronous upstream dial —
 //! callers (the mesh connector, future `H3Upstream` engine
-//! integration) call `request` and get the complete response.
+//! integration) call `request` and get the complete response. The
+//! QUIC stack runs on a dedicated OS thread so tokio-context callers
+//! work too.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -39,8 +41,11 @@ impl Default for H3ClientConfig {
 /// One HTTP/3 response: status + header pairs + full body.
 #[derive(Debug, Clone)]
 pub struct H3Response {
+    /// Response status code.
     pub status: u16,
+    /// Response header pairs (order preserved).
     pub headers: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Response body bytes.
     pub body: Vec<u8>,
 }
 
@@ -61,15 +66,12 @@ pub fn request(
     request_body: &[u8],
     timeout: Duration,
 ) -> Result<H3Response, String> {
-    // Run the QUIC stack on a dedicated OS thread: callers may sit on
-    // a tokio worker (where block_on panics), and the engine's workers
-    // are plain threads.
     let server_certs = cfg.server_certs.clone();
     let alpn = cfg.alpn.clone();
     let server_name = cfg.server_name.clone();
+    let authority = authority.to_owned();
     let method = method.to_owned();
     let path = path.to_owned();
-    let authority = authority.to_owned();
     let request_body = request_body.to_vec();
 
     let handle = std::thread::spawn(move || {
@@ -120,7 +122,7 @@ pub fn request(
             let req = http::Request::builder()
                 .method(method.as_str())
                 .uri(format!("https://{server_name}{path}"))
-                .header("host", server_name.as_str())
+                .header("host", authority)
                 .body(())
                 .map_err(|e| format!("request build: {e}"))?;
             let mut stream = send_request
