@@ -32,13 +32,15 @@ feature silently hung on `h2c = true` listeners (the promotion code is
 feature-gated) — `h2` is now a default feature and startup refuses
 h2c listeners without it.
 
-## Regression watch (2026-09-26): chunked_relay_h2_to_h1
+## Regression watch (2026-09-26): chunked_relay_h2_to_h1 — RESOLVED
 
-The h2 receive-path validations (this document's protocol work) regressed
-`chunked_relay_h2_to_h1` — CL-less chunked POST relay stalls after the
-head; the h2 crate client receives 0 of 65536 body bytes. Deterministic
-standalone (fails 3/3 at ~10 s), passed 3/3 at the pre-validation commit
-(a0955d68 worktree). The kernel has NO diff between those commits in
-connection.rs — the trigger is in the SHIM's interaction with the new
-window/CL accounting (h2_intake → handle_read path). Quarantined with a
-full note; next session: frame-level trace of the shim/kernel relay.
+The h2 receive-path validations briefly regressed `chunked_relay_h2_to_h1`
+(0 of 65536 body bytes relayed). Root cause: the window-overflow
+accumulator double-counted the initial 65,535 window — WINDOW_UPDATE
+increments extend the window beyond the initial value, so the base for
+the sum must be 0, not 65,535. With the 0-based accumulator the relay
+passes 3/3 standalone and the suite is stable at 16/16 ×3.
+
+State: chunked_relay and the streaming family are un-quarantined and
+green (16 passed / 2 ignored per suite run). The single remaining
+h2spec divergence is the lenient idle-stream WINDOW_UPDATE (see above).

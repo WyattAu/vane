@@ -2013,7 +2013,6 @@ workers = 1
 /// interaction before re-enabling.
 #[cfg(feature = "h2")]
 #[tokio::test]
-#[ignore = "regressed by the h2 receive-path validations; needs flow-control trace — see docs/h2-conformance.md"]
 async fn chunked_relay_h2_to_h1() {
     let _serial = lock_serial();
     // h1 echo upstream: parses chunked request bodies.

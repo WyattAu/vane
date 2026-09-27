@@ -726,7 +726,20 @@ impl Connection {
         } else if let Some(st) = self.streams.get_mut(&hdr.stream_id) {
             st.send_window += inc;
             if st.send_window > (1 << 31) - 1 {
-                return Err(error_code::FLOW_CONTROL_ERROR);
+                // Stream-level overflow → stream error: RST_STREAM on
+                // the offending stream (RFC 7540 §6.9), connection
+                // stays up.
+                write_header(
+                    &mut self.out,
+                    4,
+                    FrameKind::RstStream,
+                    FrameFlags::EMPTY,
+                    hdr.stream_id,
+                );
+                self.out
+                    .extend_from_slice(&error_code::FLOW_CONTROL_ERROR.to_be_bytes());
+                self.streams.remove(&hdr.stream_id);
+                return Ok(());
             }
         } else {
             // Retired (closed) stream: keep a shadow accumulator so an
