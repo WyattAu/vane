@@ -1,7 +1,7 @@
 [package]
 name = "vane-control"
 # 0.2.2 adds envoy::decode_cla (EDS resources) required by vane-proxy.
-version = "0.2.2"
+version = "0.3.0"
 description = "Configuration, discovery providers, ACME, and health checks for Vane"
 edition.workspace = true
 rust-version.workspace = true
@@ -16,7 +16,7 @@ docker-provider = []
 k8s = []
 
 [dependencies]
-vane-proto = { path = "../vane-proto", version = "0.2.0" }
+vane-proto = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

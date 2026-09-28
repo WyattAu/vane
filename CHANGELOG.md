@@ -4,7 +4,46 @@ All notable changes to vane are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 semver.
 
-## [Unreleased]
+## [0.3.0] — 2026-09-28
+
+### Changed
+
+- **HTTP/3 promoted out of experimental — the `h3` feature is now
+  default.** The published binary serves h3 (QUIC) listeners and the
+  Alt-Svc advertisement out of the box, matching the h2 promotion in
+  0.2.3. Compile it out with `default-features = false` or
+  `features = ["h2"]`.
+
+### Fixed
+
+- **h2 stream-level WINDOW_UPDATE overflow is now a stream error**:
+  the offending stream is reset with an in-band
+  `RST_STREAM(FLOW_CONTROL_ERROR)` (RFC 7540 §6.9) and the connection
+  survives — previously it tore the whole connection down. h2spec
+  137/138 (the one documented divergence: lenient idle-stream
+  WINDOW_UPDATE, required by the h2 crate client's early credit
+  grants).
+- **chunked_relay_h2_to_h1 un-quarantined**: the window-overflow
+  accumulator had double-counted the initial 65,535 window and
+  FLOW_CONTROL_ERROR'd the client's legitimate early grant. With the
+  0-based accumulator the relay passes and the streaming suite is
+  green (16/16 ×3).
+- Idle-stream WINDOW_UPDATEs are applied (not rejected) via the
+  retired-stream accumulator and merged into the stream window when
+  the stream opens.
+
+### Added
+
+- **Snapshot-driven listener TLS rotation (LDS parity, TLS
+  dimension).** `XdsSnapshot.listeners` carries
+  `{ address, cert, key, client_ca }`; the admin plane swaps the
+  pre-bound listener's TLS slot live — certificate rotation via
+  control plane, same hot-swap the file watcher performs. An address
+  that is not a pre-bound TLS listener is rejected with `400` (xDS
+  never binds ports).
+- h3spec harness (`scripts/h3spec_run.sh`) + calibration against the
+  h3 crate's own reference server (identical 48 error-case failures
+  upstream — documented in `docs/h3-design.md`).
 
 ## [0.2.3] — 2026-09-26 (vane-proxy only)
 
