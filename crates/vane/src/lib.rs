@@ -12,6 +12,7 @@ pub mod h2_edge;
 pub mod h2_server;
 #[cfg(feature = "h3")]
 #[cfg(feature = "h3")]
+pub mod h3_bridge;
 pub mod h3_client;
 #[cfg(feature = "h3")]
 pub mod h3_edge;

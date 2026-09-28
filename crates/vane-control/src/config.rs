@@ -143,9 +143,42 @@ pub struct ClusterConfig {
     /// Honored by the h2 edge; the engine's h1 pool ignores it.
     #[serde(default)]
     pub http2: bool,
+    /// Speak HTTP/3 (QUIC) to this cluster's backends: the engine
+    /// dials an in-process loopback bridge that re-originates the h1
+    /// stream over QUIC (docs/h3-design.md, milestone 4).
+    #[serde(default)]
+    pub http3: bool,
+    /// TLS material for the h3 upstream dial (required with
+    /// `http3 = true` — QUIC is TLS-always).
+    #[serde(default)]
+    pub h3_tls: Option<H3UpstreamTls>,
     /// Mesh mTLS upstream (SPIFFE-verified). Absent = plaintext.
     #[serde(default)]
     pub mesh: Option<MeshUpstreamConfig>,
+}
+
+/// TLS material for the h3 upstream bridge (`clusters.*.h3_tls`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct H3UpstreamTls {
+    /// CA bundle (PEM) the backend's certificate must chain to.
+    pub ca: String,
+    /// SNI name for the h3 handshake.
+    #[serde(default = "default_h3_server_name")]
+    pub server_name: String,
+    /// Client certificate chain (PEM) for mTLS backends (mesh SVID).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_cert: Option<String>,
+    /// Client private key (PEM).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_key: Option<String>,
+    /// ALPN protocol (default `h3`; the mesh connector uses
+    /// `vane-mesh`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alpn: Option<String>,
+}
+
+fn default_h3_server_name() -> String {
+    "localhost".to_string()
 }
 
 /// Mesh mTLS upstream identity for a cluster (design:

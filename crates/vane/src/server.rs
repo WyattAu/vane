@@ -303,7 +303,7 @@ fn resolve_admin_token(
 
 /// Runs the proxy until shutdown. Returns the process exit code.
 pub async fn run(opts: RunOptions) -> i32 {
-    let config = match load_config(opts.config_path.as_deref()) {
+    let mut config = match load_config(opts.config_path.as_deref()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("vane: {e}");
@@ -709,6 +709,61 @@ pub async fn run(opts: RunOptions) -> i32 {
              refusing to start with silent h2c listeners"
         );
         return 1;
+    }
+
+    #[cfg(not(feature = "h3"))]
+    if config.clusters.values().any(|c| c.http3) {
+        eprintln!(
+            "vane: cluster http3 = true requires the `h3` feature (default); \
+             refusing to start with a bridge-less h3 cluster"
+        );
+        return 1;
+    }
+    for (name, c) in &config.clusters {
+        if c.http3 && c.h3_tls.is_none() {
+            eprintln!(
+                "vane: cluster `{name}` sets http3 = true without h3_tls \
+                 (QUIC is TLS-always — a CA bundle is required)"
+            );
+            return 1;
+        }
+        if !c.http3 && c.h3_tls.is_some() {
+            eprintln!("vane: cluster `{name}` sets h3_tls without http3 = true");
+            return 1;
+        }
+    }
+
+    // ---- HTTP/3 upstream clusters: spawn the in-process bridge and
+    // point the cluster's backends at it. The worker then dials a
+    // normal loopback h1 backend; the bridge re-originates over QUIC
+    // (docs/h3-design.md, milestone 4).
+    #[cfg(feature = "h3")]
+    {
+        let timeout = Duration::from_millis(config.runtime.first_byte_timeout_ms);
+        for (name, cluster) in config.clusters.iter_mut() {
+            if !cluster.http3 {
+                continue;
+            }
+            let backends: Vec<std::net::SocketAddr> = cluster
+                .backends
+                .iter()
+                .filter_map(|b| b.parse().ok())
+                .collect();
+            if backends.is_empty() {
+                eprintln!("vane: cluster `{name}` http3 = true with no parsable backends");
+                return 1;
+            }
+            match crate::h3_bridge::spawn(backends, cluster.h3_tls.clone(), timeout) {
+                Ok(addr) => {
+                    tracing::info!("h3 bridge: cluster `{name}` re-originates via {addr}");
+                    cluster.backends = vec![addr.to_string()];
+                }
+                Err(e) => {
+                    eprintln!("vane: h3 bridge for cluster `{name}`: {e}");
+                    return 1;
+                }
+            }
+        }
     }
 
     // ---- Access-log drain: workers push fixed-size events into their

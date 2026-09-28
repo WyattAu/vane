@@ -145,6 +145,8 @@ pub fn apply_snapshot(
             compression: cluster.compression,
             outlier: cluster.outlier.clone(),
             http2: cluster.http2,
+            http3: false,
+            h3_tls: None,
             mesh: None,
         };
         let backends = resolve_backends(&cluster_cfg, health);

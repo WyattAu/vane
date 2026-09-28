@@ -39,24 +39,32 @@ fn spawn_upstream() -> std::net::SocketAddr {
         for stream in listener.incoming().flatten() {
             let mut s = stream;
             std::thread::spawn(move || {
-                use std::io::Write as _;
-                let _ = s.write_all(
-                    b"HTTP/1.1 200 OK\r\ncontent-length: 8\r\nconnection: keep-alive\r\n\r\nh3-works",
-                );
-                let _ = s.shutdown(std::net::Shutdown::Both);
+                use std::io::{Read as _, Write as _};
+                let mut buf = [0u8; 8192];
+                loop {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            if s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 8\r\nconnection: keep-alive\r\n\r\nh3-works").is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
             });
         }
     });
     addr
 }
 
-/// KNOWN ISSUE: fails under the #[tokio::test] runtime (quinn connect
-/// times out) — the h3 client runtime thread + the test's tokio
-/// context interact. Works when driven from a plain thread. Tracked
-/// with the h3 conformance work.
-#[tokio::test]
-#[ignore = "h3 client runtime nesting under tokio::test — needs dedicated-thread harness"]
-async fn h3_client_roundtrip() {
+/// Plain-thread harness (2026-09-28): the h3 client's internal
+/// runtime thread times out under `#[tokio::test]` — the test's own
+/// tokio context interferes with quinn. The bridge tests cover the
+/// production shape; this drives the same library call from a plain
+/// thread. The URI-authority fix resolved the header-build failure
+/// the original note tracked.
+#[test]
+fn h3_client_roundtrip() {
     let upstream = spawn_upstream();
     let router = test_router(upstream);
     let edge = Arc::new(vane::h3_edge::H3Edge::new(
@@ -80,13 +88,22 @@ async fn h3_client_roundtrip() {
 
     let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp bind");
     let local: std::net::SocketAddr = udp.local_addr().expect("addr");
-    vane::h3_edge::spawn(udp, Arc::new(server_tls), edge);
-    for _ in 0..60 {
-        if std::net::UdpSocket::bind("127.0.0.1:0").is_ok() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    // The edge spawns onto tokio: host it on a dedicated runtime
+    // thread (no test-runtime context — see the harness note above).
+    std::thread::Builder::new()
+        .name("h3-edge-host".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("edge runtime");
+            rt.block_on(async move {
+                vane::h3_edge::spawn(udp, Arc::new(server_tls), edge);
+                std::future::pending::<()>().await;
+            });
+        })
+        .expect("edge thread");
+    std::thread::sleep(std::time::Duration::from_millis(300));
 
     // Client TLS material trusting the server cert.
     let mut roots = rustls::RootCertStore::empty();
@@ -96,6 +113,7 @@ async fn h3_client_roundtrip() {
         .with_no_client_auth();
 
     let cfg = vane::h3_client::H3ClientConfig {
+        client_cert: None,
         server_certs: vec![certs.cert.der().clone()],
         server_name: "localhost".into(),
         alpn: vec![b"h3".to_vec()],

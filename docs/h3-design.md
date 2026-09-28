@@ -69,7 +69,7 @@ QuinnEndpoint (worker-owned)
    advertised endpoint serves h3. h2spec-h3 parity remains open.
 4. Client-side h3 (H3Upstream) for mesh east-west.
 
-## Milestone 4 design: client-side H3Upstream (pending implementation)
+## Milestone 4: client-side H3Upstream — SHIPPED (2026-09-28, loopback-bridge form)
 
 The upstream connector runs on the synchronous mio worker; quinn needs
 an async runtime. Three options were considered:
@@ -80,23 +80,40 @@ an async runtime. Three options were considered:
 | B. dedicated h3 runtime thread | One tokio current-thread runtime per process hosts a shared quinn Endpoint; workers hand requests to it over an SPSC ring, responses stream back over a second ring | Chosen for a first cut: mirrors the in-process SHM sidecar bridge (`sidecar::spawn_bridge`) and keeps workers synchronous; per-request state lives on the h3 thread, workers keep their slot model |
 | C. reqwest http3 (experimental feature) | reqwest's `http3` feature on the edge path | Rejected: pulls an unstable reqwest feature and hides the mesh connector (client certs/ALPN `vane-mesh`) behind an opaque stack |
 
-### Plan (option B)
+### Shipped form (2026-09-28): the in-process loopback bridge
 
-1. `h3_client` thread (tokio, current-thread): owns the quinn Endpoint
-   per cluster (`mesh.upstream_h3 = true`), dials with the mesh SVID +
-   ALPN `vane-mesh`, and multiplexes request streams.
-2. Worker handoff: `upstream_send` on an h3 upstream writes the
-   serialized head/body into a bounded SPSC ring keyed by session slot;
-   the h3 thread drains it, opens a bidi stream, relays; response bytes
-   come back over the response ring and re-enter the worker as
-   synthetic `on_upstream_data` events (same shape as the h2up shim).
-3. Backpressure: the request ring bound is the h3 upstream's
-   `WRITE_PENDING_CAP` analog; response flow control maps h3
-   `send_window` updates onto the existing credit path.
-4. Failure semantics: h3 dial/response timeout → `upstream_failed`
-   (502, failover rules identical to h1/h2 upstreams).
-5. Tests: h3-edge-to-h3-edge roundtrip (both directions over QUIC),
-   plus an mTLS variant asserting the SPIFFE identity of the h3 peer.
+Option B's ring handoff, simplified to option **B′**: the bridge is an
+in-process mini-proxy. The server spawns `h3_bridge::spawn(backends,
+tls, timeout)` per `http3 = true` cluster; it binds an ephemeral
+loopback TCP port and the cluster's backend list is REWRITTEN to that
+address before the workers start — the synchronous mio worker dials a
+normal h1 backend and the entire engine (pool, health, failover,
+timeouts) works unchanged.
 
-Estimated: ~600–800 LOC for the bridge + client, after the ring
-handoff pattern is copied from the sidecar bridge.
+- h1 side: thread-per-connection accept loop; one httparse request
+  per connection (CL-delimited or bodyless; chunked → 501).
+- h3 side: `h3_client::request` per request (its own current-thread
+  runtime per dial); round-robin across the cluster's real backends.
+- Failure semantics: any h3 dial/response failure closes the socket
+  abruptly — the worker sees premature EOF and the existing failover
+  rules apply (no synthetic 502 to mask a dead backend).
+- TLS: `h3_tls.ca` (server trust), optional `client_cert`/`client_key`
+  (mesh SVID for mTLS backends), `alpn` (default `h3`).
+- The h3 client carries the authority in the URI (`:authority`); an
+  explicit `host` header mismatching the URI host makes the h3 crate
+  fail the header build (H3_INTERNAL_ERROR) — that bug class is
+  designed out.
+
+Acceptance: `tests/h3_bridge.rs` — h1→bridge→QUIC→vane-h3-edge→h1
+roundtrip (200 + body), dead-backend abrupt close, and the mTLS
+variant (bridge presents a CA-signed SVID against a client-cert-
+required h3 backend; anonymous dial rejected). `tests/h3_client.rs`
+un-ignored with a plain-thread harness.
+
+### Future optimization: SPSC rings (the original option B)
+
+The loopback hop costs one memcpy per direction. If profiled as hot,
+replace the TCP bridge with the original design: request/response
+SPSC rings + eventfd wakeup registered in the worker's poller (the
+SHM sidecar pattern). Semantics and config are unchanged — `h3_bridge`
+swaps its transport under the same interface.
