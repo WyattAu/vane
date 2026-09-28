@@ -59,6 +59,22 @@ pub struct XdsRoute {
     pub allowed_spiffe_prefixes: Vec<String>,
 }
 
+/// Listener TLS material delivered by xDS (LDS parity for the TLS
+/// dimension). Applied to the PRE-BOUND listener with the matching
+/// address — the process binds at startup; xDS only swaps material.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct XdsListenerTls {
+    /// Listener address as configured at startup ("127.0.0.1:8443").
+    pub address: String,
+    /// PEM certificate chain (file path).
+    pub cert: String,
+    /// PEM private key (file path).
+    pub key: String,
+    /// PEM CA for downstream client certificates (optional mTLS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ca: Option<String>,
+}
+
 /// A full-state configuration snapshot: replace-everything semantics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XdsSnapshot {
@@ -71,6 +87,9 @@ pub struct XdsSnapshot {
     /// Dynamic routes.
     #[serde(default)]
     pub routes: Vec<XdsRoute>,
+    /// Listener TLS material for pre-bound listeners (LDS parity).
+    #[serde(default)]
+    pub listeners: Vec<XdsListenerTls>,
 }
 
 /// Last applied snapshot version (shared with the admin plane).

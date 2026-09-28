@@ -201,6 +201,7 @@ pub fn compile(state: &GatewayState) -> Result<XdsSnapshot, String> {
         version: format!("gw-{:016x}", version_hash),
         clusters,
         routes,
+        listeners: Vec::new(),
     })
 }
 

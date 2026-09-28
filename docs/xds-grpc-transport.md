@@ -81,7 +81,7 @@ than inline assignments. Implementation:
    `EdsClusterConfig` (eds_config = ADS) and seed the snapshot's EDS
    resource; the interop script then asserts the same live route.
 
-### LDS (listeners) — larger, design only for now
+### LDS (listeners) — TLS rotation shipped (2026-09-28)
 
 LDS responses carry `Listener` resources: `address` (1) →
 `socket_address` (1/2), `filter_chains` = 25 →
@@ -90,7 +90,24 @@ LDS responses carry `Listener` resources: `address` (1) →
 `XdsSnapshot` with a `listeners` list (address, port, TLS material
 reference, routes) and extending `apply_snapshot` to compile listener
 entries — the admin plane currently only owns routes + clusters.
-Design sketch:
+
+**Shipped (this milestone): snapshot-driven listener TLS rotation.**
+`XdsSnapshot.listeners` now carries `XdsListenerTls { address, cert,
+key, client_ca }`. The admin plane holds the per-listener TLS slots
+(`build_admin_router` gains the `(address, TlsSlot)` registry); a
+snapshot entry addresses a PRE-BOUND TLS listener by its startup
+address and swaps the shared slot — the same hot-swap the file watcher
+performs, driven by xDS push instead of file mtime. This is the
+highest-value LDS dimension for real deployments: certificate rotation
+via control plane. Semantics: an address that is not a pre-bound TLS
+listener → `400` (xDS may never bind or rebind ports); unknown but
+loadable material errors the whole apply (`400`), leaving the previous
+certificate serving. Covered by `xds_snapshot_rotates_listener_tls`
+(live rotation, new cert serves routed traffic without restart) and
+the unknown-address rejection unit test.
+
+**Still design-only: full listener declaration** (route attachment via
+`route_config_name`, h2c/h3 toggles, new-socket binding). Sketch:
 
 - `XdsListener { address, port, server_names, route_config_name }`;
   TLS material stays file-based (`listeners.tls.cert/key` style) until

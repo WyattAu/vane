@@ -31,10 +31,17 @@ pub fn build_admin_router(
     xds_state: Arc<XdsState>,
     listeners_bound: Arc<AtomicBool>,
     auth_token: Option<Arc<str>>,
+    tls_slots: Vec<(String, crate::tls_reload::TlsSlot)>,
 ) -> Router {
     let health2 = Arc::clone(&health);
     let xds_for_snapshot = Arc::clone(&xds_state);
     let xds_for_version = Arc::clone(&xds_state);
+    let xds_tls_slots = Arc::new(
+        tls_slots
+            .iter()
+            .map(|(a, s)| (a.clone(), std::sync::Arc::clone(s)))
+            .collect::<Vec<_>>(),
+    );
     let app = Router::new()
         .route(
             "/health",
@@ -97,7 +104,8 @@ pub fn build_admin_router(
                 let router = Arc::clone(&router);
                 let health = Arc::clone(&health);
                 let xds = Arc::clone(&xds_for_snapshot);
-                async move { xds_snapshot(router, health, xds, body).await }
+                let slots = Arc::clone(&xds_tls_slots);
+                async move { xds_snapshot(router, health, xds, slots, body).await }
             }),
         )
         .route(
@@ -173,6 +181,7 @@ async fn xds_snapshot(
     router: Arc<RouteRouter>,
     health: Arc<vane_control::HealthMap>,
     xds: Arc<vane_control::xds::XdsState>,
+    tls_slots: Arc<Vec<(String, crate::tls_reload::TlsSlot)>>,
     body: String,
 ) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
     let snapshot: vane_control::xds::XdsSnapshot = serde_json::from_str(&body).map_err(|e| {
@@ -187,6 +196,33 @@ async fn xds_snapshot(
             format!("snapshot rejected: {e}"),
         )
     })?;
+    // Listener TLS material from the snapshot (LDS parity): for each
+    // snapshot listener entry, swap the pre-bound listener's shared
+    // slot — same hot-swap the file watcher performs.
+    for l in &snapshot.listeners {
+        let Some((_, slot)) = tls_slots.iter().find(|(a, _)| a.as_str() == l.address) else {
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                format!(
+                    "snapshot listener `{}` is not a pre-bound TLS listener",
+                    l.address
+                ),
+            ));
+        };
+        let cfg = vane_tls::server_config_mtls(
+            std::path::Path::new(&l.cert),
+            std::path::Path::new(&l.key),
+            l.client_ca.as_deref().map(std::path::Path::new),
+        )
+        .map_err(|e| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("listener `{}` tls: {e}", l.address),
+            )
+        })?;
+        let mut w = slot.write().expect("tls slot");
+        *w = Arc::new(cfg);
+    }
     Ok(axum::Json(serde_json::json!({
         "status": "applied",
         "version": snapshot.version,

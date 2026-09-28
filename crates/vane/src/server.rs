@@ -754,6 +754,13 @@ pub async fn run(opts: RunOptions) -> i32 {
     let xds_state = crate::admin::xds_state_handle();
     if config.admin.enabled {
         let admin_addr: std::net::SocketAddr = config.admin.address.parse().expect("validated");
+        // (address, TLS slot) pairs for snapshot-driven listener TLS.
+        let listener_tls_pairs: Vec<(String, crate::tls_reload::TlsSlot)> = config
+            .listeners
+            .iter()
+            .enumerate()
+            .filter_map(|(li, l)| Some((l.address.clone(), tls_cfg_slots.get(li)?.clone()?)))
+            .collect();
         let admin_router = crate::admin::build_admin_router(
             Arc::clone(&router),
             Arc::clone(&registry),
@@ -761,6 +768,7 @@ pub async fn run(opts: RunOptions) -> i32 {
             xds_state,
             Arc::clone(&listeners_bound),
             admin_token,
+            listener_tls_pairs,
         );
         tokio::spawn(async move {
             if let Err(e) = crate::admin::serve(admin_addr, admin_router).await {

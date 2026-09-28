@@ -1878,3 +1878,129 @@ workers = 1
     .await
     .expect("client task");
 }
+
+/// Snapshot-driven listener TLS rotation (LDS parity): POST
+/// /xds/snapshot with a `listeners` entry swaps the pre-bound
+/// listener's certificate live — the new cert is served without a
+/// restart.
+#[test]
+fn xds_snapshot_rotates_listener_tls() {
+    let _serial = lock_serial();
+    let upstream = spawn_upstream();
+    let port = free_port();
+    let admin = free_port();
+
+    // Cert A: the listener's starting material. Cert B: what the
+    // snapshot rotates in.
+    let dir = tempfile::tempdir().expect("dir");
+    let certs_a = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert a");
+    let certs_b = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert b");
+    let cert_a = dir.path().join("cert_a.pem");
+    let key_a = dir.path().join("key_a.pem");
+    let cert_b = dir.path().join("cert_b.pem");
+    let key_b = dir.path().join("key_b.pem");
+    std::fs::write(&cert_a, certs_a.cert.pem()).expect("cert a");
+    std::fs::write(&key_a, certs_a.signing_key.serialize_pem()).expect("key a");
+    std::fs::write(&cert_b, certs_b.cert.pem()).expect("cert b");
+    std::fs::write(&key_b, certs_b.signing_key.serialize_pem()).expect("key b");
+
+    let toml = format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[listeners.tls]
+cert = "{}"
+key = "{}"
+
+[clusters.up]
+backends = ["{upstream}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = true
+address = "127.0.0.1:{admin}"
+
+[runtime]
+force_mio = true
+workers = 1
+"#,
+        cert_a.display(),
+        key_a.display()
+    );
+    let path = dir.path().join("vane.toml");
+    std::fs::write(&path, toml).expect("write");
+    let cfg = path.to_str().expect("utf8").to_owned();
+
+    let _server_guard_4 = spawn_proxy(cfg);
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    // Rotate: the snapshot addresses the listener by its startup
+    // address and names cert B's material.
+    let body = format!(
+        r#"{{"version":"tls-1","clusters":{{"up":{{"backends":["{upstream}"]}}}},"routes":[{{"pattern":"/*rest","cluster":"up"}}],"listeners":[{{"address":"127.0.0.1:{port}","cert":"{}","key":"{}"}}]}}"#,
+        cert_b.display(),
+        key_b.display()
+    );
+    let admin_addr: std::net::SocketAddr = format!("127.0.0.1:{admin}").parse().expect("addr");
+    let mut s = None;
+    for _ in 0..100 {
+        if let Ok(c) = std::net::TcpStream::connect(admin_addr) {
+            s = Some(c);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut s = s.expect("admin never came up");
+    let req = format!(
+        "POST /xds/snapshot HTTP/1.1\r\nHost: a\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    s.write_all(req.as_bytes()).expect("admin write");
+    let mut resp = Vec::new();
+    s.read_to_end(&mut resp).expect("admin read");
+    let resp = String::from_utf8_lossy(&resp).into_owned();
+    assert!(resp.contains("200"), "snapshot apply: {resp:?}");
+    assert!(resp.contains("applied"), "snapshot body: {resp:?}");
+    drop(s);
+
+    // The listener now serves cert B live: a client trusting B (and
+    // only B) completes the handshake and gets routed.
+    let mut roots = rustls::RootCertStore::empty();
+    use rustls::pki_types::pem::PemObject as _;
+    let der = rustls::pki_types::CertificateDer::from_pem_file(&cert_b).expect("cert b der");
+    roots.add(der).expect("add b");
+    let client_cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server_name =
+        rustls::pki_types::ServerName::try_from("localhost".to_string()).expect("sni");
+    let mut conn = rustls::ClientConnection::new(std::sync::Arc::new(client_cfg), server_name)
+        .expect("client conn");
+    let mut sock = std::net::TcpStream::connect(proxy).expect("tcp");
+    let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+    tls.write_all(b"GET /x HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+        .expect("tls write");
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match tls.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    let got = String::from_utf8_lossy(&got).into_owned();
+    assert!(got.contains("200 OK"), "rotated tls response: {got:?}");
+    assert!(got.contains("hello-vane"), "rotated tls body: {got:?}");
+}

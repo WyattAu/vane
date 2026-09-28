@@ -43,6 +43,7 @@ fn app() -> axum::Router {
         vane_control::xds::shared_state(),
         Arc::new(AtomicBool::new(true)),
         None,
+        Vec::new(),
     )
 }
 
@@ -58,6 +59,7 @@ fn app_with(
         vane_control::xds::shared_state(),
         Arc::new(AtomicBool::new(listeners_bound)),
         auth_token.map(Arc::from),
+        Vec::new(),
     )
 }
 
@@ -260,6 +262,7 @@ async fn metrics_render_prometheus() {
         vane_control::xds::shared_state(),
         Arc::new(AtomicBool::new(true)),
         None,
+        Vec::new(),
     );
     let res = app
         .oneshot(
@@ -312,6 +315,7 @@ async fn serve_binds_and_answers() {
         vane_control::xds::shared_state(),
         Arc::new(AtomicBool::new(true)),
         None,
+        Vec::new(),
     );
     // Bind first to pick a free port, then hand the listener over.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -426,6 +430,7 @@ async fn xds_snapshot_applies_and_replaces() {
         vane_control::xds::shared_state(),
         Arc::new(AtomicBool::new(true)),
         None,
+        Vec::new(),
     );
 
     // Apply a snapshot routing /dyn/* to a live upstream.
@@ -500,4 +505,36 @@ fn test_router_keepalive() -> std::sync::Arc<RouteRouter> {
         });
     });
     Arc::new(r)
+}
+
+/// A snapshot `listeners` entry whose address is not a pre-bound TLS
+/// listener is rejected with `400` — xDS may only rotate material for
+/// listeners the process already owns.
+#[tokio::test]
+async fn xds_snapshot_listener_unknown_address_rejected() {
+    let app = app();
+
+    let snap = r#"{
+        "version": "tls-bad",
+        "clusters": {},
+        "routes": [],
+        "listeners": [ { "address": "127.0.0.1:1", "cert": "/x.pem", "key": "/x.key" } ]
+    }"#;
+    let res = app
+        .oneshot(
+            Request::post("/xds/snapshot")
+                .body(Body::from(snap))
+                .expect("valid request"),
+        )
+        .await
+        .expect("oneshot");
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(res.into_body(), 4096)
+        .await
+        .expect("body");
+    let body = String::from_utf8_lossy(&body).into_owned();
+    assert!(
+        body.contains("not a pre-bound TLS listener"),
+        "rejection detail: {body:?}"
+    );
 }

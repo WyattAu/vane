@@ -285,6 +285,7 @@ pub fn map_snapshot(clusters: &[EnvoyCluster], route_config: &EnvoyRouteConfig) 
         version: String::new(),
         clusters: std::collections::BTreeMap::new(),
         routes: Vec::new(),
+        listeners: Vec::new(),
     };
     for c in clusters {
         snapshot.clusters.insert(
