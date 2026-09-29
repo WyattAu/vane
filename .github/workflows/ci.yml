@@ -101,6 +101,25 @@ jobs:
       - name: all features (h2/h3/wasm/k8s/rkyv)
         run: cargo check --workspace --all-features
 
+  h3-quic:
+    name: h3 QUIC suites (release)
+    runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: sccache stats
+        run: sccache --start-server || true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # QUIC/TLS handshakes in debug are ~20x slower and make the
+      # streaming suites load-flaky — the h3 gate runs in release.
+      - name: h3 bridge/client/edge e2e
+        run: |
+          cargo test --release -p vane-proxy --test h3_bridge --test h3_client --test h3_edge
+
   coverage:
     name: coverage (llvm-cov)
     runs-on: ubuntu-latest

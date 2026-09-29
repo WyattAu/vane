@@ -144,7 +144,10 @@ fn h3_bridge_roundtrip() {
     let bridge = vane::h3_bridge::spawn(
         vec![quic_addr],
         Some(bridge_tls(&ca)),
-        Duration::from_secs(10),
+        vane::h3_bridge::BridgeOptions {
+            first_byte_timeout: Duration::from_secs(10),
+            ..Default::default()
+        },
     )
     .expect("bridge");
 
@@ -168,8 +171,15 @@ fn h3_bridge_dead_backend_closes() {
     let certs = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
     std::fs::write(&ca, certs.cert.pem()).expect("write ca");
 
-    let bridge = vane::h3_bridge::spawn(vec![dead], Some(bridge_tls(&ca)), Duration::from_secs(2))
-        .expect("bridge");
+    let bridge = vane::h3_bridge::spawn(
+        vec![dead],
+        Some(bridge_tls(&ca)),
+        vane::h3_bridge::BridgeOptions {
+            first_byte_timeout: Duration::from_secs(2),
+            ..Default::default()
+        },
+    )
+    .expect("bridge");
 
     let resp = h1_get(bridge, "/x");
     assert!(
@@ -298,8 +308,15 @@ fn h3_bridge_mtls_client_cert() {
         client_key: Some(cli_key_pem.display().to_string()),
         alpn: None,
     };
-    let bridge = vane::h3_bridge::spawn(vec![quic_addr], Some(tls), Duration::from_secs(10))
-        .expect("bridge");
+    let bridge = vane::h3_bridge::spawn(
+        vec![quic_addr],
+        Some(tls),
+        vane::h3_bridge::BridgeOptions {
+            first_byte_timeout: Duration::from_secs(10),
+            ..Default::default()
+        },
+    )
+    .expect("bridge");
     let resp = String::from_utf8_lossy(&h1_get(bridge, "/y")).into_owned();
     assert!(resp.contains("200 OK"), "mTLS bridge status: {resp:?}");
     assert!(resp.contains("mtls-h3!"), "mTLS bridge body: {resp:?}");
@@ -308,7 +325,10 @@ fn h3_bridge_mtls_client_cert() {
     let anon_bridge = vane::h3_bridge::spawn(
         vec![quic_addr],
         Some(bridge_tls(&ca_pem)),
-        Duration::from_secs(5),
+        vane::h3_bridge::BridgeOptions {
+            first_byte_timeout: Duration::from_secs(5),
+            ..Default::default()
+        },
     )
     .expect("anon bridge");
     let resp = h1_get(anon_bridge, "/y");
@@ -316,5 +336,150 @@ fn h3_bridge_mtls_client_cert() {
         resp.is_empty(),
         "anon bridge must be rejected without a response, got {}",
         String::from_utf8_lossy(&resp)
+    );
+}
+
+/// Health-aware routing: one live backend, one black-holed. The
+/// bridge's active probes mark the dead one down and the in-bridge
+/// retry covers the optimistic-start window — every request must be
+/// served by the live backend.
+#[test]
+fn h3_bridge_health_routes_around_dead_backend() {
+    init_log();
+    let upstream = spawn_upstream();
+    let (live, cert_pem) = spawn_h3_edge_backend(test_router(upstream));
+
+    let dead_udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp bind");
+    let dead: SocketAddr = dead_udp.local_addr().expect("addr");
+    drop(dead_udp);
+
+    let dir = tempfile::tempdir().expect("dir");
+    let ca = dir.path().join("ca.pem");
+    std::fs::write(&ca, cert_pem).expect("write ca");
+
+    let bridge = vane::h3_bridge::spawn(
+        vec![live, dead],
+        Some(bridge_tls(&ca)),
+        vane::h3_bridge::BridgeOptions {
+            first_byte_timeout: Duration::from_secs(2),
+            health_path: Some("/healthz".into()),
+            probe_interval: Duration::from_millis(200),
+        },
+    )
+    .expect("bridge");
+
+    // Warm-up: let a probe cycle mark the dead backend down.
+    std::thread::sleep(Duration::from_millis(700));
+
+    for i in 0..8 {
+        let resp = h1_get(bridge, &format!("/h{i}"));
+        let resp = String::from_utf8_lossy(&resp).into_owned();
+        assert!(
+            resp.contains("200 OK") && resp.contains("h3-edge!"),
+            "request {i} must be served by the live backend: {resp:?}"
+        );
+    }
+}
+
+/// Connection reuse: N requests (each on its own h1 side-connection)
+/// ride ONE pooled QUIC connection — the backend sees exactly one
+/// accept (deterministic: counted server-side).
+#[test]
+fn h3_bridge_reuses_one_quic_connection() {
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    let accepts = Arc::new(AtomicUsize::new(0));
+
+    // Raw quinn+h3 backend with an accept counter.
+    let certs = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
+    let server_key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
+        certs.signing_key.serialize_pem().as_bytes(),
+    ))
+    .expect("pem")
+    .expect("key");
+    let mut server_tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![certs.cert.der().clone()], server_key)
+        .expect("server cert");
+    server_tls.alpn_protocols = vec![b"h3".to_vec()];
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp bind");
+    let quic_addr: SocketAddr = udp.local_addr().expect("addr");
+    let tls_cfg = Arc::new(server_tls);
+    let accept_count = Arc::clone(&accepts);
+    std::thread::Builder::new()
+        .name("h3-reuse-backend".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("backend runtime");
+            rt.block_on(async move {
+                let qcfg = quinn::crypto::rustls::QuicServerConfig::try_from((*tls_cfg).clone())
+                    .expect("quinn server");
+                let endpoint = quinn::Endpoint::new(
+                    quinn::EndpointConfig::default(),
+                    Some(quinn::ServerConfig::with_crypto(Arc::new(qcfg))),
+                    udp,
+                    Arc::new(quinn::TokioRuntime),
+                )
+                .expect("endpoint");
+                while let Some(incoming) = endpoint.accept().await {
+                    accept_count.fetch_add(1, AtomicOrdering::Relaxed);
+                    let Ok(conn) = incoming.await else { continue };
+                    tokio::spawn(async move {
+                        let Ok(mut send) =
+                            h3::server::Connection::new(h3_quinn::Connection::new(conn)).await
+                        else {
+                            return;
+                        };
+                        while let Ok(Some(resolver)) = send.accept().await {
+                            let Ok((req, mut stream)) = resolver.resolve_request().await else {
+                                return;
+                            };
+                            let _ = req;
+                            let resp = http::Response::builder()
+                                .status(200)
+                                .header("content-type", "text/plain")
+                                .body(())
+                                .expect("resp");
+                            if stream.send_response(resp).await.is_err() {
+                                return;
+                            }
+                            let _ = stream
+                                .send_data(bytes::Bytes::from_static(b"reused!"))
+                                .await;
+                            let _ = stream.finish().await;
+                        }
+                    });
+                }
+            });
+        })
+        .expect("backend thread");
+
+    let dir = tempfile::tempdir().expect("dir");
+    let ca = dir.path().join("ca.pem");
+    std::fs::write(&ca, certs.cert.pem()).expect("write ca");
+
+    let bridge = vane::h3_bridge::spawn(
+        vec![quic_addr],
+        Some(bridge_tls(&ca)),
+        vane::h3_bridge::BridgeOptions {
+            first_byte_timeout: Duration::from_secs(10),
+            ..Default::default()
+        },
+    )
+    .expect("bridge");
+
+    for i in 0..4 {
+        let resp = h1_get(bridge, &format!("/r{i}"));
+        let resp = String::from_utf8_lossy(&resp).into_owned();
+        assert!(resp.contains("200 OK"), "request {i}: {resp:?}");
+        assert!(resp.contains("reused!"), "request {i} body: {resp:?}");
+    }
+    // Four h1 requests (four loopback TCP connections), one QUIC
+    // accept: the pool multiplexes instead of re-handshaking.
+    assert_eq!(
+        accepts.load(AtomicOrdering::Relaxed),
+        1,
+        "expected exactly one QUIC handshake for all requests"
     );
 }

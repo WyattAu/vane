@@ -1,22 +1,38 @@
 //! In-process HTTP/3 upstream bridge (feature `h3`) — the milestone-4
-//! integration (docs/h3-design.md, option B in its simplest form).
+//! integration (docs/h3-design.md).
 //!
 //! The engine's synchronous workers dial a loopback TCP listener and
 //! speak plain HTTP/1.1, exactly as they would with any other
 //! backend; this bridge re-originates each request over QUIC/HTTP-3
 //! to the cluster's real backends and translates the response back to
-//! h1. The worker needs no knowledge of QUIC; the bridge thread owns
-//! the async stack (one thread per accepted connection, `h3_client`
-//! per request).
+//! h1. The worker needs no knowledge of QUIC.
 //!
-//! Failure semantics: an h3 dial/response failure closes the socket
-//! abruptly, so the worker sees premature EOF — the existing
-//! failover/retry rules treat it like any dead backend.
+//! Architecture: the bridge's h3 engine runs on ONE dedicated thread
+//! hosting a current-thread tokio runtime. It owns a shared
+//! `quinn::Endpoint` and a per-backend connection pool — one QUIC
+//! handshake per backend, requests multiplex as h3 streams. The h1
+//! side (thread-per-connection) hands each parsed request to the
+//! engine over a channel and blocks on the response.
+//!
+//! Health: the engine owns backend health for the cluster. Active
+//! probes (`health_path`) plus active-failure feedback mark backends
+//! down; round-robin picks among healthy backends, with one in-bridge
+//! retry on the next healthy backend. This covers what the engine
+//! cannot see past the loopback address (its health probes, outlier
+//! ejection, and breaker all apply to the bridge itself).
+//!
+//! Failure semantics: when no backend answers, the h1 socket closes
+//! abruptly — the worker sees premature EOF and the existing failover
+//! rules treat it like any dead backend.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::sync::{mpsc, oneshot};
 use vane_control::config::H3UpstreamTls;
 
 /// Head/body read cap for the loopback h1 side (the engine only ever
@@ -24,16 +40,188 @@ use vane_control::config::H3UpstreamTls;
 const MAX_HEAD: usize = 64 * 1024;
 const MAX_BODY: usize = 32 * 1024 * 1024;
 
-/// Spawns the bridge on a dedicated thread bound to an ephemeral
-/// loopback port. Returns the address the engine should use as the
-/// cluster's (single) backend.
+/// Bridge tuning beyond the TLS material.
+#[derive(Debug, Clone)]
+pub struct BridgeOptions {
+    /// Whole-exchange timeout (dial + head + body) — mirrors the
+    /// engine's first-byte deadline.
+    pub first_byte_timeout: Duration,
+    /// Active health-check path; `None` disables proactive probing
+    /// (reactive marking on request failure still applies).
+    pub health_path: Option<String>,
+    /// Interval between active health probes.
+    pub probe_interval: Duration,
+}
+
+impl Default for BridgeOptions {
+    fn default() -> Self {
+        Self {
+            first_byte_timeout: Duration::from_secs(10),
+            health_path: None,
+            probe_interval: Duration::from_secs(5),
+        }
+    }
+}
+
+/// One request handed from the h1 side to the h3 engine.
+struct Job {
+    method: String,
+    path: String,
+    authority: String,
+    body: Vec<u8>,
+    respond: oneshot::Sender<Result<crate::h3_client::H3Response, String>>,
+}
+
+/// Pooled h3 connection to one backend.
+struct Pooled {
+    send: crate::h3_client::H3SendRequest,
+}
+
+/// Engine state shared by the job handler and the prober.
+struct Engine {
+    cfg: crate::h3_client::H3ClientConfig,
+    endpoint: quinn::Endpoint,
+    backends: Vec<SocketAddr>,
+    /// Healthy mask (parallel to `backends`).
+    healthy: Mutex<Vec<bool>>,
+    /// Round-robin cursor.
+    rr: AtomicUsize,
+    pool: Mutex<HashMap<SocketAddr, Pooled>>,
+    opts: BridgeOptions,
+}
+
+impl Engine {
+    fn mark(&self, idx: usize, healthy: bool) {
+        let mut h = self.healthy.lock().expect("health lock");
+        h[idx] = healthy;
+    }
+
+    /// A pooled h3 client for `addr`, dialing on miss (or after an
+    /// eviction). The driver task is spawned once per connection.
+    async fn pooled(&self, addr: SocketAddr) -> Result<crate::h3_client::H3SendRequest, String> {
+        if let Some(p) = self.pool.lock().expect("pool lock").get(&addr) {
+            return Ok(p.send.clone());
+        }
+        let connecting = self
+            .endpoint
+            .connect(addr, &self.cfg.server_name)
+            .map_err(|e| format!("connect: {e}"))?;
+        let quinn_conn = match tokio::time::timeout(self.opts.first_byte_timeout, connecting).await
+        {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => return Err(format!("quinn connect: {e}")),
+            Err(_) => return Err("quinn connect timed out".into()),
+        };
+        let (mut driver, send) = crate::h3_client::client_new(quinn_conn).await?;
+        tokio::spawn(async move {
+            let err = driver.wait_idle().await;
+            tracing::trace!("h3 bridge: connection driver idle: {err:?}");
+        });
+        self.pool
+            .lock()
+            .expect("pool lock")
+            .insert(addr, Pooled { send: send.clone() });
+        Ok(send)
+    }
+
+    fn evict(&self, addr: SocketAddr) {
+        self.pool.lock().expect("pool lock").remove(&addr);
+    }
+
+    /// One full attempt against a specific backend.
+    async fn attempt(
+        self: &Arc<Self>,
+        idx: usize,
+        addr: SocketAddr,
+        job: &Job,
+    ) -> Result<crate::h3_client::H3Response, String> {
+        let mut send = match self.pooled(addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                self.evict(addr);
+                self.mark(idx, false);
+                return Err(e);
+            }
+        };
+        let fut = crate::h3_client::exchange(
+            &mut send,
+            &job.method,
+            &job.path,
+            &job.authority,
+            &job.body,
+        );
+        match tokio::time::timeout(self.opts.first_byte_timeout, fut).await {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(e)) => {
+                // Broken pooled connection: evict and mark down.
+                self.evict(addr);
+                self.mark(idx, false);
+                Err(e)
+            }
+            Err(_) => {
+                self.evict(addr);
+                self.mark(idx, false);
+                Err("h3 exchange timed out".into())
+            }
+        }
+    }
+
+    /// Serves one job: pick a healthy backend, exchange, retry once on
+    /// the next healthy backend.
+    async fn handle(self: &Arc<Self>, job: Job) {
+        let mut attempts = 0usize;
+        let mut tried: Vec<usize> = Vec::new();
+        let max_attempts = 2usize;
+        while let Some((idx, addr)) = (|| {
+            let healthy = self.healthy.lock().expect("health lock");
+            let start = self.rr.fetch_add(1, Ordering::Relaxed) % self.backends.len();
+            for i in 0..self.backends.len() {
+                let idx = (start + i) % self.backends.len();
+                if healthy[idx] && !tried.contains(&idx) {
+                    return Some((idx, self.backends[idx]));
+                }
+            }
+            // Fall back to any untried backend (feed health).
+            for i in 0..self.backends.len() {
+                let idx = (start + i) % self.backends.len();
+                if !tried.contains(&idx) {
+                    return Some((idx, self.backends[idx]));
+                }
+            }
+            None
+        })() {
+            tried.push(idx);
+            attempts += 1;
+            match self.attempt(idx, addr, &job).await {
+                Ok(resp) => {
+                    let _ = job.respond.send(Ok(resp));
+                    return;
+                }
+                Err(e) => {
+                    tracing::debug!(%addr, method = %job.method, path = %job.path,
+                        "h3 bridge: attempt failed: {e}");
+                    if attempts >= max_attempts {
+                        let _ = job.respond.send(Err(e));
+                        return;
+                    }
+                }
+            }
+        }
+        let _ = job.respond.send(Err("h3 bridge: no backends".into()));
+    }
+}
+
+/// Spawns the bridge: an ephemeral loopback TCP listener (the engine's
+/// backend address) plus the h3 engine thread (shared endpoint, pool,
+/// health). Returns the address the engine should use as the cluster's
+/// (single) backend.
 ///
 /// # Errors
 /// Listener bind or TLS material load failures.
 pub fn spawn(
     backends: Vec<SocketAddr>,
     tls: Option<H3UpstreamTls>,
-    first_byte_timeout: Duration,
+    opts: BridgeOptions,
 ) -> Result<SocketAddr, String> {
     if backends.is_empty() {
         return Err("no backends".into());
@@ -41,18 +229,70 @@ pub fn spawn(
     let cfg = build_client_config(tls.as_ref())?;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind: {e}"))?;
     let addr = listener.local_addr().map_err(|e| format!("addr: {e}"))?;
+    let (tx, rx) = mpsc::channel::<Job>(256);
+
+    // h3 engine thread: the shared endpoint, connection pool, and
+    // health prober all live on this runtime (quinn endpoints bind to
+    // the runtime that created them — do not hoist this out).
+    let engine_backends = backends.clone();
+    let engine_opts = opts.clone();
     std::thread::Builder::new()
         .name("vane-h3-bridge".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("h3 bridge runtime");
+            rt.block_on(async move {
+                let endpoint =
+                    match crate::h3_client::client_endpoint(&cfg, engine_opts.first_byte_timeout) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            tracing::error!("h3 bridge: client endpoint: {e}");
+                            return;
+                        }
+                    };
+                let engine = Arc::new(Engine {
+                    cfg,
+                    endpoint,
+                    healthy: Mutex::new(vec![true; engine_backends.len()]),
+                    backends: engine_backends,
+                    rr: AtomicUsize::new(0),
+                    pool: Mutex::new(HashMap::new()),
+                    opts: engine_opts,
+                });
+                // Active health prober.
+                if engine.opts.health_path.is_some() {
+                    let prober = Arc::clone(&engine);
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(prober.opts.probe_interval).await;
+                            probe_once(&prober).await;
+                        }
+                    });
+                }
+                // Job loop.
+                let mut rx = rx;
+                while let Some(job) = rx.recv().await {
+                    let e = Arc::clone(&engine);
+                    tokio::spawn(async move { e.handle(job).await });
+                }
+            });
+        })
+        .map_err(|e| format!("bridge thread: {e}"))?;
+
+    // h1 accept loop: thread-per-connection (sync side).
+    std::thread::Builder::new()
+        .name("vane-h3-bridge-accept".into())
         .spawn(move || {
             for stream in listener.incoming() {
                 match stream {
                     Ok(sock) => {
-                        let cfg = cfg.clone();
-                        let backends = backends.clone();
-                        let timeout = first_byte_timeout;
+                        let tx = tx.clone();
+                        let opts = opts.clone();
                         let _ = std::thread::Builder::new()
                             .name("vane-h3-bridge-conn".into())
-                            .spawn(move || handle_conn(sock, &cfg, &backends, timeout));
+                            .spawn(move || handle_conn(sock, tx, &opts));
                     }
                     Err(e) => {
                         tracing::debug!("h3 bridge accept: {e}");
@@ -60,57 +300,52 @@ pub fn spawn(
                 }
             }
         })
-        .map_err(|e| format!("bridge thread: {e}"))?;
+        .map_err(|e| format!("bridge accept thread: {e}"))?;
     Ok(addr)
 }
 
-/// Loads the TLS material and assembles the h3 client config.
-fn build_client_config(
-    tls: Option<&H3UpstreamTls>,
-) -> Result<crate::h3_client::H3ClientConfig, String> {
-    use rustls::pki_types::pem::PemObject as _;
-    let mut cfg = crate::h3_client::H3ClientConfig::default();
-    let Some(tls) = tls else {
-        return Ok(cfg);
+/// One active health probe across all backends.
+async fn probe_once(engine: &Arc<Engine>) {
+    let Some(path) = engine.opts.health_path.clone() else {
+        return;
     };
-    let cas: Vec<_> = rustls::pki_types::CertificateDer::pem_file_iter(&tls.ca)
-        .map_err(|e| format!("ca {}: {e}", tls.ca))?
-        .collect::<Result<_, _>>()
-        .map_err(|e| format!("ca {}: {e}", tls.ca))?;
-    cfg.server_certs = cas;
-    cfg.server_name = tls.server_name.clone();
-    if let Some(alpn) = &tls.alpn {
-        cfg.alpn = vec![alpn.clone().into_bytes()];
-    }
-    match (&tls.client_cert, &tls.client_key) {
-        (Some(cert), Some(key)) => {
-            let chain: Vec<_> = rustls::pki_types::CertificateDer::pem_file_iter(cert)
-                .map_err(|e| format!("client cert: {e}"))?
-                .collect::<Result<_, _>>()
-                .map_err(|e| format!("client cert: {e}"))?;
-            let key = rustls::pki_types::PrivateKeyDer::from_pem_file(key)
-                .map_err(|e| format!("client key: {e}"))?;
-            cfg.client_cert = Some(crate::h3_client::ClientCert { chain, key });
+    for (idx, &addr) in engine.backends.iter().enumerate() {
+        let mut send = match engine.pooled(addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(%addr, "h3 bridge: probe dial failed: {e}");
+                engine.mark(idx, false);
+                continue;
+            }
+        };
+        let fut = crate::h3_client::exchange(&mut send, "GET", &path, &engine.cfg.server_name, &[]);
+        let timeout = engine.opts.first_byte_timeout.min(Duration::from_secs(3));
+        match tokio::time::timeout(timeout, fut).await {
+            Ok(Ok(resp)) if resp.status < 500 => engine.mark(idx, true),
+            Ok(Ok(resp)) => {
+                engine.mark(idx, false);
+                tracing::debug!(%addr, status = resp.status, "h3 bridge: probe unhealthy");
+            }
+            Ok(Err(e)) => {
+                engine.evict(addr);
+                engine.mark(idx, false);
+                tracing::debug!(%addr, "h3 bridge: probe failed: {e}");
+            }
+            Err(_) => {
+                engine.evict(addr);
+                engine.mark(idx, false);
+                tracing::debug!(%addr, "h3 bridge: probe timed out");
+            }
         }
-        (Some(_), None) | (None, Some(_)) => {
-            return Err("h3_tls: client_cert and client_key must be set together".into());
-        }
-        (None, None) => {}
     }
-    Ok(cfg)
 }
 
 /// Serves one loopback h1 connection: parse the request (single
 /// request per connection — the engine's pool opens fresh upstream
-/// connections for relay), re-originates it over h3, translates the
+/// connections for relay), hand it to the h3 engine, translate the
 /// response back.
-fn handle_conn(
-    mut sock: std::net::TcpStream,
-    cfg: &crate::h3_client::H3ClientConfig,
-    backends: &[SocketAddr],
-    timeout: Duration,
-) {
-    let _ = sock.set_read_timeout(Some(timeout.max(Duration::from_secs(1))));
+fn handle_conn(mut sock: std::net::TcpStream, jobs: mpsc::Sender<Job>, opts: &BridgeOptions) {
+    let _ = sock.set_read_timeout(Some(opts.first_byte_timeout.max(Duration::from_secs(1))));
     let _ = sock.set_nodelay(true);
 
     // Read the head (one `httparse::Request` parse yields method,
@@ -181,25 +416,31 @@ fn handle_conn(
     }
     body.truncate(cl as usize);
 
-    // Round-robin backend.
-    let backend = {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let i = NEXT.fetch_add(1, Ordering::Relaxed) % backends.len();
-        backends[i]
+    // Hand off to the h3 engine and wait.
+    let authority = authority.unwrap_or_else(|| "localhost".to_owned());
+    let (rtx, rrx) = oneshot::channel();
+    let job = Job {
+        method: method.to_owned(),
+        path: path.to_owned(),
+        authority,
+        body,
+        respond: rtx,
     };
-
-    let authority = authority.unwrap_or_else(|| backend.to_string());
-    let resp =
-        match crate::h3_client::request(backend, cfg, method, path, &authority, &body, timeout) {
-            Ok(r) => r,
-            Err(e) => {
-                // h3 failure: abrupt close → worker sees premature EOF
-                // and applies its failover rules.
-                tracing::debug!(%backend, method, path, "h3 bridge: upstream failed: {e}");
-                return;
-            }
-        };
+    if jobs.blocking_send(job).is_err() {
+        return;
+    }
+    let Ok(resp) = rrx.blocking_recv() else {
+        return; // engine gone: abrupt close
+    };
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => {
+            // h3 failure: abrupt close → worker sees premature EOF
+            // and applies its failover rules.
+            tracing::debug!(method, path, "h3 bridge: upstream failed: {e}");
+            return;
+        }
+    };
 
     // Translate to h1. The body is fully buffered, so Content-Length
     // is exact; hop-by-hop and framing headers are dropped.
@@ -225,6 +466,42 @@ fn handle_conn(
     out.extend_from_slice(&resp.body);
     let _ = sock.write_all(&out);
     let _ = sock.shutdown(std::net::Shutdown::Write);
+}
+
+/// Loads the TLS material and assembles the h3 client config.
+fn build_client_config(
+    tls: Option<&H3UpstreamTls>,
+) -> Result<crate::h3_client::H3ClientConfig, String> {
+    use rustls::pki_types::pem::PemObject as _;
+    let mut cfg = crate::h3_client::H3ClientConfig::default();
+    let Some(tls) = tls else {
+        return Ok(cfg);
+    };
+    let cas: Vec<_> = rustls::pki_types::CertificateDer::pem_file_iter(&tls.ca)
+        .map_err(|e| format!("ca {}: {e}", tls.ca))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("ca {}: {e}", tls.ca))?;
+    cfg.server_certs = cas;
+    cfg.server_name = tls.server_name.clone();
+    if let Some(alpn) = &tls.alpn {
+        cfg.alpn = vec![alpn.clone().into_bytes()];
+    }
+    match (&tls.client_cert, &tls.client_key) {
+        (Some(cert), Some(key)) => {
+            let chain: Vec<_> = rustls::pki_types::CertificateDer::pem_file_iter(cert)
+                .map_err(|e| format!("client cert: {e}"))?
+                .collect::<Result<_, _>>()
+                .map_err(|e| format!("client cert: {e}"))?;
+            let key = rustls::pki_types::PrivateKeyDer::from_pem_file(key)
+                .map_err(|e| format!("client key: {e}"))?;
+            cfg.client_cert = Some(crate::h3_client::ClientCert { chain, key });
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err("h3_tls: client_cert and client_key must be set together".into());
+        }
+        (None, None) => {}
+    }
+    Ok(cfg)
 }
 
 /// Reason phrase for the common status codes (empty reason is valid

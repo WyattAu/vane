@@ -438,6 +438,12 @@ pub async fn run(opts: RunOptions) -> i32 {
     reconciler.publish_static(&config);
     let mut checker = vane_control::HealthChecker::new(Arc::clone(&health), Duration::from_secs(5));
     for (name, cluster) in &config.clusters {
+        // http3 clusters: the backends were rewritten to the bridge's
+        // loopback address — probing it is vacuous. The bridge owns
+        // backend health (active h3 probes + failure feedback).
+        if cluster.http3 {
+            continue;
+        }
         if let Some(path) = &cluster.health_path {
             for b in &cluster.backends {
                 if let Ok(addr) = b.parse::<std::net::SocketAddr>() {
@@ -753,7 +759,12 @@ pub async fn run(opts: RunOptions) -> i32 {
                 eprintln!("vane: cluster `{name}` http3 = true with no parsable backends");
                 return 1;
             }
-            match crate::h3_bridge::spawn(backends, cluster.h3_tls.clone(), timeout) {
+            let opts = crate::h3_bridge::BridgeOptions {
+                first_byte_timeout: timeout,
+                health_path: cluster.health_path.clone(),
+                probe_interval: Duration::from_secs(5),
+            };
+            match crate::h3_bridge::spawn(backends, cluster.h3_tls.clone(), opts) {
                 Ok(addr) => {
                     tracing::info!("h3 bridge: cluster `{name}` re-originates via {addr}");
                     cluster.backends = vec![addr.to_string()];

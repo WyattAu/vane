@@ -92,9 +92,19 @@ timeouts) works unchanged.
 
 - h1 side: thread-per-connection accept loop; one httparse request
   per connection (CL-delimited or bodyless; chunked → 501).
-- h3 side: `h3_client::request` per request (its own current-thread
-  runtime per dial); round-robin across the cluster's real backends.
-- Failure semantics: any h3 dial/response failure closes the socket
+- h3 side: ONE shared `quinn::Endpoint` on a dedicated runtime thread
+  with a per-backend connection pool — one QUIC handshake per
+  backend, requests multiplex as h3 streams (`h3_client::exchange`
+  on pooled `SendRequest` handles). Health-aware round-robin with a
+  single in-bridge retry on the next healthy backend.
+- Health: the bridge owns backend health for the cluster — active
+  probes (`cluster.health_path`) over the pooled connections every
+  `probe_interval` (5 s), plus reactive marking on request/dial
+  failure, plus probe-based recovery. Engine-side health probes,
+  outlier ejection, and the breaker stay applied to the loopback
+  bridge address only (vacuous by construction — skipped for http3
+  clusters); the bridge is the owner of that logic in this shape.
+- Failure semantics: when no backend answers, the h1 socket closes
   abruptly — the worker sees premature EOF and the existing failover
   rules apply (no synthetic 502 to mask a dead backend).
 - TLS: `h3_tls.ca` (server trust), optional `client_cert`/`client_key`
@@ -105,10 +115,12 @@ timeouts) works unchanged.
   designed out.
 
 Acceptance: `tests/h3_bridge.rs` — h1→bridge→QUIC→vane-h3-edge→h1
-roundtrip (200 + body), dead-backend abrupt close, and the mTLS
+roundtrip (200 + body), dead-backend abrupt close, the mTLS
 variant (bridge presents a CA-signed SVID against a client-cert-
-required h3 backend; anonymous dial rejected). `tests/h3_client.rs`
-un-ignored with a plain-thread harness.
+required h3 backend; anonymous dial rejected), health-aware routing
+around a black-holed backend, and connection reuse (server-side
+accept counter: 4 requests → exactly 1 QUIC handshake).
+`tests/h3_client.rs` un-ignored with a plain-thread harness.
 
 ### Future optimization: SPSC rings (the original option B)
 

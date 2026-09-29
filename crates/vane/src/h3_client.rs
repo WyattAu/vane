@@ -147,12 +147,32 @@ pub async fn request_async(
     request_body: &[u8],
     timeout: Duration,
 ) -> Result<H3Response, String> {
-    let server_certs = cfg.server_certs.clone();
-    let alpn = cfg.alpn.clone();
-    let server_name = cfg.server_name.clone();
     let request_body = request_body.to_vec();
+    let endpoint = client_endpoint(cfg, timeout)?;
+    let quinn_conn = endpoint
+        .connect(addr, &cfg.server_name)
+        .map_err(|e| format!("connect: {e}"))?
+        .await
+        .map_err(|e| format!("quinn connect: {e}"))?;
+
+    let (mut driver, mut send_request) = client_new(quinn_conn).await?;
+    tokio::spawn(async move {
+        let err = driver.wait_idle().await;
+        tracing::trace!("h3 client driver idle: {err:?}");
+    });
+
+    exchange(&mut send_request, method, path, authority, &request_body).await
+}
+
+/// Builds the shared client endpoint (rustls material + transport
+/// timeouts). The bridge owns one endpoint per process and multiplexes
+/// request streams over pooled connections.
+///
+/// # Errors
+/// TLS material or endpoint bind failures as strings.
+pub fn client_endpoint(cfg: &H3ClientConfig, timeout: Duration) -> Result<quinn::Endpoint, String> {
     let mut roots = rustls::RootCertStore::empty();
-    for cert in &server_certs {
+    for cert in &cfg.server_certs {
         roots.add(cert.clone()).map_err(|e| format!("root: {e}"))?;
     }
     let builder = rustls::ClientConfig::builder();
@@ -164,7 +184,7 @@ pub async fn request_async(
     } else {
         builder.with_root_certificates(roots).with_no_client_auth()
     };
-    client_tls.alpn_protocols = alpn.clone();
+    client_tls.alpn_protocols = cfg.alpn.clone();
 
     let qcc =
         QuicClientConfig::try_from(client_tls).map_err(|e| format!("quinn client config: {e}"))?;
@@ -180,21 +200,22 @@ pub async fn request_async(
     let mut endpoint =
         quinn::Endpoint::client(bind).map_err(|e| format!("client endpoint: {e}"))?;
     endpoint.set_default_client_config(client_cfg);
+    Ok(endpoint)
+}
 
-    let quinn_conn = endpoint
-        .connect(addr, &server_name)
-        .map_err(|e| format!("connect: {e}"))?
-        .await
-        .map_err(|e| format!("quinn connect: {e}"))?;
-
-    let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(quinn_conn))
-        .await
-        .map_err(|e| format!("h3 handshake: {e}"))?;
-    tokio::spawn(async move {
-        let err = driver.wait_idle().await;
-        eprintln!("h3 client driver done: {err:?}");
-    });
-
+/// Runs one request/response exchange on an established h3 client
+/// (`send_request` handle from [`client_new`]). The bridge multiplexes
+/// these over pooled connections.
+///
+/// # Errors
+/// Send or receive failures as strings.
+pub async fn exchange(
+    send_request: &mut H3SendRequest,
+    method: &str,
+    path: &str,
+    authority: &str,
+    request_body: &[u8],
+) -> Result<H3Response, String> {
     // The authority rides the URI (:authority pseudo-header).
     // An explicit `host` header mismatching the URI host makes
     // the h3 crate fail the header build (H3_INTERNAL_ERROR).
@@ -208,7 +229,7 @@ pub async fn request_async(
         .await
         .map_err(|e| format!("send request: {e}"))?;
     if !request_body.is_empty() {
-        let data = Bytes::copy_from_slice(&request_body);
+        let data = Bytes::copy_from_slice(request_body);
         if stream.send_data(data).await.is_err() {
             return Err("send body failed".to_string());
         }
@@ -242,4 +263,28 @@ pub async fn request_async(
         headers,
         body: body_out,
     })
+}
+
+/// The send-request handle type for a pooled h3 connection.
+pub type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
+
+/// Completes the h3 handshake on an established QUIC connection:
+/// returns the send-request handle; the returned driver future must
+/// be polled (spawn it) for the connection to make progress.
+///
+/// # Errors
+/// Handshake failure as a string.
+pub async fn client_new(
+    quinn_conn: quinn::Connection,
+) -> Result<
+    (
+        h3::client::Connection<h3_quinn::Connection, Bytes>,
+        H3SendRequest,
+    ),
+    String,
+> {
+    let (driver, send_request) = h3::client::new(h3_quinn::Connection::new(quinn_conn))
+        .await
+        .map_err(|e| format!("h3 handshake: {e}"))?;
+    Ok((driver, send_request))
 }
