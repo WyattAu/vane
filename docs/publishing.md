@@ -39,13 +39,11 @@ vane --version
 
 ## Container image
 
-After crates land: build + push `ghcr.io/wyattau/vane:0.2.0` via the
-repo Dockerfile (needs registry push credentials):
+Automated: pushing a `vX.Y.Z` tag triggers `.github/workflows/
+release.yml`, which builds the Dockerfile and pushes
+`ghcr.io/wyattau/vane:X.Y.Z` (+ `X.Y`) with the workflow-scoped
+`GITHUB_TOKEN` — no PAT, no local credentials. No `latest` tag: charts
+and compose pin exact versions. Backfill an already-cut tag by
+deleting and re-pushing it (or run the workflow manually).
 
-```bash
-docker build -t ghcr.io/wyattau/vane:0.2.0 .
-docker push ghcr.io/wyattau/vane:0.2.0
-```
-
-The compose files and Helm chart already reference
-`ghcr.io/wyattau/vane:0.2.0` by default.
+Local builds for testing: `docker build -t ghcr.io/wyattau/vane:X.Y.Z .`
