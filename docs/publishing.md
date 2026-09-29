@@ -5,9 +5,11 @@
 > publishes as **`vane-kernel`** and the installable package as
 > **`vane-proxy`** (the binary it installs is still named `vane`).
 > Published: 0.2.0 train (all crates), 0.2.1–0.2.3 trains (vane-proxy
-> + kernel), and **0.3.0 (2026-09-28, all 11 crates — HTTP/3 GA**,
-> h3 default feature**)**, verified with `cargo install
-> vane-proxy --version 0.3.0 --locked`. Order below unchanged.
+> + kernel), **0.3.0 (2026-09-28, all 11 crates — HTTP/3 GA**, h3
+> default feature**)**, and **0.3.1 (2026-09-29, vane-control +
+> vane-proxy — h3 upstream bridge, connection reuse, health)**,
+> verified with `cargo install vane-proxy --version 0.3.1 --locked`.
+> Order below unchanged.
 
 crates.io forbids git dependencies, so the leaves must land in
 dependency order. The only external blocker was `slab-pool` (git dep
