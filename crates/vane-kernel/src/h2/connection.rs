@@ -153,6 +153,12 @@ pub struct ConnectionConfig {
     pub header_table_size: u32,
     /// Largest header list we accept (approximate, bytes).
     pub max_header_list_size: u32,
+    /// Reject WINDOW_UPDATE on streams the peer has never opened
+    /// (RFC 7540 §5.1: idle → PROTOCOL_ERROR connection error).
+    /// Default lenient: the h2 crate client grants stream credit
+    /// before its HEADERS land, and strict rejection starves real
+    /// relays. Conformance runs set this.
+    pub strict_idle_window_update: bool,
 }
 
 impl Default for ConnectionConfig {
@@ -163,6 +169,7 @@ impl Default for ConnectionConfig {
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             header_table_size: 4096,
             max_header_list_size: 128 * 1024,
+            strict_idle_window_update: false,
         }
     }
 }
@@ -741,6 +748,12 @@ impl Connection {
                 self.streams.remove(&hdr.stream_id);
                 return Ok(());
             }
+        } else if self.cfg.strict_idle_window_update && self.is_peer_idle(hdr.stream_id) {
+            // Strict conformance mode: WINDOW_UPDATE on a stream the
+            // peer has never opened is PROTOCOL_ERROR (RFC 7540 §5.1
+            // idle state). Default mode is lenient — the h2 crate
+            // client legitimately grants stream credit early.
+            return Err(error_code::PROTOCOL_ERROR);
         } else {
             // Retired (closed) stream: keep a shadow accumulator so an
             // overflowing WINDOW_UPDATE still raises FLOW_CONTROL_ERROR

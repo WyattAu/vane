@@ -28,6 +28,7 @@ fn make_proxy(
             first_byte_timeout_ms: 30_000,
             pool_per_backend: 4,
             tls: None,
+            h2_strict_idle_window_update: false,
             plugins,
             http01_tokens: None,
             access: None,

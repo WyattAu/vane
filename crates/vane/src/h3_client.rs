@@ -164,13 +164,17 @@ pub async fn request_async(
     exchange(&mut send_request, method, path, authority, &request_body).await
 }
 
-/// Builds the shared client endpoint (rustls material + transport
-/// timeouts). The bridge owns one endpoint per process and multiplexes
-/// request streams over pooled connections.
+/// Builds the QUIC client config (rustls material + transport
+/// timeouts) — the reloadable half of [`client_endpoint`]. The bridge
+/// rebuilds this when upstream material rotates and swaps it onto the
+/// live endpoint.
 ///
 /// # Errors
-/// TLS material or endpoint bind failures as strings.
-pub fn client_endpoint(cfg: &H3ClientConfig, timeout: Duration) -> Result<quinn::Endpoint, String> {
+/// TLS material failures as strings.
+pub fn client_config(
+    cfg: &H3ClientConfig,
+    timeout: Duration,
+) -> Result<quinn::ClientConfig, String> {
     let mut roots = rustls::RootCertStore::empty();
     for cert in &cfg.server_certs {
         roots.add(cert.clone()).map_err(|e| format!("root: {e}"))?;
@@ -196,6 +200,17 @@ pub fn client_endpoint(cfg: &H3ClientConfig, timeout: Duration) -> Result<quinn:
         }
         t
     }));
+    Ok(client_cfg)
+}
+
+/// Builds the shared client endpoint (rustls material + transport
+/// timeouts). The bridge owns one endpoint per process and multiplexes
+/// request streams over pooled connections.
+///
+/// # Errors
+/// TLS material or endpoint bind failures as strings.
+pub fn client_endpoint(cfg: &H3ClientConfig, timeout: Duration) -> Result<quinn::Endpoint, String> {
+    let client_cfg = client_config(cfg, timeout)?;
     let bind: SocketAddr = "127.0.0.1:0".parse().expect("bind addr");
     let mut endpoint =
         quinn::Endpoint::client(bind).map_err(|e| format!("client endpoint: {e}"))?;

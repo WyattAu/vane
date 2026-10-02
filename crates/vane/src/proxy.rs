@@ -65,6 +65,9 @@ pub struct ProxyConfig {
     pub access: Option<std::sync::Arc<vane_observe::access::AccessLog>>,
     /// JWT bearer authentication (`None` = disabled).
     pub jwt: Option<std::sync::Arc<vane_filters::jwt::JwtValidator>>,
+    /// Strict h2 conformance: reject WINDOW_UPDATE on idle streams
+    /// (`[http2] strict_idle_window_update`).
+    pub h2_strict_idle_window_update: bool,
     /// Process-wide GCRA bucket (`Some` replaces the per-worker
     /// limiter so the configured rate is the true aggregate).
     pub shared_rate_limit: Option<std::sync::Arc<vane_shm::ratelimit::SharedGcra>>,
@@ -666,7 +669,10 @@ impl HttpProxy {
         self.flush_tls(io);
         #[cfg(feature = "h2")]
         if alpn_h2 && self.conns.get(&slot).is_some_and(|c| c.h2.is_none()) {
-            let mut h2s = Box::new(crate::h2_server::H2Server::new(slot));
+            let mut h2s = Box::new(crate::h2_server::H2Server::new(
+                slot,
+                self.config.h2_strict_idle_window_update,
+            ));
             // The engine's initial SETTINGS were queued at
             // construction — flush them before app data.
             let out = h2s.pending_writes();
@@ -1561,7 +1567,10 @@ impl Handler for HttpProxy {
         #[cfg(feature = "h2")]
         if self.config.h2c && self.config.tls.is_none() {
             eprintln!("H2CDBG promoting slot={slot}");
-            let mut h2s = Box::new(crate::h2_server::H2Server::new(slot));
+            let mut h2s = Box::new(crate::h2_server::H2Server::new(
+                slot,
+                self.config.h2_strict_idle_window_update,
+            ));
             let out = h2s.pending_writes();
             eprintln!("H2CDBG initial settings bytes={}", out.len());
             self.conn(slot).h2 = Some(h2s);
@@ -1578,10 +1587,11 @@ impl Handler for HttpProxy {
                     #[cfg(feature = "h2")]
                     {
                         let alpn_h2 = conn.alpn_protocol() == Some(b"h2");
+                        let strict = self.config.h2_strict_idle_window_update;
                         let c = self.conn(slot);
                         c.tls = Some(conn);
                         if alpn_h2 {
-                            c.h2 = Some(Box::new(crate::h2_server::H2Server::new(slot)));
+                            c.h2 = Some(Box::new(crate::h2_server::H2Server::new(slot, strict)));
                         }
                     }
                     #[cfg(not(feature = "h2"))]

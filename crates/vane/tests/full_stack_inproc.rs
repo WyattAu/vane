@@ -2004,3 +2004,168 @@ workers = 1
     assert!(got.contains("200 OK"), "rotated tls response: {got:?}");
     assert!(got.contains("hello-vane"), "rotated tls body: {got:?}");
 }
+
+/// Mesh over QUIC end-to-end: an h3 listener with required client
+/// certs (`client_ca`) and SPIFFE-enforced routes; the h3 bridge
+/// presents SVIDs — allowed prefix serves, wrong prefix 403s
+/// (h3-edge enforcement mirroring the h2 engine), no cert fails the
+/// handshake.
+#[test]
+fn mesh_http3_spiffe_end_to_end() {
+    use rcgen::{CertificateParams, KeyPair, SanType};
+
+    let _serial = lock_serial();
+    let dir = tempfile::tempdir().expect("dir");
+
+    // Mesh CA + server cert + two SVIDs (good/bad SPIFFE prefixes).
+    let ca_key = KeyPair::generate().expect("ca key");
+    let mut ca_params = CertificateParams::new(vec!["mesh-ca".into()]).expect("params");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).expect("ca");
+    let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
+
+    let srv_params = CertificateParams::new(vec!["localhost".into()]).expect("params");
+    let srv_key = KeyPair::generate().expect("srv key");
+    let srv = srv_params.signed_by(&srv_key, &issuer).expect("srv");
+
+    let svid = |uri: &str| -> (String, String) {
+        let mut params = CertificateParams::new(vec!["proxy".into()]).expect("params");
+        params.subject_alt_names = vec![SanType::URI(
+            rcgen::string::Ia5String::try_from(uri).expect("uri"),
+        )];
+        let key = KeyPair::generate().expect("svid key");
+        let cert = params.signed_by(&key, &issuer).expect("svid");
+        (cert.pem(), key.serialize_pem())
+    };
+    let (good_cert, good_key) = svid("spiffe://example.org/vane/proxy");
+    let (bad_cert, bad_key) = svid("spiffe://other.org/elsewhere");
+    let good_cert_p = dir.path().join("svid-good.pem");
+    let good_key_p = dir.path().join("svid-good-key.pem");
+    let bad_cert_p = dir.path().join("svid-bad.pem");
+    let bad_key_p = dir.path().join("svid-bad-key.pem");
+    std::fs::write(&good_cert_p, &good_cert).expect("write");
+    std::fs::write(&good_key_p, &good_key).expect("write");
+    std::fs::write(&bad_cert_p, &bad_cert).expect("write");
+    std::fs::write(&bad_key_p, &bad_key).expect("write");
+
+    let srv_cert_p = dir.path().join("srv.pem");
+    let srv_key_p = dir.path().join("srv-key.pem");
+    let ca_p = dir.path().join("ca.pem");
+    std::fs::write(&srv_cert_p, srv.pem()).expect("write");
+    std::fs::write(&srv_key_p, srv_key.serialize_pem()).expect("write");
+    std::fs::write(&ca_p, ca.pem()).expect("write");
+
+    let upstream = spawn_upstream();
+    let port = free_port();
+
+    let toml = format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[listeners.tls]
+cert = "{}"
+key = "{}"
+client_ca = "{}"
+h3 = true
+
+[clusters.up]
+backends = ["{upstream}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+allowed_spiffe_prefixes = ["spiffe://example.org/vane/"]
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = true
+workers = 1
+"#,
+        srv_cert_p.display(),
+        srv_key_p.display(),
+        ca_p.display()
+    );
+    let path = dir.path().join("vane.toml");
+    std::fs::write(&path, toml).expect("write");
+    let cfg = path.to_str().expect("utf8").to_owned();
+
+    let _server_guard_5 = spawn_proxy(cfg);
+    let quic_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(quic_addr);
+    // The QUIC socket binds after the TCP listener — give it a beat.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let bridge_with = |cert: &std::path::Path, key: &std::path::Path| {
+        vane::h3_bridge::spawn(
+            vec![quic_addr],
+            Some(vane_control::config::H3UpstreamTls {
+                ca: ca_p.display().to_string(),
+                server_name: "localhost".into(),
+                client_cert: Some(cert.display().to_string()),
+                client_key: Some(key.display().to_string()),
+                alpn: None,
+            }),
+            vane::h3_bridge::BridgeOptions {
+                first_byte_timeout: Duration::from_secs(5),
+                ..Default::default()
+            },
+        )
+        .expect("bridge")
+    };
+
+    // Allowed SPIFFE prefix → routed over h3.
+    let good = bridge_with(&good_cert_p, &good_key_p);
+    let resp = String::from_utf8_lossy(&{
+        let mut s = std::net::TcpStream::connect(good).expect("connect");
+        s.write_all(b"GET /x HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+            .expect("write");
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).expect("read");
+        out
+    })
+    .into_owned();
+    assert!(resp.contains("200 OK"), "allowed spiffe: {resp:?}");
+    assert!(resp.contains("hello-vane"), "body: {resp:?}");
+
+    // Wrong SPIFFE prefix → 403 from the h3 edge.
+    let bad = bridge_with(&bad_cert_p, &bad_key_p);
+    let resp = String::from_utf8_lossy(&{
+        let mut s = std::net::TcpStream::connect(bad).expect("connect");
+        s.write_all(b"GET /y HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+            .expect("write");
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).expect("read");
+        out
+    })
+    .into_owned();
+    // The h3 edge's static replies are body-less by convention —
+    // the 403 status on this route (and 200 on the allowed prefix
+    // above) is the SPIFFE enforcement signal.
+    assert!(resp.contains("403"), "wrong prefix: {resp:?}");
+
+    // No client cert at all → handshake rejected → abrupt close.
+    let anon = vane::h3_bridge::spawn(
+        vec![quic_addr],
+        Some(vane_control::config::H3UpstreamTls {
+            ca: ca_p.display().to_string(),
+            server_name: "localhost".into(),
+            client_cert: None,
+            client_key: None,
+            alpn: None,
+        }),
+        vane::h3_bridge::BridgeOptions {
+            first_byte_timeout: Duration::from_secs(5),
+            ..Default::default()
+        },
+    )
+    .expect("anon bridge");
+    let mut s = std::net::TcpStream::connect(anon).expect("connect");
+    s.write_all(b"GET /z HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+        .expect("write");
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    assert!(out.is_empty(), "anon must fail the handshake, got {out:?}");
+}

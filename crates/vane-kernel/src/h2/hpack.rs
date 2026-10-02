@@ -284,6 +284,11 @@ impl HpackDecoder {
         let mut headers = Vec::new();
         let mut out = Vec::new(); // string scratch
         let mut pos = 0usize;
+        // RFC 7541 §4.2: dynamic table size updates MUST occur at the
+        // beginning of the header block — after any field
+        // representation they are a decoding error (COMPRESSION_ERROR
+        // at the frame layer).
+        let mut seen_field_rep = false;
 
         while pos < buf.len() {
             out.clear();
@@ -291,6 +296,7 @@ impl HpackDecoder {
 
             if b & 0x80 != 0 {
                 // 1xxxxxxx: indexed header field.
+                seen_field_rep = true;
                 let index = decode_int(buf, &mut pos, 7)?;
                 if index == 0 {
                     return Err(HpackError::InvalidIndex);
@@ -302,6 +308,7 @@ impl HpackDecoder {
                 });
             } else if b & 0xc0 == 0x40 {
                 // 01xxxxxx: literal with incremental indexing.
+                seen_field_rep = true;
                 let index = decode_int(buf, &mut pos, 6)?;
                 let name = self.decode_name(buf, &mut pos, index, &mut out)?;
                 let value = decode_string_value(buf, &mut pos, &mut out)?;
@@ -309,6 +316,9 @@ impl HpackDecoder {
                 headers.push(Header { name, value });
             } else if b & 0xe0 == 0x20 {
                 // 001xxxxx: dynamic table size update.
+                if seen_field_rep {
+                    return Err(HpackError::TableSizeViolation);
+                }
                 let size = decode_int(buf, &mut pos, 5)?;
                 if size > u64::from(self.protocol_max) {
                     return Err(HpackError::TableSizeViolation);
@@ -318,6 +328,7 @@ impl HpackDecoder {
                 // 0000xxxx / 0001xxxx: literal without indexing / never
                 // indexed. Same wire format; never-indexed semantics are
                 // a policy hint for intermediaries (we never store).
+                seen_field_rep = true;
                 let index = decode_int(buf, &mut pos, 4)?;
                 let name = self.decode_name(buf, &mut pos, index, &mut out)?;
                 let value = decode_string_value(buf, &mut pos, &mut out)?;

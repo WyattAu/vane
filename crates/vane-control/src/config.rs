@@ -11,12 +11,26 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// HTTP/2 protocol tuning.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Http2Config {
+    /// Reject WINDOW_UPDATE on streams the peer has never opened
+    /// (RFC 7540 §5.1 idle → PROTOCOL_ERROR connection error).
+    /// Default lenient: the h2 crate client grants stream credit
+    /// before its HEADERS land. Conformance runs set this.
+    #[serde(default)]
+    pub strict_idle_window_update: bool,
+}
+
 /// Top-level configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VaneConfig {
     /// Ingress listeners.
     #[serde(default)]
     pub listeners: Vec<ListenerConfig>,
+    /// HTTP/2 protocol tuning.
+    #[serde(default)]
+    pub http2: Http2Config,
     /// Upstream clusters.
     #[serde(default)]
     pub clusters: BTreeMap<String, ClusterConfig>,
@@ -199,6 +213,12 @@ pub struct MeshUpstreamConfig {
     /// (e.g. `spiffe://example.org/vane/`).
     #[serde(default)]
     pub spiffe_prefix: String,
+    /// Originate this mesh cluster's traffic over HTTP/3 (QUIC) via
+    /// the in-process bridge: the SVID is the client cert, the mesh
+    /// CA the trust anchor, ALPN `vane-mesh`. Mutually exclusive with
+    /// `clusters.*.h3_tls`.
+    #[serde(default)]
+    pub http3: bool,
     /// SPIFFE Workload API Unix socket (docs/mesh-mtls-design.md,
     /// milestone 3). When set, vane fetches the SVID from the agent at
     /// startup and re-materializes `cert`/`key`/`ca` on every rotation

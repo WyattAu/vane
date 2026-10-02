@@ -483,3 +483,166 @@ fn h3_bridge_reuses_one_quic_connection() {
         "expected exactly one QUIC handshake for all requests"
     );
 }
+
+/// Upstream-material rotation (SVID expiry story): the bridge serves
+/// with client SVID v1; rotating the files to an untrusted cert breaks
+/// traffic, rotating back recovers — no restart, no rebuild.
+#[test]
+fn h3_bridge_rotates_upstream_material() {
+    use rcgen::{CertificateParams, KeyPair};
+
+    let dir = tempfile::tempdir().expect("dir");
+
+    // CA1: signs the SERVER cert (bridge trust anchor).
+    let ca1_key = KeyPair::generate().expect("ca1 key");
+    let mut ca1_params = CertificateParams::new(vec!["ca1".into()]).expect("params");
+    ca1_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca1 = ca1_params.self_signed(&ca1_key).expect("ca1");
+    let issuer1 = rcgen::Issuer::from_params(&ca1_params, &ca1_key);
+
+    // CA2: signs the client SVIDs (server's client-auth root).
+    let ca2_key = KeyPair::generate().expect("ca2 key");
+    let mut ca2_params = CertificateParams::new(vec!["ca2".into()]).expect("params");
+    ca2_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca2 = ca2_params.self_signed(&ca2_key).expect("ca2");
+    let issuer2 = rcgen::Issuer::from_params(&ca2_params, &ca2_key);
+
+    // CA3: signs the BAD SVID (untrusted by the server).
+    let ca3_key = KeyPair::generate().expect("ca3 key");
+    let mut ca3_params = CertificateParams::new(vec!["ca3".into()]).expect("params");
+    ca3_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let issuer3 = rcgen::Issuer::from_params(&ca3_params, &ca3_key);
+    let _ = ca3_params.self_signed(&ca3_key).expect("ca3"); // cert unused; only trust matters
+
+    // Server cert: DNS localhost, signed by CA1.
+    let srv_params = CertificateParams::new(vec!["localhost".into()]).expect("params");
+    let srv_key = KeyPair::generate().expect("srv key");
+    let srv = srv_params.signed_by(&srv_key, &issuer1).expect("srv");
+
+    // SVID v1: CA2-signed (valid). SVID v2: CA3-signed (untrusted).
+    let make_svid = |issuer: &rcgen::Issuer<'_, &rcgen::KeyPair>| -> (String, String) {
+        let params = CertificateParams::new(vec!["bridge".into()]).expect("params");
+        let key = KeyPair::generate().expect("svid key");
+        let cert = params.signed_by(&key, issuer).expect("svid");
+        (cert.pem(), key.serialize_pem())
+    };
+    let (v1_cert, v1_key) = make_svid(&issuer2);
+    let (v2_cert, v2_key) = make_svid(&issuer3);
+
+    let cli_cert = dir.path().join("cli.pem");
+    let cli_key = dir.path().join("cli-key.pem");
+    std::fs::write(&cli_cert, &v1_cert).expect("write");
+    std::fs::write(&cli_key, &v1_key).expect("write");
+
+    // Server: quinn+h3, client-auth required against CA2, canned 200.
+    let srv_certs: Vec<_> = rustls_pemfile::certs(&mut srv.pem().as_bytes())
+        .map(Result::unwrap)
+        .collect();
+    let server_key = rustls_pemfile::private_key(&mut srv_key.serialize_pem().as_bytes())
+        .expect("pem")
+        .expect("key");
+    let mut cas_roots = rustls::RootCertStore::empty();
+    let ca2_der: Vec<_> = rustls_pemfile::certs(&mut ca2.pem().as_bytes())
+        .map(Result::unwrap)
+        .collect();
+    for c in ca2_der {
+        cas_roots.add(c).expect("ca2 root");
+    }
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(cas_roots))
+        .build()
+        .expect("verifier");
+    let mut server_tls = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(srv_certs, server_key)
+        .expect("server cert");
+    server_tls.alpn_protocols = vec![b"h3".to_vec()];
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp bind");
+    let quic_addr: SocketAddr = udp.local_addr().expect("addr");
+    let tls_cfg = Arc::new(server_tls);
+    std::thread::Builder::new()
+        .name("h3-rotate-backend".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("backend runtime");
+            rt.block_on(async move {
+                let qcfg = quinn::crypto::rustls::QuicServerConfig::try_from((*tls_cfg).clone())
+                    .expect("quinn server");
+                let endpoint = quinn::Endpoint::new(
+                    quinn::EndpointConfig::default(),
+                    Some(quinn::ServerConfig::with_crypto(Arc::new(qcfg))),
+                    udp,
+                    Arc::new(quinn::TokioRuntime),
+                )
+                .expect("endpoint");
+                while let Some(incoming) = endpoint.accept().await {
+                    let Ok(conn) = incoming.await else { continue };
+                    tokio::spawn(async move {
+                        let Ok(mut send) =
+                            h3::server::Connection::new(h3_quinn::Connection::new(conn)).await
+                        else {
+                            return;
+                        };
+                        while let Ok(Some(resolver)) = send.accept().await {
+                            let Ok((_req, mut stream)) = resolver.resolve_request().await else {
+                                return;
+                            };
+                            let resp = http::Response::builder()
+                                .status(200)
+                                .body(())
+                                .expect("resp");
+                            if stream.send_response(resp).await.is_err() {
+                                return;
+                            }
+                            let _ = stream
+                                .send_data(bytes::Bytes::from_static(b"rotated!"))
+                                .await;
+                            let _ = stream.finish().await;
+                        }
+                    });
+                }
+            });
+        })
+        .expect("backend thread");
+
+    // Bridge: ca = CA1 (server trust), SVID v1 files.
+    let ca1_pem = dir.path().join("ca1.pem");
+    std::fs::write(&ca1_pem, ca1.pem()).expect("write ca1");
+    let bridge = vane::h3_bridge::spawn(
+        vec![quic_addr],
+        Some(vane_control::config::H3UpstreamTls {
+            ca: ca1_pem.display().to_string(),
+            server_name: "localhost".into(),
+            client_cert: Some(cli_cert.display().to_string()),
+            client_key: Some(cli_key.display().to_string()),
+            alpn: None,
+        }),
+        vane::h3_bridge::BridgeOptions {
+            first_byte_timeout: Duration::from_secs(5),
+            ..Default::default()
+        },
+    )
+    .expect("bridge");
+
+    // Phase 1: valid SVID → 200.
+    let resp = String::from_utf8_lossy(&h1_get(bridge, "/a")).into_owned();
+    assert!(resp.contains("200 OK"), "phase1 (valid svid): {resp:?}");
+
+    // Phase 2: rotate to the untrusted SVID → reload (~1 s) → EOF.
+    std::fs::write(&cli_cert, &v2_cert).expect("rotate bad cert");
+    std::fs::write(&cli_key, &v2_key).expect("rotate bad key");
+    std::thread::sleep(Duration::from_millis(2500));
+    let resp = h1_get(bridge, "/b");
+    assert!(
+        resp.is_empty(),
+        "phase2 (untrusted svid) must close abruptly, got {resp:?}"
+    );
+
+    // Phase 3: rotate back to a valid SVID → recovers.
+    std::fs::write(&cli_cert, &v1_cert).expect("rotate good cert");
+    std::fs::write(&cli_key, &v1_key).expect("rotate good key");
+    std::thread::sleep(Duration::from_millis(2500));
+    let resp = String::from_utf8_lossy(&h1_get(bridge, "/c")).into_owned();
+    assert!(resp.contains("200 OK"), "phase3 (rotated back): {resp:?}");
+}

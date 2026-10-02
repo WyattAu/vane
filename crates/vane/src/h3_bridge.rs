@@ -80,7 +80,13 @@ struct Pooled {
 /// Engine state shared by the job handler and the prober.
 struct Engine {
     cfg: crate::h3_client::H3ClientConfig,
-    endpoint: quinn::Endpoint,
+    /// Endpoint handle behind a lock: the reloader swaps the default
+    /// client config on rotation; dialers clone the handle fresh per
+    /// attempt so new dials pick up rotated material.
+    endpoint: Mutex<quinn::Endpoint>,
+    /// Raw upstream material paths — re-read when the files change
+    /// (SVID rotation) and swapped onto the live endpoint.
+    tls: Option<H3UpstreamTls>,
     backends: Vec<SocketAddr>,
     /// Healthy mask (parallel to `backends`).
     healthy: Mutex<Vec<bool>>,
@@ -102,8 +108,8 @@ impl Engine {
         if let Some(p) = self.pool.lock().expect("pool lock").get(&addr) {
             return Ok(p.send.clone());
         }
-        let connecting = self
-            .endpoint
+        let endpoint = self.endpoint.lock().expect("endpoint lock").clone();
+        let connecting = endpoint
             .connect(addr, &self.cfg.server_name)
             .map_err(|e| format!("connect: {e}"))?;
         let quinn_conn = match tokio::time::timeout(self.opts.first_byte_timeout, connecting).await
@@ -254,12 +260,50 @@ pub fn spawn(
                     };
                 let engine = Arc::new(Engine {
                     cfg,
-                    endpoint,
+                    endpoint: Mutex::new(endpoint),
+                    tls,
                     healthy: Mutex::new(vec![true; engine_backends.len()]),
                     backends: engine_backends,
                     rr: AtomicUsize::new(0),
                     pool: Mutex::new(HashMap::new()),
                     opts: engine_opts,
+                });
+                // Upstream-material reloader (SVID rotation): fingerprint
+                // the files; on change rebuild the QUIC client config and
+                // swap it onto the live endpoint, evicting the pool so
+                // the next request re-handshakes with fresh material.
+                let reloader = Arc::clone(&engine);
+                tokio::spawn(async move {
+                    let mut last = material_stamp(reloader.tls.as_ref());
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        let cur = material_stamp(reloader.tls.as_ref());
+                        if cur == last {
+                            continue;
+                        }
+                        match build_client_config(reloader.tls.as_ref()).and_then(|c| {
+                            crate::h3_client::client_config(&c, reloader.opts.first_byte_timeout)
+                        }) {
+                            Ok(qcfg) => {
+                                reloader
+                                    .endpoint
+                                    .lock()
+                                    .expect("endpoint lock")
+                                    .set_default_client_config(qcfg);
+                                reloader.pool.lock().expect("pool lock").clear();
+                                tracing::info!(
+                                    "h3 bridge: upstream material rotated — pool re-handshakes"
+                                );
+                                last = cur;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "h3 bridge: material reload failed (keeping previous): {e}"
+                                );
+                                last = cur; // don't spin on a broken file
+                            }
+                        }
+                    }
                 });
                 // Active health prober.
                 if engine.opts.health_path.is_some() {
@@ -466,6 +510,37 @@ fn handle_conn(mut sock: std::net::TcpStream, jobs: mpsc::Sender<Job>, opts: &Br
     out.extend_from_slice(&resp.body);
     let _ = sock.write_all(&out);
     let _ = sock.shutdown(std::net::Shutdown::Write);
+}
+
+/// (mtime ns, len) fingerprint of the material files, in fixed order
+/// (ca, client_cert, client_key). Absent files/fields stamp as (0, 0).
+fn material_stamp(tls: Option<&H3UpstreamTls>) -> Vec<(u128, u64)> {
+    let Some(t) = tls else {
+        return Vec::new();
+    };
+    let mut v = Vec::new();
+    for p in [
+        Some(t.ca.as_str()),
+        t.client_cert.as_deref(),
+        t.client_key.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        match std::fs::metadata(p) {
+            Ok(m) => {
+                let mtime = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                v.push((mtime, m.len()));
+            }
+            Err(_) => v.push((0, 0)),
+        }
+    }
+    v
 }
 
 /// Loads the TLS material and assembles the h3 client config.

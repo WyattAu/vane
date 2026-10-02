@@ -129,6 +129,12 @@ impl H3Edge {
         &self,
         conn: quinn::Connection,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Inbound caller identity: mTLS peer certificates (present
+        // only when the listener requires/verifies client certs).
+        let peer_certs = conn.peer_identity().and_then(|id| {
+            id.downcast_ref::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+                .cloned()
+        });
         let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(conn))
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
@@ -136,7 +142,8 @@ impl H3Edge {
             match h3_conn.accept().await {
                 Ok(Some(resolver)) => {
                     let (request, stream) = resolver.resolve_request().await?;
-                    self.serve_request(request, stream).await;
+                    self.serve_request(request, stream, peer_certs.as_deref())
+                        .await;
                 }
                 Ok(None) => break,
                 Err(e) => return Err(Box::new(e)),
@@ -145,7 +152,12 @@ impl H3Edge {
         Ok(())
     }
 
-    async fn serve_request(&self, request: http::Request<()>, mut stream: H3RequestStream) {
+    async fn serve_request(
+        &self,
+        request: http::Request<()>,
+        mut stream: H3RequestStream,
+        peer_certs: Option<&[rustls::pki_types::CertificateDer<'static>]>,
+    ) {
         let started = std::time::Instant::now();
         let span = crate::tracing_util::serve_span(
             request.method().as_str(),
@@ -252,6 +264,29 @@ impl H3Edge {
             }
             RouteCheck::Route(r) => r,
         };
+
+        // Inbound caller identity authorization (mirrors the h2
+        // engine path): routes with `allowed_spiffe_prefixes` require
+        // an mTLS peer whose SPIFFE URI SAN matches at least one
+        // prefix. Cert-less callers have no identity → 403.
+        if !route.allowed_spiffe_prefixes.is_empty() {
+            let peer_id = peer_certs
+                .and_then(|certs| certs.first())
+                .and_then(|leaf| vane_tls::mesh::spiffe_id(leaf));
+            let allowed = peer_id.as_ref().is_some_and(|id| {
+                route
+                    .allowed_spiffe_prefixes
+                    .iter()
+                    .any(|p| id.starts_with(p))
+            });
+            if !allowed {
+                tracing::warn!(
+                    "h3 edge: caller identity rejected: {}",
+                    peer_id.as_deref().unwrap_or("<none>")
+                );
+                reply!(403, "caller identity not allowed");
+            }
+        }
         let upstream_path = route
             .strip_prefix
             .as_ref()

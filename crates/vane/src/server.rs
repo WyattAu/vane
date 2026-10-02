@@ -690,6 +690,7 @@ pub async fn run(opts: RunOptions) -> i32 {
                 h2c: config.listeners.get(li).is_some_and(|l| l.h2c),
                 alt_svc: alt_svc.clone(),
                 mesh: Arc::clone(&mesh_identities),
+                h2_strict_idle_window_update: config.http2.strict_idle_window_update,
             };
             match spawn_worker(
                 li * workers_per_listener + w,
@@ -747,9 +748,33 @@ pub async fn run(opts: RunOptions) -> i32 {
     {
         let timeout = Duration::from_millis(config.runtime.first_byte_timeout_ms);
         for (name, cluster) in config.clusters.iter_mut() {
-            if !cluster.http3 {
+            let mesh_h3 = cluster.mesh.as_ref().is_some_and(|m| m.http3);
+            if !cluster.http3 && !mesh_h3 {
                 continue;
             }
+            if cluster.http3 && mesh_h3 {
+                eprintln!(
+                    "vane: cluster `{name}` sets both h3_tls and mesh.http3 — \
+                     mesh owns the material; drop one"
+                );
+                return 1;
+            }
+            // Material: explicit h3_tls, or synthesized from the mesh
+            // section (SVID as client cert, mesh CA as trust anchor,
+            // ALPN vane-mesh) — reload-safe: the SVID watcher
+            // re-materializes the files, the bridge reloads on change.
+            let tls = if mesh_h3 {
+                let m = cluster.mesh.as_ref().expect("mesh");
+                Some(vane_control::config::H3UpstreamTls {
+                    ca: m.ca.clone(),
+                    server_name: m.server_name.clone(),
+                    client_cert: Some(m.cert.clone()),
+                    client_key: Some(m.key.clone()),
+                    alpn: Some("vane-mesh".to_string()),
+                })
+            } else {
+                cluster.h3_tls.clone()
+            };
             let backends: Vec<std::net::SocketAddr> = cluster
                 .backends
                 .iter()
@@ -764,7 +789,7 @@ pub async fn run(opts: RunOptions) -> i32 {
                 health_path: cluster.health_path.clone(),
                 probe_interval: Duration::from_secs(5),
             };
-            match crate::h3_bridge::spawn(backends, cluster.h3_tls.clone(), opts) {
+            match crate::h3_bridge::spawn(backends, tls, opts) {
                 Ok(addr) => {
                     tracing::info!("h3 bridge: cluster `{name}` re-originates via {addr}");
                     cluster.backends = vec![addr.to_string()];
@@ -1040,6 +1065,8 @@ struct WorkerFactory {
     h2c: bool,
     /// RFC 7838 Alt-Svc value injected into responses (h3 listeners).
     alt_svc: Option<String>,
+    /// Strict h2 conformance (`[http2] strict_idle_window_update`).
+    h2_strict_idle_window_update: bool,
 }
 
 impl vane_core::HandlerFactory for WorkerFactory {
@@ -1068,6 +1095,7 @@ impl vane_core::HandlerFactory for WorkerFactory {
                 jwt: self.jwt.clone(),
                 l4_splice: self.mode == CoreMode::L4,
                 mesh: self.mesh.clone(),
+                h2_strict_idle_window_update: self.h2_strict_idle_window_update,
             },
             self.worker_id,
         ))

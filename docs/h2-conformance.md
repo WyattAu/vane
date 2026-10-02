@@ -1,6 +1,21 @@
 # HTTP/2 conformance (h2spec v2.6.0)
 
-Run: `bash scripts/h2spec_target.sh` against a vane h2c listener
+Run: `bash scripts/h2spec_run.sh` against a vane h2c listener in
+**strict mode** (`[http2] strict_idle_window_update = true`).
+Status 2026-10-02: **145/145 pass, 0 failed** (146 cases — http2 +
+hpack — 1 skipped: TLS-only). Full-worklist history below.
+
+Earlier baselines: 2026-09-26 **112/138** (25 failures, one class:
+missing protocol validations in the native h2 shim); 2026-09-27
+**137/138** (worklist complete except the lenient idle-stream
+WINDOW_UPDATE divergence — now the `[http2]
+strict_idle_window_update` knob: strict mode rejects per RFC 7540
+§5.1, the default build stays lenient because the h2 crate client
+grants stream credit before its HEADERS land); 2026-10-02 the run
+widened to all specs (http2 + hpack) and exposed a hpack gap —
+dynamic table size updates after field representations — now
+enforced (COMPRESSION_ERROR).
+
 (`--http2-prior-knowledge` client). Status 2026-09-26: **112/138
 pass**, 25 failures + 1 skip — all one class: missing protocol
 validations in the native h2 shim (`vane-core` h2 connection +

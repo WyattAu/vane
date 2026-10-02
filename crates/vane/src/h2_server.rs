@@ -99,12 +99,15 @@ struct ResponseTranslator {
 }
 
 impl H2Server {
-    /// A new h2 session bound to `slot`.
-    pub fn new(slot: u32) -> Self {
+    /// A new h2 session bound to `slot`. `strict_idle_window_update`
+    /// rejects WINDOW_UPDATE on never-opened streams (conformance
+    /// mode; lenient by default).
+    pub fn new(slot: u32, strict_idle_window_update: bool) -> Self {
         let cfg = ConnectionConfig {
             // v0.2 serializes transactions per h2 connection; extra
             // concurrent streams are refused with REFUSED_STREAM.
             max_concurrent_streams: 1,
+            strict_idle_window_update,
             ..ConnectionConfig::default()
         };
         Self {
@@ -737,7 +740,7 @@ mod flow_tests {
     #[test]
     fn emitted_bytes_never_exceed_granted_window() {
         const BODY: usize = 1024 * 1024;
-        let mut h2s = H2Server::new(0);
+        let mut h2s = H2Server::new(0, false);
         // Request head (POST, CL = BODY, END_STREAM off) as h2 frames.
         let mut events = Vec::new();
         // HPACK literal (no indexing, new name): :method POST
