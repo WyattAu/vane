@@ -371,11 +371,29 @@ impl H3Edge {
         }
         if let Some(id) = &peer_id {
             upstream = upstream.header("x-vane-spiffe-id", id.as_str());
+            // Chaining: preserve what a trusted mesh hop sent, append
+            // this hop's verified caller. The h3 edge forwards only
+            // vane-injected headers, so inbound chains are trusted to
+            // exactly the same degree as the verified caller.
+            let mut chain: Vec<String> = request
+                .headers()
+                .get("x-vane-spiffe-chain")
+                .and_then(|h| h.to_str().ok())
+                .map(|h| {
+                    h.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            chain.push(id.clone());
+            upstream = upstream.header("x-vane-spiffe-chain", chain.join(","));
         }
         let response = match upstream.body(body_bytes).send().await {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!("h3 edge upstream send failed: {e}");
+                tracing::warn!("h3 edge upstream send failed: {e:?}");
                 self.breaker.record_failure(&route.cluster);
                 reply!(502, "upstream unreachable");
             }

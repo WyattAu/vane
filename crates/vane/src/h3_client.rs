@@ -161,7 +161,15 @@ pub async fn request_async(
         tracing::trace!("h3 client driver idle: {err:?}");
     });
 
-    exchange(&mut send_request, method, path, authority, &request_body).await
+    exchange(
+        &mut send_request,
+        method,
+        path,
+        authority,
+        &request_body,
+        &[],
+    )
+    .await
 }
 
 /// Builds the QUIC client config (rustls material + transport
@@ -230,13 +238,18 @@ pub async fn exchange(
     path: &str,
     authority: &str,
     request_body: &[u8],
+    extra_headers: &[(&str, String)],
 ) -> Result<H3Response, String> {
     // The authority rides the URI (:authority pseudo-header).
     // An explicit `host` header mismatching the URI host makes
     // the h3 crate fail the header build (H3_INTERNAL_ERROR).
-    let req = http::Request::builder()
+    let mut builder = http::Request::builder()
         .method(method)
-        .uri(format!("https://{authority}{path}"))
+        .uri(format!("https://{authority}{path}"));
+    for (name, value) in extra_headers {
+        builder = builder.header(*name, value.as_str());
+    }
+    let req = builder
         .body(())
         .map_err(|e| format!("request build: {e}"))?;
     let mut stream = send_request

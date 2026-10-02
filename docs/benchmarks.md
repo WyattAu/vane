@@ -91,3 +91,30 @@ See `scripts/bench.sh` for the full harness.
 | Config generation swap | ~1 µs | `CP-02` |
 
 (Criterion benches, dev profile.)
+
+## h3 bridge path (2026-10-02, release, 8 keep-alive connections, 8 s)
+
+`scripts/bench_bridge.sh` — same route served two ways on one near
+instance; the only difference is the cluster the route selects:
+
+| path | req/s | p50 | p99 |
+|---|---|---|---|
+| h1 cluster (baseline) | 40,276 | 177 µs | 653 µs |
+| http3 cluster (bridge → QUIC → vane h3 edge → h1) | 4,404 | 1,662 µs | 3,519 µs |
+
+The mesh-QUIC path crosses: the loopback bridge (h1 parse + channel +
+h1 write), a QUIC stream hop, the far instance's h3 edge (reqwest h1
+dial to its upstream), and one more h1 relay — ~9× the direct-h1
+cost, ~1.5 ms added per request at this concurrency.
+
+**Decision (SPSC-ring transport)**: the loopback hop is only one of
+several costs — the ring would recover a fraction of the gap, not all
+of it. Profile the QUIC-stream and edge-reqwest segments before
+building the ring transport; at 4.4k req/s per cluster the current
+shape is comfortably sufficient for mesh east-west control traffic
+and moderate data-plane loads.
+
+Tooling: the load generator is a purpose-built keep-alive client
+(`/tmp/opencode/loadgen`, tokio; req/s + latency percentiles) — this
+environment has no `ab`/`wrk`. Same client both legs, so the delta
+isolates the bridge + QUIC cost.

@@ -1396,9 +1396,12 @@ impl HttpProxy {
             if is_x_forwarded(name) {
                 continue;
             }
-            // Same for the caller-identity header: only identities this
-            // proxy verified are forwarded, never client-supplied ones.
-            if name.eq_ignore_ascii_case("x-vane-spiffe-id") {
+            // Same for the caller-identity headers: only identities
+            // this proxy verified are forwarded, never client-supplied
+            // ones (the outgoing chain rides the inject list).
+            if name.eq_ignore_ascii_case("x-vane-spiffe-id")
+                || name.eq_ignore_ascii_case("x-vane-spiffe-chain")
+            {
                 continue;
             }
             out.extend_from_slice(name.as_bytes());
@@ -2222,6 +2225,23 @@ impl HttpProxy {
             );
             if let Some(id) = &peer_id {
                 ctx.inject("X-Vane-Spiffe-Id", id);
+                // Chaining (XFCC-lite): preserve the chain a trusted
+                // mesh hop forwarded and append THIS hop's verified
+                // caller — oldest first. Unverified ingress never
+                // carries a chain (stripped below / on the h3 edge).
+                let mut chain: Vec<String> = view
+                    .header("x-vane-spiffe-chain")
+                    .and_then(|h| std::str::from_utf8(h).ok())
+                    .map(|h| {
+                        h.split(',')
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                chain.push(id.clone());
+                ctx.inject("X-Vane-Spiffe-Chain", &chain.join(","));
             }
             let outcome = self.pipeline.run(&mut ctx);
             let rejected = outcome != Outcome::Continue

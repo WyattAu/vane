@@ -434,6 +434,72 @@ pub async fn run(opts: RunOptions) -> i32 {
     let mesh_identities: Arc<HashMap<String, vane_control::config::MeshUpstreamConfig>> =
         Arc::new(mesh_map);
 
+    // ---- HTTP/3 upstream clusters: spawn the in-process bridge and
+    // point the cluster's backends at it. The worker then dials a
+    // normal loopback h1 backend; the bridge re-originates over QUIC
+    // (docs/h3-design.md, milestone 4).
+    #[cfg(feature = "h3")]
+    {
+        let timeout = Duration::from_millis(config.runtime.first_byte_timeout_ms);
+        for (name, cluster) in config.clusters.iter_mut() {
+            let mesh_h3 = cluster.mesh.as_ref().is_some_and(|m| m.http3);
+            if !cluster.http3 && !mesh_h3 {
+                continue;
+            }
+            if cluster.http3 && mesh_h3 {
+                eprintln!(
+                    "vane: cluster `{name}` sets both h3_tls and mesh.http3 — \
+                     mesh owns the material; drop one"
+                );
+                return 1;
+            }
+            // Material: explicit h3_tls, or synthesized from the mesh
+            // section (SVID as client cert, mesh CA as trust anchor).
+            // ALPN stays "h3" — the hop IS HTTP/3; the mesh identity
+            // rides the SVID, not a private ALPN. Reload-safe: the
+            // SVID watcher re-materializes the files, the bridge
+            // reloads on change.
+            let tls = if mesh_h3 {
+                let m = cluster.mesh.as_ref().expect("mesh");
+                Some(vane_control::config::H3UpstreamTls {
+                    ca: m.ca.clone(),
+                    server_name: m.server_name.clone(),
+                    client_cert: Some(m.cert.clone()),
+                    client_key: Some(m.key.clone()),
+                    alpn: None, // "h3" — see above
+                })
+            } else {
+                cluster.h3_tls.clone()
+            };
+            let backends: Vec<std::net::SocketAddr> = cluster
+                .backends
+                .iter()
+                .filter_map(|b| b.parse().ok())
+                .collect();
+            if backends.is_empty() {
+                eprintln!("vane: cluster `{name}` http3 = true with no parsable backends");
+                return 1;
+            }
+            let opts = crate::h3_bridge::BridgeOptions {
+                first_byte_timeout: timeout,
+                health_path: cluster.health_path.clone(),
+                probe_interval: Duration::from_secs(5),
+                cluster: name.clone(),
+                registry: Some(Arc::clone(&registry)),
+            };
+            match crate::h3_bridge::spawn(backends, tls, opts) {
+                Ok(addr) => {
+                    tracing::info!("h3 bridge: cluster `{name}` re-originates via {addr}");
+                    cluster.backends = vec![addr.to_string()];
+                }
+                Err(e) => {
+                    eprintln!("vane: h3 bridge for cluster `{name}`: {e}");
+                    return 1;
+                }
+            }
+        }
+    }
+
     // Static routes + health probe paths.
     reconciler.publish_static(&config);
     let mut checker = vane_control::HealthChecker::new(Arc::clone(&health), Duration::from_secs(5));
@@ -740,68 +806,6 @@ pub async fn run(opts: RunOptions) -> i32 {
         if !c.http3 && c.h3_tls.is_some() {
             eprintln!("vane: cluster `{name}` sets h3_tls without http3 = true");
             return 1;
-        }
-    }
-
-    // ---- HTTP/3 upstream clusters: spawn the in-process bridge and
-    // point the cluster's backends at it. The worker then dials a
-    // normal loopback h1 backend; the bridge re-originates over QUIC
-    // (docs/h3-design.md, milestone 4).
-    #[cfg(feature = "h3")]
-    {
-        let timeout = Duration::from_millis(config.runtime.first_byte_timeout_ms);
-        for (name, cluster) in config.clusters.iter_mut() {
-            let mesh_h3 = cluster.mesh.as_ref().is_some_and(|m| m.http3);
-            if !cluster.http3 && !mesh_h3 {
-                continue;
-            }
-            if cluster.http3 && mesh_h3 {
-                eprintln!(
-                    "vane: cluster `{name}` sets both h3_tls and mesh.http3 — \
-                     mesh owns the material; drop one"
-                );
-                return 1;
-            }
-            // Material: explicit h3_tls, or synthesized from the mesh
-            // section (SVID as client cert, mesh CA as trust anchor,
-            // ALPN vane-mesh) — reload-safe: the SVID watcher
-            // re-materializes the files, the bridge reloads on change.
-            let tls = if mesh_h3 {
-                let m = cluster.mesh.as_ref().expect("mesh");
-                Some(vane_control::config::H3UpstreamTls {
-                    ca: m.ca.clone(),
-                    server_name: m.server_name.clone(),
-                    client_cert: Some(m.cert.clone()),
-                    client_key: Some(m.key.clone()),
-                    alpn: Some("vane-mesh".to_string()),
-                })
-            } else {
-                cluster.h3_tls.clone()
-            };
-            let backends: Vec<std::net::SocketAddr> = cluster
-                .backends
-                .iter()
-                .filter_map(|b| b.parse().ok())
-                .collect();
-            if backends.is_empty() {
-                eprintln!("vane: cluster `{name}` http3 = true with no parsable backends");
-                return 1;
-            }
-            let opts = crate::h3_bridge::BridgeOptions {
-                first_byte_timeout: timeout,
-                health_path: cluster.health_path.clone(),
-                probe_interval: Duration::from_secs(5),
-            };
-            match crate::h3_bridge::spawn(backends, tls, opts) {
-                Ok(addr) => {
-                    tracing::info!("h3 bridge: cluster `{name}` re-originates via {addr}");
-                    cluster.backends = vec![addr.to_string()];
-                }
-                Err(e) => {
-                    eprintln!("vane: h3 bridge for cluster `{name}`: {e}");
-                    return 1;
-                }
-            }
         }
     }
 

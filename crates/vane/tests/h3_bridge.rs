@@ -364,6 +364,7 @@ fn h3_bridge_health_routes_around_dead_backend() {
             first_byte_timeout: Duration::from_secs(2),
             health_path: Some("/healthz".into()),
             probe_interval: Duration::from_millis(200),
+            ..Default::default()
         },
     )
     .expect("bridge");

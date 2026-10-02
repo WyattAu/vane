@@ -5,6 +5,7 @@
 //! guaranteeing exit.
 
 use std::io::{Read, Write};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use vane::server::RunOptions;
@@ -2324,5 +2325,237 @@ workers = 1
         head.to_ascii_lowercase()
             .contains("x-vane-spiffe-id: spiffe://example.org/vane/proxy"),
         "verified identity must propagate: {head:?}"
+    );
+}
+
+/// Identity chaining across two vane hops: the caller's SVID is
+/// verified by vane1, vane1's SVID by vane2 — the upstream sees the
+/// full chain, oldest first.
+#[test]
+fn spiffe_chain_across_two_hops() {
+    use rcgen::{CertificateParams, KeyPair, SanType};
+
+    let _serial = lock_serial();
+    let dir = tempfile::tempdir().expect("dir");
+
+    // Capture upstream: every head lands on the channel.
+    let (tx, rx) = mpsc::channel::<String>();
+    let up_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let upstream = up_listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for stream in up_listener.incoming().flatten() {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut s = stream;
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if s.read_exact(&mut byte).is_err() {
+                        return;
+                    }
+                    head.push(byte[0]);
+                }
+                eprintln!(
+                    "CAPTURED-REQ({}): {:?}",
+                    head.len(),
+                    String::from_utf8_lossy(&head)
+                );
+                let _ = tx.send(String::from_utf8_lossy(&head).into_owned());
+                let resp = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok";
+                eprintln!("CAPTURED-RESP: {:?}", String::from_utf8_lossy(resp));
+                let _ = s.write_all(resp);
+            });
+        }
+    });
+
+    let ca_key = KeyPair::generate().expect("ca key");
+    let mut ca_params = CertificateParams::new(vec!["mesh-ca".into()]).expect("params");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).expect("ca");
+    let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
+
+    let srv_params = CertificateParams::new(vec!["localhost".into()]).expect("params");
+    let srv_key = KeyPair::generate().expect("srv key");
+    let srv = srv_params.signed_by(&srv_key, &issuer).expect("srv");
+
+    let svid = |uri: &str| -> (String, String) {
+        let mut params = CertificateParams::new(vec!["svid".into()]).expect("params");
+        params.subject_alt_names = vec![SanType::URI(
+            rcgen::string::Ia5String::try_from(uri).expect("uri"),
+        )];
+        let key = KeyPair::generate().expect("svid key");
+        let cert = params.signed_by(&key, &issuer).expect("svid");
+        (cert.pem(), key.serialize_pem())
+    };
+    let (caller_cert, caller_key) = svid("spiffe://example.org/vane/caller");
+    let (hop1_cert, hop1_key) = svid("spiffe://example.org/vane/hop1");
+
+    // Write material: shared server cert, per-SVID files.
+    let write = |name: &str, body: &str| {
+        let p = dir.path().join(name);
+        std::fs::write(&p, body).expect("write");
+        p
+    };
+    let srv_cert_p = write("srv.pem", &srv.pem());
+    let srv_key_p = write("srv-key.pem", &srv_key.serialize_pem());
+    let ca_p = write("ca.pem", &ca.pem());
+    let caller_cert_p = write("caller.pem", &caller_cert);
+    let caller_key_p = write("caller-key.pem", &caller_key);
+    let hop1_cert_p = write("hop1.pem", &hop1_cert);
+    let hop1_key_p = write("hop1-key.pem", &hop1_key);
+
+    // Probe the capture server directly first.
+    {
+        let mut s = std::net::TcpStream::connect(upstream).expect("capture connect");
+        s.write_all(b"GET /probe HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+            .expect("probe write");
+        let mut r = Vec::new();
+        s.read_to_end(&mut r).expect("probe read");
+        eprintln!(
+            "CAPTURE-PROBE: {} bytes, head={:?}",
+            r.len(),
+            String::from_utf8_lossy(&r)
+        );
+        let got = rx.recv_timeout(Duration::from_secs(5)).expect("probe head");
+        eprintln!("CAPTURE-HEAD: {got:?}");
+    }
+
+    // vane2: the far hop — mTLS h3 listener, SPIFFE route, capture.
+    let vane2_port = free_port();
+    let vane2_toml = format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{vane2_port}"
+
+[listeners.tls]
+cert = "{}"
+key = "{}"
+client_ca = "{}"
+h3 = true
+
+[clusters.up]
+backends = ["{upstream}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+allowed_spiffe_prefixes = ["spiffe://example.org/vane/"]
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = true
+workers = 1
+"#,
+        srv_cert_p.display(),
+        srv_key_p.display(),
+        ca_p.display()
+    );
+    let (_d2, vane2_cfg) = {
+        let d = tempfile::tempdir().expect("dir2");
+        let p = d.path().join("vane.toml");
+        std::fs::write(&p, vane2_toml).expect("write");
+        (d, p.to_str().expect("utf8").to_owned())
+    };
+    let _vane2 = spawn_proxy(vane2_cfg);
+    eprintln!("PORTS: capture={upstream} vane2_listener={vane2_port}");
+    let vane2_quic: std::net::SocketAddr = format!("127.0.0.1:{vane2_port}").parse().expect("addr");
+    wait_bound(vane2_quic);
+    std::thread::sleep(Duration::from_millis(300));
+
+    // vane1: the near hop — mesh.http3 cluster → vane2.
+    let vane1_port = free_port();
+    let vane1_toml = format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{vane1_port}"
+
+[listeners.tls]
+cert = "{}"
+key = "{}"
+client_ca = "{}"
+h3 = true
+
+[clusters.up]
+backends = ["127.0.0.1:{vane2_port}"]
+
+[clusters.up.mesh]
+cert = "{}"
+key = "{}"
+ca = "{}"
+server_name = "localhost"
+http3 = true
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+allowed_spiffe_prefixes = ["spiffe://example.org/vane/"]
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = true
+workers = 1
+"#,
+        srv_cert_p.display(),
+        srv_key_p.display(),
+        ca_p.display(),
+        hop1_cert_p.display(),
+        hop1_key_p.display(),
+        ca_p.display()
+    );
+    let (_d1, vane1_cfg) = {
+        let d = tempfile::tempdir().expect("dir1");
+        let p = d.path().join("vane.toml");
+        std::fs::write(&p, vane1_toml).expect("write");
+        (d, p.to_str().expect("utf8").to_owned())
+    };
+    let _vane1 = spawn_proxy(vane1_cfg);
+    eprintln!("PORTS: vane1_listener={vane1_port}");
+    let vane1_quic: std::net::SocketAddr = format!("127.0.0.1:{vane1_port}").parse().expect("addr");
+    wait_bound(vane1_quic);
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Caller bridge → vane1.
+    let caller = vane::h3_bridge::spawn(
+        vec![vane1_quic],
+        Some(vane_control::config::H3UpstreamTls {
+            ca: ca_p.display().to_string(),
+            server_name: "localhost".into(),
+            client_cert: Some(caller_cert_p.display().to_string()),
+            client_key: Some(caller_key_p.display().to_string()),
+            alpn: None,
+        }),
+        vane::h3_bridge::BridgeOptions {
+            first_byte_timeout: Duration::from_secs(5),
+            ..Default::default()
+        },
+    )
+    .expect("caller bridge");
+
+    let mut s = std::net::TcpStream::connect(caller).expect("connect");
+    s.write_all(b"GET /hop HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+        .expect("write");
+    let mut resp = Vec::new();
+    s.read_to_end(&mut resp).expect("read");
+    let resp = String::from_utf8_lossy(&resp).into_owned();
+    assert!(resp.contains("200 OK"), "two-hop routed: {resp:?}");
+
+    let head = rx.recv_timeout(Duration::from_secs(5)).expect("head");
+    let lower = head.to_ascii_lowercase();
+    assert!(
+        lower.contains(
+            "x-vane-spiffe-chain: spiffe://example.org/vane/caller, spiffe://example.org/vane/hop1"
+        ) || lower.contains(
+            "x-vane-spiffe-chain: spiffe://example.org/vane/caller,spiffe://example.org/vane/hop1"
+        ),
+        "chain must be [caller, hop1]: {head:?}"
+    );
+    // The immediate caller from vane2's perspective is hop1.
+    assert!(
+        lower.contains("x-vane-spiffe-id: spiffe://example.org/vane/hop1"),
+        "immediate caller: {head:?}"
     );
 }
