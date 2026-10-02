@@ -81,6 +81,18 @@ than inline assignments. Implementation:
    `EdsClusterConfig` (eds_config = ADS) and seed the snapshot's EDS
    resource; the interop script then asserts the same live route.
 
+### SDS — shipped (2026-10-02)
+
+`XdsSnapshot.secrets` (name → cert/key/ca PEM content) +
+`XdsListenerTls.secret` refs: control-plane-delivered material is
+built via `vane_tls::server_config_from_parts` (PEM content, never
+disk) and hot-swapped onto the pre-bound listener — certificate
+rotation end-to-end from the management plane. The xds-client
+subscribes SDS and carries secrets; listener/secret entries persist
+across republishes (apply merges absent-listeners = keep, secrets
+union), so xds-client and operator snapshots compose. Covered by
+wire-decode unit tests, a merge test, and a full-stack SDS rotate.
+
 ### LDS (listeners) — TLS rotation shipped (2026-09-28)
 
 LDS responses carry `Listener` resources: `address` (1) →

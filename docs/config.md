@@ -308,6 +308,28 @@ healthy backend, and hot reload of the `h3_tls` files every second
 http3 clusters (the bridge owns backend health). Full story:
 docs/quickstart-h3.md.
 
+## xDS secrets (SDS)
+
+`POST /xds/snapshot` snapshots may carry `secrets` — SDS-decoded TLS
+material by name (PEM content, never file paths):
+
+```json
+{
+  "version": "sds-1",
+  "clusters": {},
+  "routes": [],
+  "listeners": [ { "address": "0.0.0.0:8443", "secret": "edge" } ],
+  "secrets": { "edge": { "cert": "-----BEGIN...", "key": "-----BEGIN...", "ca": "-----BEGIN..." } }
+}
+```
+
+A listener entry with `secret` serves the control-plane-delivered
+certificate live (same hot-swap as file-based rotation); without
+`secret`, `cert`/`key` are file paths as before. `vane xds-client`
+subscribes SDS and carries secrets in its snapshots. Listener and
+secret entries persist across xds-client republishes (empty
+listeners = keep stored; secrets union).
+
 ## Identity propagation + chaining
 
 Routes with `allowed_spiffe_prefixes` authorize the caller's verified
