@@ -184,18 +184,21 @@ async fn xds_snapshot(
     tls_slots: Arc<Vec<(String, crate::tls_reload::TlsSlot)>>,
     body: String,
 ) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    let snapshot: vane_control::xds::XdsSnapshot = serde_json::from_str(&body).map_err(|e| {
-        (
-            axum::http::StatusCode::BAD_REQUEST,
-            format!("snapshot parse: {e}"),
-        )
-    })?;
-    vane_control::xds::apply_snapshot_state(&router, &health, &xds, &snapshot).map_err(|e| {
-        (
-            axum::http::StatusCode::BAD_REQUEST,
-            format!("snapshot rejected: {e}"),
-        )
-    })?;
+    let mut snapshot: vane_control::xds::XdsSnapshot =
+        serde_json::from_str(&body).map_err(|e| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("snapshot parse: {e}"),
+            )
+        })?;
+    vane_control::xds::apply_snapshot_state(&router, &health, &xds, &mut snapshot).map_err(
+        |e| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("snapshot rejected: {e}"),
+            )
+        },
+    )?;
     // Listener TLS material from the snapshot (LDS parity): for each
     // snapshot listener entry, swap the pre-bound listener's shared
     // slot — same hot-swap the file watcher performs.
@@ -209,11 +212,34 @@ async fn xds_snapshot(
                 ),
             ));
         };
-        let cfg = vane_tls::server_config_mtls(
-            std::path::Path::new(&l.cert),
-            std::path::Path::new(&l.key),
-            l.client_ca.as_deref().map(std::path::Path::new),
-        )
+        // Material: SDS secret ref (control-plane PEM, never disk) or
+        // file paths (the hot-reload watcher owns those otherwise).
+        let cfg = if let Some(secret_name) = &l.secret {
+            let Some(sec) = snapshot.secrets.get(secret_name) else {
+                return Err((
+                    axum::http::StatusCode::BAD_REQUEST,
+                    format!(
+                        "listener `{}` references unknown secret `{secret_name}`",
+                        l.address
+                    ),
+                ));
+            };
+            vane_tls::server_config_from_parts(&sec.cert, &sec.key, sec.ca.as_deref())
+        } else if l.cert.is_empty() || l.key.is_empty() {
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                format!(
+                    "listener `{}` needs either `secret` or cert/key file paths",
+                    l.address
+                ),
+            ));
+        } else {
+            vane_tls::server_config_mtls(
+                std::path::Path::new(&l.cert),
+                std::path::Path::new(&l.key),
+                l.client_ca.as_deref().map(std::path::Path::new),
+            )
+        }
         .map_err(|e| {
             (
                 axum::http::StatusCode::BAD_REQUEST,

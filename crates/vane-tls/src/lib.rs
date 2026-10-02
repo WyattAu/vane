@@ -95,16 +95,39 @@ pub fn server_config_mtls(
     key_path: &std::path::Path,
     client_ca: Option<&std::path::Path>,
 ) -> Result<rustls::ServerConfig, TlsError> {
-    let (certs, key) = load_cert_key(cert_path, key_path)?;
+    let cert_pem = std::fs::read_to_string(cert_path)
+        .map_err(|e| TlsError::Material(format!("{}: {e}", cert_path.display())))?;
+    let key_pem = std::fs::read_to_string(key_path)
+        .map_err(|e| TlsError::Material(format!("{}: {e}", key_path.display())))?;
+    let ca_pem = client_ca
+        .map(std::fs::read_to_string)
+        .transpose()
+        .map_err(|e| TlsError::Material(format!("ca: {e}")))?;
+    server_config_from_parts(&cert_pem, &key_pem, ca_pem.as_deref())
+}
+
+/// Builds the server config from PEM CONTENT — the SDS path (control-
+/// plane-delivered material never touches disk).
+///
+/// # Errors
+/// Material parse failures.
+pub fn server_config_from_parts(
+    cert_pem: &str,
+    key_pem: &str,
+    client_ca_pem: Option<&str>,
+) -> Result<rustls::ServerConfig, TlsError> {
+    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        .collect::<Result<_, _>>()
+        .map_err(|e| TlsError::Material(e.to_string()))?;
+    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+        .map_err(|e| TlsError::Material(e.to_string()))?
+        .ok_or_else(|| TlsError::Material("no private key found".into()))?;
     let builder = rustls::ServerConfig::builder();
-    let builder = match client_ca {
+    let builder = match client_ca_pem {
         Some(ca) => {
-            let cas: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(
-                std::fs::File::open(ca)
-                    .map_err(|e| TlsError::Material(format!("{}: {e}", ca.display())))?,
-            ))
-            .collect::<Result<_, _>>()
-            .map_err(|e| TlsError::Material(e.to_string()))?;
+            let cas: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(ca.as_bytes()))
+                .collect::<Result<_, _>>()
+                .map_err(|e| TlsError::Material(e.to_string()))?;
             let mut roots = rustls::RootCertStore::empty();
             for c in cas {
                 roots

@@ -248,6 +248,10 @@ pub fn xds_client_loop(management: &str, node_id: &str, admin: &str) -> i32 {
     // CDS assignment when present).
     let mut eds_backends: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
+    // SDS-delivered secrets (ride the snapshot; listener entries
+    // referencing them are admin-supplied and persist server-side).
+    let mut secrets: std::collections::BTreeMap<String, vane_control::xds::XdsSecret> =
+        std::collections::BTreeMap::new();
     // Standard ADS bootstrapping: subscribe LDS + CDS + EDS up front,
     // and hold the RDS subscription until the Cluster set is ACKed —
     // real management planes answer watches independently, so an RDS
@@ -319,6 +323,14 @@ pub fn xds_client_loop(management: &str, node_id: &str, admin: &str) -> i32 {
                             eds_backends.insert(name, backends);
                         }
                     }
+                } else if type_url == vane_proto::xds::type_url::SECRET {
+                    for any in res {
+                        let (_, value) = vane_control::xds_grpc::any_value(any)
+                            .ok_or_else(|| "secret Any".to_string())?;
+                        if let Some((name, secret)) = envoy::decode_secret(&value) {
+                            secrets.insert(name, secret);
+                        }
+                    }
                 }
                 Ok(())
             };
@@ -382,7 +394,8 @@ pub fn xds_client_loop(management: &str, node_id: &str, admin: &str) -> i32 {
                             c
                         })
                         .collect();
-                    let snapshot = envoy::map_snapshot(&clusters, rc);
+                    let mut snapshot = envoy::map_snapshot(&clusters, rc);
+                    snapshot.secrets = secrets.clone();
                     match serde_json::to_string(&snapshot) {
                         Ok(body) => match http
                             .post(&snapshot_url)

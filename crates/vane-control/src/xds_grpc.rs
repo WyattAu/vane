@@ -9,11 +9,12 @@ use vane_proto::pb;
 
 /// The resource types vane subscribes to, in subscription order
 /// (LDS → RDS → CDS → EDS per the xDS-transport design).
-pub const SUBSCRIBED_TYPES: [&str; 4] = [
+pub const SUBSCRIBED_TYPES: [&str; 5] = [
     vane_proto::xds::type_url::LISTENER,
     vane_proto::xds::type_url::ROUTE,
     vane_proto::xds::type_url::CLUSTER,
     vane_proto::xds::type_url::ENDPOINT,
+    vane_proto::xds::type_url::SECRET,
 ];
 
 /// Per-type ADS subscription state.

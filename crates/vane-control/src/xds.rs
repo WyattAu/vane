@@ -66,13 +66,32 @@ pub struct XdsRoute {
 pub struct XdsListenerTls {
     /// Listener address as configured at startup ("127.0.0.1:8443").
     pub address: String,
-    /// PEM certificate chain (file path).
+    /// PEM certificate chain (file path). Unused when `secret` is set.
+    #[serde(default)]
     pub cert: String,
-    /// PEM private key (file path).
+    /// PEM private key (file path). Unused when `secret` is set.
+    #[serde(default)]
     pub key: String,
     /// PEM CA for downstream client certificates (optional mTLS).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_ca: Option<String>,
+    /// SDS secret name: when set, `cert`/`key`/`client_ca` resolve
+    /// from `XdsSnapshot.secrets` (control-plane-delivered material —
+    /// PEM content, never file paths).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+}
+
+/// SDS-delivered TLS material (PEM content).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct XdsSecret {
+    /// PEM certificate chain.
+    pub cert: String,
+    /// PEM private key.
+    pub key: String,
+    /// PEM CA bundle (client-auth trust anchors), optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca: Option<String>,
 }
 
 /// A full-state configuration snapshot: replace-everything semantics.
@@ -90,12 +109,22 @@ pub struct XdsSnapshot {
     /// Listener TLS material for pre-bound listeners (LDS parity).
     #[serde(default)]
     pub listeners: Vec<XdsListenerTls>,
+    /// SDS-delivered secrets by name; listener `secret` refs resolve
+    /// against this map at apply time.
+    #[serde(default)]
+    pub secrets: BTreeMap<String, XdsSecret>,
 }
 
 /// Last applied snapshot version (shared with the admin plane).
 #[derive(Debug, Default)]
 pub struct XdsState {
     version: std::sync::Mutex<Option<String>>,
+    /// Listener TLS entries + SDS secrets. The xds-client does not
+    /// manage listeners; admin-supplied entries persist across
+    /// snapshot updates unless an update supplies its own (full
+    /// snapshot semantics apply to routes/clusters only).
+    listeners: std::sync::Mutex<Vec<XdsListenerTls>>,
+    secrets: std::sync::Mutex<std::collections::BTreeMap<String, XdsSecret>>,
 }
 
 impl XdsState {
@@ -202,8 +231,26 @@ pub fn apply_snapshot_state(
     router: &Router,
     health: &HealthMap,
     state: &XdsState,
-    snapshot: &XdsSnapshot,
+    snapshot: &mut XdsSnapshot,
 ) -> Result<(), String> {
+    // Listeners + secrets merge: the xds-client's snapshots carry
+    // none, so admin-supplied entries persist; a snapshot that
+    // supplies its own replaces them. Secrets union (incoming wins).
+    {
+        let mut stored = state.listeners.lock().unwrap_or_else(|e| e.into_inner());
+        if snapshot.listeners.is_empty() {
+            snapshot.listeners = stored.clone();
+        } else {
+            *stored = snapshot.listeners.clone();
+        }
+    }
+    {
+        let mut stored = state.secrets.lock().unwrap_or_else(|e| e.into_inner());
+        for (k, v) in &snapshot.secrets {
+            stored.insert(k.clone(), v.clone());
+        }
+        snapshot.secrets = stored.clone();
+    }
     apply_snapshot(router, health, snapshot)?;
     state.set_version(snapshot.version.clone());
     Ok(())
@@ -238,7 +285,7 @@ mod tests {
         let health = HealthMap::new();
         let state = XdsState::new();
         assert_eq!(state.version(), None);
-        apply_snapshot_state(&router, &health, &state, &snapshot()).expect("apply");
+        apply_snapshot_state(&router, &health, &state, &mut snapshot()).expect("apply");
         assert_eq!(state.version().as_deref(), Some("v7"));
         let table = router.load();
         assert_eq!(table.table().snapshot_records().len(), 1);
@@ -249,12 +296,12 @@ mod tests {
         let router = Router::new();
         let health = HealthMap::new();
         let state = XdsState::new();
-        apply_snapshot_state(&router, &health, &state, &snapshot()).expect("apply");
+        apply_snapshot_state(&router, &health, &state, &mut snapshot()).expect("apply");
 
         let mut bad = snapshot();
         bad.version = "v8".into();
         bad.routes[0].cluster = "missing".into();
-        assert!(apply_snapshot_state(&router, &health, &state, &bad).is_err());
+        assert!(apply_snapshot_state(&router, &health, &state, &mut bad).is_err());
         assert_eq!(state.version().as_deref(), Some("v7"), "version unchanged");
         let table = router.load();
         assert_eq!(table.table().snapshot_records().len(), 1, "live table kept");
@@ -265,12 +312,12 @@ mod tests {
         let router = Router::new();
         let health = HealthMap::new();
         let state = XdsState::new();
-        apply_snapshot_state(&router, &health, &state, &snapshot()).expect("apply");
+        apply_snapshot_state(&router, &health, &state, &mut snapshot()).expect("apply");
 
         let mut next = snapshot();
         next.version = "v8".into();
         next.routes.clear();
-        apply_snapshot_state(&router, &health, &state, &next).expect("apply");
+        apply_snapshot_state(&router, &health, &state, &mut next).expect("apply");
         let table = router.load();
         assert!(table.table().snapshot_records().is_empty(), "replaced");
     }
@@ -279,7 +326,7 @@ mod tests {
     fn outlier_and_compression_flags_threaded() {
         let router = Router::new();
         let health = HealthMap::new();
-        let snap: XdsSnapshot = serde_json::from_str(
+        let mut snap: XdsSnapshot = serde_json::from_str(
             r#"{
             "version": "v1",
             "clusters": {
@@ -293,7 +340,7 @@ mod tests {
         }"#,
         )
         .expect("snapshot");
-        apply_snapshot_state(&router, &health, &state_unused(), &snap).expect("apply");
+        apply_snapshot_state(&router, &health, &state_unused(), &mut snap).expect("apply");
         let table = router.load();
         let records = table.table().snapshot_records();
         assert_eq!(records.len(), 1);
@@ -304,10 +351,46 @@ mod tests {
     }
 
     #[test]
+    fn listeners_and_secrets_persist_across_snapshots() {
+        let router = Router::new();
+        let health = HealthMap::new();
+        let state = XdsState::new();
+        // First snapshot: carries a listener TLS entry + a secret.
+        let mut a: XdsSnapshot = serde_json::from_str(
+            r#"{
+            "version": "a",
+            "clusters": { "web": { "backends": ["127.0.0.1:9001"] } },
+            "routes": [ { "pattern": "/*rest", "cluster": "web" } ],
+            "listeners": [ { "address": "127.0.0.1:8443", "secret": "edge" } ],
+            "secrets": { "edge": { "cert": "C", "key": "K" } }
+        }"#,
+        )
+        .expect("snapshot");
+        apply_snapshot_state(&router, &health, &state, &mut a).expect("apply a");
+
+        // Second snapshot: routes/clusters update, no listeners —
+        // the stored entries persist and the secrets union.
+        let mut b: XdsSnapshot = serde_json::from_str(
+            r#"{
+            "version": "b",
+            "clusters": { "web": { "backends": ["127.0.0.1:9002"] } },
+            "routes": [ { "pattern": "/*rest", "cluster": "web" } ],
+            "secrets": { "extra": { "cert": "C2", "key": "K2" } }
+        }"#,
+        )
+        .expect("snapshot");
+        apply_snapshot_state(&router, &health, &state, &mut b).expect("apply b");
+        assert_eq!(b.listeners.len(), 1, "listeners persist");
+        assert_eq!(b.listeners[0].secret.as_deref(), Some("edge"));
+        assert_eq!(b.secrets.len(), 2, "secrets union");
+        assert!(b.secrets.contains_key("edge") && b.secrets.contains_key("extra"));
+    }
+
+    #[test]
     fn policy_default_is_p2c() {
         let router = Router::new();
         let health = HealthMap::new();
-        let snap: XdsSnapshot = serde_json::from_str(
+        let mut snap: XdsSnapshot = serde_json::from_str(
             r#"{
             "version": "v1",
             "clusters": { "web": { "backends": ["127.0.0.1:9001"] } },
@@ -315,6 +398,6 @@ mod tests {
         }"#,
         )
         .expect("snapshot");
-        apply_snapshot_state(&router, &health, &XdsState::new(), &snap).expect("apply");
+        apply_snapshot_state(&router, &health, &XdsState::new(), &mut snap).expect("apply");
     }
 }

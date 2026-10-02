@@ -202,6 +202,7 @@ pub fn compile(state: &GatewayState) -> Result<XdsSnapshot, String> {
         clusters,
         routes,
         listeners: Vec::new(),
+        secrets: Default::default(),
     })
 }
 

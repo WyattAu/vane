@@ -3,7 +3,7 @@
 //! socket-address backends) and RouteConfigurations (domain/prefix →
 //! cluster). Field numbers are Envoy API v3 exact.
 
-use crate::xds::{XdsCluster, XdsRoute, XdsSnapshot};
+use crate::xds::{XdsCluster, XdsRoute, XdsSecret, XdsSnapshot};
 use vane_proto::pb;
 
 /// A decoded Envoy `Cluster` (the vane-relevant subset).
@@ -181,6 +181,84 @@ pub fn decode_cla(buf: &[u8]) -> Option<(String, Vec<String>)> {
     Some((name, backends))
 }
 
+/// Decodes an SDS `Secret` resource:
+/// `name` = 1, `tls_certificate` = 2 (repeated, first wins),
+/// `validation_context` = 3. Certificate fields are
+/// `DataSource` chains: `filename` = 1, `inline_bytes` = 2,
+/// `inline_string` = 3 — inline content wins; filenames are read at
+/// decode time. Returns `(name, secret)`.
+#[must_use]
+pub fn decode_secret(buf: &[u8]) -> Option<(String, XdsSecret)> {
+    let mut name = String::new();
+    let mut cert: Option<String> = None;
+    let mut key: Option<String> = None;
+    let mut ca: Option<String> = None;
+    let mut pos = 0;
+    while pos < buf.len() {
+        let (f, n) = pb::decode_field(&buf[pos..])?;
+        pos += n;
+        match f.number {
+            1 => name = String::from_utf8_lossy(f.bytes).into_owned(),
+            2 => {
+                // TlsCertificate: cert_chain = 2, private_key = 3.
+                let mut pos2 = 0;
+                while pos2 < f.bytes.len() {
+                    let (g, m) = pb::decode_field(&f.bytes[pos2..])?;
+                    pos2 += m;
+                    match g.number {
+                        2 => cert = cert.or_else(|| decode_data_source(g.bytes)),
+                        3 => key = key.or_else(|| decode_data_source(g.bytes)),
+                        _ => {}
+                    }
+                }
+            }
+            3 => {
+                // CertificateValidationContext: trusted_ca = 1.
+                let mut pos2 = 0;
+                while pos2 < f.bytes.len() {
+                    let (g, m) = pb::decode_field(&f.bytes[pos2..])?;
+                    pos2 += m;
+                    if g.number == 1 {
+                        ca = ca.or_else(|| decode_data_source(g.bytes));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if name.is_empty() || cert.is_none() || key.is_none() {
+        return None;
+    }
+    Some((
+        name,
+        XdsSecret {
+            cert: cert.expect("cert"),
+            key: key.expect("key"),
+            ca,
+        },
+    ))
+}
+
+/// `envoy.config.core.v3.DataSource`: filename = 1 (read now),
+/// inline_bytes = 2, inline_string = 3.
+fn decode_data_source(buf: &[u8]) -> Option<String> {
+    let mut pos = 0;
+    while pos < buf.len() {
+        let (f, n) = pb::decode_field(&buf[pos..])?;
+        pos += n;
+        match f.number {
+            1 => {
+                let path = String::from_utf8_lossy(f.bytes).into_owned();
+                return std::fs::read_to_string(&path).ok();
+            }
+            2 => return Some(String::from_utf8_lossy(f.bytes).into_owned()),
+            3 => return Some(String::from_utf8_lossy(f.bytes).into_owned()),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Decodes an Envoy `RouteConfiguration` message.
 #[must_use]
 pub fn decode_route_config(buf: &[u8]) -> Option<EnvoyRouteConfig> {
@@ -286,6 +364,7 @@ pub fn map_snapshot(clusters: &[EnvoyCluster], route_config: &EnvoyRouteConfig) 
         clusters: std::collections::BTreeMap::new(),
         routes: Vec::new(),
         listeners: Vec::new(),
+        secrets: Default::default(),
     };
     for c in clusters {
         snapshot.clusters.insert(
@@ -323,6 +402,61 @@ pub fn map_snapshot(clusters: &[EnvoyCluster], route_config: &EnvoyRouteConfig) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Wire helper: tag (field<<3|2), varint len, bytes.
+    fn pb_bytes(num: u32, data: &[u8]) -> Vec<u8> {
+        // Wire: tag (field<<3|2), varint len, bytes.
+        let mut out: Vec<u8> = vec![((num << 3) | 2) as u8];
+        let mut n = data.len();
+        loop {
+            let b = (n & 0x7f) as u8;
+            n >>= 7;
+            if n == 0 {
+                out.push(b);
+                break;
+            }
+            out.push(b | 0x80);
+        }
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn pb_str(num: u32, s: &str) -> Vec<u8> {
+        pb_bytes(num, s.as_bytes())
+    }
+
+    #[test]
+    fn decode_secret_inline_and_name() {
+        // DataSource{inline_string}: field 3 string.
+        let ds = |pem: &str| pb_bytes(3, pem.as_bytes());
+        // TlsCertificate: cert_chain = 2, private_key = 3.
+        let tls_cert = [pb_bytes(2, &ds("CERT-PEM")), pb_bytes(3, &ds("KEY-PEM"))].concat();
+        // ValidationContext: trusted_ca = 1.
+        let vc = pb_bytes(1, &ds("CA-PEM"));
+        // Secret: name = 1, tls_certificate = 2, validation_context = 3.
+        let buf = [
+            pb_str(1, "mesh-svid"),
+            pb_bytes(2, &tls_cert),
+            pb_bytes(3, &vc),
+        ]
+        .concat();
+
+        let (name, secret) = super::decode_secret(&buf).expect("decode");
+        assert_eq!(name, "mesh-svid");
+        assert_eq!(secret.cert, "CERT-PEM");
+        assert_eq!(secret.key, "KEY-PEM");
+        assert_eq!(secret.ca.as_deref(), Some("CA-PEM"));
+    }
+
+    #[test]
+    fn decode_secret_requires_cert_and_key() {
+        // name only → None.
+        assert!(super::decode_secret(&pb_str(1, "x")).is_none());
+        // cert without key → None.
+        let tls_cert = pb_bytes(2, &pb_bytes(3, "CERT-PEM".as_bytes()));
+        let buf = [pb_str(1, "x"), pb_bytes(2, &tls_cert)].concat();
+        assert!(super::decode_secret(&buf).is_none());
+    }
 
     /// Hand-encodes an Envoy Cluster: name + one socket-address
     /// endpoint + http2 options.
@@ -419,30 +553,6 @@ mod tests {
         assert_eq!(snap.routes[0].cluster, "shop");
         assert_eq!(snap.routes[0].host.as_deref(), Some("shop.example.com"));
     }
-}
-
-#[cfg(test)]
-mod wire_tests {
-    use super::*;
-
-    /// The exact bytes go-control-plane v0.14 sent on the wire.
-    #[test]
-    fn decodes_real_gcpx_cluster() {
-        let wire: Vec<u8> = vec![
-            0x0a, 0x04, 0x73, 0x68, 0x6f, 0x70, 0x22, 0x02, 0x08, 0x02, 0x8a, 0x02, 0x1f, 0x0a,
-            0x04, 0x73, 0x68, 0x6f, 0x70, 0x12, 0x17, 0x12, 0x15, 0x0a, 0x13, 0x0a, 0x11, 0x0a,
-            0x0f, 0x12, 0x09, 0x31, 0x32, 0x37, 0x2e, 0x30, 0x2e, 0x30, 0x2e, 0x31, 0x18, 0xa1,
-            0x8d, 0x01,
-        ];
-        let c = decode_cluster(&wire).expect("decode");
-        assert_eq!(c.name, "shop");
-        assert_eq!(c.backends, vec!["127.0.0.1:18081"]);
-    }
-}
-
-#[cfg(test)]
-mod cla_trace {
-    use super::*;
     #[test]
     fn decode_cla_direct() {
         let cla: Vec<u8> = vec![
@@ -466,5 +576,24 @@ mod cla_trace {
             eprintln!("field {} wire {:?} len {}", f.number, f.wire, f.bytes.len());
         }
         assert_eq!(pos, wire.len());
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    /// The exact bytes go-control-plane v0.14 sent on the wire.
+    #[test]
+    fn decodes_real_gcpx_cluster() {
+        let wire: Vec<u8> = vec![
+            0x0a, 0x04, 0x73, 0x68, 0x6f, 0x70, 0x22, 0x02, 0x08, 0x02, 0x8a, 0x02, 0x1f, 0x0a,
+            0x04, 0x73, 0x68, 0x6f, 0x70, 0x12, 0x17, 0x12, 0x15, 0x0a, 0x13, 0x0a, 0x11, 0x0a,
+            0x0f, 0x12, 0x09, 0x31, 0x32, 0x37, 0x2e, 0x30, 0x2e, 0x30, 0x2e, 0x31, 0x18, 0xa1,
+            0x8d, 0x01,
+        ];
+        let c = decode_cluster(&wire).expect("decode");
+        assert_eq!(c.name, "shop");
+        assert_eq!(c.backends, vec!["127.0.0.1:18081"]);
     }
 }

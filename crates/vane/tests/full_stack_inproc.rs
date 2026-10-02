@@ -2559,3 +2559,121 @@ workers = 1
         "immediate caller: {head:?}"
     );
 }
+
+/// SDS apply: a snapshot carrying `secrets` + a listener `secret` ref
+/// serves the control-plane-delivered certificate live (material
+/// never touches the bridge's file paths).
+#[test]
+fn xds_snapshot_sds_secret_rotates_listener() {
+    let _serial = lock_serial();
+    let upstream = spawn_upstream();
+    let port = free_port();
+    let admin = free_port();
+
+    // Cert A: starting material. SDS secret: cert B (rotated in).
+    let dir = tempfile::tempdir().expect("dir");
+    let certs_a = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("a");
+    let certs_b = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("b");
+    let cert_a = dir.path().join("cert_a.pem");
+    let key_a = dir.path().join("key_a.pem");
+    std::fs::write(&cert_a, certs_a.cert.pem()).expect("write");
+    std::fs::write(&key_a, certs_a.signing_key.serialize_pem()).expect("write");
+
+    let toml = format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[listeners.tls]
+cert = "{}"
+key = "{}"
+
+[clusters.up]
+backends = ["{upstream}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = true
+address = "127.0.0.1:{admin}"
+
+[runtime]
+force_mio = true
+workers = 1
+"#,
+        cert_a.display(),
+        key_a.display()
+    );
+    let path = dir.path().join("vane.toml");
+    std::fs::write(&path, toml).expect("write");
+    let cfg = path.to_str().expect("utf8").to_owned();
+    let _server_guard_7 = spawn_proxy(cfg);
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    let admin_addr: std::net::SocketAddr = format!("127.0.0.1:{admin}").parse().expect("addr");
+    let mut admin_conn = None;
+    for _ in 0..100 {
+        if let Ok(c) = std::net::TcpStream::connect(admin_addr) {
+            admin_conn = Some(c);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut s = admin_conn.expect("admin never came up");
+    // Snapshot: SDS secret `edge` holds cert B inline; the listener
+    // references it — no file paths involved.
+    let body = format!(
+        r#"{{"version":"sds-1","clusters":{{"up":{{"backends":["{upstream}"]}}}},"routes":[{{"pattern":"/*rest","cluster":"up"}}],"listeners":[{{"address":"127.0.0.1:{port}","secret":"edge"}}],"secrets":{{"edge":{{"cert":"{}","key":"{}"}}}}}}"#,
+        certs_b.cert.pem().replace('\n', "\\n"),
+        certs_b.signing_key.serialize_pem().replace('\n', "\\n")
+    );
+    let req = format!(
+        "POST /xds/snapshot HTTP/1.1\r\nHost: a\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    s.write_all(req.as_bytes()).expect("admin write");
+    let mut resp = Vec::new();
+    s.read_to_end(&mut resp).expect("admin read");
+    let resp = String::from_utf8_lossy(&resp).into_owned();
+    assert!(resp.contains("200"), "sds apply: {resp:?}");
+    drop(s);
+
+    // The listener serves the SDS-delivered cert.
+    let mut roots = rustls::RootCertStore::empty();
+    use rustls::pki_types::pem::PemObject as _;
+    let der = rustls::pki_types::CertificateDer::from_pem_slice(certs_b.cert.pem().as_bytes())
+        .expect("cert b der");
+    roots.add(der).expect("add");
+    let client_cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server_name =
+        rustls::pki_types::ServerName::try_from("localhost".to_string()).expect("sni");
+    let mut conn = rustls::ClientConnection::new(std::sync::Arc::new(client_cfg), server_name)
+        .expect("client conn");
+    let mut sock = std::net::TcpStream::connect(proxy).expect("tcp");
+    let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+    tls.write_all(b"GET /s HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+        .expect("tls write");
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match tls.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    let got = String::from_utf8_lossy(&got).into_owned();
+    assert!(got.contains("200 OK"), "sds-served response: {got:?}");
+    assert!(got.contains("hello-vane"), "sds body: {got:?}");
+}
