@@ -269,6 +269,53 @@ mount convention paths (`/etc/vane/certs/{secret}`). v0.2 is
 poll-based (no watch API) and single-namespace; the Helm chart ships
 a `gatewayOperator.enabled=true` deployment + read-only RBAC.
 
+## `[http2]` — protocol tuning
+
+```toml
+[http2]
+strict_idle_window_update = false   # default: lenient
+```
+
+`strict_idle_window_update = true` rejects WINDOW_UPDATE frames on
+streams the peer never opened (RFC 7540 §5.1 idle state →
+PROTOCOL_ERROR connection error), matching h2spec. The default is
+lenient because the h2 crate client legitimately grants stream credit
+before its HEADERS land — strict mode is for conformance runs
+(`scripts/h2spec_run.sh`, 145/145).
+
+## cluster `http3` — upstream over QUIC (bridge)
+
+```toml
+[clusters.up]
+backends = ["10.0.0.7:443"]
+http3 = true
+
+[clusters.up.h3_tls]
+ca = "/etc/vane/upstream-ca.pem"    # trusts the backend cert
+server_name = "backend.internal"    # SNI for the handshake
+# client_cert = "/run/secrets/svid.pem"   # optional mTLS SVID
+# client_key  = "/run/secrets/svid-key.pem"
+# alpn = "vane-mesh"                # default "h3"
+```
+
+The engine dials a loopback bridge that re-originates requests over
+QUIC/HTTP-3: one QUIC handshake per backend (streams multiplex),
+health-aware round-robin with active `health_path` probes every 5 s
+plus failure-reactive marking, one in-bridge retry on the next
+healthy backend, and hot reload of the `h3_tls` files every second
+(SVID rotation without restart). Chunked requests are declined with
+501; engine-side health probes/outlier ejection are skipped for
+http3 clusters (the bridge owns backend health). Full story:
+docs/quickstart-h3.md.
+
+## Identity propagation + chaining
+
+Routes with `allowed_spiffe_prefixes` authorize the caller's verified
+SPIFFE ID (mTLS ingress on h2 or h3; wrong prefix → 403, no cert →
+handshake failure). The verified ID is forwarded upstream as
+`X-Vane-Spiffe-Id`; inbound values of that header are stripped, so
+only vane-verified identities flow. See docs/quickstart-h3.md.
+
 ## cluster `mesh` — mTLS upstreams with SPIFFE identities
 
 ```toml
@@ -281,9 +328,13 @@ key = "/etc/vane/spiffe/key.pem"       # client SVID key
 ca = "/etc/vane/spiffe/bundle.pem"     # mesh CA bundle
 server_name = "mesh.local"             # SNI for the upstream
 spiffe_prefix = "spiffe://example.org/vane/"
+http3 = true                          # optional: mesh over QUIC
 ```
 
-Upstream connections dial with mutual TLS (ALPN `vane-mesh`): the
+`http3 = true` originates this cluster over the QUIC bridge: the SVID
+is the client certificate, `ca` the trust anchor, ALPN `vane-mesh`.
+Mutually exclusive with `h3_tls`. Upstream connections dial with
+mutual TLS (ALPN `vane-mesh`): the
 proxy presents its SVID, requires the backend's certificate to chain
 to `ca`, and enforces the backend's SPIFFE URI SAN against
 `spiffe_prefix` after the handshake. Verification failure (or any TLS
