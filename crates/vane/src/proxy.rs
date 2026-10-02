@@ -1396,6 +1396,11 @@ impl HttpProxy {
             if is_x_forwarded(name) {
                 continue;
             }
+            // Same for the caller-identity header: only identities this
+            // proxy verified are forwarded, never client-supplied ones.
+            if name.eq_ignore_ascii_case("x-vane-spiffe-id") {
+                continue;
+            }
             out.extend_from_slice(name.as_bytes());
             out.extend_from_slice(b": ");
             out.extend_from_slice(h.value);
@@ -2123,19 +2128,20 @@ impl HttpProxy {
             return;
         }
 
-        // Inbound caller identity authorization: routes with
-        // `allowed_spiffe_prefixes` require an mTLS peer whose SPIFFE
-        // URI SAN matches at least one prefix
-        // (docs/mesh-mtls-design.md, milestone 4). Plain-TLS or
-        // cert-less callers have no identity → 403.
+        // Inbound caller identity: the mTLS peer's SPIFFE URI SAN, when
+        // the listener terminates client certs. Two uses: route
+        // authorization (`allowed_spiffe_prefixes`, mismatch → 403) and
+        // identity propagation — the verified ID is forwarded upstream
+        // as `X-Vane-Spiffe-Id` (inbound values of that header are
+        // stripped as untrusted, so only vane-verified identities flow).
+        let peer_id = self
+            .conns
+            .get(&slot)
+            .and_then(|c| c.tls.as_ref())
+            .and_then(|tls| tls.peer_certificates())
+            .and_then(|certs| certs.first())
+            .and_then(|leaf| vane_tls::mesh::spiffe_id(leaf));
         if !route.allowed_spiffe_prefixes.is_empty() {
-            let peer_id = self
-                .conns
-                .get(&slot)
-                .and_then(|c| c.tls.as_ref())
-                .and_then(|tls| tls.peer_certificates())
-                .and_then(|certs| certs.first())
-                .and_then(|leaf| vane_tls::mesh::spiffe_id(leaf));
             let allowed = peer_id.as_ref().is_some_and(|id| {
                 route
                     .allowed_spiffe_prefixes
@@ -2214,6 +2220,9 @@ impl HttpProxy {
                     "http"
                 },
             );
+            if let Some(id) = &peer_id {
+                ctx.inject("X-Vane-Spiffe-Id", id);
+            }
             let outcome = self.pipeline.run(&mut ctx);
             let rejected = outcome != Outcome::Continue
                 || matches!(self.breaker.run(&mut ctx), Outcome::Reject(503, _));

@@ -265,14 +265,16 @@ impl H3Edge {
             RouteCheck::Route(r) => r,
         };
 
-        // Inbound caller identity authorization (mirrors the h2
-        // engine path): routes with `allowed_spiffe_prefixes` require
-        // an mTLS peer whose SPIFFE URI SAN matches at least one
-        // prefix. Cert-less callers have no identity → 403.
+        // Inbound caller identity (mirrors the h2 engine path): the
+        // mTLS peer's SPIFFE URI SAN. Two uses: route authorization
+        // (`allowed_spiffe_prefixes`, mismatch → 403) and identity
+        // propagation — the verified ID is forwarded upstream as
+        // `X-Vane-Spiffe-Id`. The h3 edge forwards only vane-injected
+        // headers, so client-supplied identity headers cannot pass.
+        let peer_id = peer_certs
+            .and_then(|certs| certs.first())
+            .and_then(|leaf| vane_tls::mesh::spiffe_id(leaf));
         if !route.allowed_spiffe_prefixes.is_empty() {
-            let peer_id = peer_certs
-                .and_then(|certs| certs.first())
-                .and_then(|leaf| vane_tls::mesh::spiffe_id(leaf));
             let allowed = peer_id.as_ref().is_some_and(|id| {
                 route
                     .allowed_spiffe_prefixes
@@ -366,6 +368,9 @@ impl H3Edge {
         let mut upstream = client.request(method, &url);
         for (name, value) in &inject {
             upstream = upstream.header(name.as_str(), value.as_str());
+        }
+        if let Some(id) = &peer_id {
+            upstream = upstream.header("x-vane-spiffe-id", id.as_str());
         }
         let response = match upstream.body(body_bytes).send().await {
             Ok(r) => r,

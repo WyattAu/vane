@@ -604,6 +604,10 @@ pub async fn run(opts: RunOptions) -> i32 {
                 }
                 _ => None,
             };
+        // One slot per LISTENER (indexed by li — the h3 edge and
+        // the admin TLS registry read by listener index; the
+        // reload watcher deduplicates per listener too).
+        tls_cfg_slots.push(tls_cfg.clone());
         for w in 0..workers_per_listener {
             // SO_REUSEPORT lets each worker own a duplicate bind; the
             // kernel load-balances accepts across cores.
@@ -655,7 +659,6 @@ pub async fn run(opts: RunOptions) -> i32 {
                 }
             });
             let jwt = jwt.flatten();
-            tls_cfg_slots.push(tls_cfg.clone());
             // RFC 7838 Alt-Svc: TLS listeners with h3 = true advertise
             // the h3 endpoint on the same port (feature `h3`).
             #[cfg(feature = "h3")]

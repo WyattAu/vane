@@ -2169,3 +2169,160 @@ workers = 1
     let _ = s.read_to_end(&mut out);
     assert!(out.is_empty(), "anon must fail the handshake, got {out:?}");
 }
+
+/// Identity propagation: the h3 mesh caller's verified SPIFFE ID
+/// reaches the upstream as `X-Vane-Spiffe-Id`; a client-forged value
+/// on the plain h1 path is stripped (only proxy-verified identities
+/// flow).
+#[test]
+fn spiffe_identity_propagates_and_cannot_be_forged() {
+    use rcgen::{CertificateParams, KeyPair, SanType};
+    use std::sync::mpsc;
+
+    let _serial = lock_serial();
+    let dir = tempfile::tempdir().expect("dir");
+
+    // Capturing upstream: every request head lands on the channel.
+    let (tx, rx) = mpsc::channel::<String>();
+    let up_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let upstream = up_listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for stream in up_listener.incoming().flatten() {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut s = stream;
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if s.read_exact(&mut byte).is_err() {
+                        return;
+                    }
+                    head.push(byte[0]);
+                }
+                let _ = tx.send(String::from_utf8_lossy(&head).into_owned());
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                );
+            });
+        }
+    });
+
+    // Mesh CA + server cert + one good SVID.
+    let ca_key = KeyPair::generate().expect("ca key");
+    let mut ca_params = CertificateParams::new(vec!["mesh-ca".into()]).expect("params");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).expect("ca");
+    let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
+    let srv_params = CertificateParams::new(vec!["localhost".into()]).expect("params");
+    let srv_key = KeyPair::generate().expect("srv key");
+    let srv = srv_params.signed_by(&srv_key, &issuer).expect("srv");
+    let mut svid_params = CertificateParams::new(vec!["proxy".into()]).expect("params");
+    svid_params.subject_alt_names = vec![SanType::URI(
+        rcgen::string::Ia5String::try_from("spiffe://example.org/vane/proxy").expect("uri"),
+    )];
+    let svid_key = KeyPair::generate().expect("svid key");
+    let svid = svid_params.signed_by(&svid_key, &issuer).expect("svid");
+
+    let srv_cert_p = dir.path().join("srv.pem");
+    let srv_key_p = dir.path().join("srv-key.pem");
+    let ca_p = dir.path().join("ca.pem");
+    let svid_cert_p = dir.path().join("svid.pem");
+    let svid_key_p = dir.path().join("svid-key.pem");
+    std::fs::write(&srv_cert_p, srv.pem()).expect("write");
+    std::fs::write(&srv_key_p, srv_key.serialize_pem()).expect("write");
+    std::fs::write(&ca_p, ca.pem()).expect("write");
+    std::fs::write(&svid_cert_p, svid.pem()).expect("write");
+    std::fs::write(&svid_key_p, svid_key.serialize_pem()).expect("write");
+
+    let plain_port = free_port();
+    let tls_port = free_port();
+    let toml = format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{plain_port}"
+
+[[listeners]]
+address = "127.0.0.1:{tls_port}"
+
+[listeners.tls]
+cert = "{}"
+key = "{}"
+client_ca = "{}"
+h3 = true
+
+[clusters.up]
+backends = ["{upstream}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[[routes]]
+host = "tls.local"
+pattern = "/*rest"
+cluster = "up"
+allowed_spiffe_prefixes = ["spiffe://example.org/vane/"]
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = true
+workers = 1
+"#,
+        srv_cert_p.display(),
+        srv_key_p.display(),
+        ca_p.display()
+    );
+    let path = dir.path().join("vane.toml");
+    std::fs::write(&path, toml).expect("write");
+    let cfg = path.to_str().expect("utf8").to_owned();
+
+    let _server_guard_6 = spawn_proxy(cfg);
+    let plain: std::net::SocketAddr = format!("127.0.0.1:{plain_port}").parse().expect("addr");
+    wait_bound(plain);
+    std::thread::sleep(Duration::from_millis(300)); // QUIC socket
+
+    // 1. Forged identity on the plain path: stripped upstream.
+    let resp = request(
+        plain,
+        b"GET /forge HTTP/1.1\r\nHost: t\r\nx-vane-spiffe-id: spiffe://forged\r\nConnection: close\r\n\r\n",
+    );
+    assert!(resp.contains("200 OK"), "plain routed: {resp:?}");
+    let head = rx.recv_timeout(Duration::from_secs(5)).expect("head 1");
+    assert!(
+        !head.to_ascii_lowercase().contains("x-vane-spiffe-id"),
+        "forged identity must be stripped: {head:?}"
+    );
+
+    // 2. Verified identity over h3: propagated upstream.
+    let quic_addr: std::net::SocketAddr = format!("127.0.0.1:{tls_port}").parse().expect("addr");
+    let bridge = vane::h3_bridge::spawn(
+        vec![quic_addr],
+        Some(vane_control::config::H3UpstreamTls {
+            ca: ca_p.display().to_string(),
+            server_name: "localhost".into(),
+            client_cert: Some(svid_cert_p.display().to_string()),
+            client_key: Some(svid_key_p.display().to_string()),
+            alpn: None,
+        }),
+        vane::h3_bridge::BridgeOptions {
+            first_byte_timeout: Duration::from_secs(5),
+            ..Default::default()
+        },
+    )
+    .expect("bridge");
+    let mut s = std::net::TcpStream::connect(bridge).expect("bridge connect");
+    s.write_all(b"GET /p HTTP/1.1\r\nHost: tls.local\r\nConnection: close\r\n\r\n")
+        .expect("write");
+    let mut resp = Vec::new();
+    s.read_to_end(&mut resp).expect("read");
+    let resp = String::from_utf8_lossy(&resp).into_owned();
+    assert!(resp.contains("200 OK"), "h3 mesh routed: {resp:?}");
+    let head = rx.recv_timeout(Duration::from_secs(5)).expect("head 2");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("x-vane-spiffe-id: spiffe://example.org/vane/proxy"),
+        "verified identity must propagate: {head:?}"
+    );
+}
