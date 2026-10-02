@@ -25,3 +25,6 @@ harness = false
 
 [lints]
 workspace = true
+
+[package.metadata.layers]
+tier = "L1"

@@ -20,3 +20,6 @@ name = "sdk_roundtrip"
 
 [[example]]
 name = "sidecar_roundtrip"
+
+[package.metadata.layers]
+tier = "L1"

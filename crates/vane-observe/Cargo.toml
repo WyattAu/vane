@@ -21,3 +21,6 @@ loom = ["dep:loom"]
 
 [lints]
 workspace = true
+
+[package.metadata.layers]
+tier = "L0"
