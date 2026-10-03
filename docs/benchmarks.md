@@ -207,3 +207,30 @@ the three on this rig**, with two clear liabilities: the h2 shim bug
 NOT overall market leadership, which requires the h2 fix, the
 64-connection scaling answer, the memory story, and production
 hardening none of which are done.
+
+### Corrected comparative run (2026-10-03, post h2-shim fix, quiet window)
+
+After v0.5.3 fixed the h2 edge (the REFUSED_STREAM stack), the same
+harness reruns with vane's h2 leg live:
+
+| proxy | h1 (8) | h1 (64) | h2 (8) | h3 (8) | RSS |
+|---|---|---|---|---|---|
+| **vane 0.5.3** | 43,649 | 37,164 | **32,832** | **22,559** | 636 MB |
+| Caddy 2.10.2 | 21,068 | 24,344 | 14,096 | 10,842 | 47 MB |
+| Traefik 3.3.6 | **67,210** | **132,250** | not measured | not measured | 84 MB |
+
+Data-driven position:
+
+- **vane leads h2 (2.3× Caddy) and h3 (2.1× Caddy)** — Traefik's
+  h2/h3 legs remain unmeasured (config debugging pending).
+- **Traefik leads h1, decisively at 64 connections** (132k vs vane's
+  37k): Go's scheduler handles many-connection fan-in better than
+  vane's current per-worker model. This is vane's clearest engine
+  gap.
+- **Memory remains 7–13× the Go proxies** (vane preallocates buffer
+  pools per worker; a size knob is the cheap first step).
+
+The pre-fix "vane h2 is broken" liability is resolved; the new
+priorities by measured impact are (1) many-connection h1 scaling,
+(2) memory sizing. Both are now evidence-backed rather than
+speculative.
