@@ -137,3 +137,26 @@ Tooling: the load generator is a purpose-built keep-alive client
 (`/tmp/opencode/loadgen`, tokio; req/s + latency percentiles) — this
 environment has no `ab`/`wrk`. Same client both legs, so the delta
 isolates the bridge + QUIC cost.
+
+## Comparative harness (2026-10-03) — numbers pending a quiet machine
+
+`scripts/bench_compare.sh` runs vane vs nginx (1.27, docker) vs Caddy
+(2-alpine) vs Traefik (v3.3) on identical configs (plain + TLS
+listeners, same upstream, docker host networking) with the shared
+loadgen (h1 8/64 conns, h2, h3) and RSS sampling. Envoy v1.31 is
+documented as not measurable in this environment (its data plane
+accepts + reads requests but never responds — host and bridge
+networking, minimal direct_response config, zero log errors).
+
+Two full runs landed during load-average 28–64 windows (concurrent
+rustc builds on this host) and are DISCARDED as invalid: all proxies
+depressed 10–100×, several legs failed on client timeouts. The
+harness is committed; **numbers will be published from a quiet
+machine** — rerun is one command.
+
+One REAL finding fell out regardless: the h2 crate client stalls
+against the h3/h2 edge's h2 listener (REFUSED_STREAM on the second
+sequential stream) — tracked in docs/h2-streaming-flake.md with a
+deterministic repro test. nginx/Caddy/Traefik h2 legs answered
+correctly under the same client, so this is a vane bug, not client
+noise.
