@@ -14,7 +14,7 @@ vane-proto = { path = "../crates/vane-proto" }
 vane-router = { path = "../crates/vane-router" }
 vane-shm = { path = "../crates/vane-shm" }
 vane-observe = { path = "../crates/vane-observe" }
-vane-core = { path = "../crates/vane-core" }
+vane-kernel = { path = "../crates/vane-kernel" }
 
 [[bin]]
 name = "parse_request"

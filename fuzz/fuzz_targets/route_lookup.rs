@@ -29,6 +29,9 @@ fn build_router() -> Router {
                     1,
                 )],
                 policy: Policy::P2C,
+                compression: false,
+                outlier: None,
+                allowed_spiffe_prefixes: Vec::new(),
                 priority: 0,
             };
             if let Ok(entry) = builder.compile() {

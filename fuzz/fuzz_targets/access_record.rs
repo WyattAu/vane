@@ -2,7 +2,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use vane_observe::access::{AccessRecord, Str8};
+use vane_observe::access::AccessRecord;
 
 fuzz_target!(|data: &[u8]| {
     if data.is_empty() {
