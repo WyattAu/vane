@@ -3,6 +3,8 @@
 name: ci
 
 on:
+  schedule:
+    - cron: "0 3 * * *"
   push:
     branches: [main]
   pull_request:
@@ -217,3 +219,20 @@ jobs:
         run: cargo fuzz run access_record -- -max_total_time=60 -detect_leaks=0
       - name: router smoke (60s)
         run: cargo fuzz run route_lookup -- -max_total_time=60 -detect_leaks=0
+  fuzz-nightly:
+    name: fuzz deep (nightly)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-fuzz --locked
+      # Deeper budgets than the per-push smoke: 10 minutes per target.
+      # Any artifact uploaded for triage; crashes fail the run.
+      - name: deep fuzz (600s per target)
+        run: |
+          for t in parse_request parse_response frame hpack h2_conn_server xds_decode h1pool_response route_lookup shm_descriptors access_record; do
+            echo "=== $t ==="
+            cargo fuzz run "$t" -- -max_total_time=600 -max_len=16384 -detect_leaks=0 -artifact_prefix=/tmp/artifacts/
+          done
