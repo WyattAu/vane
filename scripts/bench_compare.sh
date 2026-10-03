@@ -51,11 +51,13 @@ record() { # proxy leg conns "req/s: N total: M non200: B p50: X p99: Y"
 "
 }
 
-leg() { # port proto conns
+leg() { # port proto conns [extra]
   case "$2" in
-    h1) "$LG/loadgen" "127.0.0.1:$1" "$3" "$DURATION" /bench bench 2>/dev/null ;;
-    h2) "$LG/h2load" "127.0.0.1:$1" "$3" "$DURATION" /bench localhost "$DIR/cert.pem" 2>/dev/null ;;
-    h3) "$LG/h3load" "127.0.0.1:$1" "$3" "$DURATION" /bench localhost "$DIR/cert.pem" h3 2>/dev/null ;;
+    h1)     "$LG/loadgen" "127.0.0.1:$1" "$3" "$DURATION" /bench bench 2>/dev/null ;;
+    h1post) "$LG/loadgen" "127.0.0.1:$1" "$3" "$DURATION" /bench bench 4096 2>/dev/null ;;
+    h1big)  "$LG/loadgen" "127.0.0.1:$1" "$3" "$DURATION" /big bench 2>/dev/null ;;
+    h2)     "$LG/h2load" "127.0.0.1:$1" "$3" "$DURATION" /bench localhost "$DIR/cert.pem" 2>/dev/null ;;
+    h3)     "$LG/h3load" "127.0.0.1:$1" "$3" "$DURATION" /bench localhost "$DIR/cert.pem" h3 2>/dev/null ;;
   esac
 }
 
@@ -70,10 +72,12 @@ wait_up() { # port name
 }
 
 run_legs() { # name plain_port tls_port
-  record "$1" "h1 8"  8  "$(leg "$2" h1 8)"
-  record "$1" "h1 64" 64 "$(leg "$2" h1 64)"
-  record "$1" "h2 8"  8  "$(leg "$3" h2 8)"
-  record "$1" "h3 8"  8  "$(leg "$3" h3 8)"
+  record "$1" "h1 8"      8  "$(leg "$2" h1 8)"
+  record "$1" "h1 64"     64 "$(leg "$2" h1 64)"
+  record "$1" "h2 8"      8  "$(leg "$3" h2 8)"
+  record "$1" "h3 8"      8  "$(leg "$3" h3 8)"
+  record "$1" "POST 4KB"  8  "$(leg "$2" h1post 8)"
+  record "$1" "GET 64KB"  8  "$(leg "$2" h1big 8)"
 }
 
 # ================= vane =================

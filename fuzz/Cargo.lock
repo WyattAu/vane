@@ -3151,7 +3151,7 @@ dependencies = [
 
 [[package]]
 name = "vane-proto"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "bytes",
  "flate2",
@@ -3163,7 +3163,7 @@ dependencies = [
 
 [[package]]
 name = "vane-proxy"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "axum",
  "axum-stack",
