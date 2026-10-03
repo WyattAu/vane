@@ -160,3 +160,50 @@ sequential stream) — tracked in docs/h2-streaming-flake.md with a
 deterministic repro test. nginx/Caddy/Traefik h2 legs answered
 correctly under the same client, so this is a vane bug, not client
 noise.
+
+## Comparative run (2026-10-03, native, load 15–24)
+
+`scripts/bench_compare.sh` — vane vs Caddy 2.10.2 vs Traefik 3.3.6,
+all native processes, identical plain+TLS listeners, same upstream,
+same client, 8s legs, tiny body. nginx and Envoy are NOT included:
+this machine's docker is rootless-style and containerized proxies
+measured the network plumbing, not the proxy (nginx in docker:
+~1k req/s at 8.5 ms p50 against a ~0.2 ms upstream — invalid); both
+ship as "requires container install" for a rerun elsewhere. Traefik's
+h2/h3 legs are "not measured" (client/config mismatch to debug — its
+h1 legs answered, so the process itself was healthy).
+
+| proxy | h1 (8) | h1 (64) | h2 (8) | h3 (8) | RSS |
+|---|---|---|---|---|---|
+| **vane 0.5.2** | **37,173** | 26,612 | **1 (bug — tracked)** | **14,151** | 467 MB |
+| Caddy 2.10.2 | 17,965 | 18,820 | **12,163** | 6,516 | 48 MB |
+| Traefik 3.3.6 | 9,534 | **27,251** | not measured | not measured | 81 MB |
+
+(All numbers from one run at load 15–24; treat small deltas as noise.
+Configs are in the script; the client is vane's loadgen — deltas are
+the claim, not absolutes.)
+
+### What the data says
+
+- **vane leads h1 at 8 connections: 2.1× Caddy, 3.9× Traefik** — the
+  epoll/io_uring relay is genuinely fast where it works.
+- **vane leads h3: 2.2× Caddy** — and vane is the only one of the
+  three with an h3 *upstream* story at all.
+- **vane's h2 is broken with standard clients** (the tracked
+  REFUSED_STREAM bug): Caddy serves 12.2k where vane serves 1. This
+  is the highest-priority fix in the project.
+- **vane scales WORSE to 64 connections** (37k → 26k, while Traefik
+  climbs 9.5k → 27k) — many-connection handling needs attention.
+- **vane's RSS is 6–10× the Go proxies** (467 MB vs 48/81 MB) — the
+  zero-copy buffer pool preallocates per worker; a pool-size knob or
+  smaller defaults would matter for small deployments.
+
+### Positioning (data-driven)
+
+On this evidence vane is the **fastest h1/h3 per-connection proxy of
+the three on this rig**, with two clear liabilities: the h2 shim bug
+(fix in flight) and memory footprint. That supports a
+"conformance-leading, h1/h3-fast Rust edge+mesh data plane" niche —
+NOT overall market leadership, which requires the h2 fix, the
+64-connection scaling answer, the memory story, and production
+hardening none of which are done.

@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Comparative reverse-proxy benchmark: vane vs nginx vs Caddy vs
-# Traefik (Envoy not measurable here — see NOTES at the bottom) —
+# Comparative reverse-proxy benchmark: vane vs Caddy vs Traefik —
 # same machine, same tiny threaded upstream, same client, same
-# workload. Honest methodology:
+# workload, ALL RUN NATIVELY. Honest methodology:
 #
 # - Two listeners per proxy: PLAIN (h1 leg) and TLS (h2 + h3 legs).
 # - Reasonable production-shaped configs (all published in this
@@ -125,40 +124,11 @@ if wait_up "$VANE_P1" vane; then
 fi
 kill "$VANE_PID" 2>/dev/null; wait "$VANE_PID" 2>/dev/null
 
-# ================= nginx =================
-echo "== nginx =="
-cat > "$DIR/nginx.conf" <<EOF
-worker_processes 1;
-error_log /dev/stderr warn;
-events { worker_connections 4096; }
-http {
-  access_log off;
-  server {
-    listen $NGINX_P1;
-    location / { proxy_pass http://127.0.0.1:$FREE_UP; }
-  }
-  server {
-    listen $NGINX_P2 ssl;
-    http2 on;
-    listen $NGINX_P2 quic;
-    ssl_certificate     $DIR/cert.pem;
-    ssl_certificate_key $DIR/key.pem;
-    location / { proxy_pass http://127.0.0.1:$FREE_UP; }
-  }
-}
-EOF
-docker rm -f bench-nginx > /dev/null 2>&1
-docker run -d --name bench-nginx --network host \
-  -v "$DIR/nginx.conf:/etc/nginx/nginx.conf:ro" \
-  -v "$DIR/cert.pem:$DIR/cert.pem:ro" \
-  -v "$DIR/key.pem:$DIR/key.pem:ro" \
-  nginx:1.27-alpine > /dev/null
-sleep 2
-if wait_up "$NGINX_P1" nginx; then
-  run_legs nginx "$NGINX_P1" "$NGINX_P2"
-  echo "  RSS: $(rss=$(ps -o rss= -C nginx 2>/dev/null | sort -n | tail -1 | tr -d ' '); echo "${rss:-0} KB")"
-fi
-docker rm -f bench-nginx > /dev/null 2>&1
+# ================= nginx (not measurable natively here) =================
+echo "== nginx: skipped — no native install available; docker networking on
+   this machine is rootless-style and invalidates the measurement
+   (see the methodology note above). =="
+PORT_NGINX_P1=""; PORT_NGINX_P2=""
 
 # ================= Caddy =================
 echo "== Caddy =="
@@ -175,18 +145,19 @@ cat > "$DIR/Caddyfile" <<EOF
   reverse_proxy 127.0.0.1:$FREE_UP
 }
 EOF
-docker rm -f bench-caddy > /dev/null 2>&1
-docker run -d --name bench-caddy --network host \
-  -v "$DIR/Caddyfile:/etc/caddy/Caddyfile:ro" \
-  -v "$DIR/cert.pem:$DIR/cert.pem:ro" \
-  -v "$DIR/key.pem:$DIR/key.pem:ro" \
-  caddy:2-alpine caddy run --config /etc/caddy/Caddyfile > /dev/null
+CADDY_BIN=/tmp/opencode/proxies/caddy
+[ -x "$CADDY_BIN" ] || { echo "  (not measurable: caddy binary missing)"; CADDY_BIN=""; }
+if [ -n "$CADDY_BIN" ]; then
+"$CADDY_BIN" run --config "$DIR/Caddyfile" > "$DIR/caddy.log" 2>&1 &
+CADDY_PID=$!
 sleep 2
 if wait_up "$CADDY_P1" caddy; then
   run_legs caddy "$CADDY_P1" "$CADDY_P2"
-  echo "  RSS: $(rss=$(ps -o rss= -C caddy 2>/dev/null | sort -n | tail -1 | tr -d ' '); echo "${rss:-0} KB")"
+  echo "  RSS: $(rss=$(ps -o rss= -p "$CADDY_PID" 2>/dev/null | tr -d ' '); echo "${rss:-0} KB")"
 fi
-docker rm -f bench-caddy > /dev/null 2>&1
+[ -n "${CADDY_PID:-}" ] && kill "$CADDY_PID" 2>/dev/null
+wait "${CADDY_PID:-}" 2>/dev/null
+fi
 
 # ================= Traefik =================
 echo "== Traefik =="
@@ -230,19 +201,21 @@ tls:
           keyFile: "/certs/key.pem"
 EOF
 sed -i "s|REPLACE_UP|$FREE_UP|" "$DIR/rules/dynamic.yml"
-docker rm -f bench-traefik > /dev/null 2>&1
-docker run -d --name bench-traefik --network host \
-  -v "$DIR/traefik.yml:/etc/traefik/traefik.yml:ro" \
-  -v "$DIR/rules:/rules:ro" \
-  -v "$DIR/cert.pem:/certs/cert.pem:ro" \
-  -v "$DIR/key.pem:/certs/key.pem:ro" \
-  traefik:v3.3 > /dev/null
+TRAEFIK_BIN=/tmp/opencode/proxies/traefik
+[ -x "$TRAEFIK_BIN" ] || { echo "  (not measurable: traefik binary missing)"; TRAEFIK_BIN=""; }
+# Native traefik reads local paths directly (no /certs mount).
+sed -i 's|/certs/|'"$DIR"'/|g' "$DIR/rules/dynamic.yml"
+if [ -n "$TRAEFIK_BIN" ]; then
+"$TRAEFIK_BIN" --configfile "$DIR/traefik.yml" > "$DIR/traefik.log" 2>&1 &
+TRAEFIK_PID=$!
 sleep 3
 if wait_up "$TRAEFIK_P1" traefik; then
   run_legs traefik "$TRAEFIK_P1" "$TRAEFIK_P2"
-  echo "  RSS: $(rss=$(ps -o rss= -C traefik 2>/dev/null | sort -n | tail -1 | tr -d ' '); echo "${rss:-0} KB")"
+  echo "  RSS: $(rss=$(ps -o rss= -p "$TRAEFIK_PID" 2>/dev/null | tr -d ' '); echo "${rss:-0} KB")"
 fi
-docker rm -f bench-traefik > /dev/null 2>&1
+[ -n "${TRAEFIK_PID:-}" ] && kill "$TRAEFIK_PID" 2>/dev/null
+wait "${TRAEFIK_PID:-}" 2>/dev/null
+fi
 
 # ================= Envoy (not measurable here) =================
 echo "== Envoy: skipped — the v1.31 image accepts connections and reads"
