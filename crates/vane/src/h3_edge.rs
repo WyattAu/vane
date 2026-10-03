@@ -70,11 +70,12 @@ pub struct H3Edge {
     router: Arc<Router>,
     breaker: Arc<vane_filters::BreakerGate>,
     rate: Option<Arc<vane_filters::RateLimit>>,
-    /// HTTP/1.1 upstream client (default).
-    http: reqwest::Client,
     /// HTTP/2 prior-knowledge upstream client (clusters with
     /// `http2 = true`).
     http2: reqwest::Client,
+    /// Pooled plain-h1 upstream client (the measured fast path —
+    /// replaces reqwest for http:// upstreams; pooled per address).
+    h1: std::sync::Mutex<std::collections::HashMap<std::net::SocketAddr, crate::h1pool::H1Pool>>,
     /// Structured access log (`None` = disabled).
     access: Option<std::sync::Arc<vane_observe::access::AccessLog>>,
 }
@@ -92,10 +93,7 @@ impl H3Edge {
             router,
             breaker,
             rate: None,
-            http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .expect("reqwest client"),
+            h1: std::sync::Mutex::new(std::collections::HashMap::new()),
             http2: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .http2_prior_knowledge()
@@ -359,14 +357,104 @@ impl H3Edge {
             }
         }
 
-        let client = if route.upstream_h2 {
-            &self.http2
-        } else {
-            &self.http
-        };
+        // Inject headers (X-Forwarded-*, verified identity) — the
+        // ONLY headers the h3 edge forwards upstream.
+        let mut inject_headers: Vec<(String, String)> = inject;
+        if let Some(id) = &peer_id {
+            inject_headers.push(("x-vane-spiffe-id".into(), id.clone()));
+            // Chaining: preserve what a trusted mesh hop sent and
+            // append THIS hop's verified caller (oldest first). A
+            // chain always starts here when none arrived.
+            let mut chain: Vec<String> = request
+                .headers()
+                .get("x-vane-spiffe-chain")
+                .and_then(|h| h.to_str().ok())
+                .map(|h| {
+                    h.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            chain.push(id.clone());
+            inject_headers.push(("x-vane-spiffe-chain".into(), chain.join(",")));
+        }
+
+        // Plain-h1 upstreams take the pooled fast path (no reqwest);
+        // h2 upstreams keep the reqwest http2 client.
+        if !route.upstream_h2 {
+            let pool = {
+                let mut h1 = self.h1.lock().expect("h1 pool map");
+                h1.entry(addr)
+                    .or_insert_with(|| {
+                        crate::h1pool::H1Pool::new(addr, std::time::Duration::from_secs(30))
+                    })
+                    .clone()
+            };
+            let mut heads: Vec<(String, String)> = Vec::with_capacity(inject_headers.len() + 1);
+            heads.push(("x-forwarded-proto".into(), "http".into()));
+            for (n, v) in &inject_headers {
+                heads.push((n.clone(), v.clone()));
+            }
+            let resp = match pool
+                .request(
+                    method.as_str(),
+                    &upstream_path,
+                    &addr.to_string(),
+                    &heads,
+                    body_bytes,
+                )
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("h3 edge upstream send failed: {e}");
+                    self.breaker.record_failure(&route.cluster);
+                    reply!(502, "upstream unreachable");
+                }
+            };
+            if resp.status >= 500 {
+                self.breaker.record_failure(&route.cluster);
+            } else {
+                self.breaker.record_success(&route.cluster);
+            }
+            let status = resp.status;
+            let head = add_headers(
+                http::Response::builder().status(status),
+                &resp
+                    .headers
+                    .iter()
+                    .map(|(n, v)| {
+                        (
+                            http::HeaderName::from_bytes(n).expect("hname"),
+                            http::HeaderValue::from_bytes(v).expect("hval"),
+                        )
+                    })
+                    .collect::<http::HeaderMap>(),
+            );
+            if stream.send_response(head).await.is_err() {
+                return;
+            }
+            let bytes_out = resp.body.len() as u64;
+            if stream
+                .send_data(bytes::Bytes::from(resp.body))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let _ = stream.finish().await;
+            span.record("http.status_code", status);
+            span.record("http.response_size", bytes_out);
+            emit(status, bytes_out);
+            return;
+        }
+
+        let client = &self.http2;
         let url = format!("http://{addr}{upstream_path}");
         let mut upstream = client.request(method, &url);
-        for (name, value) in &inject {
+        for (name, value) in &inject_headers {
             upstream = upstream.header(name.as_str(), value.as_str());
         }
         if let Some(id) = &peer_id {

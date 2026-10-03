@@ -122,6 +122,8 @@ sleep 2
 
 echo "== h1 cluster (baseline): 8 conns, ${DURATION}s =="
 run "h1" "h1"
+echo "== h3 edge direct (QUIC -> edge -> h1, no bridge): 8 QUIC conns =="
+"$LG/h3load" "127.0.0.1:$PORT_FAR" 8 "$DURATION" /bench localhost "$DIR/cert.pem" h3
 echo "== http3 cluster (bridge -> QUIC -> edge -> h1): 8 conns, ${DURATION}s =="
 run "quic" "quic"
 

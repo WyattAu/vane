@@ -114,6 +114,25 @@ building the ring transport; at 4.4k req/s per cluster the current
 shape is comfortably sufficient for mesh east-west control traffic
 and moderate data-plane loads.
 
+### After the edge fast path (2026-10-03)
+
+Profiling showed the edge's reqwest hop, not the loopback, was the
+largest segment: the h3 edge now dials plain-h1 upstreams through
+`h1pool` (prebuilt head bytes over pooled keep-alive sockets; h2
+upstreams keep reqwest).
+
+| path | req/s | p50 | p99 | vs baseline |
+|---|---|---|---|---|
+| h1 cluster (baseline) | 43,734 | 159 µs | 712 µs | 1× |
+| h3 edge direct (QUIC → edge → h1) | 22,144 | 320 µs | 1,112 µs | 2.0× |
+| http3 cluster (bridge → QUIC → edge → h1) | 7,592 | 954 µs | 2,081 µs | 5.8× |
+
+The edge-reqwest elimination recovered +45% on the edge leg and +85%
+end-to-end (the full mesh path nearly doubled). The remaining gap is
+dominated by the bridge's per-request channel hop and the QUIC stream
+segment; the ring transport decision stays deferred until the bridge
+segment is profiled in isolation.
+
 Tooling: the load generator is a purpose-built keep-alive client
 (`/tmp/opencode/loadgen`, tokio; req/s + latency percentiles) — this
 environment has no `ab`/`wrk`. Same client both legs, so the delta
