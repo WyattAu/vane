@@ -93,6 +93,23 @@ across republishes (apply merges absent-listeners = keep, secrets
 union), so xds-client and operator snapshots compose. Covered by
 wire-decode unit tests, a merge test, and a full-stack SDS rotate.
 
+### LDS (listeners) — decode + multi-RDS merge shipped (2026-10-03)
+
+`envoy.decode_listener` maps the v3 Listener: name (1), address (2 →
+SocketAddress address/port), filter_chains (25) → first chain →
+http_connection_manager filter → `rds.route_config_name`. The
+xds-client decodes LDS listeners, collects their RDS names, and
+subscribes RDS **by those names**; every named table's virtual hosts
+merge into the single global router (host matching disambiguates
+listeners — vane keeps one route table, the same model as the Gateway
+operator). RouteConfig responses echo their name (field 1) for the
+per-name table map.
+
+Out of scope by design (documented, not forgotten): per-listener
+route TABLES would need per-listener routers in the worker bootstrap —
+an architecture change, not a decode change. The global-table +
+host-matching model covers gateway-style deployments today.
+
 ### LDS (listeners) — TLS rotation shipped (2026-09-28)
 
 LDS responses carry `Listener` resources: `address` (1) →

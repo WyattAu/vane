@@ -244,6 +244,12 @@ pub fn xds_client_loop(management: &str, node_id: &str, admin: &str) -> i32 {
     let mut session = AdsSession::new(node_id, "vane");
     let mut clusters: Vec<envoy::EnvoyCluster> = Vec::new();
     let mut route_config: Option<envoy::EnvoyRouteConfig> = None;
+    // LDS listeners → the RDS names their HCMs attach; every named
+    // table's routes merge into the global router (host matching
+    // disambiguates listeners — vane keeps one table).
+    let mut lds_names: Vec<String> = Vec::new();
+    let mut route_tables: std::collections::BTreeMap<String, envoy::EnvoyRouteConfig> =
+        std::collections::BTreeMap::new();
     // EDS-driven endpoint sets by cluster name (override the inline
     // CDS assignment when present).
     let mut eds_backends: std::collections::BTreeMap<String, Vec<String>> =
@@ -295,6 +301,20 @@ pub fn xds_client_loop(management: &str, node_id: &str, admin: &str) -> i32 {
             let mut resources = response.resources.clone();
             let mut decode_error: Option<String> = None;
             let validate = |res: &[Vec<u8>]| -> Result<(), String> {
+                if type_url == vane_proto::xds::type_url::LISTENER {
+                    for any in res {
+                        let (_, value) = vane_control::xds_grpc::any_value(any)
+                            .ok_or_else(|| "listener Any".to_string())?;
+                        if let Some(l) = envoy::decode_listener(&value) {
+                            if let Some(rcn) = &l.route_config_name {
+                                if !lds_names.contains(rcn) {
+                                    lds_names.push(rcn.clone());
+                                }
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
                 if type_url == vane_proto::xds::type_url::CLUSTER {
                     let mut decoded = Vec::new();
                     for any in res {
@@ -310,10 +330,15 @@ pub fn xds_client_loop(management: &str, node_id: &str, admin: &str) -> i32 {
                     for any in res {
                         let (_, value) = vane_control::xds_grpc::any_value(any)
                             .ok_or_else(|| "route Any".to_string())?;
-                        route_config = Some(
-                            envoy::decode_route_config(&value)
-                                .ok_or_else(|| "route proto".to_string())?,
-                        );
+                        let rc = envoy::decode_route_config(&value)
+                            .ok_or_else(|| "route proto".to_string())?;
+                        // Per-name tables (LDS attachments); the
+                        // unnamed config (plain RDS) stays the default.
+                        if rc.name.is_empty() {
+                            route_config = Some(rc);
+                        } else {
+                            route_tables.insert(rc.name.clone(), rc);
+                        }
                     }
                 } else if type_url == vane_proto::xds::type_url::ENDPOINT {
                     for any in res {
@@ -365,11 +390,16 @@ pub fn xds_client_loop(management: &str, node_id: &str, admin: &str) -> i32 {
                 return 1;
             }
             // The Cluster set is accepted: now subscribe RDS (see the
-            // held-back subscription above).
+            // held-back subscription above). With LDS attachments the
+            // subscription lists the attached route-config names;
+            // without, the wildcard (all) watch.
             if !route_subscribed && type_url == vane_proto::xds::type_url::CLUSTER {
-                if let Err(e) =
-                    client.send_message(&session.initial_request(vane_proto::xds::type_url::ROUTE))
-                {
+                let req = if lds_names.is_empty() {
+                    session.initial_request(vane_proto::xds::type_url::ROUTE)
+                } else {
+                    session.initial_request_names(vane_proto::xds::type_url::ROUTE, &lds_names)
+                };
+                if let Err(e) = client.send_message(&req) {
                     eprintln!("xds-client: subscribe RDS: {e}");
                     return 1;
                 }
@@ -377,11 +407,35 @@ pub fn xds_client_loop(management: &str, node_id: &str, admin: &str) -> i32 {
             }
             // CDS + RDS both accepted → publish. An EDS update with a
             // known route config also re-publishes (endpoint drift).
+            // LDS-attached deployments publish when any named table
+            // lands, even without a plain RDS config.
+            let has_tables = !route_tables.is_empty();
             let should_publish = (type_url == vane_proto::xds::type_url::ROUTE
-                || type_url == vane_proto::xds::type_url::ENDPOINT)
-                && route_config.is_some();
+                || type_url == vane_proto::xds::type_url::ENDPOINT
+                || (type_url == vane_proto::xds::type_url::LISTENER && has_tables))
+                && (route_config.is_some() || has_tables);
             if should_publish {
-                if let Some(rc) = &route_config {
+                // Merge: the default RDS config (if any) plus every
+                // LDS-attached table — host matching disambiguates
+                // listeners in the single global table.
+                let merged_rc: Option<envoy::EnvoyRouteConfig> = match (&route_config, has_tables) {
+                    (Some(rc), false) => Some(rc.clone()),
+                    (rc_opt, true) => {
+                        let mut vhosts: Vec<envoy::EnvoyVirtualHost> = rc_opt
+                            .as_ref()
+                            .map(|r| r.vhosts.clone())
+                            .unwrap_or_default();
+                        for t in route_tables.values() {
+                            vhosts.extend(t.vhosts.iter().cloned());
+                        }
+                        Some(envoy::EnvoyRouteConfig {
+                            name: String::new(),
+                            vhosts,
+                        })
+                    }
+                    (None, false) => None,
+                };
+                if let Some(rc) = &merged_rc {
                     // EDS merge: EDS endpoint sets override the inline
                     // CDS assignment per cluster name.
                     let clusters: Vec<envoy::EnvoyCluster> = clusters

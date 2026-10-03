@@ -79,6 +79,24 @@ impl AdsSession {
         self.request(type_url, "", "", None)
     }
 
+    /// Initial request with explicit `resource_names` (RDS watches
+    /// attached to LDS listeners: one request lists every attached
+    /// `route_config_name`).
+    #[must_use]
+    pub fn initial_request_names(&self, type_url: &str, names: &[String]) -> Vec<u8> {
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let req = vane_proto::xds::DiscoveryRequest {
+            version_info: "",
+            node_id: &self.node_id,
+            node_cluster: &self.node_cluster,
+            resource_names: &refs,
+            type_url,
+            response_nonce: "",
+            error_message: None,
+        };
+        req.encode()
+    }
+
     /// Encodes an ACK request for `type_url` at its current state.
     #[must_use]
     pub fn ack_request(&self, type_url: &str) -> Vec<u8> {

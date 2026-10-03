@@ -143,6 +143,9 @@ fn decode_socket_address(buf: &[u8], backends: &mut Vec<String>) {
 /// A decoded Envoy `RouteConfiguration` subset.
 #[derive(Debug, Clone, Default)]
 pub struct EnvoyRouteConfig {
+    /// Config name (field 1 — RDS responses echo the requested
+    /// `route_config_name`; LDS attachments key tables by it).
+    pub name: String,
     /// Virtual hosts: (name, domains, routes as (prefix, cluster)).
     pub vhosts: Vec<EnvoyVirtualHost>,
 }
@@ -267,11 +270,145 @@ pub fn decode_route_config(buf: &[u8]) -> Option<EnvoyRouteConfig> {
     while pos < buf.len() {
         let (f, n) = pb::decode_field(&buf[pos..])?;
         pos += n;
-        if f.number == 2 {
-            out.vhosts.push(decode_virtual_host(f.bytes));
+        match f.number {
+            1 => out.name = String::from_utf8_lossy(f.bytes).into_owned(),
+            2 => out.vhosts.push(decode_virtual_host(f.bytes)),
+            _ => {}
         }
     }
     Some(out)
+}
+
+/// A decoded LDS `Listener` — the subset vane maps:
+/// `name` = 1, `address` = 2 (SocketAddress: address = 2,
+/// port_specifier = 3 → port_value = 1), `filter_chains` = 25 (first
+/// chain) → `filters` = 3 → http_connection_manager `typed_config`
+/// (field 4) → HCM `rds` = 7 → `route_config_name` = 1.
+#[derive(Debug, Clone, Default)]
+pub struct EnvoyListener {
+    /// Resource name.
+    pub name: String,
+    /// Listen address ("0.0.0.0:8443" form).
+    pub address: String,
+    /// RDS route-config name from the HCM (None = inline route_config
+    /// or a non-HCM chain — vane does not map those).
+    pub route_config_name: Option<String>,
+}
+
+/// Decodes an LDS `Listener` into its name, listen address, and (when
+/// the chain is an HCM) the attached RDS `route_config_name`. See the
+/// struct docs for field numbers.
+///
+/// # Errors
+/// None — returns `None` on unmappable resources.
+#[must_use]
+pub fn decode_listener(buf: &[u8]) -> Option<EnvoyListener> {
+    let mut out = EnvoyListener::default();
+    let mut pos = 0;
+    while pos < buf.len() {
+        let (f, n) = pb::decode_field(&buf[pos..])?;
+        pos += n;
+        match f.number {
+            1 => out.name = String::from_utf8_lossy(f.bytes).into_owned(),
+            2 => decode_listener_address(f.bytes, &mut out),
+            25 => {
+                // FilterChain (first wins): filters = 3 → Filter{name
+                // = 1, typed_config = 4} → HCM Any value.
+                let mut pos2 = 0;
+                while pos2 < f.bytes.len() {
+                    let (g, m) = pb::decode_field(&f.bytes[pos2..])?;
+                    pos2 += m;
+                    if g.number == 3 {
+                        if let Some(rcn) = decode_chain_hcm(g.bytes) {
+                            out.route_config_name = Some(rcn);
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if out.name.is_empty() || out.address.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// SocketAddress: address = 2, port_specifier = 3 → PortSpecifier
+/// port_value = 1.
+fn decode_listener_address(buf: &[u8], out: &mut EnvoyListener) {
+    let mut addr = String::new();
+    let mut port = 0u32;
+    let mut pos = 0;
+    while pos < buf.len() {
+        let (f, n) = match pb::decode_field(&buf[pos..]) {
+            Some(x) => x,
+            None => break,
+        };
+        pos += n;
+        match f.number {
+            2 => addr = String::from_utf8_lossy(f.bytes).into_owned(),
+            3 => {
+                let mut pos2 = 0;
+                while pos2 < f.bytes.len() {
+                    let (g, m) = match pb::decode_field(&f.bytes[pos2..]) {
+                        Some(x) => x,
+                        None => break,
+                    };
+                    pos2 += m;
+                    if g.number == 1 {
+                        // Varint wire type: the value rides `varint`.
+                        port = g.varint as u32;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if !addr.is_empty() && port > 0 {
+        out.address = format!("{addr}:{port}");
+    }
+}
+
+/// FilterChain → first network filter's HCM rds.route_config_name.
+fn decode_chain_hcm(filter: &[u8]) -> Option<String> {
+    // Filter message: name = 1, typed_config = 4 (google.protobuf.Any
+    // of the HCM). The caller extracts field 3 (the Filter) from the
+    // FilterChain before calling.
+    let mut name = String::new();
+    let mut any: Option<(String, Vec<u8>)> = None;
+    let mut pos = 0;
+    while pos < filter.len() {
+        let (f, n) = pb::decode_field(&filter[pos..])?;
+        pos += n;
+        match f.number {
+            1 => name = String::from_utf8_lossy(f.bytes).into_owned(),
+            4 => any = Some(crate::xds_grpc::any_value(f.bytes)?),
+            _ => {}
+        }
+    }
+    if name != "envoy.filters.network.http_connection_manager" {
+        return None;
+    }
+    let (_type_url, value) = any?;
+    // HCM: rds = 7 → Rds{route_config_name = 1}.
+    let mut pos3 = 0;
+    while pos3 < value.len() {
+        let (h, k) = pb::decode_field(&value[pos3..])?;
+        pos3 += k;
+        if h.number == 7 {
+            let mut pos4 = 0;
+            while pos4 < h.bytes.len() {
+                let (r, j) = pb::decode_field(&h.bytes[pos4..])?;
+                pos4 += j;
+                if r.number == 1 {
+                    return Some(String::from_utf8_lossy(r.bytes).into_owned());
+                }
+            }
+        }
+    }
+    None
 }
 
 fn decode_virtual_host(buf: &[u8]) -> EnvoyVirtualHost {
@@ -403,10 +540,19 @@ pub fn map_snapshot(clusters: &[EnvoyCluster], route_config: &EnvoyRouteConfig) 
 mod tests {
     use super::*;
 
-    /// Wire helper: tag (field<<3|2), varint len, bytes.
+    /// Wire helper: varint tag (field<<3|2), varint len, bytes.
     fn pb_bytes(num: u32, data: &[u8]) -> Vec<u8> {
-        // Wire: tag (field<<3|2), varint len, bytes.
-        let mut out: Vec<u8> = vec![((num << 3) | 2) as u8];
+        let mut tag = (num << 3) | 2;
+        let mut out = Vec::new();
+        loop {
+            let b = (tag & 0x7f) as u8;
+            tag >>= 7;
+            if tag == 0 {
+                out.push(b);
+                break;
+            }
+            out.push(b | 0x80);
+        }
         let mut n = data.len();
         loop {
             let b = (n & 0x7f) as u8;
@@ -536,6 +682,7 @@ mod tests {
             http2: true,
         };
         let rc = EnvoyRouteConfig {
+            name: String::new(),
             vhosts: vec![EnvoyVirtualHost {
                 name: "shop-vh".into(),
                 domains: vec!["shop.example.com".into()],
@@ -553,6 +700,43 @@ mod tests {
         assert_eq!(snap.routes[0].cluster, "shop");
         assert_eq!(snap.routes[0].host.as_deref(), Some("shop.example.com"));
     }
+
+    #[test]
+    fn decodes_listener_with_rds_attachment() {
+        // Any{type_url=1, value=2} wrapping the HCM config.
+        let hcm = "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager";
+        let rds = pb_bytes(7, &pb_bytes(1, b"edge-routes")); // HCM.rds{route_config_name}
+        // google.protobuf.Any: type_url = 1, value = 2 (HCM bytes).
+        let mut any = pb_str(1, hcm);
+        any.extend_from_slice(&pb_bytes(2, &rds));
+        let mut filter = pb_str(1, "envoy.filters.network.http_connection_manager");
+        filter.extend_from_slice(&pb_bytes(4, &any)); // typed_config (Any)
+        // SocketAddress: address = 2, port_specifier = 3 → port_value = 1.
+        let mut sock_addr = pb_str(2, "0.0.0.0");
+        sock_addr.extend_from_slice(&pb_bytes(
+            3,
+            &[0x08, ((8443 & 0x7f) | 0x80) as u8, (8443 >> 7) as u8],
+        ));
+        let filter_chain = pb_bytes(3, &filter);
+        let mut listener = pb_str(1, "ingress");
+        listener.extend_from_slice(&pb_bytes(2, &sock_addr));
+        listener.extend_from_slice(&pb_bytes(25, &filter_chain));
+
+        let l = super::decode_listener(&listener).expect("decode");
+        assert_eq!(l.name, "ingress");
+        assert_eq!(l.address, "0.0.0.0:8443");
+        assert_eq!(l.route_config_name.as_deref(), Some("edge-routes"));
+    }
+
+    #[test]
+    fn decode_route_config_echoes_name() {
+        let mut buf = pb_str(1, "edge-routes");
+        buf.extend_from_slice(&pb_bytes(2, &pb_str(1, "vh")));
+        let rc = super::decode_route_config(&buf).expect("decode");
+        assert_eq!(rc.name, "edge-routes");
+        assert_eq!(rc.vhosts.len(), 1);
+    }
+
     #[test]
     fn decode_cla_direct() {
         let cla: Vec<u8> = vec![
