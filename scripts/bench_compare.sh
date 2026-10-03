@@ -175,12 +175,18 @@ entryPoints:
       advertisedPort: $TRAEFIK_P2
 providers:
   file:
-    directory: "/rules"
+    directory: "$DIR/rules"
 log:
   level: ERROR
 EOF
 mkdir -p "$DIR/rules"
+# Quoted heredoc keeps the router-rule backticks; the cert dir is
+# substituted explicitly (native run reads local paths).
 cat > "$DIR/rules/dynamic.yml" <<'EOF'
+tls:
+  certificates:
+    - certFile: "CERTDIR/cert.pem"
+      keyFile: "CERTDIR/key.pem"
 http:
   routers:
     plain:
@@ -197,19 +203,10 @@ http:
       loadBalancer:
         servers:
           - url: "http://127.0.0.1:REPLACE_UP"
-tls:
-  options:
-    default:
-      certificates:
-        - certFile: "/certs/cert.pem"
-          keyFile: "/certs/key.pem"
 EOF
-sed -i "s|REPLACE_UP|$FREE_UP|" "$DIR/rules/dynamic.yml"
+sed -i "s|REPLACE_UP|$FREE_UP|; s|CERTDIR|$DIR|g" "$DIR/rules/dynamic.yml"
 TRAEFIK_BIN=/tmp/opencode/proxies/traefik
-[ -x "$TRAEFIK_BIN" ] || { echo "  (not measurable: traefik binary missing)"; TRAEFIK_BIN=""; }
-# Native traefik reads local paths directly (no /certs mount).
-sed -i 's|/certs/|'"$DIR"'/|g' "$DIR/rules/dynamic.yml"
-if [ -n "$TRAEFIK_BIN" ]; then
+[ -x "$TRAEFIK_BIN" ] || { echo "  (not measurable: traefik binary missing)"; exit 1; }
 "$TRAEFIK_BIN" --configfile "$DIR/traefik.yml" > "$DIR/traefik.log" 2>&1 &
 TRAEFIK_PID=$!
 sleep 3
@@ -217,9 +214,8 @@ if wait_up "$TRAEFIK_P1" traefik; then
   run_legs traefik "$TRAEFIK_P1" "$TRAEFIK_P2"
   echo "  RSS: $(rss=$(ps -o rss= -p "$TRAEFIK_PID" 2>/dev/null | tr -d ' '); echo "${rss:-0} KB")"
 fi
-[ -n "${TRAEFIK_PID:-}" ] && kill "$TRAEFIK_PID" 2>/dev/null
-wait "${TRAEFIK_PID:-}" 2>/dev/null
-fi
+kill "$TRAEFIK_PID" 2>/dev/null
+wait "$TRAEFIK_PID" 2>/dev/null
 
 # ================= Envoy (not measurable here) =================
 echo "== Envoy: skipped — the v1.31 image accepts connections and reads"

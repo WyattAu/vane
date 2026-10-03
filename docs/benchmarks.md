@@ -244,6 +244,23 @@ evidence-backed engine gap: **absolute h1 throughput vs Traefik**
 are pending client-interop debugging (curl confirms its h2/h3 work;
 the loadgen legs return 0 — under investigation).
 
+### Completed comparison (2026-10-03, all legs, quiet windows)
+
+Every leg measured; Traefik's h2/h3 landed after fixing a harness
+defect (the Traefik dynamic config was not loading the benchmark
+certificate — it served its default cert, and the loadgen correctly
+rejected it; curl's `-k` had masked this during setup).
+
+| proxy | h1 (8) | h1 (64) | h2 (8) | h3 (8) | RSS |
+|---|---|---|---|---|---|
+| **vane 0.5.3 (fair)** | 43,805 | 43,076 | **33,106** | **20,697** | 383 MB |
+| Caddy 2.10.2 | 16,907 | 19,458 | 12,150 | 9,224 | 42 MB |
+| Traefik 3.3.6 | **59,586** | **103,754** | 15,707 | 12,477 | 83 MB |
+
+**vane leads h2 (2.1× Traefik, 2.7× Caddy) and h3 (1.7× Traefik,
+2.2× Caddy).** Traefik leads h1 (1.4× at 8 conns, 2.4× at 64).
+vane's RSS is highest (by-design per-core pools; tunable).
+
 ### Fair-config correction (2026-10-03, quiet window)
 
 The prior comparative run handicapped vane (`workers = 1`,
