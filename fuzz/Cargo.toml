@@ -10,11 +10,14 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 httparse = "1.10"
+bytes = "1"
 vane-proto = { path = "../crates/vane-proto" }
 vane-router = { path = "../crates/vane-router" }
 vane-shm = { path = "../crates/vane-shm" }
 vane-observe = { path = "../crates/vane-observe" }
 vane-kernel = { path = "../crates/vane-kernel" }
+vane-control = { path = "../crates/vane-control" }
+vane-proxy = { path = "../crates/vane", features = ["h3"] }
 
 [[bin]]
 name = "parse_request"
@@ -61,6 +64,27 @@ bench = false
 [[bin]]
 name = "frame"
 path = "fuzz_targets/frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h2_conn_server"
+path = "fuzz_targets/h2_conn_server.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xds_decode"
+path = "fuzz_targets/xds_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h1pool_response"
+path = "fuzz_targets/h1pool_response.rs"
 test = false
 doc = false
 bench = false

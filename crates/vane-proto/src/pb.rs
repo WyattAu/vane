@@ -131,7 +131,10 @@ pub fn decode_field(buf: &[u8]) -> Option<(Field<'_>, usize)> {
         WireType::Len => {
             let (len, n) = decode_varint(&buf[pos..])?;
             pos += n;
-            let end = pos + len as usize;
+            // Saturate: a hostile length varint (up to 2^63) must not
+            // overflow the offset — that would wrap past the bounds
+            // check and slice out of range.
+            let end = pos.saturating_add(len as usize);
             if buf.len() < end {
                 return None;
             }
@@ -181,6 +184,26 @@ pub fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
         }
     }
     None
+}
+
+/// A hostile length varint (2^63-ish) must not overflow the offset
+/// arithmetic — regression for the fuzz-found Len-overflow crash.
+#[test]
+fn len_field_overflow_returns_none() {
+    // Field 1, wire type 2, length varint = 0xFF 0xFF 0xFF 0xFF 0x7F
+    // (≈ 2^31-1... large enough to overflow any realistic buffer).
+    let buf = [0x0a, 0xff, 0xff, 0xff, 0xff, 0x7f];
+    assert!(decode_field(&buf).is_none());
+}
+
+/// Ten-byte varints (shift >= 64) are rejected, not shifted-into
+/// oblivion.
+#[test]
+fn varint_shift_overflow_is_none() {
+    let buf = [
+        0x0a, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+    ];
+    assert!(decode_field(&buf).is_none());
 }
 
 #[cfg(test)]

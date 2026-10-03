@@ -158,12 +158,25 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-fn parse_response(buf: &[u8]) -> Option<RawResponse> {
+/// Parses one HTTP/1.1 response (status line + headers + body) from
+/// a complete buffer. Public for fuzz coverage — this parser faces
+/// upstream bytes on every h3-edge relay.
+///
+/// # Panics
+/// Never (returns `None` on malformed input).
+#[must_use]
+pub fn parse_response(buf: &[u8]) -> Option<RawResponse> {
     let pos = find(buf, b"\r\n\r\n")?;
     let head = String::from_utf8_lossy(&buf[..pos]);
     let mut lines = head.lines();
     let status_line = lines.next()?;
+    // HTTP statuses are 100..=599; anything else is malformed and
+    // must not flow downstream (invalid statuses break Response
+    // construction in the relay).
     let status: u16 = status_line.split_whitespace().nth(1)?.parse().ok()?;
+    if !(100..=599).contains(&status) {
+        return None;
+    }
     let mut headers = Vec::new();
     for l in lines {
         if let Some((n, v)) = l.split_once(':') {
@@ -178,4 +191,23 @@ fn parse_response(buf: &[u8]) -> Option<RawResponse> {
         headers,
         body: buf[pos + 4..].to_vec(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: statuses outside 100..=599 are malformed and must
+    /// not parse (fuzz-found: out-of-range statuses broke downstream
+    /// Response construction).
+    #[test]
+    fn out_of_range_status_is_rejected() {
+        assert!(parse_response(b"HTTP/1.1 600 X\r\ncontent-length: 0\r\n\r\n").is_none());
+        assert!(parse_response(b"HTTP/1.1 99 X\r\ncontent-length: 0\r\n\r\n").is_none());
+        assert!(parse_response(b"HTTP/1.1 99999 X\r\n\r\n").is_none());
+        let ok = parse_response(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+            .expect("valid response parses");
+        assert_eq!(ok.status, 200);
+        assert_eq!(ok.body, b"ok");
+    }
 }

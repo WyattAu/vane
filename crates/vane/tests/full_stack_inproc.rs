@@ -2768,7 +2768,7 @@ workers = 1
     let server_name =
         rustls::pki_types::ServerName::try_from("localhost".to_string()).expect("sni");
     let tls_stream = connector.connect(server_name, tcp).await.expect("tls");
-    let (mut send_request, mut conn) = h2::client::handshake(tls_stream)
+    let (mut send_request, conn) = h2::client::handshake(tls_stream)
         .await
         .expect("h2 handshake");
     tokio::spawn(async move {
@@ -2782,7 +2782,7 @@ workers = 1
             .uri(format!("https://localhost:{port}/s{i}"))
             .body(())
             .expect("req");
-        let (resp_fut, mut stream) = match send_request.send_request(req, true) {
+        let (resp_fut, _stream) = match send_request.send_request(req, true) {
             Ok(x) => x,
             Err(e) => panic!("request {i}: send failed: {e}"),
         };
@@ -2804,7 +2804,6 @@ workers = 1
         }
         assert_eq!(got, b"ok", "request {i} body");
         ok += 1;
-        let _ = stream; // EOS already sent
     }
     assert_eq!(ok, 50, "all sequential h2 streams must complete");
 }
