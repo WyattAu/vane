@@ -148,3 +148,22 @@ accept listener index).
    script).
 3. Instrument the worker write-queue (pop/submit log with seq numbers) and
    the mio engine's park/resume path (`try_write_now`, EPOLLOUT dispatch).
+
+## Tracked (2026-10-03): h2 shim refuses the second sequential stream
+
+Repro: `h2_edge_h2crate_client_sequential_streams` (full_stack_inproc,
+#[ignore]d) — the h2 crate client, one TLS connection, sequential
+request streams (h2load's exact pattern): request 1 (stream 1)
+completes 200; request 2 (stream 3) is refused with REFUSED_STREAM.
+The external symptom: h2load against the h2 edge stalls at ~2
+requests (0 req/s in the comparative run).
+
+The shim serializes transactions (`max_concurrent_streams = 1`) and
+clears `active_stream` when the response completes — but stream 3's
+HEADERS still see the slot held. A CRDBG trace of the stall showed
+stream 3's HEADERS (10-byte, complete) processed twice. Suspects: the
+slot release racing the next HEADERS frame, or a duplicate HEADERS
+dispatch in the shim intake.
+
+Next session: shim trace with `vane_dbg`, fix the release ordering,
+un-ignore the repro.

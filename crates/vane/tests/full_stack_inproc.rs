@@ -2677,3 +2677,135 @@ workers = 1
     assert!(got.contains("200 OK"), "sds-served response: {got:?}");
     assert!(got.contains("hello-vane"), "sds body: {got:?}");
 }
+
+/// TRACKED REPRO: the h2 crate client (h2load pattern — one connection,
+/// a new stream per request, sequential) stalls against the engine's
+/// h2 edge after ~2 requests; a CRDBG trace showed a 10-byte HEADERS
+/// fragment arriving as its own frame (split head) and the shim
+/// treating fragments as complete heads. This test drives the same
+/// pattern in-process: 50 sequential streams must all answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "tracked: the h2 shim refuses the second sequential stream (REFUSED_STREAM on stream 3) — the h2load pattern stalls identically; needs a shim trace (vane_dbg CRDBG) of stream-1 completion vs stream-3 HEADERS"]
+async fn h2_edge_h2crate_client_sequential_streams() {
+    use std::sync::Arc;
+
+    let _serial = lock_serial();
+    let dir = tempfile::tempdir().expect("dir");
+    let certs = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
+    let cert_path = dir.path().join("cert.pem");
+    let key_path = dir.path().join("key.pem");
+    std::fs::write(&cert_path, certs.cert.pem()).expect("write");
+    std::fs::write(&key_path, certs.signing_key.serialize_pem()).expect("write");
+
+    // Canned upstream.
+    let up_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let upstream = up_listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for stream in up_listener.incoming().flatten() {
+            let mut s = stream;
+            std::thread::spawn(move || {
+                use std::io::{Read as _, Write as _};
+                let mut buf = [0u8; 4096];
+                loop {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            if s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: keep-alive\r\n\r\nok").is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let port = free_port();
+    let (_dir2, cfg) = temp_config(format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[listeners.tls]
+cert = "{}"
+key = "{}"
+alpn_h2 = true
+
+[clusters.up]
+backends = ["{upstream}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = true
+workers = 1
+"#,
+        cert_path.display(),
+        key_path.display()
+    ));
+    let _server_guard_8 = spawn_proxy(cfg);
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    // h2 crate client: one TLS connection, 50 sequential streams.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut roots = rustls::RootCertStore::empty();
+    use rustls::pki_types::pem::PemObject as _;
+    let der = rustls::pki_types::CertificateDer::from_pem_file(&cert_path).expect("cert der");
+    roots.add(der).expect("add");
+    let mut tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"h2".to_vec()];
+    let tls = Arc::new(tls);
+    let tcp = tokio::net::TcpStream::connect(proxy).await.expect("tcp");
+    let _ = tcp.set_nodelay(true);
+    let connector = tokio_rustls::TlsConnector::from(tls);
+    let server_name =
+        rustls::pki_types::ServerName::try_from("localhost".to_string()).expect("sni");
+    let tls_stream = connector.connect(server_name, tcp).await.expect("tls");
+    let (mut send_request, mut conn) = h2::client::handshake(tls_stream)
+        .await
+        .expect("h2 handshake");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let mut ok = 0usize;
+    for i in 0..50 {
+        let req = http::Request::builder()
+            .method("GET")
+            .uri(format!("https://localhost:{port}/s{i}"))
+            .body(())
+            .expect("req");
+        let (resp_fut, mut stream) = match send_request.send_request(req, true) {
+            Ok(x) => x,
+            Err(e) => panic!("request {i}: send failed: {e}"),
+        };
+        let resp = tokio::time::timeout(Duration::from_secs(5), resp_fut)
+            .await
+            .unwrap_or_else(|_| panic!("request {i}: response timed out"))
+            .expect("response");
+        assert_eq!(resp.status(), 200, "request {i} status");
+        let mut body = resp.into_body();
+        let mut got = Vec::new();
+        loop {
+            let chunk = tokio::time::timeout(Duration::from_secs(5), body.data())
+                .await
+                .expect("body timed out");
+            match chunk {
+                Some(Ok(c)) => got.extend_from_slice(&c),
+                _ => break,
+            }
+        }
+        assert_eq!(got, b"ok", "request {i} body");
+        ok += 1;
+        let _ = stream; // EOS already sent
+    }
+    assert_eq!(ok, 50, "all sequential h2 streams must complete");
+}
