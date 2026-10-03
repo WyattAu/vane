@@ -227,13 +227,22 @@ Data-driven position:
   37k): Go's scheduler handles many-connection fan-in better than
   vane's current per-worker model. This is vane's clearest engine
   gap.
-- **Memory remains 7–13× the Go proxies** (vane preallocates buffer
-  pools per worker; a size knob is the cheap first step).
+- **Memory: 383 MB at 32 workers ≈ 10 MB/worker — reasonable for the
+  class** (nginx workers run ~10–20 MB; Envoy workers 50 MB+). The
+  profile: ~4 MB/worker buffer pool (tunable via
+  `[runtime] pool_slots`), ~2 MB/worker event ring, ~2 MB runtime.
+  The single-process Go proxies (Caddy 42 MB, Traefik 83 MB) trade
+  per-core parallelism for a smaller flat footprint — different
+  designs, both defensible; vane's number scales linearly with cores
+  by design.
 
-The pre-fix "vane h2 is broken" liability is resolved; the new
-priorities by measured impact are (1) many-connection h1 scaling,
-(2) memory sizing. Both are now evidence-backed rather than
-speculative.
+The pre-fix "vane h2 is broken" liability is resolved and the
+memory liability dissolved on measurement. The one remaining
+evidence-backed engine gap: **absolute h1 throughput vs Traefik**
+(1.4× at 8 conns, 2.4× at 64) — targeted at the accept path
+(io_uring multishot accept) in a future round. Traefik's h2/h3 legs
+are pending client-interop debugging (curl confirms its h2/h3 work;
+the loadgen legs return 0 — under investigation).
 
 ### Fair-config correction (2026-10-03, quiet window)
 
