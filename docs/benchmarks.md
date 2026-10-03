@@ -283,3 +283,32 @@ was a bench artifact:
 - RSS improved to 383 MB under the fair config (the 1-worker config
   was memory-INEFFICIENT as well); still ~4.6× Caddy — profiling
   next.
+
+### Validated comparison (2026-10-03, status-checked client, tokio upstream)
+
+Two rig defects invalidated the earlier runs and are now fixed:
+(1) the threaded-Python upstream's GIL capped the whole rig at
+~56k req/s (any proxy number near or above that was upstream-bound
+or error-noise — Traefik's earlier "132k" was error responses
+counted as throughput); (2) the loadgen counted every parsed
+response as throughput, including proxy errors. Both fixed: the
+upstream is now tokio (ceiling 111k@8 / 215k@128 conns), and every
+client leg reports its non-200 count.
+
+| proxy | h1 (8) | h1 (64) | h2 (8) | h3 (8) | RSS |
+|---|---|---|---|---|---|
+| **vane 0.5.3** | **49,918** | **82,522** | **34,012** | **22,125** | 378 MB |
+| Caddy 2.10.2 | 22,191 | 33,288 | 14,330 | 11,494 | 33 MB |
+| Traefik 3.3.6 | 29,103 | 55,087 | 18,238 | 14,028 | 69 MB |
+
+Every leg: non200 = 0 (all responses were genuine proxy→upstream
+200s). Run window load 4–12.
+
+**On this rig, with this workload, with all responses verified:
+vane is the fastest of the three on every protocol** — h1 1.5–2.3×,
+h2 1.9–2.4×, h3 1.6–1.9× — with the lowest p50 on every leg, and
+h1 that SCALES with connections (49.9k@8 → 82.5k@64). Memory is the
+standing tradeoff (378 MB vs 33/69 MB — per-core pools, tunable,
+documented above). Traefik's h2/h3 legs were only measurable after
+fixing a harness defect (its dynamic config was not loading the
+benchmark certificate).

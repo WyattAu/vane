@@ -31,34 +31,23 @@ for v in VANE_P1 VANE_P2 NGINX_P1 NGINX_P2 CADDY_P1 CADDY_P2 TRAEFIK_P1 TRAEFIK_
 done
 
 # ---- shared upstream (identical for every proxy) ----
-python3 - <<PY &
-import socket, threading
-s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("127.0.0.1", $FREE_UP)); s.listen(1024)
-def handle(c):
-    try:
-        while True:
-            d = c.recv(4096)
-            if not d: break
-            c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: keep-alive\r\n\r\nhello-vane")
-    finally: c.close()
-while True:
-    c, _ = s.accept()
-    threading.Thread(target=handle, args=(c,), daemon=True).start()
-PY
+# The tokio upstream (loadgen crate) replaces the earlier threaded
+# Python one, whose GIL capped the whole rig at ~56k req/s.
+"$LG/upstream" "127.0.0.1:$FREE_UP" &
 UP=$!
-sleep 0.3
+sleep 0.5
 
 DIR=$(mktemp -d)
 "$LG/certgen" "$DIR"
 
-RESULTS=$'| proxy | leg | conns | req/s | p50 | p99 |\n|---|---|---|---|---|---|'
-record() { # proxy leg conns "req/s: N total: M p50: X p99: Y"
-  local reqs p50 p99
+RESULTS=$'| proxy | leg | conns | req/s | p50 | p99 | non200 |\n|---|---|---|---|---|---|---|'
+record() { # proxy leg conns "req/s: N total: M non200: B p50: X p99: Y"
+  local reqs p50 p99 nb
   reqs=$(echo "$4" | sed -n 's/.*req\/s: \([0-9]*\).*/\1/p')
+  nb=$(echo "$4" | sed -n 's/.*non200: \([0-9]*\).*/\1/p')
   p50=$(echo "$4" | sed -n 's/.*p50: \([0-9]*\).*/\1/p')
   p99=$(echo "$4" | sed -n 's/.*p99: \([0-9]*\).*/\1/p')
-  RESULTS+="| $1 | $2 | $3 | ${reqs:-0} | ${p50:-0}µs | ${p99:-0}µs |
+  RESULTS+="| $1 | $2 | $3 | ${reqs:-0} | ${p50:-0}µs | ${p99:-0}µs | ${nb:-?} |
 "
 }
 
