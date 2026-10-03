@@ -89,12 +89,17 @@ run_legs() { # name plain_port tls_port
 
 # ================= vane =================
 echo "== vane =="
+# Fair config: workers = 0 → one worker per core (shared-nothing
+# SO_REUSEPORT, matching Traefik's default all-core concurrency);
+# io_uring backend (the compiled-in default — force_mio = false).
 cat > "$DIR/vane.toml" <<TOML
 [[listeners]]
 address = "127.0.0.1:$VANE_P1"
+workers = 0
 
 [[listeners]]
 address = "127.0.0.1:$VANE_P2"
+workers = 0
 
 [listeners.tls]
 cert = "$DIR/cert.pem"
@@ -113,8 +118,7 @@ cluster = "up"
 enabled = false
 
 [runtime]
-force_mio = true
-workers = 1
+force_mio = false
 TOML
 ./target/release/vane run -c "$DIR/vane.toml" & VANE_PID=$!
 sleep 2

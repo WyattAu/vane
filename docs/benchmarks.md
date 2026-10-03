@@ -234,3 +234,26 @@ The pre-fix "vane h2 is broken" liability is resolved; the new
 priorities by measured impact are (1) many-connection h1 scaling,
 (2) memory sizing. Both are now evidence-backed rather than
 speculative.
+
+### Fair-config correction (2026-10-03, quiet window)
+
+The prior comparative run handicapped vane (`workers = 1`,
+`force_mio = true` — a single mio thread vs Traefik's all-core
+defaults), violating this document's own methodology rule. Corrected
+config (workers = cores, io_uring backend) — the 64-connection "gap"
+was a bench artifact:
+
+| proxy | h1 (8) | h1 (64) | h2 (8) | h3 (8) | RSS |
+|---|---|---|---|---|---|
+| **vane 0.5.3 (fair)** | 43,805 | 43,076 | **33,106** | **20,697** | 383 MB |
+| Caddy 2.10.2 | 16,907 | 19,458 | 12,150 | 9,224 | 42 MB |
+| Traefik 3.3.6 | **59,586** | **103,754** | not measured | not measured | 83 MB |
+
+- vane's h1 now sustains flat 8→64 connections (43.8k → 43.1k, no
+  drop) — the worker model scales as designed.
+- Traefik still leads absolute h1 (1.4× at 8 conns, 2.4× at 64) —
+  the remaining real engine gap, targeted at the accept path.
+- vane leads h2 (2.7×) and h3 (2.2×).
+- RSS improved to 383 MB under the fair config (the 1-worker config
+  was memory-INEFFICIENT as well); still ~4.6× Caddy — profiling
+  next.
