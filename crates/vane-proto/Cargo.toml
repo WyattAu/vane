@@ -1,7 +1,7 @@
 [package]
 name = "vane-proto"
 description = "Zero-copy HTTP/1.1 engine for the Vane data plane"
-version.workspace = true
+version = "0.5.4"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
