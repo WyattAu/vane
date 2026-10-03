@@ -1,7 +1,7 @@
 [package]
 name = "vane-control"
 # 0.2.2 adds envoy::decode_cla (EDS resources) required by vane-proxy.
-version = "0.5.1"
+version = "0.5.3"
 description = "Configuration, discovery providers, ACME, and health checks for Vane"
 edition.workspace = true
 rust-version.workspace = true

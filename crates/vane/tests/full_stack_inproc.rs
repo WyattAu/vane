@@ -2685,7 +2685,6 @@ workers = 1
 /// treating fragments as complete heads. This test drives the same
 /// pattern in-process: 50 sequential streams must all answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "tracked: the h2 shim refuses the second sequential stream (REFUSED_STREAM on stream 3) — the h2load pattern stalls identically; needs a shim trace (vane_dbg CRDBG) of stream-1 completion vs stream-3 HEADERS"]
 async fn h2_edge_h2crate_client_sequential_streams() {
     use std::sync::Arc;
 

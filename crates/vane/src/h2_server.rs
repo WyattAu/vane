@@ -198,6 +198,10 @@ impl H2Server {
                 headers,
             } => {
                 if self.active_stream.is_some() {
+                    eprintln!(
+                        "SHIM-REFUSE: incoming stream {} while active {:?}",
+                        stream_id, self.active_stream
+                    );
                     // Serialized mode: refuse overlap.
                     self.conn.send_rst_stream(
                         stream_id,
@@ -216,6 +220,10 @@ impl H2Server {
 
                 if accepted {
                     if let Some(head) = Self::translate_head(&headers, chunked_req) {
+                        // New transaction: clear the previous response's
+                        // done flag (per-connection state that must not
+                        // leak across serialized streams).
+                        self.resp_done = false;
                         self.active_stream = Some(stream_id);
                         self.req_chunked = chunked_req;
                         self.body_remaining = match Self::request_content_length(&headers) {
@@ -439,6 +447,10 @@ impl H2Server {
         let done = self.translator.as_ref().is_some_and(|t| t.done);
         if done {
             self.translator = None;
+            let sid = self.active_stream.take();
+            if let Some(sid) = sid {
+                self.conn.mark_stream_closed(sid);
+            }
             self.active_stream = None;
             self.resp_done = true;
         } else if !self.held.is_empty() {
@@ -485,6 +497,7 @@ impl H2Server {
             t.done = true;
         }
         self.translator = None;
+        self.conn.mark_stream_closed(stream_id);
         self.active_stream = None;
         (out, EofOutcome::Completed)
     }
@@ -540,6 +553,10 @@ impl H2Server {
         let done = self.translator.as_ref().is_some_and(|t| t.done);
         if done {
             self.translator = None;
+            let sid = self.active_stream.take();
+            if let Some(sid) = sid {
+                self.conn.mark_stream_closed(sid);
+            }
             self.active_stream = None;
             self.resp_done = true;
         } else if !self.held.is_empty() {
@@ -564,6 +581,7 @@ impl H2Server {
         }
         let frames = emit_header_block_full_end(stream_id, &headers, max_frame);
         self.translator = None;
+        self.conn.mark_stream_closed(stream_id);
         self.active_stream = None;
         self.resp_done = true;
         frames

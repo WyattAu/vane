@@ -165,5 +165,22 @@ stream 3's HEADERS (10-byte, complete) processed twice. Suspects: the
 slot release racing the next HEADERS frame, or a duplicate HEADERS
 dispatch in the shim intake.
 
-Next session: shim trace with `vane_dbg`, fix the release ordering,
-un-ignore the repro.
+**FIXED (2026-10-03)** — three stacked bugs, found via the shim trace
+(vane_dbg) with the deterministic repro:
+
+1. **Kernel concurrency check counted closed-but-unpruned streams**
+   (`streams.len() >= max_concurrent`): after stream 1 closed (still
+   resident in the map), every later stream was REFUSED. Now counts
+   open streams only, with closed-stream pruning at HEADERS time.
+2. **Kernel/shim state divergence**: the shim emits raw frames outside
+   the kernel's send API, so the kernel never saw the server's
+   END_STREAM — streams stuck HalfClosedRemote (open) forever. The
+   shim now syncs via `conn.mark_stream_closed` at every completion
+   site.
+3. **`resp_done` never reset between serialized transactions**: after
+   response 1, every later response hit the `resp_done` short-circuit
+   and was silently dropped (0 frames to the client).
+
+The repro is un-ignored and green (50 sequential h2-crate streams);
+h2spec stays 145/145 strict; the external h2load went 1 → 32.7k
+req/s (8 conns).

@@ -822,8 +822,15 @@ impl Connection {
         }
         if !known
             && self.role == Role::Server
-            && self.streams.len() >= self.cfg.max_concurrent_streams as usize
+            && self.open_peer_streams() >= self.cfg.max_concurrent_streams as usize
         {
+            #[cfg(feature = "vane_dbg")]
+            eprintln!(
+                "KERNEL-REFUSE: stream {} open={} states={:?}",
+                hdr.stream_id,
+                self.open_peer_streams(),
+                self.streams.values().map(|st| st.state).collect::<Vec<_>>()
+            );
             // Over the limit: refuse this stream (stream-level error).
             write_header(
                 &mut self.out,
@@ -836,6 +843,7 @@ impl Connection {
                 .extend_from_slice(&error_code::REFUSED_STREAM.to_be_bytes());
             return Ok(());
         }
+        self.prune_closed_streams();
         self.last_peer_stream_id = hdr.stream_id;
 
         // Priority hints parsed and ignored (RFC 9113 §5.3 deprecates) —
@@ -1030,6 +1038,45 @@ impl Connection {
     /// `true` when `stream_id` belongs to the PEER's namespace and is
     /// above every id the peer has opened — i.e. the stream is idle
     /// (server role: peer streams are odd; client role: even).
+    /// Marks a stream fully closed (both directions ended). The shim
+    /// layer emits raw frames outside the kernel's send API, so the
+    /// kernel's stream state must be synced when a transaction
+    /// completes — otherwise HalfClosedRemote streams count against
+    /// the concurrency limit forever.
+    pub fn mark_stream_closed(&mut self, stream_id: u32) {
+        if let Some(st) = self.streams.get_mut(&stream_id) {
+            st.state = StreamState::Closed;
+        }
+    }
+
+    /// Open (not fully closed) peer streams — the concurrency check
+    /// must not count closed-but-unpruned entries, or serialized-mode
+    /// connections REFUSE every stream after the first.
+    fn open_peer_streams(&self) -> usize {
+        self.streams
+            .values()
+            .filter(|st| st.state != StreamState::Closed)
+            .count()
+    }
+
+    /// Bounds the stream map: fully Closed streams have no further
+    /// protocol role (their WINDOW_UPDATEs land in the retired
+    /// accumulator); prune opportunistically on new streams.
+    fn prune_closed_streams(&mut self) {
+        if self.streams.len() <= 64 {
+            return;
+        }
+        let closed: Vec<u32> = self
+            .streams
+            .iter()
+            .filter(|(_, st)| st.state == StreamState::Closed)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in closed {
+            self.streams.remove(&id);
+        }
+    }
+
     fn is_peer_idle(&self, stream_id: u32) -> bool {
         let peer_parity = match self.role {
             Role::Server => stream_id & 1 == 1,
