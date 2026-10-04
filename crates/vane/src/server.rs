@@ -104,6 +104,9 @@ pub fn receive_inherited(
                 policy: vane_router::Policy::P2C,
                 priority: 20,
                 allowed_spiffe_prefixes: Vec::new(),
+                retry: Default::default(),
+                mirror: None,
+                mirror_backends: Vec::new(),
             };
             match builder.compile() {
                 Ok(entry) => editor.insert(entry),
@@ -524,6 +527,130 @@ pub async fn run(opts: RunOptions) -> i32 {
     let checker = Arc::new(checker);
     checker.spawn();
     let _reconcile_task = tokio::spawn(reconciler.run());
+
+    // ---- Config hot-reload: watch vane.toml; a valid changed config
+    // re-publishes routes/clusters through the same reconciler path as
+    // xDS (source "static"). Listeners are startup-bound: a listener
+    // change is logged as restart-required, the rest still applies.
+    if let Some(cfg_path) = opts.config_path.clone() {
+        let health_for_reload = Arc::clone(&health);
+        let update_tx = update_tx.clone();
+        let live_listeners: Arc<Vec<String>> = Arc::new(
+            config
+                .listeners
+                .iter()
+                .map(|l| {
+                    format!(
+                        "{}:{}{}",
+                        l.address,
+                        match l.mode {
+                            vane_control::config::ListenerMode::Http => "http",
+                            vane_control::config::ListenerMode::Tcp => "tcp",
+                        },
+                        l.tls.as_ref().map_or("", |_| "+tls")
+                    )
+                })
+                .collect(),
+        );
+        let live_listeners_ref = Arc::clone(&live_listeners);
+        tokio::spawn(async move {
+            let (evt_tx, mut evt_rx) = tokio::sync::mpsc::channel::<()>(8);
+            // The notify watcher runs on a blocking thread (inotify is
+            // a sync API); it forwards change events to this task.
+            {
+                let evt_tx = evt_tx.clone();
+                let cfg_path = cfg_path.clone();
+                std::thread::Builder::new()
+                    .name("cfg-watch".into())
+                    .spawn(move || {
+                        let (ntx, nrx) = std::sync::mpsc::channel();
+                        let Ok(mut watcher) = notify::recommended_watcher(ntx) else {
+                            return;
+                        };
+                        use notify::Watcher as _;
+                        if let Err(e) = watcher.watch(
+                            std::path::Path::new(&cfg_path),
+                            notify::RecursiveMode::NonRecursive,
+                        ) {
+                            eprintln!("vane: config watch: {e}");
+                            return;
+                        }
+                        for res in nrx {
+                            if res.is_ok() && evt_tx.blocking_send(()).is_err() {
+                                return;
+                            }
+                        }
+                    })
+                    .expect("cfg-watch thread");
+            }
+            // mtime+size fingerprint: editors emit bursts per save.
+            let fingerprint = || -> Option<(u128, u64)> {
+                let m = std::fs::metadata(&cfg_path).ok()?;
+                Some((
+                    m.modified()
+                        .ok()?
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()?
+                        .as_nanos(),
+                    m.len(),
+                ))
+            };
+            let mut last = fingerprint();
+            let mut poll = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                tokio::select! {
+                    _ = evt_rx.recv() => {}
+                    _ = poll.tick() => {}
+                }
+                let cur = fingerprint();
+                if cur == last {
+                    continue;
+                }
+                // Debounce: editors write in several quick steps.
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                last = fingerprint(); // re-read post-debounce
+                match load_config(Some(&cfg_path)) {
+                    Ok(new) => {
+                        let new_listeners: Vec<String> = new
+                            .listeners
+                            .iter()
+                            .map(|l| {
+                                format!(
+                                    "{}:{}{}",
+                                    l.address,
+                                    match l.mode {
+                                        vane_control::config::ListenerMode::Http => "http",
+                                        vane_control::config::ListenerMode::Tcp => "tcp",
+                                    },
+                                    l.tls.as_ref().map_or("", |_| "+tls")
+                                )
+                            })
+                            .collect();
+                        if new_listeners != *live_listeners_ref {
+                            tracing::warn!(
+                                "config reload: listener set changed — listeners are \
+                                 startup-bound; routes/clusters still applied"
+                            );
+                        }
+                        let routes = vane_control::routes::static_routes(&new, &health_for_reload);
+                        let count = routes.len();
+                        let _ = update_tx
+                            .send(vane_control::providers::ProviderUpdate {
+                                source: "static",
+                                routes,
+                            })
+                            .await;
+                        tracing::info!(
+                            "config reloaded: {count} route(s) applied (listeners unchanged)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("config reload rejected (keeping previous): {e}");
+                    }
+                }
+            }
+        });
+    }
 
     // File provider.
     #[cfg(feature = "file-provider")]
@@ -1235,6 +1362,9 @@ cluster = "up"
                 gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
                 priority: 0,
                 allowed_spiffe_prefixes: Vec::new(),
+                retry: Default::default(),
+                mirror: None,
+                mirror_backends: Vec::new(),
             });
         });
         let records = crate::proxy::flatten_routes(&router);
@@ -1385,6 +1515,9 @@ mod handover_helper_tests {
                 gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
                 priority: 0,
                 allowed_spiffe_prefixes: Vec::new(),
+                retry: Default::default(),
+                mirror: None,
+                mirror_backends: Vec::new(),
             });
         });
         let health = Arc::new(vane_control::HealthMap::new());

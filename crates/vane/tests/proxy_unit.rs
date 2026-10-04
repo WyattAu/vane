@@ -77,6 +77,9 @@ fn make_router(routes: &[(&str, &str)]) -> Arc<Router> {
                     policy: Policy::P2C,
                     priority: 0,
                     allowed_spiffe_prefixes: Vec::new(),
+                    retry: Default::default(),
+                    mirror: None,
+                    mirror_backends: Vec::new(),
                 }
                 .compile()
                 .expect("valid route"),

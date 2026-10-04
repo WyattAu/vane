@@ -165,6 +165,8 @@ struct Conn {
     upstream_addr: Option<SocketAddr>,
     /// Connect attempts for the current transaction (failover cap).
     attempts: u8,
+    /// Request head bytes kept for response-phase retry (5xx failover).
+    req_head_copy: Vec<u8>,
     /// Access-log fields for the in-flight transaction.
     req_method: String,
     req_host: Option<String>,
@@ -806,10 +808,47 @@ impl HttpProxy {
         let framing = self.conn(slot).body;
         match framing {
             BodyFraming::AwaitingHead => {
-                let (head_len, _status, _close) = self.parse_upstream_head(slot, data);
+                let (head_len, status, _close) = self.parse_upstream_head(slot, data);
                 if head_len == 0 {
                     self.respond_full(io, Status::BadGateway, "bad upstream response\n");
                     io.close();
+                    return;
+                }
+                // Configured 5xx retry: retry idempotent, bodyless
+                // requests while attempts remain. The response was
+                // never relayed downstream, so the swap is invisible.
+                let retry_5xx = self
+                    .conn(slot)
+                    .route
+                    .as_ref()
+                    .is_some_and(|r| r.retry.retry_5xx);
+                let attempts = self.conn(slot).attempts;
+                let max_attempts = self
+                    .conn(slot)
+                    .route
+                    .as_ref()
+                    .map_or(3, |r| r.retry.max_attempts)
+                    .max(1);
+                let method = self.conn(slot).req_method.as_str();
+                let idempotent =
+                    method == "GET" || method == "HEAD" || method == "PUT" || method == "DELETE";
+                let is_5xx = matches!(
+                    status,
+                    Status::InternalServerError
+                        | Status::BadGateway
+                        | Status::ServiceUnavailable
+                        | Status::GatewayTimeout
+                );
+                if is_5xx && retry_5xx && attempts + 1 < max_attempts && idempotent {
+                    self.log(
+                        LogLevel::Debug,
+                        &format!(
+                            "5xx retry {}/{}: upstream returned 5xx",
+                            attempts + 2,
+                            max_attempts
+                        ),
+                    );
+                    self.failover(io);
                     return;
                 }
                 self.metrics.responses.inc(&self.config.registry);
@@ -1480,6 +1519,9 @@ impl HttpProxy {
     }
 }
 
+/// Round-robin cursor for mirror (shadow) backend picks.
+static MIRROR_RR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Handler-side cap for body bytes arriving before the upstream
 /// connects. The window is one dial; anything beyond this is abusive.
 const REQ_PENDING_CAP: usize = 1024 * 1024;
@@ -1752,6 +1794,7 @@ impl Handler for HttpProxy {
             let mut buf = std::mem::take(&mut self.conn(slot).head_buf);
             let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
             if let Parsed::Complete(view, head_len) = RequestView::parse_in(&buf, &mut storage) {
+                self.conn(slot).req_head_copy = buf[..head_len].to_vec();
                 if view.is_chunked() {
                     // h2 has no chunked encoding; v0.2 declines.
                     self.respond_full(
@@ -1819,10 +1862,56 @@ impl Handler for HttpProxy {
         let buf = std::mem::take(&mut self.conn(slot).head_buf);
         let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
         if let Parsed::Complete(view, head_len) = RequestView::parse_in(&buf, &mut storage) {
+            // Head-only copy for response-phase retry (5xx failover).
+            self.conn(slot).req_head_copy = buf[..head_len].to_vec();
             // Recycled scratch: one allocation for the connection's
             // lifetime instead of one per request.
             let mut head = std::mem::take(&mut self.conn(slot).head_out);
             self.build_upstream_head(&mut head, &view, &route, &upstream_path, &inject, false, 0);
+            // Mirror (fire-and-forget): a detached thread copies the
+            // request to the shadow cluster. Every error is ignored —
+            // mirroring never delays or fails the real response.
+            eprintln!(
+                "MIRRORDBG: mirror_backends={} head_len={}",
+                route.mirror_backends.len(),
+                head.len()
+            );
+            if !route.mirror_backends.is_empty() {
+                let idx = MIRROR_RR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    % route.mirror_backends.len();
+                let maddr = route.mirror_backends[idx].addr;
+                let mhead = head.clone();
+                let mbody = buf[head_len..].to_vec();
+                let _ = std::thread::Builder::new()
+                    .name("mirror".into())
+                    .spawn(move || {
+                        use std::io::{Read as _, Write as _};
+                        let conn_res = std::net::TcpStream::connect(maddr);
+                        eprintln!("MIRRORTHREAD: connect={:?}", conn_res.is_ok());
+                        let Ok(mut s) = conn_res else {
+                            return;
+                        };
+                        let _ = s.set_nodelay(true);
+                        let w = s.write_all(&mhead);
+                        eprintln!(
+                            "MIRRORTHREAD: head write {:?} len {}",
+                            w.is_ok(),
+                            mhead.len()
+                        );
+                        if w.is_err() {
+                            return;
+                        }
+                        if !mbody.is_empty() && s.write_all(&mbody).is_err() {
+                            return;
+                        }
+                        let mut drain = [0u8; 2048];
+                        while let Ok(n) = s.read(&mut drain) {
+                            if n == 0 {
+                                break;
+                            }
+                        }
+                    });
+            }
             self.upstream_send(io, &head);
             io.mark_request_sent();
             self.conn(slot).head_out = head;
@@ -2563,6 +2652,7 @@ impl HttpProxy {
                 conn.access_logged = false;
                 conn.req_framing = ReqFraming::AwaitingHead;
                 conn.req_pending.clear();
+                conn.req_head_copy.clear();
                 conn.gzip = None;
                 #[cfg(feature = "h2")]
                 {
@@ -2598,7 +2688,13 @@ impl HttpProxy {
     fn failover(&mut self, io: &mut SessionIo<'_>) {
         let slot = io.slot_index();
         let attempts = self.conn(slot).attempts;
-        if attempts >= 2 {
+        let max_attempts = self
+            .conn(slot)
+            .route
+            .as_ref()
+            .map_or(3, |r| r.retry.max_attempts)
+            .max(1);
+        if attempts + 1 >= max_attempts {
             self.respond_full(io, Status::BadGateway, "upstream unreachable\n");
             io.close();
             return;

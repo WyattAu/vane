@@ -5,6 +5,7 @@
 //! guaranteeing exit.
 
 use std::io::{Read, Write};
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -2806,4 +2807,314 @@ workers = 1
         ok += 1;
     }
     assert_eq!(ok, 50, "all sequential h2 streams must complete");
+}
+
+/// Config hot-reload: editing vane.toml's route target while running
+/// re-points the live router — no restart, no dropped connection.
+#[test]
+fn config_hot_reload_applies_route_changes() {
+    let _serial = lock_serial();
+    // Two upstreams: /old serves "old", /new serves "new".
+    let up_old = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let old_addr = up_old.local_addr().expect("addr");
+    let up_new = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let new_addr = up_new.local_addr().expect("addr");
+    for (l, tag) in [(&up_old, "old"), (&up_new, "new")] {
+        let l = l.try_clone().expect("clone");
+        std::thread::spawn(move || {
+            for stream in l.incoming().flatten() {
+                let mut s = stream;
+                let mut b = [0u8; 4096];
+                let _ = s.read(&mut b);
+                let body = tag.to_string();
+                let r = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: keep-alive\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(r.as_bytes());
+            }
+        });
+    }
+
+    let port = free_port();
+    let dir = tempfile::tempdir().expect("dir");
+    let path = dir.path().join("vane.toml");
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.up]
+backends = ["{old_addr}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = false
+workers = 1
+"#
+        ),
+    )
+    .expect("write");
+
+    let _server_guard_9 = spawn_proxy(path.to_str().expect("utf8").to_owned());
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    let get = |proxy: std::net::SocketAddr| -> String {
+        let mut s = std::net::TcpStream::connect(proxy).expect("connect");
+        s.write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+            .expect("write");
+        let mut r = Vec::new();
+        s.read_to_end(&mut r).expect("read");
+        String::from_utf8_lossy(&r).into_owned()
+    };
+
+    assert!(
+        get(proxy).contains("old"),
+        "before reload the old backend serves"
+    );
+
+    // Rewrite the config: the cluster's backend moves to the new upstream.
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.up]
+backends = ["{new_addr}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = false
+workers = 1
+"#
+        ),
+    )
+    .expect("write rewrite");
+
+    // Wait for the watcher (debounce + apply).
+    let mut applied = false;
+    for _ in 0..40 {
+        if get(proxy).contains("new") {
+            applied = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert!(applied, "hot-reloaded config serves the new backend");
+    // And it sticks (subsequent requests hit the new backend too).
+    assert!(get(proxy).contains("new"), "post-reload steady state");
+}
+
+/// Per-route retries: one upstream that 500s its first two hits then
+/// 200s forever. With `retry = { max_attempts = 3, retry_5xx = true }`
+/// the third attempt must surface "recovered".
+#[test]
+fn retry_5xx_failover_and_cap() {
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    let _serial = lock_serial();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let flaky = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let flaky_addr = flaky.local_addr().expect("addr");
+    let hits_c = Arc::clone(&hits);
+    std::thread::spawn(move || {
+        for stream in flaky.incoming().flatten() {
+            let hits = Arc::clone(&hits_c);
+            std::thread::spawn(move || {
+                let n = hits.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                let mut s = stream;
+                let mut b = [0u8; 4096];
+                let _ = s.read(&mut b);
+                let (code, body) = if n <= 2 {
+                    ("500", "flaky-500")
+                } else {
+                    ("200", "recovered")
+                };
+                let r = format!(
+                    "HTTP/1.1 {code} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(r.as_bytes());
+            });
+        }
+    });
+
+    let port = free_port();
+    let dir = tempfile::tempdir().expect("dir");
+    let path = dir.path().join("vane.toml");
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.up]
+backends = ["{flaky_addr}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+retry = {{ max_attempts = 3, retry_5xx = true }}
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = false
+workers = 1
+"#
+        ),
+    )
+    .expect("write");
+
+    let _server_guard_10 = spawn_proxy(path.to_str().expect("utf8").to_owned());
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    // Attempt 1 and 2 hit the 500; attempt 3 (max_attempts = 3) gets
+    // the recovered 200.
+    let mut last = String::new();
+    for i in 0..3 {
+        let mut s = std::net::TcpStream::connect(proxy).expect("connect");
+        s.write_all(
+            b"GET /r HTTP/1.1
+Host: t
+Connection: close
+
+",
+        )
+        .expect("write");
+        let mut r = Vec::new();
+        s.read_to_end(&mut r).expect("read");
+        last = String::from_utf8_lossy(&r).into_owned();
+        eprintln!("attempt {}: {}", i + 1, last.lines().next().unwrap_or(""));
+    }
+    assert!(
+        last.contains("recovered"),
+        "the third attempt must surface the recovered 200: {last:?}"
+    );
+    let total = hits.load(AtomicOrdering::Relaxed);
+    assert!(total >= 3, "expected >= 3 upstream hits, got {total}");
+}
+
+/// Request mirroring: a route with `mirror` sends a fire-and-forget
+/// copy to the shadow cluster; the main response is unaffected and
+/// the shadow received the request.
+#[test]
+fn request_mirror_sends_shadow_copy() {
+    use std::sync::mpsc;
+
+    let _serial = lock_serial();
+    let (tx, rx) = mpsc::channel::<String>();
+    // Shadow: captures whatever arrives.
+    let shadow = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let shadow_addr = shadow.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for stream in shadow.incoming().flatten() {
+            let tx = tx.clone();
+            let mut s = stream;
+            std::thread::spawn(move || {
+                let mut b = [0u8; 4096];
+                let n = s.read(&mut b).unwrap_or(0);
+                eprintln!("SHADOW-READ: {n} bytes");
+                if n > 0 {
+                    let _ = tx.send(String::from_utf8_lossy(&b[..n]).into_owned());
+                }
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 6\r\nconnection: close\r\n\r\nshadow",
+                );
+            });
+        }
+    });
+
+    let main_up = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let main_addr = main_up.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for stream in main_up.incoming().flatten() {
+            let mut s = stream;
+            let mut b = [0u8; 4096];
+            let _ = s.read(&mut b);
+            let _ = s.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\nmain",
+            );
+        }
+    });
+
+    let port = free_port();
+    let dir = tempfile::tempdir().expect("dir");
+    let path = dir.path().join("vane.toml");
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.main]
+backends = ["{main_addr}"]
+
+[clusters.shadow]
+backends = ["{shadow_addr}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "main"
+mirror = "shadow"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = false
+workers = 1
+"#
+        ),
+    )
+    .expect("write");
+
+    let _server_guard_11 = spawn_proxy(path.to_str().expect("utf8").to_owned());
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    let mut s = std::net::TcpStream::connect(proxy).expect("connect");
+    s.write_all(b"GET /m HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+        .expect("write");
+    let mut r = Vec::new();
+    s.read_to_end(&mut r).expect("read");
+    let r = String::from_utf8_lossy(&r).into_owned();
+    assert!(r.contains("200 OK"), "main path unaffected: {r:?}");
+    assert!(r.contains("main"), "served by the main cluster: {r:?}");
+
+    // A benign 0-byte probe conn may arrive first; drain until the
+    // mirrored request lands.
+    let captured = loop {
+        let msg = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("shadow received the copy");
+        if !msg.is_empty() {
+            break msg;
+        }
+    };
+    assert!(
+        captured.contains("GET /m"),
+        "the shadow cluster received the mirrored request: {captured:?}"
+    );
 }

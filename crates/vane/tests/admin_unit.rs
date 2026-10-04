@@ -30,6 +30,9 @@ fn test_router() -> Arc<RouteRouter> {
             gauges: Arc::new(vane_router::balancer::ConnGauges::new(0)),
             priority: 0,
             allowed_spiffe_prefixes: Vec::new(),
+            retry: Default::default(),
+            mirror: None,
+            mirror_backends: Vec::new(),
         });
     });
     Arc::new(r)
@@ -502,6 +505,9 @@ fn test_router_keepalive() -> std::sync::Arc<RouteRouter> {
             gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
             priority: 0,
             allowed_spiffe_prefixes: Vec::new(),
+            retry: Default::default(),
+            mirror: None,
+            mirror_backends: Vec::new(),
         });
     });
     Arc::new(r)

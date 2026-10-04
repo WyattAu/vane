@@ -26,6 +26,9 @@ fn test_router(upstream: std::net::SocketAddr) -> Arc<Router> {
             policy: vane_router::Policy::P2C,
             priority: 0,
             allowed_spiffe_prefixes: Vec::new(),
+            retry: Default::default(),
+            mirror: None,
+            mirror_backends: Vec::new(),
         };
         editor.insert(builder.compile().expect("route"));
     });

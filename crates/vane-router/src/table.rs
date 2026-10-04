@@ -19,6 +19,12 @@ pub struct RouteEntry {
     pub methods: Vec<String>,
     /// Upstream cluster name.
     pub cluster: String,
+    /// Retry policy (failover cap + 5xx predicate).
+    pub retry: RetryPolicy,
+    /// Mirror (shadow) cluster name, if configured.
+    pub mirror: Option<String>,
+    /// The mirror cluster's resolved backends.
+    pub mirror_backends: Vec<crate::balancer::Backend>,
     /// Prefix to strip from the matched path before forwarding.
     pub strip_prefix: Option<String>,
     /// Request timeout override (ms).
@@ -150,6 +156,25 @@ pub enum RouterError {
     Invalid(String),
 }
 
+/// Per-cluster retry policy (failover behavior on failed attempts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicy {
+    /// Total dial attempts including the first (default 3 = 2 retries).
+    pub max_attempts: u8,
+    /// Retry idempotent requests on 5xx responses (default: connect
+    /// failures only — POST-safe by construction).
+    pub retry_5xx: bool,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            retry_5xx: false,
+        }
+    }
+}
+
 /// Declarative route input (config-plane shape).
 #[derive(Debug, Clone)]
 pub struct RouteBuilder {
@@ -181,6 +206,14 @@ pub struct RouteBuilder {
     /// SPIFFE ID prefixes an inbound mTLS caller must match (empty =
     /// unrestricted).
     pub allowed_spiffe_prefixes: Vec<String>,
+    /// Retry policy (failover cap + 5xx predicate).
+    pub retry: RetryPolicy,
+    /// Mirror (shadow) cluster: a fire-and-forget request copy goes
+    /// here; responses are discarded.
+    pub mirror: Option<String>,
+    /// The mirror cluster's resolved backends (materialized by the
+    /// caller; empty = mirroring disabled).
+    pub mirror_backends: Vec<crate::balancer::Backend>,
 }
 
 impl RouteBuilder {
@@ -205,6 +238,9 @@ impl RouteBuilder {
             pattern: self.pattern,
             methods: self.methods.iter().map(|m| m.to_uppercase()).collect(),
             cluster: self.cluster,
+            retry: self.retry,
+            mirror: self.mirror,
+            mirror_backends: self.mirror_backends,
             strip_prefix: self.strip_prefix,
             timeout_ms: self.timeout_ms,
             backends,
@@ -367,6 +403,9 @@ mod tests {
             policy: Policy::P2C,
             priority: 0,
             allowed_spiffe_prefixes: Vec::new(),
+            retry: Default::default(),
+            mirror_backends: Vec::new(),
+            mirror: None,
         }
     }
 

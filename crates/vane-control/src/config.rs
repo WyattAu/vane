@@ -250,6 +250,22 @@ impl From<PolicyConfig> for vane_router::Policy {
     }
 }
 
+/// Per-route retry policy input (`[[routes]] retry`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct RetryInput {
+    /// Total dial attempts including the first (default 3).
+    #[serde(default = "default_retry_attempts")]
+    pub max_attempts: u8,
+    /// Also retry idempotent requests (GET/HEAD/PUT/DELETE, no body)
+    /// on 5xx responses (default false).
+    #[serde(default)]
+    pub retry_5xx: bool,
+}
+
+fn default_retry_attempts() -> u8 {
+    3
+}
+
 /// A statically configured route.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteConfig {
@@ -277,6 +293,13 @@ pub struct RouteConfig {
     /// requests without a verified SPIFFE ID are answered 403.
     #[serde(default)]
     pub allowed_spiffe_prefixes: Vec<String>,
+    /// Mirror (shadow) cluster: a fire-and-forget copy of each request
+    /// goes to this cluster; its responses are discarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror: Option<String>,
+    /// Per-route retry policy override (failover cap + 5xx predicate).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryInput>,
 }
 
 /// Admin server configuration.

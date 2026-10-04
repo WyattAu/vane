@@ -38,6 +38,20 @@ pub fn static_routes(cfg: &VaneConfig, health: &HealthMap) -> Vec<RouteBuilder> 
             policy: cluster.policy.into(),
             priority: r.priority,
             allowed_spiffe_prefixes: r.allowed_spiffe_prefixes.clone(),
+            retry: r
+                .retry
+                .as_ref()
+                .map_or(Default::default(), |c| vane_router::RetryPolicy {
+                    max_attempts: c.max_attempts,
+                    retry_5xx: c.retry_5xx,
+                }),
+            mirror: r.mirror.clone(),
+            mirror_backends: r
+                .mirror
+                .as_ref()
+                .and_then(|name| cfg.clusters.get(name))
+                .map(|c| resolve_backends(c, health))
+                .unwrap_or_default(),
         });
     }
     out

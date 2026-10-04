@@ -204,6 +204,9 @@ pub fn apply_snapshot(
             policy: cluster_cfg.policy.into(),
             priority: route.priority,
             allowed_spiffe_prefixes: route.allowed_spiffe_prefixes.clone(),
+            retry: Default::default(),
+            mirror_backends: Vec::new(),
+            mirror: None,
         });
     }
 
