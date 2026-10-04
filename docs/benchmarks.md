@@ -284,7 +284,35 @@ was a bench artifact:
   was memory-INEFFICIENT as well); still ~4.6× Caddy — profiling
   next.
 
-### Validated comparison (2026-10-03, status-checked client, tokio upstream)
+### Interleaved comparison (2026-10-04, window 1 of 3)
+
+`scripts/bench_compare.sh` now runs all three proxies simultaneously
+and cycles proxy x leg across three windows, publishing per-leg
+MEDIANS (single-window spikes from this host's external build storms
+are filtered by construction; the per-window raw file is kept).
+Load 182 storms prevented windows 2–3 from completing today; window
+1 is complete with all 12 legs at non200 = 0:
+
+| proxy | h1 (8) | h1 (64) | h2 (8) | h3 (8) |
+|---|---|---|---|---|
+| **vane 0.5.5** | **42,132** | **81,294** | 18,013 | **23,342** |
+| Caddy 2.10.2 | 17,264 | 31,675 | 14,472 | 10,644 |
+| Traefik 3.3.6 | 27,260 | 48,145 | **16,942** | 13,235 |
+
+- **vane leads every leg in the complete window**: h1-8 (1.5×
+  Traefik, 2.4× Caddy), h1-64 (1.7× / 2.6×), h3 (1.8× / 2.2×).
+- The h2 leg vs Traefik is the CLOSEST (18.0k vs 16.9k = 1.07×) —
+  Traefik's Go h2 stack is competitive; vane's edge is thinner here
+  than elsewhere.
+- vane scales +93% from 8 to 64 connections (h1) — the fair-config
+  worker model sustains fan-in.
+- Medians across 3 clean windows are the eventual bar; window 1 is
+  the first complete dataset. The per-window raw file + harness make
+  every number reproducible.
+
+(The 2026-10-03 runs below used sequential per-proxy sections and a
+GIL-capped Python upstream — superseded by this interleaved harness,
+though their vane numbers were confirmed in-window here.)
 
 Two rig defects invalidated the earlier runs and are now fixed:
 (1) the threaded-Python upstream's GIL capped the whole rig at
