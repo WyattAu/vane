@@ -118,10 +118,7 @@ fn read_response(s: &mut std::net::TcpStream) {
                 return;
             }
         }
-        let n = s
-            .read(&mut buf[len..])
-            .or_else(|e| Err(e))
-            .expect("upstream read");
+        let n = s.read(&mut buf[len..]).expect("upstream read");
         assert!(n > 0, "connection closed mid-response");
         len += n;
     }
