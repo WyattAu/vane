@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use vane_core::handler::{Handler, SessionIo};
 use vane_filters::pipeline::Filter as _;
-use vane_filters::{BreakerGate, Outcome, Pipeline, RateLimit, RequestCtx};
+use vane_filters::{BreakerGate, Outcome, RateLimit, RequestCtx};
 use vane_observe::metrics::{MetricHandle, MetricKind, Registry};
 use vane_observe::ring::EventRing;
 
@@ -232,10 +232,11 @@ enum BodyFraming {
 /// The HTTP/1.1 proxy handler. One instance per worker.
 pub struct HttpProxy {
     config: ProxyConfig,
-    /// Pipeline: access-log -> rate-limit -> breaker -> forwarded headers.
-    pipeline: Pipeline<
-        vane_filters::pipeline::Chain<vane_filters::RateLimit, vane_filters::pipeline::Nil>,
-    >,
+    /// Rate limiting (GCRA) when `[rate_limit]` is configured — `None`
+    /// short-circuits the per-request limiter entirely (the check +
+    /// metrics cost ~3% of the relay hot path for a feature that may
+    /// be off).
+    rate_limit: Option<vane_filters::RateLimit>,
     breaker: Arc<BreakerGate>,
     conns: ConnMap,
     /// Per-worker date cache (one refresh/second, zero alloc otherwise).
@@ -315,18 +316,13 @@ impl HttpProxy {
             latency: registry.register_histogram("vane_request_duration_us"),
         };
         let breaker = Arc::new(BreakerGate::new(Arc::clone(&registry)));
-        // None = unlimited in practice (1M rps burst; GCRA stays O(1) and
-        // rate limiting remains opt-in via config).
-        // With a shared bucket the aggregate is enforced there, so the
-        // per-worker stage runs wide open (it would multiply the rate).
-        let (rps, burst) = if config.shared_rate_limit.is_some() {
-            (1_000_000, 1_000_000)
-        } else {
-            config
-                .rate_limit_rps
-                .map_or((1_000_000, 1_000_000), |r| (r, r))
-        };
-        let pipeline = Pipeline::new().then(RateLimit::new(Arc::clone(&registry), rps, burst));
+        // Rate limiting is opt-in: `None` removes the per-request
+        // GCRA check entirely (~3% of the relay hot path). The
+        // shared-bucket aggregate (cross-worker) is enforced in the
+        // request path independently.
+        let rate_limit = config
+            .rate_limit_rps
+            .map(|rps| RateLimit::new(Arc::clone(&registry), rps, rps));
         // Wasm plugins (feature `wasm`): compiled per module, instantiated
         // once per worker.
         #[cfg(feature = "wasm")]
@@ -358,7 +354,7 @@ impl HttpProxy {
         }
         Self {
             config,
-            pipeline,
+            rate_limit,
             breaker,
             conns: ConnMap::default(),
             date: vane_proto::date::DateCache::new(),
@@ -2243,7 +2239,10 @@ impl HttpProxy {
                 chain.push(id.clone());
                 ctx.inject("X-Vane-Spiffe-Chain", &chain.join(","));
             }
-            let outcome = self.pipeline.run(&mut ctx);
+            let outcome = match &self.rate_limit {
+                Some(rl) => rl.run(&mut ctx),
+                None => Outcome::Continue,
+            };
             let rejected = outcome != Outcome::Continue
                 || matches!(self.breaker.run(&mut ctx), Outcome::Reject(503, _));
             let sc = if rejected {

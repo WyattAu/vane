@@ -61,6 +61,20 @@ leg() { # port proto conns [extra]
   esac
 }
 
+# External build storms on this host saturate all cores for minutes
+# at a time; measurements taken mid-storm are invalid. Gate every
+# proxy section on a quiet load window.
+wait_quiet() {
+  for _ in $(seq 1 240); do
+    local l
+    l=$(awk '{print int($1)}' /proc/loadavg)
+    [ "${l:-99}" -lt 4 ] && return 0
+    sleep 5
+  done
+  echo "  (WARN: load never dropped below 4 — numbers may be depressed)"
+  return 0
+}
+
 wait_up() { # port name
   for _ in $(seq 1 40); do
     curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$1/probe" && return 0
@@ -114,6 +128,7 @@ enabled = false
 force_mio = false
 TOML
 ./target/release/vane run -c "$DIR/vane.toml" & VANE_PID=$!
+wait_quiet
 sleep 2
 if wait_up "$VANE_P1" vane; then
   run_legs vane "$VANE_P1" "$VANE_P2"
@@ -147,6 +162,7 @@ CADDY_BIN=/tmp/opencode/proxies/caddy
 if [ -n "$CADDY_BIN" ]; then
 "$CADDY_BIN" run --config "$DIR/Caddyfile" > "$DIR/caddy.log" 2>&1 &
 CADDY_PID=$!
+wait_quiet
 sleep 2
 if wait_up "$CADDY_P1" caddy; then
   run_legs caddy "$CADDY_P1" "$CADDY_P2"
@@ -202,6 +218,7 @@ TRAEFIK_BIN=/tmp/opencode/proxies/traefik
 [ -x "$TRAEFIK_BIN" ] || { echo "  (not measurable: traefik binary missing)"; exit 1; }
 "$TRAEFIK_BIN" --configfile "$DIR/traefik.yml" > "$DIR/traefik.log" 2>&1 &
 TRAEFIK_PID=$!
+wait_quiet
 sleep 3
 if wait_up "$TRAEFIK_P1" traefik; then
   run_legs traefik "$TRAEFIK_P1" "$TRAEFIK_P2"

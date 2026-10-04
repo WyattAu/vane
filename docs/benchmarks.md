@@ -312,3 +312,27 @@ standing tradeoff (378 MB vs 33/69 MB — per-core pools, tunable,
 documented above). Traefik's h2/h3 legs were only measurable after
 fixing a harness defect (its dynamic config was not loading the
 benchmark certificate).
+
+### Hot-path profile (2026-10-04, perf, 64 conns)
+
+`perf record` on the h1 relay (41k samples, line tables in release):
+
+| cost | share | note |
+|---|---|---|
+| worker loop (inlined relay) | ~8% | the relay itself |
+| io_uring submit/complete | ~7% | the engine |
+| request handling + upstream intake | ~10% | h1 dispatch |
+| **malloc/free** | ~9% | per-request allocations (head clones, inject vecs, ctx) |
+| **clock reads (vdso)** | ~4.7% | deadline + metrics timestamping |
+| rate limit + breaker | 2% → ~0.3% | rate limit now opt-in (fixed) |
+| httparse | ~3% | |
+
+**Landed**: rate limiting is opt-in — `None` short-circuits the
+per-request GCRA check entirely (it previously ran with placeholder
+1M-rps limits, costing ~2% for a disabled feature). Profile delta
+confirmed (RateLimit out of the top symbols).
+
+**Next levers by measured cost**: (1) per-request allocation churn
+(~9% — head-buffer clones, inject vecs; reusable scratch would cut
+most of it), (2) clock-read coalescing (~4.7% — one timestamp per
+event-loop iteration instead of per call site).

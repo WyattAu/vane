@@ -155,7 +155,10 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+# Line tables stay in the binary: perf/profiling attribution without
+# the size cost of full debug info.
 strip = "debuginfo"
+debug = "line-tables-only"
 
 [profile.bench]
 debug = true
