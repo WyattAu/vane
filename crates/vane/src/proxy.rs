@@ -372,6 +372,13 @@ impl HttpProxy {
         Instant::now() + Duration::from_millis(ms)
     }
 
+    /// Deadline from a reference instant (the request's `started`
+    /// timestamp) — one fewer clock read on the hot path; the
+    /// first-byte bound is relative to the request start either way.
+    fn deadline_from(&self, at: Instant, ms: u64) -> Instant {
+        at + Duration::from_millis(ms)
+    }
+
     /// Writes bytes downstream, encrypting through TLS when terminated.
     fn write_downstream(&mut self, io: &mut SessionIo<'_>, bytes: &[u8]) {
         let slot = io.slot_index();
@@ -1838,10 +1845,15 @@ impl Handler for HttpProxy {
             }
             // The local buffer was drained above and restored to the
             // connection (capacity preserved) — no re-parse of old
-            // bytes on the next keep-alive transaction.
-            // First-byte deadline.
+            // bytes on the next keep-alive transaction. The first-byte
+            // deadline derives from the request's start timestamp (no
+            // fresh clock read).
+            let started = self.conn(slot).started;
             io.set_deadline(
-                Some(self.deadline(self.config.first_byte_timeout_ms)),
+                Some(started.map_or_else(
+                    || self.deadline(self.config.first_byte_timeout_ms),
+                    |s| self.deadline_from(s, self.config.first_byte_timeout_ms),
+                )),
                 vane_core::handler::DeadlineReason::FirstByte,
             );
         } else {
