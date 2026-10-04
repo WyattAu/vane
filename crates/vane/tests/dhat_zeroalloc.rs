@@ -9,7 +9,13 @@
 //! limiting, tracing, or active health probes. The date cache refresh
 //! is allocation-free by construction.
 //!
-//! Run: `cargo test -p vane-proxy --test dhat_zeroalloc --release`
+//! dhat must own the process allocator; the optional `mimalloc`
+//! feature installs a competing one, so under that feature this gate
+//! compiles out (run it with default features).
+//!
+//! Run: `cargo test -p vane-proxy --test dhat_zeroalloc --release -- --ignored`
+
+#![cfg(not(feature = "mimalloc"))]
 
 use std::io::{Read, Write};
 use std::time::Duration;

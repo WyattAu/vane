@@ -5,10 +5,8 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 // Global allocator (MM-02): mimalloc, feature-gated (default off so
-// embedders/tests keep the system allocator). `not(test)` keeps test
-// binaries allocator-neutral — the dhat gate installs its own
-// counting allocator, which cannot coexist with another one.
-#[cfg(all(feature = "mimalloc", not(test)))]
+// embedders/tests keep the system allocator).
+#[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 pub mod admin;
