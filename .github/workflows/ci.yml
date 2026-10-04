@@ -122,6 +122,27 @@ jobs:
         run: |
           cargo test --release -p vane-proxy --test h3_bridge --test h3_client --test h3_edge
 
+  bench-budgets:
+    name: bench budgets (percentile-kit)
+    runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: sccache stats
+        run: sccache --start-server || true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Bench suite
+        run: |
+          cargo bench -p vane-proto --bench parse
+          cargo bench -p vane-router --bench lookup
+          cargo bench -p vane-shm --bench roundtrip
+      - name: Enforce percentile budgets
+        run: cargo test -p vane-router --test budget_gate -- --ignored --nocapture
+
   coverage:
     name: coverage (llvm-cov)
     runs-on: ubuntu-latest

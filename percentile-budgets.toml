@@ -1,0 +1,28 @@
+# Latency budgets for the criterion bench suite (MM-01 / estate
+# standard). Gated in CI by `cargo test -p vane-router --test
+# budget_gate -- --ignored` after `cargo bench`.
+#
+# Budgets are set at ~1.5x the P50 / P99 baselines measured on a
+# loaded development machine (see README "Benchmarks" for the caveat
+# and the numbers), with max_regression_pct on top — the gate exists
+# to catch gross regressions (algorithmic blows-ups, accidental
+# allocations on the hot path), not to arbitrate single-digit
+# nanoseconds on shared CI hardware.
+
+[[budget]]
+metric = "http1_parse_head"        # vane-proto: full h1 head parse (PR-01)
+p50 = 500.0                        # ns/req (baseline 311 ns loaded)
+p99 = 900.0                        # ns/req (baseline 365 ns loaded)
+max_regression_pct = 50.0
+
+[[budget]]
+metric = "router_lookup_10k_routes" # vane-router: CP-01 (<80 ns target is the dedicated hardware spec)
+p50 = 400.0                         # ns/lookup (baseline 245 ns loaded)
+p99 = 1000.0                        # ns/lookup (baseline 402 ns loaded)
+max_regression_pct = 50.0
+
+[[budget]]
+metric = "shm_sidecar_rtt_512b"     # vane-shm: IP-01 (<25 us target)
+p50 = 5000.0                        # ns/rtt (baseline 3134 ns loaded)
+p99 = 8000.0                        # ns/rtt (baseline 3341 ns loaded)
+max_regression_pct = 50.0

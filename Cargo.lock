@@ -2366,6 +2366,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "percentile-kit"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "821537297c1e1bf92068a5dec6a70a079dd576aaf2b017fdcaf9c057300e415e"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
 name = "petgraph"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4195,6 +4207,7 @@ version = "0.6.0"
 dependencies = [
  "criterion",
  "crossbeam-epoch",
+ "percentile-kit",
  "rand 0.9.5",
  "rkyv",
  "serde",
