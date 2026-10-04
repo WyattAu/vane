@@ -20,6 +20,12 @@ pub enum AuthError {
     Unavailable,
 }
 
+/// Minimum interval between file `stat()` checks (`MM-01`): the
+/// per-request reload probe stats the key file on every call — a
+/// syscall on the hot path. Key rotation is still detected within
+/// this window; the mtime gate below is unchanged.
+const MTIME_RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
+
 impl core::fmt::Display for AuthError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -44,6 +50,12 @@ pub struct JwtValidator {
     jwks_path: Option<std::path::PathBuf>,
     secret_path: Option<std::path::PathBuf>,
     last_mtime: std::sync::Arc<std::sync::RwLock<Option<SystemTime>>>,
+    /// Milliseconds (worker monotonic base) of the last `stat()` —
+    /// throttles the per-request probe to one syscall per
+    /// [`MTIME_RECHECK`] (`MM-01`).
+    last_stat_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Monotonic base for [`Self::last_stat_ms`].
+    stat_base: std::sync::Arc<std::sync::OnceLock<std::time::Instant>>,
 }
 
 impl JwtValidator {
@@ -75,6 +87,10 @@ impl JwtValidator {
         }
         validation.validate_exp = true;
         let last_mtime = current_mtime(jwks_path.or(secret_path));
+        let stat_base = std::sync::Arc::new(std::sync::OnceLock::new());
+        stat_base
+            .set(std::time::Instant::now())
+            .expect("fresh base");
         Ok(Self {
             inner: std::sync::Arc::new(RwLock::new(std::sync::Arc::new(Loaded {
                 jwks,
@@ -84,16 +100,33 @@ impl JwtValidator {
             jwks_path: jwks_path.map(std::path::PathBuf::from),
             secret_path: secret_path.map(std::path::PathBuf::from),
             last_mtime: std::sync::Arc::new(std::sync::RwLock::new(last_mtime)),
+            last_stat_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            stat_base,
         })
     }
 
-    /// Reloads material when the file mtime changed. Cheap stat per
-    /// call; safe to invoke per request.
+    /// Reloads material when the file mtime changed.
+    ///
+    /// The `stat()` probe is throttled to one call per
+    /// [`MTIME_RECHECK`] (a syscall per request showed up in the dhat
+    /// hot-path profile); between probes the cached mtime is trusted.
     pub fn maybe_reload(&self) {
         let path = match (self.jwks_path.as_deref(), self.secret_path.as_deref()) {
             (Some(p), _) | (None, Some(p)) => p,
             (None, None) => return,
         };
+        // Monotonic throttle: skip the stat entirely inside the
+        // recheck window (Relaxed — a racing worker just stats once
+        // more). The base is construction time, so a rotation test
+        // (or operator) sleeping past the window always probes.
+        let base = self.stat_base.get().expect("base set at construction");
+        let now_ms = base.elapsed().as_millis() as u64;
+        let last = self.last_stat_ms.load(std::sync::atomic::Ordering::Relaxed);
+        if now_ms.wrapping_sub(last) < MTIME_RECHECK.as_millis() as u64 {
+            return;
+        }
+        self.last_stat_ms
+            .store(now_ms, std::sync::atomic::Ordering::Relaxed);
         let mtime = current_mtime(Some(path));
         let changed = {
             let last = self.last_mtime.read().expect("mtime lock");
@@ -324,6 +357,17 @@ mod tests {
         .expect("sign");
         let got = v.verify(&token).expect("verify");
         assert_eq!(got["sub"], "rsa-user");
+    }
+
+    #[test]
+    fn reload_probe_is_throttled_inside_window() {
+        // Within MTIME_RECHECK of construction the stat() probe is
+        // skipped (MM-01: no syscall per request); the last-probe
+        // marker stays at the epoch sentinel.
+        let dir = tempfile::tempdir().expect("dir");
+        let v = hs256_validator(dir.path());
+        v.maybe_reload();
+        assert_eq!(v.last_stat_ms.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[test]

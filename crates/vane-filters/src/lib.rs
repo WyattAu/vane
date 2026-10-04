@@ -32,7 +32,7 @@ pub fn log_hint(msg: &str) {
     let _ = msg;
 }
 
-pub use builtins::{BreakerGate, ForwardedHeaders, RateLimit, RequestId};
+pub use builtins::{BreakerGate, ForwardedHeaders, RateLimit, RequestId, StackStr};
 pub use pipeline::{Outcome, Pipeline};
 
 /// Mutable per-request filter context.
@@ -81,13 +81,18 @@ impl<'a> RequestCtx<'a> {
     }
 
     /// Injects an upstream header (dedup by name).
+    ///
+    /// When the header set is stable across requests (the common case:
+    /// recycled context storage + the same built-in headers), this
+    /// updates the slot in place — no allocation (`MM-01`).
     pub fn inject(&mut self, name: &str, value: &str) {
         if let Some(slot) = self
             .inject_headers
             .iter_mut()
             .find(|(n, _)| n.eq_ignore_ascii_case(name))
         {
-            slot.1 = value.to_owned();
+            slot.1.clear();
+            slot.1.push_str(value);
         } else {
             self.inject_headers
                 .push((name.to_owned(), value.to_owned()));

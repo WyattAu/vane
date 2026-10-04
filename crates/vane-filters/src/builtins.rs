@@ -71,17 +71,21 @@ impl Filter for RateLimit {
 
 /// A `core::fmt::Write` adapter over a stack byte buffer: formats
 /// without touching the heap.
-struct StackStr<'a> {
+pub struct StackStr<'a> {
     buf: &'a mut [u8],
     len: usize,
 }
 
 impl<'a> StackStr<'a> {
-    fn new(buf: &'a mut [u8]) -> Self {
+    /// New adapter over `buf` (empty).
+    #[must_use]
+    pub fn new(buf: &'a mut [u8]) -> Self {
         Self { buf, len: 0 }
     }
 
-    fn as_str(&self) -> &str {
+    /// The formatted prefix as `&str` (empty on overflow).
+    #[must_use]
+    pub fn as_str(&self) -> &str {
         core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
     }
 }
@@ -186,6 +190,10 @@ pub struct RequestId {
     counter: std::sync::atomic::AtomicU64,
 }
 
+/// Fixed layout: 12 hex (micros) + 4 hex (counter) + pid digits ≤ 7
+/// (Linux pid_t is bounded by /proc/sys/kernel/pid_max ≈ 7 digits).
+const REQUEST_ID_CAP: usize = 24;
+
 impl Filter for RequestId {
     fn name(&self) -> &'static str {
         "request_id"
@@ -195,13 +203,21 @@ impl Filter for RequestId {
         let n = self
             .counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let id = format!(
-            "{:012x}{:04x}{}",
-            now_micros(),
-            (n & 0xffff) as u16,
-            std::process::id()
-        );
-        ctx.inject("X-Request-Id", &id);
+        // Pre-format into a fixed stack buffer (`MM-01`): the former
+        // `format!` malloc'd (and freed) per request.
+        let mut buf = [0u8; REQUEST_ID_CAP];
+        let mut w = StackStr::new(&mut buf);
+        core::fmt::write(
+            &mut w,
+            format_args!(
+                "{:012x}{:04x}{}",
+                now_micros(),
+                (n & 0xffff) as u16,
+                std::process::id()
+            ),
+        )
+        .ok();
+        ctx.inject("X-Request-Id", w.as_str());
         Outcome::Continue
     }
 }
