@@ -187,6 +187,12 @@ pub(crate) struct WorkerState {
     /// their `on_upstream_connected` callback delivered on the next loop
     /// pass — the handler is not reachable from the connect call site.
     inline_connected: Vec<(u32, u16)>,
+    /// Read-dispatch scratch (`MM-01`): bytes are copied here (not into
+    /// a fresh `Vec`) before the handler runs — capacity is retained
+    /// across reads, so steady-state dispatch performs no allocation.
+    /// (The former per-read `to_vec` allocated two to three times per
+    /// proxied request.)
+    read_scratch: Vec<u8>,
 }
 
 impl WorkerState {
@@ -900,12 +906,18 @@ impl WorkerState {
                                 return;
                             };
                             let Some(rs) = s.rslot.take() else { return };
-                            let v = self.pool.slot(rs)[..n as usize].to_vec();
+                            // Copy into the worker's recycled scratch
+                            // instead of a fresh `Vec` (MM-01).
+                            let v = std::mem::take(&mut self.read_scratch);
+                            let mut v = v;
+                            v.clear();
+                            v.extend_from_slice(&self.pool.slot(rs)[..n as usize]);
                             self.pool.release(rs);
                             v
                         };
                         let mut io = self.io_for(slot, generation);
                         h.on_downstream_data(&mut io, &data);
+                        self.read_scratch = data;
                         self.arm_downstream_read(slot, generation);
                     }
                     Ok(0) => {
@@ -1068,12 +1080,17 @@ impl WorkerState {
                         return;
                     };
                     let Some(rs) = s.urslot.take() else { return };
-                    let v = self.pool.slot(rs)[..n as usize].to_vec();
+                    // Copy into the worker's recycled scratch (MM-01).
+                    let v = std::mem::take(&mut self.read_scratch);
+                    let mut v = v;
+                    v.clear();
+                    v.extend_from_slice(&self.pool.slot(rs)[..n as usize]);
                     self.pool.release(rs);
                     v
                 };
                 let mut io = self.io_for(slot, generation);
                 h.on_upstream_data(&mut io, &data);
+                self.read_scratch = data;
                 self.arm_upstream_read(slot, generation);
             }
             Ok(0) => {
@@ -1399,6 +1416,7 @@ pub fn spawn(
                 drain_deadline: None,
                 mode,
                 inline_connected: Vec::new(),
+                read_scratch: Vec::with_capacity(crate::buffer::DEFAULT_BUF_SIZE),
             },
             handler,
         };
