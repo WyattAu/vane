@@ -29,6 +29,9 @@ h3 = ["dep:quinn", "dep:h3", "dep:h3-quinn"]
 wasm = ["vane-plugins/wasm"]
 k8s = ["vane-control/k8s"]
 acme-pebble = []
+# mimalloc as the process global allocator (MM-02). Off by default:
+# tests/embedders keep the system allocator; release builds enable it.
+mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 vane-kernel = { workspace = true }
@@ -76,6 +79,7 @@ pem-rfc7468 = { workspace = true }
 quinn = { workspace = true, optional = true }
 h3 = { workspace = true, optional = true }
 h3-quinn = { workspace = true, optional = true }
+mimalloc = { workspace = true, optional = true }
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]

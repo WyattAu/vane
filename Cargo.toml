@@ -96,6 +96,10 @@ clap = { version = "4", features = ["derive"] }
 # Async (control plane only)
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
+# Global allocator option (MM-02): feature-gated, off by default so
+# no_std-targeting crates and exotic platforms keep the system
+# allocator.
+mimalloc = { version = "0.1", default-features = false }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 futures = "0.3"
 
