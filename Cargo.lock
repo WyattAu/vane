@@ -4040,6 +4040,7 @@ version = "0.5.5"
 dependencies = [
  "axum",
  "axum-stack",
+ "breaker",
  "bytes",
  "clap",
  "envstack",

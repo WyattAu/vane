@@ -140,6 +140,11 @@ struct Conn {
     tunnel: bool,
     remaining: u64,
     started: Option<Instant>,
+    /// The route cluster's circuit breaker, keyed by cluster name and
+    /// persisting across keep-alive transactions: one `cluster_breaker`
+    /// resolution per connection (not per request). Re-resolved when
+    /// the routed cluster changes.
+    breaker: Option<(String, std::sync::Arc<breaker::CircuitBreaker>)>,
     trace: Option<vane_observe::trace::TraceContext>,
     /// TLS termination state (TLS listeners only).
     tls: Option<rustls::ServerConnection>,
@@ -2337,10 +2342,16 @@ impl HttpProxy {
         };
         let want_gzip = route.compression && accepts_gzip;
 
-        // Stash transaction state.
+        // Stash transaction state. The breaker Arc is re-resolved only
+        // when the routed cluster changed on this connection.
+        let cached_breaker = match &self.conn(slot).breaker {
+            Some((cluster, cb)) if cluster == &route.cluster => Arc::clone(cb),
+            _ => self.breaker.cluster_breaker(&route.cluster),
+        };
         {
             let conn = self.conn(slot);
             conn.route = Some(Arc::clone(&route));
+            conn.breaker = Some((route.cluster.clone(), Arc::clone(&cached_breaker)));
             conn.upstream_path = Some(path_mut);
             conn.inject = inject;
             conn.started = Some(started);
@@ -2352,7 +2363,7 @@ impl HttpProxy {
             });
         }
 
-        if self.breaker.cluster_breaker(&route.cluster).is_open() {
+        if cached_breaker.is_open() {
             self.respond_full(io, Status::ServiceUnavailable, "circuit open\n");
             return;
         }
@@ -2517,6 +2528,9 @@ impl HttpProxy {
             self.access_emit(io, started);
             let conn = self.conns.get(&slot).expect("conn");
             if let Some(route) = &conn.route {
+                if let Some((_, cb)) = &conn.breaker {
+                    cb.record_success();
+                }
                 self.breaker.record_success(&route.cluster);
                 if let (Some(outlier), Some(addr)) = (&route.outlier, conn.upstream_addr) {
                     if conn.resp_status >= 500 {
