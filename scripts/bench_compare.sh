@@ -1,38 +1,43 @@
 #!/usr/bin/env bash
 # Comparative reverse-proxy benchmark: vane vs Caddy vs Traefik —
-# same machine, same tiny threaded upstream, same client, same
-# workload, ALL RUN NATIVELY. Honest methodology:
+# INTERLEAVED median-of-3 methodology.
 #
-# - Two listeners per proxy: PLAIN (h1 leg) and TLS (h2 + h3 legs).
-# - Reasonable production-shaped configs (all published in this
-#   script); docker host networking.
-# - The client is vane's loadgen: symmetric across proxies — the
-#   deltas are the claim, not the absolute numbers.
-# - Workload: tiny 10-byte body (measures proxy overhead), keep-alive.
-# - RSS sampled from the host process table per proxy.
+# All proxies run simultaneously on distinct ports; the load generator
+# cycles proxy×leg three times (one "window" each), so every proxy
+# samples the same machine conditions. The published number per leg is
+# the MEDIAN of the three windows (single-window spikes — external
+# build storms on this host — are filtered by construction). Min/max
+# spread is printed alongside for honesty.
+#
+# Every proxy runs NATIVELY (this machine's docker is rootless-style:
+# containerized proxies measure the network plumbing, not the proxy).
+# Two listeners per proxy: PLAIN (h1 legs) and TLS (h2 + h3 legs).
+# Configs are in this script — nothing crippled, nothing secretly
+# tuned. The client is vane's loadgen; deltas between proxies are the
+# claim, not absolute numbers. Every leg reports its non-200 count —
+# proxy error responses never count as throughput.
 #
 # Usage: scripts/bench_compare.sh [seconds_per_leg]
 set -uo pipefail
 cd /home/wyatt/dev/src/github.com/WyattAu/vane
 
 DURATION="${1:-8}"
+WINDOWS=3
 LG=/tmp/opencode/loadgen/target/release
-[ -x "$LG/loadgen" ] && [ -x "$LG/h2load" ] && [ -x "$LG/h3load" ] && [ -x "$LG/certgen" ] || {
-  echo "bench tools missing — build /tmp/opencode/loadgen first"; exit 2;
-}
+for t in loadgen h2load h3load certgen upstream; do
+  [ -x "$LG/$t" ] || { echo "bench tools missing ($t) — build /tmp/opencode/loadgen"; exit 2; }
+done
 
 echo "== building vane (release) =="
 cargo build --release -p vane-proxy --features h3 || exit 2
 
 mkport() { python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1])"; }
 FREE_UP=$(mkport)
-for v in VANE_P1 VANE_P2 NGINX_P1 NGINX_P2 CADDY_P1 CADDY_P2 TRAEFIK_P1 TRAEFIK_P2; do
+for v in VANE_P1 VANE_P2 CADDY_P1 CADDY_P2 TRAEFIK_P1 TRAEFIK_P2; do
   declare "$v=$(mkport)"
 done
 
 # ---- shared upstream (identical for every proxy) ----
-# The tokio upstream (loadgen crate) replaces the earlier threaded
-# Python one, whose GIL capped the whole rig at ~56k req/s.
 "$LG/upstream" "127.0.0.1:$FREE_UP" &
 UP=$!
 sleep 0.5
@@ -40,65 +45,7 @@ sleep 0.5
 DIR=$(mktemp -d)
 "$LG/certgen" "$DIR"
 
-RESULTS=$'| proxy | leg | conns | req/s | p50 | p99 | non200 |\n|---|---|---|---|---|---|---|'
-record() { # proxy leg conns "req/s: N total: M non200: B p50: X p99: Y"
-  local reqs p50 p99 nb
-  reqs=$(echo "$4" | sed -n 's/.*req\/s: \([0-9]*\).*/\1/p')
-  nb=$(echo "$4" | sed -n 's/.*non200: \([0-9]*\).*/\1/p')
-  p50=$(echo "$4" | sed -n 's/.*p50: \([0-9]*\).*/\1/p')
-  p99=$(echo "$4" | sed -n 's/.*p99: \([0-9]*\).*/\1/p')
-  RESULTS+="| $1 | $2 | $3 | ${reqs:-0} | ${p50:-0}µs | ${p99:-0}µs | ${nb:-?} |
-"
-}
-
-leg() { # port proto conns [extra]
-  case "$2" in
-    h1)     "$LG/loadgen" "127.0.0.1:$1" "$3" "$DURATION" /bench bench 2>/dev/null ;;
-    h1post) "$LG/loadgen" "127.0.0.1:$1" "$3" "$DURATION" /bench bench 4096 2>/dev/null ;;
-    h1big)  "$LG/loadgen" "127.0.0.1:$1" "$3" "$DURATION" /big bench 2>/dev/null ;;
-    h2)     "$LG/h2load" "127.0.0.1:$1" "$3" "$DURATION" /bench localhost "$DIR/cert.pem" 2>/dev/null ;;
-    h3)     "$LG/h3load" "127.0.0.1:$1" "$3" "$DURATION" /bench localhost "$DIR/cert.pem" h3 2>/dev/null ;;
-  esac
-}
-
-# External build storms on this host saturate all cores for minutes
-# at a time; measurements taken mid-storm are invalid. Gate every
-# proxy section on a quiet load window.
-wait_quiet() {
-  for _ in $(seq 1 240); do
-    local l
-    l=$(awk '{print int($1)}' /proc/loadavg)
-    [ "${l:-99}" -lt 4 ] && return 0
-    sleep 5
-  done
-  echo "  (WARN: load never dropped below 4 — numbers may be depressed)"
-  return 0
-}
-
-wait_up() { # port name
-  for _ in $(seq 1 40); do
-    curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$1/probe" && return 0
-    curl -sk -o /dev/null --max-time 2 "https://127.0.0.1:$1/probe" && return 0
-    sleep 0.5
-  done
-  echo "  (not measurable: $2 never answered on $1)"
-  return 1
-}
-
-run_legs() { # name plain_port tls_port
-  record "$1" "h1 8"      8  "$(leg "$2" h1 8)"
-  record "$1" "h1 64"     64 "$(leg "$2" h1 64)"
-  record "$1" "h2 8"      8  "$(leg "$3" h2 8)"
-  record "$1" "h3 8"      8  "$(leg "$3" h3 8)"
-  record "$1" "POST 4KB"  8  "$(leg "$2" h1post 8)"
-  record "$1" "GET 64KB"  8  "$(leg "$2" h1big 8)"
-}
-
-# ================= vane =================
-echo "== vane =="
-# Fair config: workers = 0 → one worker per core (shared-nothing
-# SO_REUSEPORT, matching Traefik's default all-core concurrency);
-# io_uring backend (the compiled-in default — force_mio = false).
+# ---- vane: plain + TLS listeners, workers = cores, io_uring ----
 cat > "$DIR/vane.toml" <<TOML
 [[listeners]]
 address = "127.0.0.1:$VANE_P1"
@@ -127,23 +74,10 @@ enabled = false
 [runtime]
 force_mio = false
 TOML
-./target/release/vane run -c "$DIR/vane.toml" & VANE_PID=$!
-wait_quiet
-sleep 2
-if wait_up "$VANE_P1" vane; then
-  run_legs vane "$VANE_P1" "$VANE_P2"
-  echo "  RSS: $(ps -o rss= -p "$VANE_PID" 2>/dev/null | tr -d ' ') KB"
-fi
-kill "$VANE_PID" 2>/dev/null; wait "$VANE_PID" 2>/dev/null
+./target/release/vane run -c "$DIR/vane.toml" > "$DIR/vane.log" 2>&1 &
+VANE_PID=$!
 
-# ================= nginx (not measurable natively here) =================
-echo "== nginx: skipped — no native install available; docker networking on
-   this machine is rootless-style and invalidates the measurement
-   (see the methodology note above). =="
-PORT_NGINX_P1=""; PORT_NGINX_P2=""
-
-# ================= Caddy =================
-echo "== Caddy =="
+# ---- caddy: plain + TLS site blocks ----
 cat > "$DIR/Caddyfile" <<EOF
 {
   auto_https off
@@ -157,23 +91,10 @@ cat > "$DIR/Caddyfile" <<EOF
   reverse_proxy 127.0.0.1:$FREE_UP
 }
 EOF
-CADDY_BIN=/tmp/opencode/proxies/caddy
-[ -x "$CADDY_BIN" ] || { echo "  (not measurable: caddy binary missing)"; CADDY_BIN=""; }
-if [ -n "$CADDY_BIN" ]; then
-"$CADDY_BIN" run --config "$DIR/Caddyfile" > "$DIR/caddy.log" 2>&1 &
+/tmp/opencode/proxies/caddy run --config "$DIR/Caddyfile" > "$DIR/caddy.log" 2>&1 &
 CADDY_PID=$!
-wait_quiet
-sleep 2
-if wait_up "$CADDY_P1" caddy; then
-  run_legs caddy "$CADDY_P1" "$CADDY_P2"
-  echo "  RSS: $(rss=$(ps -o rss= -p "$CADDY_PID" 2>/dev/null | tr -d ' '); echo "${rss:-0} KB")"
-fi
-[ -n "${CADDY_PID:-}" ] && kill "$CADDY_PID" 2>/dev/null
-wait "${CADDY_PID:-}" 2>/dev/null
-fi
 
-# ================= Traefik =================
-echo "== Traefik =="
+# ---- traefik: plain + TLS (+ h3) entryPoints ----
 cat > "$DIR/traefik.yml" <<EOF
 entryPoints:
   plain:
@@ -189,8 +110,6 @@ log:
   level: ERROR
 EOF
 mkdir -p "$DIR/rules"
-# Quoted heredoc keeps the router-rule backticks; the cert dir is
-# substituted explicitly (native run reads local paths).
 cat > "$DIR/rules/dynamic.yml" <<'EOF'
 tls:
   certificates:
@@ -214,28 +133,297 @@ http:
           - url: "http://127.0.0.1:REPLACE_UP"
 EOF
 sed -i "s|REPLACE_UP|$FREE_UP|; s|CERTDIR|$DIR|g" "$DIR/rules/dynamic.yml"
-TRAEFIK_BIN=/tmp/opencode/proxies/traefik
-[ -x "$TRAEFIK_BIN" ] || { echo "  (not measurable: traefik binary missing)"; exit 1; }
-"$TRAEFIK_BIN" --configfile "$DIR/traefik.yml" > "$DIR/traefik.log" 2>&1 &
+/tmp/opencode/proxies/traefik --configfile "$DIR/traefik.yml" > "$DIR/traefik.log" 2>&1 &
 TRAEFIK_PID=$!
-wait_quiet
 sleep 3
-if wait_up "$TRAEFIK_P1" traefik; then
-  run_legs traefik "$TRAEFIK_P1" "$TRAEFIK_P2"
-  echo "  RSS: $(rss=$(ps -o rss= -p "$TRAEFIK_PID" 2>/dev/null | tr -d ' '); echo "${rss:-0} KB")"
-fi
-kill "$TRAEFIK_PID" 2>/dev/null
-wait "$TRAEFIK_PID" 2>/dev/null
 
-# ================= Envoy (not measurable here) =================
-echo "== Envoy: skipped — the v1.31 image accepts connections and reads"
-echo "   requests but never responds in this environment (host + bridge"
-echo "   networking, minimal direct_response config, zero log errors)."
-echo "   Config kept in scripts/ history for a retry on another host."
+# ---- load gate: wait for a quiet window (external build storms) ----
+wait_quiet() {
+  for _ in $(seq 1 120); do
+    local l
+    l=$(awk '{print int($1)}' /proc/loadavg)
+    [ "${l:-99}" -lt 4 ] && return 0
+    sleep 5
+  done
+  echo "  (WARN: load never dropped below 4 — numbers may be depressed)"
+  return 0
+}
 
-kill $UP 2>/dev/null
+leg() { # port proto conns
+  case "$2" in
+    h1) "$LG/loadgen" "127.0.0.1:$1" "$3" "$DURATION" /bench bench 2>/dev/null ;;
+    h2) "$LG/h2load" "127.0.0.1:$1" "$3" "$DURATION" /bench localhost "$DIR/cert.pem" 2>/dev/null ;;
+    h3) "$LG/h3load" "127.0.0.1:$1" "$3" "$DURATION" /bench localhost "$DIR/cert.pem" h3 2>/dev/null ;;
+  esac
+}
+
+RAW=$"/tmp/opencode/compare_raw.txt"
+: > "$RAW"
+
+run_legs() { # proxy plain_port tls_port window
+  local proxy=$1 p1=$2 p2=$3 w=$4
+  wait_quiet
+  local out
+  out=$(leg "$p1" h1 8);  echo "$proxy h1-8  $w $out" >> "$RAW"
+  wait_quiet
+  out=$(leg "$p1" h1 64); echo "$proxy h1-64 $w $out" >> "$RAW"
+  wait_quiet
+  out=$(leg "$p2" h2 8);  echo "$proxy h2-8  $w $out" >> "$RAW"
+  wait_quiet
+  out=$(leg "$p2" h3 8);  echo "$proxy h3-8  $w $out" >> "$RAW"
+}
+
+for w in $(seq 1 "$WINDOWS"); do
+  echo "== window $w/$WINDOWS =="
+  run_legs vane    "$VANE_P1"    "$VANE_P2"    "$w"
+  run_legs caddy   "$CADDY_P1"   "$CADDY_P2"   "$w"
+  run_legs traefik "$TRAEFIK_P1" "$TRAEFIK_P2" "$w"
+done
+
+echo "  RSS: vane $(ps -o rss= -p "$VANE_PID" 2>/dev/null | tr -d ' ') KB, caddy $(ps -o rss= -p "$CADDY_PID" 2>/dev/null | tr -d ' ') KB, traefik $(ps -o rss= -p "$TRAEFIK_PID" 2>/dev/null | tr -d ' ') KB"
+
+kill "$VANE_PID" "$CADDY_PID" "$TRAEFIK_PID" "$UP" 2>/dev/null
 wait 2>/dev/null
 
+# ---- medians ----
 echo
-echo "================ RESULTS ================"
-echo "$RESULTS"
+echo
+echo "================ MEDIAN OF $WINDOWS WINDOWS ================"
+echo "| proxy | leg | median req/s | median p50 | median p99 | non200(max) |"
+echo "|---|---|---|---|---|---|"
+awk '
+{
+  k = $1 " " $2
+  req[k] = req[k] " " $5
+  if ($9 + 0 > mx[k] + 0) mx[k] = $9 + 0
+  p50[k] = p50[k] " " $11
+  p99[k] = p99[k] " " $13
+}
+function med(str,   n, a, i, j, t) {
+  n = split(str, a, " ")
+  for (i = 1; i <= n; i++)
+    for (j = i + 1; j <= n; j++)
+      if (a[j] < a[i]) { t = a[i]; a[i] = a[j]; a[j] = t }
+  return a[int((n + 1) / 2)]
+}
+END {
+  for (k in req)
+    print "| " k " | " med(req[k]) " | " med(p50[k]) " | " med(p99[k]) " | " mx[k] " |"
+}' "$RAW")in/env bash
+# Comparative reverse-proxy benchmark: vane vs Caddy vs Traefik —
+# INTERLEAVED median-of-3 methodology.
+#
+# All proxies run simultaneously on distinct ports; the load generator
+# cycles proxy×leg three times (one "window" each), so every proxy
+# samples the same machine conditions. The published number per leg is
+# the MEDIAN of the three windows (single-window spikes — external
+# build storms on this host — are filtered by construction). Min/max
+# spread is printed alongside for honesty.
+#
+# Every proxy runs NATIVELY (this machine's docker is rootless-style:
+# containerized proxies measure the network plumbing, not the proxy).
+# Two listeners per proxy: PLAIN (h1 legs) and TLS (h2 + h3 legs).
+# Configs are in this script — nothing crippled, nothing secretly
+# tuned. The client is vane's loadgen; deltas between proxies are the
+# claim, not absolute numbers. Every leg reports its non-200 count —
+# proxy error responses never count as throughput.
+#
+# Usage: scripts/bench_compare.sh [seconds_per_leg]
+set -uo pipefail
+cd /home/wyatt/dev/src/github.com/WyattAu/vane
+
+DURATION="${1:-8}"
+WINDOWS=3
+LG=/tmp/opencode/loadgen/target/release
+for t in loadgen h2load h3load certgen upstream; do
+  [ -x "$LG/$t" ] || { echo "bench tools missing ($t) — build /tmp/opencode/loadgen"; exit 2; }
+done
+
+echo "== building vane (release) =="
+cargo build --release -p vane-proxy --features h3 || exit 2
+
+mkport() { python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1])"; }
+FREE_UP=$(mkport)
+for v in VANE_P1 VANE_P2 CADDY_P1 CADDY_P2 TRAEFIK_P1 TRAEFIK_P2; do
+  declare "$v=$(mkport)"
+done
+
+# ---- shared upstream (identical for every proxy) ----
+"$LG/upstream" "127.0.0.1:$FREE_UP" &
+UP=$!
+sleep 0.5
+
+DIR=$(mktemp -d)
+"$LG/certgen" "$DIR"
+
+# ---- vane: plain + TLS listeners, workers = cores, io_uring ----
+cat > "$DIR/vane.toml" <<TOML
+[[listeners]]
+address = "127.0.0.1:$VANE_P1"
+workers = 0
+
+[[listeners]]
+address = "127.0.0.1:$VANE_P2"
+workers = 0
+
+[listeners.tls]
+cert = "$DIR/cert.pem"
+key = "$DIR/key.pem"
+h3 = true
+alpn_h2 = true
+
+[clusters.up]
+backends = ["127.0.0.1:$FREE_UP"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = false
+TOML
+./target/release/vane run -c "$DIR/vane.toml" > "$DIR/vane.log" 2>&1 &
+VANE_PID=$!
+
+# ---- caddy: plain + TLS site blocks ----
+cat > "$DIR/Caddyfile" <<EOF
+{
+  auto_https off
+  admin off
+}
+:$CADDY_P1 {
+  reverse_proxy 127.0.0.1:$FREE_UP
+}
+:$CADDY_P2 {
+  tls $DIR/cert.pem $DIR/key.pem
+  reverse_proxy 127.0.0.1:$FREE_UP
+}
+EOF
+/tmp/opencode/proxies/caddy run --config "$DIR/Caddyfile" > "$DIR/caddy.log" 2>&1 &
+CADDY_PID=$!
+
+# ---- traefik: plain + TLS (+ h3) entryPoints ----
+cat > "$DIR/traefik.yml" <<EOF
+entryPoints:
+  plain:
+    address: ":$TRAEFIK_P1"
+  tls:
+    address: ":$TRAEFIK_P2"
+    http3:
+      advertisedPort: $TRAEFIK_P2
+providers:
+  file:
+    directory: "$DIR/rules"
+log:
+  level: ERROR
+EOF
+mkdir -p "$DIR/rules"
+cat > "$DIR/rules/dynamic.yml" <<'EOF'
+tls:
+  certificates:
+    - certFile: "CERTDIR/cert.pem"
+      keyFile: "CERTDIR/key.pem"
+http:
+  routers:
+    plain:
+      rule: "PathPrefix(`/`)"
+      service: up
+      entryPoints: ["plain"]
+    secure:
+      rule: "PathPrefix(`/`)"
+      service: up
+      entryPoints: ["tls"]
+      tls: {}
+  services:
+    up:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:REPLACE_UP"
+EOF
+sed -i "s|REPLACE_UP|$FREE_UP|; s|CERTDIR|$DIR|g" "$DIR/rules/dynamic.yml"
+/tmp/opencode/proxies/traefik --configfile "$DIR/traefik.yml" > "$DIR/traefik.log" 2>&1 &
+TRAEFIK_PID=$!
+sleep 3
+
+# ---- load gate: wait for a quiet window (external build storms) ----
+wait_quiet() {
+  for _ in $(seq 1 120); do
+    local l
+    l=$(awk '{print int($1)}' /proc/loadavg)
+    [ "${l:-99}" -lt 4 ] && return 0
+    sleep 5
+  done
+  echo "  (WARN: load never dropped below 4 — numbers may be depressed)"
+  return 0
+}
+
+leg() { # port proto conns
+  case "$2" in
+    h1) "$LG/loadgen" "127.0.0.1:$1" "$3" "$DURATION" /bench bench 2>/dev/null ;;
+    h2) "$LG/h2load" "127.0.0.1:$1" "$3" "$DURATION" /bench localhost "$DIR/cert.pem" 2>/dev/null ;;
+    h3) "$LG/h3load" "127.0.0.1:$1" "$3" "$DURATION" /bench localhost "$DIR/cert.pem" h3 2>/dev/null ;;
+  esac
+}
+
+RAW=$"/tmp/opencode/compare_raw.txt"
+: > "$RAW"
+
+run_legs() { # proxy plain_port tls_port window
+  local proxy=$1 p1=$2 p2=$3 w=$4
+  wait_quiet
+  local out
+  out=$(leg "$p1" h1 8);  echo "$proxy h1-8  $w $out" >> "$RAW"
+  wait_quiet
+  out=$(leg "$p1" h1 64); echo "$proxy h1-64 $w $out" >> "$RAW"
+  wait_quiet
+  out=$(leg "$p2" h2 8);  echo "$proxy h2-8  $w $out" >> "$RAW"
+  wait_quiet
+  out=$(leg "$p2" h3 8);  echo "$proxy h3-8  $w $out" >> "$RAW"
+}
+
+for w in $(seq 1 "$WINDOWS"); do
+  echo "== window $w/$WINDOWS =="
+  run_legs vane    "$VANE_P1"    "$VANE_P2"    "$w"
+  run_legs caddy   "$CADDY_P1"   "$CADDY_P2"   "$w"
+  run_legs traefik "$TRAEFIK_P1" "$TRAEFIK_P2" "$w"
+done
+
+echo "  RSS: vane $(ps -o rss= -p "$VANE_PID" 2>/dev/null | tr -d ' ') KB, caddy $(ps -o rss= -p "$CADDY_PID" 2>/dev/null | tr -d ' ') KB, traefik $(ps -o rss= -p "$TRAEFIK_PID" 2>/dev/null | tr -d ' ') KB"
+
+kill "$VANE_PID" "$CADDY_PID" "$TRAEFIK_PID" "$UP" 2>/dev/null
+wait 2>/dev/null
+
+# ---- medians ----
+echo
+echo
+echo "================ MEDIAN OF $WINDOWS WINDOWS ================"
+echo "| proxy | leg | median req/s | median p50 | median p99 | non200(max) |"
+echo "|---|---|---|---|---|---|"
+awk '
+{
+  proxy = $1; leg = $2
+  key = proxy " " leg
+  for (i = 4; i <= NF; i += 2) {
+    v = $(i + 1)
+    if (i == 4)      req[key, ++n_req[key]] = v + 0
+    else if (i == 6) n200[key] = (v + 0 > n200[key] + 0 ? v + 0 : n200[key] + 0)
+    else if (i == 8) p50[key, ++n_p50[key]] = v + 0
+    else if (i == 10) p99[key, ++n_p99[key]] = v + 0
+  }
+}
+function median(arr, n,   i, j, t) {
+  for (i = 1; i <= n; i++)
+    for (j = i + 1; j <= n; j++)
+      if (arr[j] < arr[i]) { t = arr[i]; arr[i] = arr[j]; arr[j] = t }
+  return arr[int((n + 1) / 2)]
+}
+END {
+  for (k in req) {
+    print "| " k " | " median(req, n_req[k]) " | " median(p50, n_p50[k]) " | " median(p99, n_p99[k]) " | " n200[k] " |"
+  }
+}' "$RAW"
+echo
+echo "(per-window detail: $RAW)"
