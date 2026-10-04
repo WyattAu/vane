@@ -153,6 +153,9 @@ struct Conn {
     /// Upstream-bound bytes deferred behind flow control (flushed on
     /// upstream-write completion).
     up_buf: Vec<u8>,
+    /// Recycled chunk staging for `upstream_flush` (`MM-01`): the
+    /// former `drain(..).collect()` malloc'd per deferred write.
+    up_out: Vec<u8>,
     /// A chunk of upstream-bound bytes is in flight.
     up_write_out: bool,
     /// Unconsumed ciphertext tail (partial TLS records between reads).
@@ -257,6 +260,10 @@ pub struct HttpProxy {
     plugins: Vec<vane_plugins::PluginInstance>,
     metrics: ProxyMetrics,
     worker_id: usize,
+    /// Per-worker scratch pool for head parsing (`MM-01`): taken,
+    /// filled, and returned per intake — capacity is retained across
+    /// requests, so steady-state parsing performs no allocation.
+    head_scratch: Vec<u8>,
 }
 
 struct ProxyMetrics {
@@ -371,6 +378,7 @@ impl HttpProxy {
             plugins,
             metrics,
             worker_id,
+            head_scratch: Vec::with_capacity(HEAD_SCRATCH_CAP),
         }
     }
 
@@ -500,10 +508,18 @@ impl HttpProxy {
                 return;
             }
             let n = conn.up_buf.len().min(UP_CHUNK);
-            conn.up_buf.drain(..n).collect::<Vec<u8>>()
+            // Stage the chunk into the connection's recycled buffer
+            // (zero alloc after warmup, `MM-01`).
+            let mut out = std::mem::take(&mut conn.up_out);
+            out.clear();
+            out.extend_from_slice(conn.up_buf.drain(..n).as_slice());
+            out
         };
         self.conn(slot).up_write_out = true;
         io.write_upstream(&chunk);
+        // The write copies into the kernel's pool slot synchronously;
+        // the staging buffer returns for the next chunk.
+        self.conn(slot).up_out = chunk;
     }
 
     /// Feeds upstream ciphertext into the mesh TLS state; returns the
@@ -1274,10 +1290,17 @@ impl HttpProxy {
             let conn = self.conn(slot);
             conn.head_buf.extend_from_slice(data);
         }
-        let buf = self.conn(slot).head_buf.clone();
+        // Parse from the worker's recycled scratch (MM-01): capacity is
+        // retained across requests, so after warmup this is a memcpy —
+        // the former per-request `head_buf.clone()` malloc'd every time
+        // a client streamed head bytes.
+        let mut buf = std::mem::take(&mut self.head_scratch);
+        buf.clear();
+        buf.extend_from_slice(&self.conn(slot).head_buf);
         let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
         match RequestView::parse_in(&buf, &mut storage) {
             Parsed::Partial => {
+                self.head_scratch = buf;
                 // Refresh idle deadline while the client streams the head.
                 io.set_deadline(
                     Some(self.deadline(self.config.idle_timeout_ms)),
@@ -1285,6 +1308,7 @@ impl HttpProxy {
                 );
             }
             Parsed::Error(e) => {
+                self.head_scratch = buf;
                 let status = match e {
                     vane_proto::request::ParseError::TooLarge => Status::PayloadTooLarge,
                     // Ambiguous framing (CL+TE, duplicate CL, non-chunked
@@ -1299,6 +1323,9 @@ impl HttpProxy {
             Parsed::Complete(view, head_len) => {
                 self.metrics.requests.inc(&self.config.registry);
                 self.handle_request(io, &view, head_len);
+                // Scratch capacity returns to the pool (the view's
+                // borrow ends with the dispatch).
+                self.head_scratch = buf;
             }
         }
     }
@@ -1525,6 +1552,12 @@ static MIRROR_RR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 /// Handler-side cap for body bytes arriving before the upstream
 /// connects. The window is one dial; anything beyond this is abusive.
 const REQ_PENDING_CAP: usize = 1024 * 1024;
+
+/// Warmup capacity of the per-worker head-parse scratch (`MM-01`):
+/// covers the request-head cap (`MAX_HEADERS` lines ≈ 16 KiB) plus the
+/// first body bytes typically coalesced into the same read, so the
+/// steady-state `extend_from_slice` never reallocates.
+const HEAD_SCRATCH_CAP: usize = 16 * 1024;
 
 /// Hop-by-hop headers the proxy manages itself (ASCII-case-insensitive).
 fn is_hop_by_hop(name: &str) -> bool {
@@ -1777,14 +1810,7 @@ impl Handler for HttpProxy {
             }
         }
         self.conn(slot).upstream_ready = true;
-        let (route, upstream_path, inject) = {
-            let conn = self.conn(slot);
-            (
-                conn.route.clone().expect("route"),
-                conn.upstream_path.clone().expect("path"),
-                std::mem::take(&mut conn.inject),
-            )
-        };
+        let route = self.conn(slot).route.clone().expect("route");
         // HTTP/2 upstream: speak h2 to the backend (prior knowledge),
         // translating the buffered h1 request head.
         #[cfg(feature = "h2")]
@@ -1859,15 +1885,32 @@ impl Handler for HttpProxy {
         // buffer; the handler call is synchronous so this is safe).
         // Zero-copy: take the buffer (capacity preserved across the
         // transaction) instead of cloning the head per request.
-        let buf = std::mem::take(&mut self.conn(slot).head_buf);
+        let mut buf = std::mem::take(&mut self.conn(slot).head_buf);
+        // Path + inject storage also move by take (`MM-01`): the build
+        // below borrows them, then both return to the connection —
+        // the former `upstream_path.clone()` allocated per request.
+        let path_taken = self.conn(slot).upstream_path.take();
+        let inject = std::mem::take(&mut self.conn(slot).inject);
         let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
         if let Parsed::Complete(view, head_len) = RequestView::parse_in(&buf, &mut storage) {
-            // Head-only copy for response-phase retry (5xx failover).
-            self.conn(slot).req_head_copy = buf[..head_len].to_vec();
+            // Head-only copy for response-phase retry (5xx failover),
+            // recycled across requests (`MM-01`).
+            {
+                let conn = self.conn(slot);
+                let mut rhc = std::mem::take(&mut conn.req_head_copy);
+                rhc.clear();
+                rhc.extend_from_slice(&buf[..head_len]);
+                conn.req_head_copy = rhc;
+            }
             // Recycled scratch: one allocation for the connection's
             // lifetime instead of one per request.
             let mut head = std::mem::take(&mut self.conn(slot).head_out);
-            self.build_upstream_head(&mut head, &view, &route, &upstream_path, &inject, false, 0);
+            let path: &str = path_taken.as_deref().expect("path");
+            self.build_upstream_head(&mut head, &view, &route, path, &inject, false, 0);
+            // Storage returns to the connection before any fallible
+            // step (retry/failover re-dials reuse it).
+            self.conn(slot).inject = inject;
+            self.conn(slot).upstream_path = path_taken;
             // Mirror (fire-and-forget): a detached thread copies the
             // request to the shadow cluster. Every error is ignored —
             // mirroring never delays or fails the real response.
@@ -1937,6 +1980,13 @@ impl Handler for HttpProxy {
             if !pending.is_empty() {
                 self.upstream_send(io, &pending);
             }
+            // Restore the head buffer (capacity preserved, `MM-01`):
+            // drop the forwarded head + inline body bytes, keep any
+            // pipelined tail for the next transaction. (The dial
+            // previously took the buffer without restoring it, so
+            // head_buf re-grew from scratch every request.)
+            buf.drain(..head_len + body.len());
+            self.conn(slot).head_buf = buf;
             // The local buffer was drained above and restored to the
             // connection (capacity preserved) — no re-parse of old
             // bytes on the next keep-alive transaction. The first-byte
@@ -2146,11 +2196,23 @@ impl HttpProxy {
             let conn = self.conn(slot);
             conn.req_method.clear();
             conn.req_method.push_str(view.method);
-            conn.req_host = view
+            // In-place reuse (`MM-01`): clear + refill keeps the
+            // String capacity; the former `to_owned` allocated per
+            // request.
+            match view
                 .header("host")
                 .and_then(|h| std::str::from_utf8(h).ok())
-                .map(|h| h.split(':').next().unwrap_or(h).to_owned());
-            conn.req_path = view.path.to_owned();
+                .map(|h| h.split(':').next().unwrap_or(h))
+            {
+                Some(h) => {
+                    let slot_str = conn.req_host.get_or_insert_with(String::new);
+                    slot_str.clear();
+                    slot_str.push_str(h);
+                }
+                None => conn.req_host = None,
+            }
+            conn.req_path.clear();
+            conn.req_path.push_str(view.path);
             conn.resp_status = 0;
             conn.bytes_out = 0;
             conn.access_logged = false;
@@ -2295,30 +2357,44 @@ impl HttpProxy {
         // take the streaming relay path instead of re-entering here).
         conn_set_framing(&mut self.conns, slot, view);
 
-        // Path rewrite.
-        let upstream_path = route
+        // Path rewrite into the connection's recycled buffer (`MM-01`):
+        // one String per connection, cleared and refilled per request —
+        // no per-request allocation (the former `to_owned` + pipeline
+        // clone allocated twice per request).
+        let mut path_buf = self.conn(slot).upstream_path.take().unwrap_or_default();
+        path_buf.clear();
+        match route
             .strip_prefix
             .as_ref()
-            .and_then(|p| {
-                view.path.strip_prefix(p.as_str()).map(|rest| {
-                    if rest.starts_with('/') {
-                        rest.to_owned()
-                    } else {
-                        format!("/{rest}")
-                    }
-                })
-            })
-            .unwrap_or_else(|| view.path.to_owned());
+            .and_then(|p| view.path.strip_prefix(p.as_str()))
+        {
+            Some(rest) if rest.starts_with('/') => path_buf.push_str(rest),
+            Some(rest) => {
+                path_buf.push('/');
+                path_buf.push_str(rest);
+            }
+            None => path_buf.push_str(view.path),
+        }
 
-        // Filter pipeline (scoped: ctx borrows `path_mut`).
-        let mut path_mut = upstream_path.clone();
+        // Filter pipeline (scoped: ctx borrows `path_buf`).
         let peer = io
             .peer()
             .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+        // Seed the pipeline with the connection's recycled inject
+        // storage: after warmup the header set is stable, so injection
+        // updates slots in place (see `RequestCtx::inject`) — no
+        // per-request Vec/String allocation.
+        let recycled_inject = std::mem::take(&mut self.conn(slot).inject);
         let (inject, short_circuit, trace) = {
-            let mut ctx = RequestCtx::new(view.method, &mut path_mut, peer, host_only);
+            let mut ctx = RequestCtx::new(view.method, &mut path_buf, peer, host_only);
+            ctx.inject_headers = recycled_inject;
             ctx.cluster = Some(&route.cluster);
-            ctx.inject("X-Forwarded-For", &peer.ip().to_string());
+            // Stack-format the client IP (`MM-01`): the former
+            // `ip().to_string()` malloc'd per request.
+            let mut ipbuf = [0u8; 46]; // max IPv6 text length
+            let mut ipw = vane_filters::StackStr::new(&mut ipbuf);
+            core::fmt::write(&mut ipw, format_args!("{}", peer.ip())).ok();
+            ctx.inject("X-Forwarded-For", ipw.as_str());
             // Scheme as this edge saw it: TLS-terminating listeners report
             // https (the h2 edge path does the same). Never trust an
             // inbound X-Forwarded-Proto — build_upstream_head strips it.
@@ -2383,7 +2459,7 @@ impl HttpProxy {
                 .collect();
             let mut rejected = None;
             for plugin in &mut self.plugins {
-                match plugin.on_request_with_headers(&upstream_path, &headers) {
+                match plugin.on_request_with_headers(&path_buf, &headers) {
                     Ok(vane_plugins::GuestVerdict::Continue) => {}
                     Ok(vane_plugins::GuestVerdict::Reject(code)) => {
                         rejected = Some(code);
@@ -2441,7 +2517,9 @@ impl HttpProxy {
             let conn = self.conn(slot);
             conn.route = Some(Arc::clone(&route));
             conn.breaker = Some((route.cluster.clone(), Arc::clone(&cached_breaker)));
-            conn.upstream_path = Some(path_mut);
+            // The recycled path buffer parks here until dial; the
+            // dial restores it after building the upstream head.
+            conn.upstream_path = Some(path_buf);
             conn.inject = inject;
             conn.started = Some(started);
             conn.close_after = view.wants_close();
@@ -2638,7 +2716,8 @@ impl HttpProxy {
                 let conn = self.conn(slot);
                 conn.head_buf.clear();
                 conn.route = None;
-                conn.upstream_path = None;
+                // upstream_path stays parked (capacity reused next
+                // request; refilled from scratch via take+clear).
                 conn.body = BodyFraming::AwaitingHead;
                 conn.remaining = 0;
                 conn.close_after = false;
