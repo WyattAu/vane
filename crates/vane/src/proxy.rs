@@ -456,31 +456,35 @@ impl HttpProxy {
 
     fn upstream_send(&mut self, io: &mut SessionIo<'_>, plaintext: &[u8]) {
         let slot = io.slot_index();
-        let ready = if let Some(tls) = self.conns.get_mut(&slot).and_then(|c| c.tls_up.as_mut()) {
-            use std::io::Write as _;
-            if tls.writer().write_all(plaintext).is_err() {
-                io.close();
-                return;
-            }
-            let mut ciphertext = Vec::with_capacity(17 * 1024);
-            let mut buf = [0u8; 17 * 1024];
-            loop {
-                match tls.write_tls(&mut buf.as_mut_slice()) {
-                    Ok(0) => break,
-                    Ok(n) => ciphertext.extend_from_slice(&buf[..n]),
-                    Err(_) => {
-                        io.close();
-                        return;
+        // Encrypt through mesh TLS when configured; otherwise relay the
+        // caller's bytes directly (no copy — `MM-01`).
+        let ciphertext =
+            if let Some(tls) = self.conns.get_mut(&slot).and_then(|c| c.tls_up.as_mut()) {
+                use std::io::Write as _;
+                if tls.writer().write_all(plaintext).is_err() {
+                    io.close();
+                    return;
+                }
+                let mut ciphertext = Vec::with_capacity(17 * 1024);
+                let mut buf = [0u8; 17 * 1024];
+                loop {
+                    match tls.write_tls(&mut buf.as_mut_slice()) {
+                        Ok(0) => break,
+                        Ok(n) => ciphertext.extend_from_slice(&buf[..n]),
+                        Err(_) => {
+                            io.close();
+                            return;
+                        }
                     }
                 }
-            }
-            ciphertext
-        } else {
-            plaintext.to_vec()
-        };
+                Some(ciphertext)
+            } else {
+                None
+            };
+        let ready: &[u8] = ciphertext.as_deref().unwrap_or(plaintext);
         {
             let conn = self.conn(slot);
-            conn.up_buf.extend_from_slice(&ready);
+            conn.up_buf.extend_from_slice(ready);
             // Runaway guard: deferral is bounded (the old close-on-
             // overflow only tripped at 1 MiB; this allows deep bursts
             // but still kills truly stuck streams).
@@ -2516,7 +2520,16 @@ impl HttpProxy {
         {
             let conn = self.conn(slot);
             conn.route = Some(Arc::clone(&route));
-            conn.breaker = Some((route.cluster.clone(), Arc::clone(&cached_breaker)));
+            // Re-resolve the breaker Arc only when the routed cluster
+            // changed (a per-request tuple rebuild cloned the cluster
+            // name every request).
+            if conn
+                .breaker
+                .as_ref()
+                .is_none_or(|(c, _)| c != &route.cluster)
+            {
+                conn.breaker = Some((route.cluster.clone(), Arc::clone(&cached_breaker)));
+            }
             // The recycled path buffer parks here until dial; the
             // dial restores it after building the upstream head.
             conn.upstream_path = Some(path_buf);
@@ -2597,13 +2610,14 @@ impl HttpProxy {
             let bytes = &data[..n];
             // Gzip relay: compress the accepted bytes. h1 frames the
             // compressed output as chunks; h2 writes it raw (DATA
-            // framing delimits).
+            // framing delimits). Without compression the bytes go
+            // downstream directly — no staging copy (`MM-01`).
             #[cfg(feature = "h2")]
             let is_h2 = self.conns.get(&slot).is_some_and(|c| c.h2.is_some());
             #[cfg(not(feature = "h2"))]
             let is_h2 = false;
             let compressing = self.conns.get(&slot).is_some_and(|c| c.gzip.is_some());
-            let out = if compressing {
+            if compressing {
                 let mut gz = self.conn(slot).gzip.take();
                 let compressed = gz
                     .as_mut()
@@ -2616,11 +2630,10 @@ impl HttpProxy {
                 } else {
                     out.extend_from_slice(&vane_proto::compression::chunk(&compressed));
                 }
-                out
+                self.write_downstream(io, &out);
             } else {
-                bytes.to_vec()
-            };
-            self.write_downstream(io, &out);
+                self.write_downstream(io, bytes);
+            }
         }
         if framing_done {
             self.finish_gzip(io);
@@ -2724,7 +2737,11 @@ impl HttpProxy {
                 conn.attempts = 0;
                 conn.upstream_ready = false;
                 conn.req_method.clear();
-                conn.req_host = None;
+                // Park the recycled host String (capacity preserved):
+                // dropping it here re-allocated it every request.
+                if let Some(h) = &mut conn.req_host {
+                    h.clear();
+                }
                 conn.req_path.clear();
                 conn.resp_status = 0;
                 conn.bytes_out = 0;

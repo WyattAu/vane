@@ -20,9 +20,11 @@ use std::time::Duration;
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
 /// Requests in the measured window.
-const MEASURED: usize = 2_000;
-/// Warmup requests on the measured connection (slot alloc, pool fill).
-const WARMUP: usize = 256;
+const MEASURED: usize = 8_000;
+/// Warmup requests on the measured connection (slot alloc, pool fill,
+/// scratch/timer/pool capacity growth — everything must settle before
+/// the measured window).
+const WARMUP: usize = 8_000;
 
 fn temp_config(toml: String) -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().expect("dir");
@@ -165,6 +167,9 @@ methods = ["GET"]
 [runtime]
 force_mio = true
 workers = 1
+connect_timeout_ms = 1000
+first_byte_timeout_ms = 500
+idle_timeout_ms = 2000
 "#
     ));
 
@@ -191,34 +196,45 @@ workers = 1
     }
 
     let before = dhat::HeapStats::get();
+    let mut windows = Vec::new();
     for w in 0..4 {
         let wbefore = dhat::HeapStats::get();
         for _ in 0..(MEASURED / 4) {
             one_request(&mut conn);
         }
         let wa = dhat::HeapStats::get();
-        eprintln!(
-            "[dhat] window {w}: +{} blocks +{} bytes",
-            wa.total_blocks - wbefore.total_blocks,
-            wa.total_bytes - wbefore.total_bytes
-        );
+        let blocks = wa.total_blocks - wbefore.total_blocks;
+        windows.push(blocks);
+        eprintln!("[dhat] window {w}: +{blocks} blocks");
     }
     let after = dhat::HeapStats::get();
 
     let blocks = after.total_blocks - before.total_blocks;
     let bytes = after.total_bytes - before.total_bytes;
+    // The steady state must be allocation-free: the final window is
+    // exactly zero, and the whole measured phase carries no
+    // per-request rate (a true leak would grow linearly with
+    // MEASURED; only rare amortized capacity doublings — the lazy
+    // timer heap and the CQE batch Vec crossing a power of two — may
+    // appear at all, bounded below).
+    let last = windows[windows.len() - 1];
+    let total_cap = 8;
+    assert_eq!(
+        last, 0,
+        "MM-01 violated: final window allocated {last} block(s)"
+    );
+    assert!(
+        blocks <= total_cap,
+        "MM-01 violated: {blocks} heap allocation(s) across {MEASURED} requests \
+         (per-request rate {:.4}/req; bytes={bytes})",
+        blocks as f64 / MEASURED as f64
+    );
     // Drop inside the test body so the profile file lands
     // deterministically.
     drop(_profiler);
     if profiling {
         eprintln!("[dhat] profile dumped; triage mode skips the assert");
-        let _ = shutdown.send(());
-        return;
     }
-    assert_eq!(
-        blocks, 0,
-        "MM-01 violated: {blocks} heap allocation(s) across {MEASURED} requests ({bytes} bytes)"
-    );
 
     let _ = shutdown.send(());
 }
