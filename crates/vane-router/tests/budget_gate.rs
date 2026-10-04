@@ -23,11 +23,8 @@ fn criterion_results_within_budget() {
     let criterion = std::env::var_os("CRITERION_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join("target/criterion"));
-    let report = percentile_kit::check_budgets(
-        &root.join("percentile-budgets.toml"),
-        &criterion,
-    )
-    .expect("budgets parse + criterion results readable");
+    let report = percentile_kit::check_budgets(&root.join("percentile-budgets.toml"), &criterion)
+        .expect("budgets parse + criterion results readable");
     println!("{}", report.to_markdown());
     report
         .ensure_pass()
