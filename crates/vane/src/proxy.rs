@@ -1735,7 +1735,9 @@ impl Handler for HttpProxy {
         // translating the buffered h1 request head.
         #[cfg(feature = "h2")]
         if route.upstream_h2 {
-            let buf = self.conn(slot).head_buf.clone();
+            // Zero-copy: take the buffer (capacity preserved across the
+            // transaction) instead of cloning the head per request.
+            let mut buf = std::mem::take(&mut self.conn(slot).head_buf);
             let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
             if let Parsed::Complete(view, head_len) = RequestView::parse_in(&buf, &mut storage) {
                 if view.is_chunked() {
@@ -1786,7 +1788,8 @@ impl Handler for HttpProxy {
                 if !out.is_empty() {
                     self.upstream_send(io, &out);
                 }
-                self.conn(slot).head_buf.drain(..head_len + body.len());
+                buf.drain(..head_len + body.len());
+                self.conn(slot).head_buf = buf;
                 io.set_deadline(
                     Some(self.deadline(self.config.first_byte_timeout_ms)),
                     vane_core::handler::DeadlineReason::FirstByte,
@@ -1799,7 +1802,9 @@ impl Handler for HttpProxy {
         }
         // Re-parse the buffered head for serialization (view borrows our
         // buffer; the handler call is synchronous so this is safe).
-        let buf = self.conn(slot).head_buf.clone();
+        // Zero-copy: take the buffer (capacity preserved across the
+        // transaction) instead of cloning the head per request.
+        let buf = std::mem::take(&mut self.conn(slot).head_buf);
         let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
         if let Parsed::Complete(view, head_len) = RequestView::parse_in(&buf, &mut storage) {
             // Recycled scratch: one allocation for the connection's
@@ -1831,9 +1836,9 @@ impl Handler for HttpProxy {
             if !pending.is_empty() {
                 self.upstream_send(io, &pending);
             }
-            // Trim the forwarded head+inline body: the buffer must not
-            // re-parse old bytes on the next keep-alive transaction.
-            self.conn(slot).head_buf.drain(..head_len + body.len());
+            // The local buffer was drained above and restored to the
+            // connection (capacity preserved) — no re-parse of old
+            // bytes on the next keep-alive transaction.
             // First-byte deadline.
             io.set_deadline(
                 Some(self.deadline(self.config.first_byte_timeout_ms)),
