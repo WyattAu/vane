@@ -89,6 +89,7 @@ jsonwebtoken = { workspace = true }
 serde_json = { workspace = true }
 flate2 = { workspace = true }
 tempfile = { workspace = true }
+dhat = "0.3"
 tower = { version = "0.5", features = ["util"] }
 http = { workspace = true }
 tokio-rustls = { workspace = true }

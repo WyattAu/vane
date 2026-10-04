@@ -60,6 +60,10 @@ pub struct MioEngine {
     buf_size: usize,
     /// RawFd -> armed ops.
     pending: HashMap<RawFd, Vec<Pending>>,
+    /// Readiness scratch, reused across polls (`MM-01`): the former
+    /// per-poll `Vec::with_capacity(64)` malloc'd on every event-loop
+    /// iteration — two per proxied request.
+    ready: Vec<(RawFd, bool, bool)>,
     events: Events,
     cqes: Vec<Cqe>,
 }
@@ -89,6 +93,7 @@ impl MioEngine {
             slot_bases,
             buf_size: pool.buf_size(),
             pending: HashMap::new(),
+            ready: Vec::with_capacity(EVENTS_CAP),
             events: Events::with_capacity(EVENTS_CAP),
             cqes: Vec::with_capacity(EVENTS_CAP),
         })
@@ -508,18 +513,21 @@ impl Engine for MioEngine {
             Some(Duration::ZERO) // non-blocking: keep inline priority
         };
         self.poller.poll(&mut self.events, wait)?;
-        // Snapshot readiness (events buffer is reused by the poller).
-        let mut ready: Vec<(RawFd, bool, bool)> = Vec::with_capacity(64);
+        // Snapshot readiness (events buffer is reused by the poller);
+        // the scratch Vec is reused across polls (zero alloc).
+        self.ready.clear();
         for ev in self.events.iter() {
             if ev.token() == MioToken(WAKER) {
                 continue;
             }
             let fd = ev.token().0 as RawFd;
-            ready.push((fd, ev.is_readable(), ev.is_writable()));
+            self.ready.push((fd, ev.is_readable(), ev.is_writable()));
         }
-        for (fd, readable, writable) in ready {
+        for i in 0..self.ready.len() {
+            let (fd, readable, writable) = self.ready[i];
             self.dispatch(fd, readable, writable);
         }
+        self.ready.clear();
         out.append(&mut self.cqes);
         Ok(())
     }

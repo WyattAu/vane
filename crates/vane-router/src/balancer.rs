@@ -118,7 +118,12 @@ pub struct Balancer<'a> {
 impl<'a> Balancer<'a> {
     /// New balancer for one worker, borrowing the route's backends.
     #[must_use]
-    pub fn new(backends: &'a [Backend], gauges: Arc<ConnGauges>, policy: Policy, seed: u64) -> Self {
+    pub fn new(
+        backends: &'a [Backend],
+        gauges: Arc<ConnGauges>,
+        policy: Policy,
+        seed: u64,
+    ) -> Self {
         Self {
             backends,
             gauges,
@@ -289,12 +294,7 @@ mod tests {
             gauges.inc(0);
         }
         let backends = vec![be(1), be(2), be(3)];
-        let mut b = Balancer::new(
-            &backends,
-            Arc::clone(&gauges),
-            Policy::P2C,
-            7,
-        );
+        let mut b = Balancer::new(&backends, Arc::clone(&gauges), Policy::P2C, 7);
         let mut idle = 0;
         for _ in 0..600 {
             let p = b.pick_addr().expect("addr").port();
@@ -312,12 +312,7 @@ mod tests {
         gauges.inc(1);
         gauges.inc(1);
         let backends = vec![be(1), be(2), be(3)];
-        let mut b = Balancer::new(
-            &backends,
-            Arc::clone(&gauges),
-            Policy::LeastConn,
-            1,
-        );
+        let mut b = Balancer::new(&backends, Arc::clone(&gauges), Policy::LeastConn, 1);
         assert_eq!(b.pick_addr().expect("addr").port(), 3);
     }
 }
@@ -327,12 +322,7 @@ mod pick_except_tests {
     use super::*;
 
     fn two_backend<'a>(policy: Policy, backends: &'a [Backend]) -> Balancer<'a> {
-        Balancer::new(
-            backends,
-            std::sync::Arc::new(ConnGauges::new(2)),
-            policy,
-            0,
-        )
+        Balancer::new(backends, std::sync::Arc::new(ConnGauges::new(2)), policy, 0)
     }
 
     #[test]

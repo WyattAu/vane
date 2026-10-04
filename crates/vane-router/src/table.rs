@@ -56,12 +56,7 @@ impl RouteEntry {
     /// allocates nothing (`MM-01`).
     #[must_use]
     pub fn balancer(&self, seed: u64) -> Balancer<'_> {
-        Balancer::new(
-            &self.backends,
-            Arc::clone(&self.gauges),
-            self.policy,
-            seed,
-        )
+        Balancer::new(&self.backends, Arc::clone(&self.gauges), self.policy, seed)
     }
 }
 
