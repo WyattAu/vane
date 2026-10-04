@@ -2,8 +2,8 @@ apiVersion: v2
 name: vane
 description: Deterministic L4/L7 reverse proxy, edge gateway, and micro sidecar
 type: application
-version: 0.5.6
-appVersion: "0.5.6"
+version: 0.6.0
+appVersion: "0.6.0"
 keywords:
   - proxy
   - gateway
