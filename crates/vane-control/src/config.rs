@@ -266,6 +266,33 @@ fn default_retry_attempts() -> u8 {
     3
 }
 
+/// Per-route CORS policy (`[[routes]] cors`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct CorsConfig {
+    /// Allowed origins: exact ("https://app.example.com") or "*" for
+    /// any. Required.
+    pub allow_origins: Vec<String>,
+    /// Allowed methods (default: the route's methods).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_methods: Option<Vec<String>>,
+    /// Allowed request headers (default: Content-Type, Authorization).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_headers: Option<Vec<String>>,
+    /// Exposed response headers (Access-Control-Expose-Headers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expose_headers: Option<Vec<String>>,
+    /// Allow cookies / Authorization credentials (default false).
+    #[serde(default)]
+    pub allow_credentials: bool,
+    /// Preflight cache duration (seconds, default 86400).
+    #[serde(default = "default_cors_max_age")]
+    pub max_age_secs: u64,
+}
+
+fn default_cors_max_age() -> u64 {
+    86400
+}
+
 /// A statically configured route.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteConfig {
@@ -300,6 +327,9 @@ pub struct RouteConfig {
     /// Per-route retry policy override (failover cap + 5xx predicate).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<RetryInput>,
+    /// CORS policy (preflight + response headers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cors: Option<CorsConfig>,
 }
 
 /// Admin server configuration.

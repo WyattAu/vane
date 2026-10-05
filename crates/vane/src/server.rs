@@ -107,6 +107,7 @@ pub fn receive_inherited(
                 retry: Default::default(),
                 mirror: None,
                 mirror_backends: Vec::new(),
+                cors: None,
             };
             match builder.compile() {
                 Ok(entry) => editor.insert(entry),
@@ -1365,6 +1366,7 @@ cluster = "up"
                 retry: Default::default(),
                 mirror: None,
                 mirror_backends: Vec::new(),
+                cors: None,
             });
         });
         let records = crate::proxy::flatten_routes(&router);
@@ -1518,6 +1520,7 @@ mod handover_helper_tests {
                 retry: Default::default(),
                 mirror: None,
                 mirror_backends: Vec::new(),
+                cors: None,
             });
         });
         let health = Arc::new(vane_control::HealthMap::new());

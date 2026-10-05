@@ -28,8 +28,9 @@ fn entry(host: Option<String>, pattern: String) -> RouteEntry {
         priority: 0,
         allowed_spiffe_prefixes: Vec::new(),
         retry: Default::default(),
-        mirror_backends: Vec::new(),
         mirror: None,
+        mirror_backends: Vec::new(),
+        cors: None,
     }
     .compile()
     .expect("valid route")

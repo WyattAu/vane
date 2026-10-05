@@ -29,6 +29,7 @@ fn test_router(upstream: std::net::SocketAddr) -> Arc<Router> {
             retry: Default::default(),
             mirror: None,
             mirror_backends: Vec::new(),
+            cors: None,
         };
         editor.insert(builder.compile().expect("route"));
     });

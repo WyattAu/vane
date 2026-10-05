@@ -31,7 +31,7 @@ fn ip16(ip: std::net::IpAddr) -> [u8; 16] {
 }
 use vane_observe::{LogEvent, LogLevel};
 use vane_proto::request::{MAX_HEADERS, Parsed, RequestView};
-use vane_proto::response::{Status, write_full};
+use vane_proto::response::{Status, write_full, write_head};
 use vane_router::{RouteEntry, Router};
 use vane_shm::handover::RouteRecord;
 
@@ -203,6 +203,10 @@ struct Conn {
     tls_backlog: Vec<u8>,
     /// Response compression state (Some = gzip the relay).
     gzip: Option<GzipRelay>,
+    /// CORS response headers resolved for this transaction (injected
+    /// into the upstream response head). Empty for non-CORS requests and
+    /// for origins outside the route's policy.
+    cors_headers: Vec<(&'static str, String)>,
 }
 
 /// Streaming gzip relay state for one response transaction.
@@ -855,6 +859,14 @@ impl HttpProxy {
                     return;
                 }
                 self.metrics.responses.inc(&self.config.registry);
+                // CORS response headers for this transaction, taken out
+                // of the connection so head injection below can borrow
+                // them without re-entering `self`. Empty (the common
+                // case) leaves the relay byte-for-byte unchanged.
+                let cors: Vec<(&'static str, String)> = match self.conns.get_mut(&slot) {
+                    Some(c) => std::mem::take(&mut c.cors_headers),
+                    None => Vec::new(),
+                };
                 #[cfg(feature = "h2")]
                 if is_h2 {
                     // The shim re-parses the head from `data` and
@@ -870,7 +882,8 @@ impl HttpProxy {
                             .map_or(0, |p| p + 4);
                         let (head, rest) = data.split_at(head_len);
                         let rewritten = vane_proto::compression::rewrite_head_for_gzip_h2(head);
-                        if let Some(rewritten) = rewritten {
+                        if let Some(mut rewritten) = rewritten {
+                            crate::cors::inject_into_head(&mut rewritten, &cors);
                             self.h2_write(io, &rewritten);
                             if !rest.is_empty() {
                                 let compressed = self.gzip_feed(slot, rest);
@@ -878,6 +891,18 @@ impl HttpProxy {
                             }
                             return;
                         }
+                    }
+                    if !cors.is_empty() {
+                        // The head must be rewritten in place, so the
+                        // body portion goes out as a second write.
+                        let mut head = data[..head_len].to_vec();
+                        crate::cors::inject_into_head(&mut head, &cors);
+                        self.h2_write(io, &head);
+                        let rest = &data[head_len..];
+                        if !rest.is_empty() {
+                            self.h2_write(io, rest);
+                        }
+                        return;
                     }
                     self.h2_write(io, data);
                     return;
@@ -900,9 +925,14 @@ impl HttpProxy {
                     // Rewrite the head: CL out, gzip + chunked in. The
                     // body relay then compresses through GzipRelay.
                     let head = data[..head_len].to_vec();
-                    if let Some(rewritten) = vane_proto::compression::rewrite_head_for_gzip(&head) {
+                    if let Some(mut rewritten) =
+                        vane_proto::compression::rewrite_head_for_gzip(&head)
+                    {
+                        crate::cors::inject_into_head(&mut rewritten, &cors);
                         self.write_downstream(io, &rewritten);
                     } else {
+                        let mut head = head;
+                        crate::cors::inject_into_head(&mut head, &cors);
                         self.write_downstream(io, &head);
                     }
                 } else {
@@ -914,13 +944,14 @@ impl HttpProxy {
                     // edge shares this listener's port. The body
                     // portion after the head is relayed below as usual.
                     let alt = self.config.alt_svc.clone();
-                    if let Some(alt) = alt.filter(|a| !a.is_empty()) {
+                    let alt = alt.filter(|a| !a.is_empty());
+                    if alt.is_some() || !cors.is_empty() {
                         let mut head = data[..head_len].to_vec();
-                        if insert_header_once(&mut head, b"alt-svc", alt.as_bytes()) {
-                            self.write_downstream(io, &head);
-                        } else {
-                            self.write_downstream(io, &data[..head_len]);
+                        if let Some(alt) = alt.as_deref() {
+                            insert_header_once(&mut head, b"alt-svc", alt.as_bytes());
                         }
+                        crate::cors::inject_into_head(&mut head, &cors);
+                        self.write_downstream(io, &head);
                     } else {
                         self.write_downstream(io, &data[..head_len]);
                     }
@@ -1350,6 +1381,87 @@ impl HttpProxy {
             Some(self.deadline(self.config.idle_timeout_ms)),
             vane_core::handler::DeadlineReason::Idle,
         );
+    }
+
+    /// Answers a CORS preflight at the edge: 204 with the policy's
+    /// headers, no upstream dial. RFC 9110 §8.3.3 forbids a
+    /// `Content-Length` on a 204, so the head is written directly.
+    fn respond_cors_preflight(
+        &mut self,
+        io: &mut SessionIo<'_>,
+        headers: &[(&'static str, String)],
+    ) {
+        let slot = io.slot_index();
+        self.conn(slot).resp_status = Status::NoContent.code();
+        if let Some(span) = self.conns.get_mut(&slot).and_then(|c| c.span.take()) {
+            span.record("http.status_code", Status::NoContent.code());
+            drop(span);
+        }
+        let owned: Vec<(&str, &[u8])> = headers
+            .iter()
+            .map(|(name, value)| (*name, value.as_bytes()))
+            .collect();
+        // Sized for a policy with long allow-lists (origin/header lists
+        // are user config and can each be hundreds of bytes).
+        let mut buf = [0u8; 2048];
+        if let Ok(n) = write_head(&mut buf, Status::NoContent, &owned, &self.date, None) {
+            self.write_downstream(io, &buf[..n]);
+            self.metrics.responses.inc(&self.config.registry);
+        } else {
+            self.log(LogLevel::Warn, "cors preflight head overflow");
+        }
+        let started = self.conns.get(&slot).and_then(|c| c.started);
+        self.access_emit(io, started);
+        io.set_deadline(
+            Some(self.deadline(self.config.idle_timeout_ms)),
+            vane_core::handler::DeadlineReason::Idle,
+        );
+    }
+
+    /// Consumes the parsed request head from the connection's parse
+    /// buffer and resets the request-phase state.
+    ///
+    /// Intake appends every downstream byte to `head_buf` and only the
+    /// upstream path drains it (it re-parses to serialize the head). A
+    /// response generated at the edge returns before that point, so
+    /// without this the head is still at the front of the buffer and the
+    /// next keep-alive transaction re-parses the stale head and replays
+    /// this response to the client.
+    fn consume_request_head(&mut self, slot: u32, head_len: usize) {
+        if let Some(c) = self.conns.get_mut(&slot) {
+            let drop = head_len.min(c.head_buf.len());
+            c.head_buf.drain(..drop);
+            // No upstream will relay a body for an edge-answered
+            // request, so the framing must not survive into the next
+            // transaction.
+            c.req_framing = ReqFraming::AwaitingHead;
+            c.req_pending.clear();
+            c.body = BodyFraming::AwaitingHead;
+            c.remaining = 0;
+        }
+    }
+
+    /// Answers a request at the edge (no upstream dial) and leaves the
+    /// connection ready for the next transaction.
+    ///
+    /// `has_body` closes the connection after the reply: vane never read
+    /// the request body, so the stream cannot be resynchronized and the
+    /// unread bytes would be parsed as the next request head. Bodyless
+    /// requests keep the connection alive.
+    fn respond_edge(
+        &mut self,
+        io: &mut SessionIo<'_>,
+        status: Status,
+        body: &str,
+        head_len: usize,
+        has_body: bool,
+    ) {
+        let slot = io.slot_index();
+        self.consume_request_head(slot, head_len);
+        self.respond_full(io, status, body);
+        if has_body {
+            io.close();
+        }
     }
 
     /// Emits the transaction's access record (once). No-op when the
@@ -2142,9 +2254,14 @@ impl Handler for HttpProxy {
 
 impl HttpProxy {
     #[allow(clippy::too_many_lines)]
-    fn handle_request(&mut self, io: &mut SessionIo<'_>, view: &RequestView<'_>, _head_len: usize) {
+    fn handle_request(&mut self, io: &mut SessionIo<'_>, view: &RequestView<'_>, head_len: usize) {
         let started = Instant::now();
         let slot = io.slot_index();
+        // A request that declares a body: an edge-generated response
+        // cannot relay it, and its unread bytes would desynchronize a
+        // keep-alive connection, so those responses close the socket.
+        let req_has_body =
+            view.content_length().flatten().is_some_and(|n| n > 0) || view.is_chunked();
         {
             let conn = self.conn(slot);
             conn.req_method.clear();
@@ -2163,6 +2280,7 @@ impl HttpProxy {
             conn.resp_status = 0;
             conn.bytes_out = 0;
             conn.access_logged = false;
+            conn.cors_headers.clear();
         }
 
         // Process-wide rate limiting (cross-worker aggregate).
@@ -2235,8 +2353,15 @@ impl HttpProxy {
             return;
         };
 
-        // Method check.
-        if !route.methods.is_empty()
+        // Method check. A CORS preflight is exempt: it carries no
+        // credentials, the browser will not send the actual request
+        // unless the preflight succeeds, and a method allowlist that
+        // omitted OPTIONS would otherwise fail every cross-origin call.
+        let cors_preflight = route.cors.is_some()
+            && view.method == "OPTIONS"
+            && view.header("access-control-request-method").is_some();
+        if !cors_preflight
+            && !route.methods.is_empty()
             && !route
                 .methods
                 .iter()
@@ -2278,6 +2403,38 @@ impl HttpProxy {
                 self.respond_full(io, Status::Forbidden, "caller identity not allowed\n");
                 io.close();
                 return;
+            }
+        }
+
+        // CORS: a preflight is answered here, at the edge — the upstream is
+        // never dialed. An actual request gets response headers injected
+        // on the way out. Evaluated after the identity check so a
+        // mesh caller's authorization still applies, and before any
+        // filter/dial work so neither pays for a preflight.
+        if let Some(policy) = route.cors.as_ref() {
+            let origin = view
+                .header("origin")
+                .and_then(|h| std::str::from_utf8(h).ok());
+            let acrm = view
+                .header("access-control-request-method")
+                .and_then(|h| std::str::from_utf8(h).ok());
+            let acrh = view
+                .header("access-control-request-headers")
+                .and_then(|h| std::str::from_utf8(h).ok());
+            match crate::cors::evaluate(policy, &route.methods, view.method, origin, acrm, acrh) {
+                crate::cors::CorsAction::Pass => {}
+                crate::cors::CorsAction::Preflight(headers) => {
+                    let slot = io.slot_index();
+                    self.consume_request_head(slot, head_len);
+                    self.respond_cors_preflight(io, &headers);
+                    if req_has_body {
+                        io.close();
+                    }
+                    return;
+                }
+                crate::cors::CorsAction::Actual(headers) => {
+                    self.conn(slot).cors_headers = headers;
+                }
             }
         }
 
@@ -2375,7 +2532,7 @@ impl HttpProxy {
             (ctx.inject_headers, sc, ctx.trace)
         };
         if let Some((code, reason)) = short_circuit {
-            self.respond_full(io, Status::from_code(code), reason);
+            self.respond_edge(io, Status::from_code(code), reason, head_len, req_has_body);
             return;
         }
 
@@ -2406,7 +2563,13 @@ impl HttpProxy {
                 }
             }
             if let Some(code) = rejected {
-                self.respond_full(io, Status::from_code(code), "rejected by plugin\n");
+                self.respond_edge(
+                    io,
+                    Status::from_code(code),
+                    "rejected by plugin\n",
+                    head_len,
+                    req_has_body,
+                );
                 return;
             }
         }
@@ -2425,7 +2588,13 @@ impl HttpProxy {
             }
         }
         let Some(addr) = addr else {
-            self.respond_full(io, Status::ServiceUnavailable, "no healthy upstream\n");
+            self.respond_edge(
+                io,
+                Status::ServiceUnavailable,
+                "no healthy upstream\n",
+                head_len,
+                req_has_body,
+            );
             return;
         };
         // Per-cluster request counter.
@@ -2464,7 +2633,13 @@ impl HttpProxy {
         }
 
         if cached_breaker.is_open() {
-            self.respond_full(io, Status::ServiceUnavailable, "circuit open\n");
+            self.respond_edge(
+                io,
+                Status::ServiceUnavailable,
+                "circuit open\n",
+                head_len,
+                req_has_body,
+            );
             return;
         }
 

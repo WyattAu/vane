@@ -23,5 +23,7 @@ pub mod table;
 pub mod trie;
 
 pub use balancer::{Backend, Balancer, Policy};
-pub use table::{RetryPolicy, RouteBuilder, RouteEntry, RouteTable, Router, TableEditor};
+pub use table::{
+    CorsPolicy, RetryPolicy, RouteBuilder, RouteEntry, RouteTable, Router, TableEditor,
+};
 pub use trie::PathTrie;

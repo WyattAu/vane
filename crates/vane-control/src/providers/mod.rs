@@ -83,6 +83,7 @@ pub fn build_route(spec: ProviderRouteSpec, health: &crate::health::HealthMap) -
         allowed_spiffe_prefixes: Vec::new(),
         retry: Default::default(),
         mirror_backends: Vec::new(),
+        cors: None,
         mirror: None,
     }
 }

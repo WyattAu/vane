@@ -46,6 +46,14 @@ pub fn static_routes(cfg: &VaneConfig, health: &HealthMap) -> Vec<RouteBuilder> 
                     retry_5xx: c.retry_5xx,
                 }),
             mirror: r.mirror.clone(),
+            cors: r.cors.as_ref().map(|c| vane_router::CorsPolicy {
+                allow_origins: c.allow_origins.clone(),
+                allow_methods: c.allow_methods.clone(),
+                allow_headers: c.allow_headers.clone(),
+                expose_headers: c.expose_headers.clone(),
+                allow_credentials: c.allow_credentials,
+                max_age_secs: c.max_age_secs,
+            }),
             mirror_backends: r
                 .mirror
                 .as_ref()

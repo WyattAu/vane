@@ -80,6 +80,7 @@ fn make_router(routes: &[(&str, &str)]) -> Arc<Router> {
                     retry: Default::default(),
                     mirror: None,
                     mirror_backends: Vec::new(),
+                    cors: None,
                 }
                 .compile()
                 .expect("valid route"),

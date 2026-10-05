@@ -25,6 +25,8 @@ pub struct RouteEntry {
     pub mirror: Option<String>,
     /// The mirror cluster's resolved backends.
     pub mirror_backends: Vec<crate::balancer::Backend>,
+    /// CORS policy (preflight + response headers).
+    pub cors: Option<CorsPolicy>,
     /// Prefix to strip from the matched path before forwarding.
     pub strip_prefix: Option<String>,
     /// Request timeout override (ms).
@@ -156,6 +158,40 @@ pub enum RouterError {
     Invalid(String),
 }
 
+/// Per-route CORS policy (resolved from the config plane).
+#[derive(Debug, Clone)]
+pub struct CorsPolicy {
+    /// Allowed origins: exact or "*".
+    pub allow_origins: Vec<String>,
+    /// Allowed methods (None = reflect the route's methods).
+    pub allow_methods: Option<Vec<String>>,
+    /// Allowed request headers.
+    pub allow_headers: Option<Vec<String>>,
+    /// Exposed response headers.
+    pub expose_headers: Option<Vec<String>>,
+    /// Allow credentials.
+    pub allow_credentials: bool,
+    /// Preflight cache duration (seconds).
+    pub max_age_secs: u64,
+}
+
+/// A zero policy allows no origin — the safe reading of "unset". The
+/// one non-zero default is the preflight cache duration: `0` would tell
+/// browsers never to cache a preflight, turning every cross-origin
+/// request into two round trips.
+impl Default for CorsPolicy {
+    fn default() -> Self {
+        Self {
+            allow_origins: Vec::new(),
+            allow_methods: None,
+            allow_headers: None,
+            expose_headers: None,
+            allow_credentials: false,
+            max_age_secs: 86_400,
+        }
+    }
+}
+
 /// Per-cluster retry policy (failover behavior on failed attempts).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {
@@ -214,6 +250,8 @@ pub struct RouteBuilder {
     /// The mirror cluster's resolved backends (materialized by the
     /// caller; empty = mirroring disabled).
     pub mirror_backends: Vec<crate::balancer::Backend>,
+    /// CORS policy (preflight + response headers).
+    pub cors: Option<CorsPolicy>,
 }
 
 impl RouteBuilder {
@@ -240,6 +278,7 @@ impl RouteBuilder {
             cluster: self.cluster,
             retry: self.retry,
             mirror: self.mirror,
+            cors: self.cors,
             mirror_backends: self.mirror_backends,
             strip_prefix: self.strip_prefix,
             timeout_ms: self.timeout_ms,
@@ -405,6 +444,7 @@ mod tests {
             allowed_spiffe_prefixes: Vec::new(),
             retry: Default::default(),
             mirror_backends: Vec::new(),
+            cors: None,
             mirror: None,
         }
     }

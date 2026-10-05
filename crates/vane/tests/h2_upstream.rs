@@ -107,6 +107,7 @@ fn router_with(upstream: SocketAddr, h2_upstream: bool) -> Arc<Router> {
             retry: Default::default(),
             mirror: None,
             mirror_backends: Vec::new(),
+            cors: None,
         });
     });
     Arc::new(r)
@@ -252,6 +253,7 @@ async fn disallowed_method_yields_405() {
             retry: Default::default(),
             mirror: None,
             mirror_backends: Vec::new(),
+            cors: None,
         });
     });
     // POST on a GET-only route.
@@ -362,6 +364,7 @@ async fn post_body_roundtrip() {
             retry: Default::default(),
             mirror: None,
             mirror_backends: Vec::new(),
+            cors: None,
         });
     });
     let edge = Arc::new(
@@ -676,6 +679,7 @@ async fn no_healthy_backend_yields_503() {
             retry: Default::default(),
             mirror: None,
             mirror_backends: Vec::new(),
+            cors: None,
         });
     });
     let (status, _, _) = request_via_edge(Arc::new(r), "/x").await;
@@ -710,6 +714,7 @@ async fn breaker_open_yields_503() {
             retry: Default::default(),
             mirror: None,
             mirror_backends: Vec::new(),
+            cors: None,
         });
     });
     // Construct the edge with the SAME breaker instance so it is open.
@@ -891,6 +896,7 @@ async fn large_body_streams_through_edge() {
             retry: Default::default(),
             mirror: None,
             mirror_backends: Vec::new(),
+            cors: None,
         });
     });
     let edge = Arc::new(

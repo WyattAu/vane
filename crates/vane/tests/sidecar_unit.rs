@@ -40,6 +40,7 @@ fn config_with_cluster(cluster: &str, backends: &[&str]) -> VaneConfig {
             allowed_spiffe_prefixes: Vec::new(),
             retry: Default::default(),
             mirror: None,
+            cors: None,
         }],
         ..VaneConfig::default()
     }
@@ -88,6 +89,7 @@ fn resolve_bridge_prefers_route_cluster() {
         allowed_spiffe_prefixes: Vec::new(),
         retry: Default::default(),
         mirror: None,
+        cors: None,
     }];
     let bridge = resolve_bridge(&cfg).expect("bridge");
     assert_eq!(

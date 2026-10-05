@@ -419,6 +419,56 @@ responses are discarded. Mirroring is best-effort: it never delays or
 fails the real response, and a down shadow is invisible to callers.
 Use for canary validation and load previews.
 
+## `[[routes]] cors` — cross-origin policy
+
+```toml
+[[routes]]
+pattern = "/api/*rest"
+cluster = "api"
+
+[routes.cors]
+allow_origins      = ["https://app.example.com", "https://admin.example.com"]
+allow_methods      = ["GET", "POST", "DELETE"]   # default: the route's methods
+allow_headers      = ["content-type", "authorization"]  # default: reflect
+expose_headers     = ["X-Total-Count"]           # default: none
+allow_credentials  = false
+max_age_secs       = 86400
+```
+
+Enforces the Fetch/CORS spec per route. Two behaviors:
+
+**Preflight** — an `OPTIONS` carrying `Access-Control-Request-Method` is
+answered at the edge with `204` and the policy's headers. The upstream is
+never dialed, so a preflight costs no backend capacity and does not show
+up in upstream metrics. A preflight is exempt from the route's `methods`
+allowlist: browsers will not send the real request if the preflight
+fails, so an allowlist that omitted `OPTIONS` would break every
+cross-origin call.
+
+**Actual requests** — proxied normally, then the response headers are
+injected into the upstream's response head. vane's `Vary` is *merged*
+with the upstream's (`Vary: Accept-Encoding` becomes
+`Vary: Accept-Encoding, Origin`) rather than duplicated.
+
+A request with no `Origin`, or an origin outside `allow_origins`, is
+relayed **untouched** — the browser is the enforcement point, so vane
+neither adds headers nor synthesizes a rejection. A preflight naming a
+method or header outside the policy is likewise relayed without
+`Access-Control-Allow-Origin`.
+
+`allow_origins = ["*"]` emits `Access-Control-Allow-Origin: *` — unless
+`allow_credentials = true`, in which case the wildcard is invalid (the
+fetch spec requires a named origin for credentialed requests) and vane
+echoes the requesting origin instead.
+
+vane does not strip `Access-Control-*` headers set by the backend: a
+service with its own CORS policy keeps it, and vane's header goes after
+it.
+
+Edge-generated responses for a request that declares a body (rate limit,
+plugin reject, open circuit) close the connection: vane never read the
+body, so the stream cannot be resynchronized.
+
 ## Config hot-reload
 
 `vane run -c vane.toml` watches the config file. A valid changed

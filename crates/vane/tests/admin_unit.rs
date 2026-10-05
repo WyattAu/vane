@@ -33,6 +33,7 @@ fn test_router() -> Arc<RouteRouter> {
             retry: Default::default(),
             mirror: None,
             mirror_backends: Vec::new(),
+            cors: None,
         });
     });
     Arc::new(r)
@@ -508,6 +509,7 @@ fn test_router_keepalive() -> std::sync::Arc<RouteRouter> {
             retry: Default::default(),
             mirror: None,
             mirror_backends: Vec::new(),
+            cors: None,
         });
     });
     Arc::new(r)

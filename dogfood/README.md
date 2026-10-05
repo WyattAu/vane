@@ -15,6 +15,19 @@ every feature is exercised the way a real deployment uses it.
 | Health checks | active probes on the file server |
 | Access logs | JSON access log per transaction |
 | Rate limiting | `[rate_limit]` with a generous default |
+| CORS | `/api/*` policy; preflights answered at the edge |
+
+## Exercising the CORS policy
+
+```sh
+# Preflight: answered by vane at the edge (204, no backend hit).
+curl -i -X OPTIONS http://localhost:8080/api/items \
+  -H 'Origin: http://localhost:5173' \
+  -H 'Access-Control-Request-Method: GET'
+
+# Actual request: relayed, with Access-Control-Allow-Origin added.
+curl -i http://localhost:8080/api/items -H 'Origin: http://localhost:5173'
+```
 
 ## Running
 
