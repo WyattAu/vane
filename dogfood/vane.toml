@@ -1,0 +1,33 @@
+# vane dogfood config — hot-reload enabled: edit and save, no restart.
+
+[[listeners]]
+address = "0.0.0.0:8080"
+
+[[listeners]]
+address = "0.0.0.0:6379"
+mode = "tcp"
+
+[clusters.web]
+backends = ["fileserver:80"]
+health_path = "/"
+
+[clusters.redis]
+backends = ["redis:6379"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "web"
+
+[[routes]]
+pattern = "/*"
+cluster = "redis"
+
+[runtime]
+workers = 0
+
+[access_log]
+enabled = true
+
+[rate_limit]
+rps = 10000
+burst = 20000
