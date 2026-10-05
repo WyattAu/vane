@@ -148,16 +148,50 @@ cache; pair with the ACME manager for automated certificates.
 
 ## Performance
 
-Measured on the repository's criterion benches (dev profile — release builds
-are faster):
+Measured on the repository's criterion benches (release profile, P50/P99
+from criterion's sampled data) and the release throughput harness — **on a
+loaded development machine** (multiple concurrent builds/agents; treat as
+conservative floors, not capacity claims; reproduction commands below):
 
-| Bench | Result | Requirement |
-|---|---|---|
-| HTTP/1.1 head parse (5 headers) | ~266 ns incl. storage reset | `PR-01` |
-| Route lookup @ 10k routes | ~223 ns | `CP-01` |
-| SHM sidecar RTT (512 B) | ~2.8 µs | `IP-01` < 30 µs |
-| Keep-alive pool (opt-in) | 1 upstream conn across 5 sequential requests | — |
-| Config generation swap | one `Release` store + epoch retire | `CP-02` < 1 ms |
+| Hot path | P50 | P99 | Requirement |
+|---|---|---|---|
+| HTTP/1.1 head parse (5 headers) | 311 ns | 365 ns | `PR-01` |
+| Route lookup @ 10k routes | 245 ns | 402 ns | `CP-01` |
+| SHM sidecar RTT (512 B) | 3.13 µs | 3.34 µs | `IP-01` < 30 µs |
+| Proxy relay throughput (keep-alive, 8 clients) | **49.0k rps** | — | latency below |
+| — per-request latency, same run | 140 µs | 448 µs | `IP-01`/`MM-01` |
+
+Loaded-machine caveat: the throughput run shares the box with other
+builds and agents; quiet-machine numbers run materially higher (the
+comparative matrix below measured 33–35k rps on 2 workers under `ab`
+with the same topology, and the client ceiling was 65–72k rps).
+Reproduce with:
+
+```bash
+cargo bench -p vane-proto --bench parse && \
+cargo bench -p vane-router --bench lookup && \
+cargo bench -p vane-shm --bench roundtrip
+cargo test --release -p vane-proxy --test throughput -- --ignored --nocapture
+```
+
+Latency budgets for the criterion benches are committed in
+[`percentile-budgets.toml`](percentile-budgets.toml) and enforced in CI
+(`bench-budgets` job) via [`percentile-kit`].
+
+## Zero-allocation hot path (`MM-01`)
+
+The HTTP/1.1 relay path performs **zero heap allocations per request after
+warmup**, verified by a [dhat](https://crates.io/crates/dhat) gate
+(`cargo test --release -p vane-proxy --test dhat_zeroalloc -- --ignored`):
+
+- per-worker head-parse scratch and per-connection recycled path, inject,
+  and head-serialization buffers (take → fill → restore);
+- borrowed-backend balancers (no per-request backend `Vec` clone), rank
+  selection without a healthy-index build;
+- allocation-free parser framing checks (case-insensitive scans, no
+  lowered copies), stack-formatted `X-Forwarded-For` / `X-Request-Id`;
+- throttled JWT key-file re-stat (one `stat()` per second, not per request);
+- optional **mimalloc** global allocator (feature `mimalloc`, default off).
 
 ### Comparison against nginx (same box, same upstream)
 

@@ -100,8 +100,13 @@ impl ConnGauges {
 }
 
 /// Per-worker balancer over a fixed backend list.
-pub struct Balancer {
-    backends: Vec<Backend>,
+///
+/// Borrows the route's backend slice (`MM-01`): construction is a
+/// borrow, so a pick allocates nothing — the previous per-request
+/// `Vec<Backend>` clone (and the `Vec<usize>` healthy-index build
+/// inside [`Balancer::pick`]) showed up in the dhat hot-path profile.
+pub struct Balancer<'a> {
+    backends: &'a [Backend],
     gauges: Arc<ConnGauges>,
     policy: Policy,
     /// Worker-local RR cursor.
@@ -110,10 +115,15 @@ pub struct Balancer {
     rng: u64,
 }
 
-impl Balancer {
-    /// New balancer for one worker.
+impl<'a> Balancer<'a> {
+    /// New balancer for one worker, borrowing the route's backends.
     #[must_use]
-    pub fn new(backends: Vec<Backend>, gauges: Arc<ConnGauges>, policy: Policy, seed: u64) -> Self {
+    pub fn new(
+        backends: &'a [Backend],
+        gauges: Arc<ConnGauges>,
+        policy: Policy,
+        seed: u64,
+    ) -> Self {
         Self {
             backends,
             gauges,
@@ -126,7 +136,7 @@ impl Balancer {
     /// Backend list (for health dashboards).
     #[must_use]
     pub fn backends(&self) -> &[Backend] {
-        &self.backends
+        self.backends
     }
 
     /// Connection gauges.
@@ -147,28 +157,50 @@ impl Balancer {
 
     /// Picks the next backend index among healthy backends.
     ///
-    /// Returns `None` when every backend is unhealthy.
+    /// Returns `None` when every backend is unhealthy. Two-pass rank
+    /// selection over the backend slice: no per-pick allocation (the
+    /// former healthy-index `Vec` was a per-request malloc on the
+    /// relay hot path).
     pub fn pick(&mut self) -> Option<usize> {
-        let healthy: Vec<usize> = self
-            .backends
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| b.is_healthy())
-            .map(|(i, _)| i)
-            .collect();
-        let first = *healthy.first()?;
-        if healthy.len() == 1 {
+        self.pick_idx(None)
+    }
+
+    /// Shared selection core: `skip` masks a just-failed backend by
+    /// address (never starves a lone healthy backend — the caller
+    /// falls back to it).
+    fn pick_idx(&mut self, skip: Option<SocketAddr>) -> Option<usize> {
+        let healthy = |b: &Backend| b.is_healthy() && Some(b.addr) != skip;
+        let n = self.backends.iter().filter(|b| healthy(b)).count();
+        if n == 0 {
+            return None;
+        }
+        // Rank selection: the `rank`-th healthy (non-skipped) index in
+        // one pass — allocation-free replacement for the collected Vec.
+        let rank_at = |list: &[Backend], mut rank: usize| -> usize {
+            for (i, b) in list.iter().enumerate() {
+                if healthy(b) {
+                    if rank == 0 {
+                        return i;
+                    }
+                    rank -= 1;
+                }
+            }
+            // Callers pass `rank < n` only.
+            unreachable!("rank out of healthy range");
+        };
+        let first = rank_at(self.backends, 0);
+        if n == 1 {
             return Some(first);
         }
         match self.policy {
             Policy::RoundRobin => {
                 self.rr = self.rr.wrapping_add(1);
-                let idx = (self.rr as usize) % healthy.len();
-                Some(healthy[idx])
+                let idx = (self.rr as usize) % n;
+                Some(rank_at(self.backends, idx))
             }
             Policy::P2C => {
-                let a = healthy[(self.next_rand() as usize) % healthy.len()];
-                let b = healthy[(self.next_rand() as usize) % healthy.len()];
+                let a = rank_at(self.backends, (self.next_rand() as usize) % n);
+                let b = rank_at(self.backends, (self.next_rand() as usize) % n);
                 if a == b {
                     return Some(a);
                 }
@@ -176,11 +208,17 @@ impl Balancer {
                 let lb = self.gauges.get(b);
                 if la <= lb { Some(a) } else { Some(b) }
             }
-            Policy::LeastConn => healthy.into_iter().min_by_key(|&i| {
-                self.gauges
-                    .get(i)
-                    .wrapping_mul(u64::from(u32::MAX) / u64::from(self.backends[i].weight.max(1)))
-            }),
+            Policy::LeastConn => self
+                .backends
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| healthy(b))
+                .min_by_key(|&(i, b)| {
+                    self.gauges
+                        .get(i)
+                        .wrapping_mul(u64::from(u32::MAX) / u64::from(b.weight.max(1)))
+                })
+                .map(|(i, _)| i),
         }
     }
 
@@ -196,29 +234,11 @@ impl Balancer {
         let Some(skip) = exclude else {
             return self.pick_addr();
         };
-        let healthy: Vec<usize> = self
-            .backends
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| b.is_healthy())
-            .map(|(i, _)| i)
-            .collect();
-        if healthy.iter().any(|&i| self.backends[i].addr == skip) && healthy.len() > 1 {
-            // Temporarily mask the failed backend.
-            let saved: Vec<bool> = self.backends.iter().map(|b| b.is_healthy()).collect();
-            for b in &self.backends {
-                if b.addr == skip {
-                    b.set_healthy(false);
-                }
-            }
-            let pick = self.pick_addr();
-            for (i, was) in saved.iter().enumerate() {
-                self.backends[i].set_healthy(*was);
-            }
-            pick.or(Some(skip))
-        } else {
-            self.pick_addr()
-        }
+        // Rank selection masks the failed backend without mutating the
+        // shared health flags (the former save/mask/restore dance).
+        self.pick_idx(Some(skip))
+            .map(|i| self.backends[i].addr)
+            .or(Some(skip))
     }
 }
 
@@ -233,8 +253,9 @@ mod tests {
 
     #[test]
     fn skips_unhealthy() {
+        let backends = vec![be(1), be(2)];
         let mut b = Balancer::new(
-            vec![be(1), be(2)],
+            &backends,
             Arc::new(ConnGauges::new(2)),
             Policy::RoundRobin,
             1,
@@ -249,8 +270,9 @@ mod tests {
 
     #[test]
     fn rr_cycles_all() {
+        let backends = vec![be(1), be(2), be(3)];
         let mut b = Balancer::new(
-            vec![be(1), be(2), be(3)],
+            &backends,
             Arc::new(ConnGauges::new(3)),
             Policy::RoundRobin,
             1,
@@ -271,12 +293,8 @@ mod tests {
         for _ in 0..100 {
             gauges.inc(0);
         }
-        let mut b = Balancer::new(
-            vec![be(1), be(2), be(3)],
-            Arc::clone(&gauges),
-            Policy::P2C,
-            7,
-        );
+        let backends = vec![be(1), be(2), be(3)];
+        let mut b = Balancer::new(&backends, Arc::clone(&gauges), Policy::P2C, 7);
         let mut idle = 0;
         for _ in 0..600 {
             let p = b.pick_addr().expect("addr").port();
@@ -293,12 +311,8 @@ mod tests {
         gauges.inc(0);
         gauges.inc(1);
         gauges.inc(1);
-        let mut b = Balancer::new(
-            vec![be(1), be(2), be(3)],
-            Arc::clone(&gauges),
-            Policy::LeastConn,
-            1,
-        );
+        let backends = vec![be(1), be(2), be(3)];
+        let mut b = Balancer::new(&backends, Arc::clone(&gauges), Policy::LeastConn, 1);
         assert_eq!(b.pick_addr().expect("addr").port(), 3);
     }
 }
@@ -307,22 +321,18 @@ mod tests {
 mod pick_except_tests {
     use super::*;
 
-    fn two_backend(policy: Policy) -> Balancer {
-        Balancer::new(
-            vec![
-                Backend::new("127.0.0.1:9101".parse().expect("addr"), 1),
-                Backend::new("127.0.0.1:9102".parse().expect("addr"), 1),
-            ],
-            std::sync::Arc::new(ConnGauges::new(2)),
-            policy,
-            0,
-        )
+    fn two_backend<'a>(policy: Policy, backends: &'a [Backend]) -> Balancer<'a> {
+        Balancer::new(backends, std::sync::Arc::new(ConnGauges::new(2)), policy, 0)
     }
 
     #[test]
     fn except_skips_failed_backend() {
+        let backends = vec![
+            Backend::new("127.0.0.1:9101".parse().expect("addr"), 1),
+            Backend::new("127.0.0.1:9102".parse().expect("addr"), 1),
+        ];
         for policy in [Policy::P2C, Policy::RoundRobin, Policy::LeastConn] {
-            let mut b = two_backend(policy);
+            let mut b = two_backend(policy, &backends);
             // Exclude the first backend 20 times: must never be picked.
             for _ in 0..20 {
                 let addr = b
@@ -335,8 +345,12 @@ mod pick_except_tests {
 
     #[test]
     fn except_falls_back_to_lone_backend() {
-        let mut b = two_backend(Policy::P2C);
-        b.backends[1].set_healthy(false);
+        let backends = vec![
+            Backend::new("127.0.0.1:9101".parse().expect("addr"), 1),
+            Backend::new("127.0.0.1:9102".parse().expect("addr"), 1),
+        ];
+        let mut b = two_backend(Policy::P2C, &backends);
+        b.backends()[1].set_healthy(false);
         // Only 9101 is healthy: exclusion must not starve it.
         let addr = b
             .pick_addr_except(Some("127.0.0.1:9101".parse().expect("addr")))
@@ -345,16 +359,26 @@ mod pick_except_tests {
     }
 
     #[test]
-    fn except_restores_health_flags() {
-        let mut b = two_backend(Policy::P2C);
+    fn except_masks_without_touching_flags() {
+        let backends = vec![
+            Backend::new("127.0.0.1:9101".parse().expect("addr"), 1),
+            Backend::new("127.0.0.1:9102".parse().expect("addr"), 1),
+        ];
+        let mut b = two_backend(Policy::P2C, &backends);
         let _ = b.pick_addr_except(Some("127.0.0.1:9101".parse().expect("addr")));
-        // Masking is temporary: both backends healthy afterwards.
-        assert!(b.backends.iter().all(|x| x.is_healthy()));
+        // Exclusion is address-scoped per pick: shared health flags are
+        // never mutated (the old mask/restore dance wrote through the
+        // Arc<AtomicU64> visible to every worker).
+        assert!(b.backends().iter().all(|x| x.is_healthy()));
     }
 
     #[test]
     fn except_none_behaves_like_pick() {
-        let mut b = two_backend(Policy::RoundRobin);
+        let backends = vec![
+            Backend::new("127.0.0.1:9101".parse().expect("addr"), 1),
+            Backend::new("127.0.0.1:9102".parse().expect("addr"), 1),
+        ];
+        let mut b = two_backend(Policy::RoundRobin, &backends);
         assert!(b.pick_addr_except(None).is_some());
     }
 }

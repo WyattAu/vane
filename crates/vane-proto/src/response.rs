@@ -289,6 +289,14 @@ mod status_tests {
 /// Maximum response headers parsed.
 pub const MAX_RESPONSE_HEADERS: usize = 64;
 
+/// `true` when `needle` occurs in `haystack` (ASCII case-insensitive).
+fn contains_ignore_case(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.len() >= needle.len()
+        && haystack
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle))
+}
+
 /// Result of parsing an upstream response head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UpstreamHead {
@@ -324,23 +332,18 @@ pub fn parse_upstream_head<'a>(
             let mut chunked = false;
             let mut close = false;
             for h in resp.headers {
-                let name = h.name.to_ascii_lowercase();
-                if name == "content-length" {
+                // Case-insensitive scans on the raw bytes — the former
+                // `to_ascii_lowercase` allocated per header per response.
+                if h.name.eq_ignore_ascii_case("content-length") {
                     content_length = std::str::from_utf8(h.value)
                         .ok()
                         .and_then(|s| s.trim().parse().ok());
-                } else if name == "transfer-encoding"
-                    && h.value
-                        .to_ascii_lowercase()
-                        .windows(7)
-                        .any(|w| w == b"chunked")
+                } else if h.name.eq_ignore_ascii_case("transfer-encoding")
+                    && contains_ignore_case(h.value, b"chunked")
                 {
                     chunked = true;
-                } else if name == "connection"
-                    && h.value
-                        .to_ascii_lowercase()
-                        .windows(5)
-                        .any(|w| w.eq_ignore_ascii_case(b"close"))
+                } else if h.name.eq_ignore_ascii_case("connection")
+                    && contains_ignore_case(h.value, b"close")
                 {
                     close = true;
                 }

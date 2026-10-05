@@ -118,17 +118,16 @@ impl<'h> RequestView<'h> {
     #[must_use]
     pub fn is_chunked(&self) -> bool {
         self.header("transfer-encoding")
-            .is_some_and(|v| v.to_ascii_lowercase().windows(7).any(|w| w == b"chunked"))
+            .is_some_and(|v| contains_ignore_case(v, b"chunked"))
     }
 
     /// `Connection` semantics: HTTP/1.0 defaults to close unless
     /// `keep-alive`; HTTP/1.1 defaults to keep-alive unless `close`.
     #[must_use]
     pub fn wants_close(&self) -> bool {
-        let conn = self
-            .header("connection")
-            .map(|v| v.to_ascii_lowercase())
-            .unwrap_or_default();
+        // Case-insensitive scan over the raw header (no lowered copy —
+        // the former `to_ascii_lowercase` allocated per request).
+        let conn = self.header("connection").unwrap_or_default();
         if self.version == 0 {
             !conn
                 .windows(10)
@@ -174,14 +173,13 @@ fn framing_is_ambiguous(view: &RequestView<'_>) -> bool {
     let mut transfer_encodings = 0usize;
     let mut te_value: Option<&[u8]> = None;
     for h in view.headers {
-        let lname = h.name.to_ascii_lowercase();
-        match lname.as_str() {
-            "content-length" => content_lengths += 1,
-            "transfer-encoding" => {
-                transfer_encodings += 1;
-                te_value = Some(h.value);
-            }
-            _ => {}
+        // Case-insensitive match on the raw name — the former
+        // `to_ascii_lowercase` allocated per header per request.
+        if h.name.eq_ignore_ascii_case("content-length") {
+            content_lengths += 1;
+        } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
+            transfer_encodings += 1;
+            te_value = Some(h.value);
         }
     }
     if content_lengths > 1 || transfer_encodings > 1 {
@@ -196,16 +194,24 @@ fn framing_is_ambiguous(view: &RequestView<'_>) -> bool {
     }
 }
 
+/// `true` when `needle` occurs in `haystack` (ASCII case-insensitive).
+fn contains_ignore_case(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.len() >= needle.len()
+        && haystack
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle))
+}
+
 /// `true` when the (single) `Transfer-Encoding` value's final coding is
 /// `chunked` (case-insensitive, comma-separated list, e.g. `gzip, chunked`).
 fn ends_with_chunked(value: &[u8]) -> bool {
-    let lowered = value.to_ascii_lowercase();
-    let last = match lowered.iter().rposition(|&b| b == b',') {
-        Some(pos) => &lowered[pos + 1..],
-        None => &lowered[..],
+    // Walk the raw bytes: find the last comma, then compare the
+    // trimmed tail case-insensitively (no lowered copy).
+    let last = match value.iter().rposition(|&b| b == b',') {
+        Some(pos) => &value[pos + 1..],
+        None => value,
     };
-    let last = last.trim_ascii();
-    last == b"chunked"
+    last.trim_ascii().eq_ignore_ascii_case(b"chunked")
 }
 
 /// Maximum accepted head size.

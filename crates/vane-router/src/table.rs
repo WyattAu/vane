@@ -51,14 +51,12 @@ pub struct RouteEntry {
 
 impl RouteEntry {
     /// Builds a worker-local balancer over this route's backends.
+    ///
+    /// Borrows the backend slice: a per-request balancer construction
+    /// allocates nothing (`MM-01`).
     #[must_use]
-    pub fn balancer(&self, seed: u64) -> Balancer {
-        Balancer::new(
-            self.backends.clone(),
-            Arc::clone(&self.gauges),
-            self.policy,
-            seed,
-        )
+    pub fn balancer(&self, seed: u64) -> Balancer<'_> {
+        Balancer::new(&self.backends, Arc::clone(&self.gauges), self.policy, seed)
     }
 }
 

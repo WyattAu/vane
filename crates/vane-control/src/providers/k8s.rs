@@ -25,6 +25,9 @@ pub struct K8sProvider {
     /// Namespaces to watch (empty = all).
     pub namespaces: Vec<String>,
     client: reqwest::Client,
+    /// Static bearer token override (`with_client`; in-cluster reads
+    /// the service-account file).
+    token: Option<String>,
 }
 
 /// Compiled HTTPRoute entry.
@@ -68,10 +71,32 @@ impl K8sProvider {
             api,
             namespaces,
             client,
+            token: None,
         })
     }
 
+    /// Builds a provider from an explicit client and optional static
+    /// bearer token — the test seam (`wiremock` mocks) and the seam for
+    /// exotic service-account setups; the in-cluster path is [`Self::new`].
+    #[must_use]
+    pub fn with_client(
+        api: String,
+        namespaces: Vec<String>,
+        client: reqwest::Client,
+        token: Option<String>,
+    ) -> Self {
+        Self {
+            api,
+            namespaces,
+            client,
+            token,
+        }
+    }
+
     fn token(&self) -> Result<String, String> {
+        if let Some(t) = &self.token {
+            return Ok(t.clone());
+        }
         std::fs::read_to_string(SA_TOKEN).map_err(|e| format!("read token: {e}"))
     }
 

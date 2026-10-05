@@ -3,6 +3,12 @@
 //! The binary (`main.rs`) is a thin CLI over [`server::run`].
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+// Global allocator (MM-02): mimalloc, feature-gated (default off so
+// embedders/tests keep the system allocator).
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 pub mod admin;
 pub mod h1pool;
 #[cfg(feature = "h2")]

@@ -28,6 +28,7 @@ const WAKER: usize = u64::MAX as usize;
 
 /// A queued operation waiting for readiness. Keyed by fd, dispatched on
 /// matching readiness.
+#[derive(Clone, Copy)]
 enum Pending {
     /// Socket read into `slot`.
     Read { slot: u32, token: Token },
@@ -60,6 +61,18 @@ pub struct MioEngine {
     buf_size: usize,
     /// RawFd -> armed ops.
     pending: HashMap<RawFd, Vec<Pending>>,
+    /// Dispatch swap scratch (`MM-01`): armed ops are swapped through
+    /// it so the per-fd Vec and the scratch both retain capacity.
+    dispatch_scratch: Vec<Pending>,
+    /// Retired per-fd op Vec (`MM-01`): `remove` prunes the entry on
+    /// detach/close; the freed Vec parks here and is reused by the
+    /// next attach (pooled upstreams detach + attach per checkout —
+    /// rebuilding the Vec allocated per request).
+    retired: Option<Vec<Pending>>,
+    /// Readiness scratch, reused across polls (`MM-01`): the former
+    /// per-poll `Vec::with_capacity(64)` malloc'd on every event-loop
+    /// iteration — two per proxied request.
+    ready: Vec<(RawFd, bool, bool)>,
     events: Events,
     cqes: Vec<Cqe>,
 }
@@ -89,6 +102,9 @@ impl MioEngine {
             slot_bases,
             buf_size: pool.buf_size(),
             pending: HashMap::new(),
+            dispatch_scratch: Vec::new(),
+            retired: None,
+            ready: Vec::with_capacity(EVENTS_CAP),
             events: Events::with_capacity(EVENTS_CAP),
             cqes: Vec::with_capacity(EVENTS_CAP),
         })
@@ -108,7 +124,24 @@ impl MioEngine {
     }
 
     fn push(&mut self, fd: RawFd, op: Pending) {
-        self.pending.entry(fd).or_default().push(op);
+        // Reuse a retired Vec when the fd has no entry yet (attach
+        // after pooled detach) — no allocation, `MM-01`.
+        if !self.pending.contains_key(&fd) {
+            let v = self.retired.take().unwrap_or_default();
+            self.pending.insert(fd, v);
+        }
+        let v = self.pending.get_mut(&fd).expect("entry inserted above");
+        // Accept readiness is a level-ish re-arm: the worker loop
+        // probes every listener on each pass, and each EAGAIN pushed
+        // another op — the listener's Vec grew without bound on a
+        // quiet edge (8 MB in a 16k-pass soak). One armed op is
+        // enough; the kernel re-fires when a connection arrives.
+        if matches!(op, Pending::Listener { .. })
+            && v.iter().any(|e| matches!(e, Pending::Listener { .. }))
+        {
+            return;
+        }
+        v.push(op);
     }
 
     /// Performs one read attempt: full/EOF/error results queue a CQE
@@ -247,9 +280,17 @@ impl MioEngine {
 
     /// Runs all armed ops matching an event.
     fn dispatch(&mut self, fd: RawFd, readable: bool, writable: bool) {
-        let ops = self.pending.remove(&fd).unwrap_or_default();
+        // Swap the armed ops out through the engine's scratch so BOTH
+        // buffers keep their capacity (`MM-01`): the former `remove()`
+        // dropped the per-fd Vec every event — two to four mallocs per
+        // proxied request. The entry is pruned when the fd closes.
+        let mut ops = std::mem::take(&mut self.dispatch_scratch);
+        ops.clear();
+        if let Some(armed) = self.pending.get_mut(&fd) {
+            std::mem::swap(&mut ops, armed);
+        }
         // Priority: connect completion first, then listener/read/write.
-        for op in ops {
+        for op in ops.iter().copied() {
             match op {
                 Pending::Connect { token } => {
                     let err = sock_error(fd);
@@ -311,6 +352,9 @@ impl MioEngine {
                 }
             }
         }
+        // The scratch (now holding the entry's retired buffer) returns;
+        // both sides of the swap retain capacity for the next event.
+        self.dispatch_scratch = ops;
     }
 }
 
@@ -450,11 +494,8 @@ impl Engine for MioEngine {
         let err = io::Error::last_os_error();
         match err.raw_os_error() {
             Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => {
-                // Re-arm accept readiness.
-                self.pending
-                    .entry(lfd)
-                    .or_default()
-                    .push(Pending::Listener { lfd, token: ltoken });
+                // Re-arm accept readiness (deduped — see `push`).
+                self.push(lfd, Pending::Listener { lfd, token: ltoken });
                 Ok(None)
             }
             Some(libc::EINTR) => self.accept(lfd, ltoken),
@@ -487,7 +528,13 @@ impl Engine for MioEngine {
         // without EEXIST, and so no stale readiness fires after close.
         let mut src = mio::unix::SourceFd(&fd);
         let _ = self.poller.registry().deregister(&mut src);
-        self.pending.remove(&fd);
+        // The entry's Vec parks in `retired` for the next attach (the
+        // former plain remove dropped the allocation, which the pooled
+        // detach/attach cycle paid per request).
+        if let Some(mut v) = self.pending.remove(&fd) {
+            v.clear();
+            self.retired = Some(v);
+        }
     }
 
     fn poll(&mut self, timeout: Option<Duration>, out: &mut Vec<Cqe>) -> io::Result<()> {
@@ -508,18 +555,21 @@ impl Engine for MioEngine {
             Some(Duration::ZERO) // non-blocking: keep inline priority
         };
         self.poller.poll(&mut self.events, wait)?;
-        // Snapshot readiness (events buffer is reused by the poller).
-        let mut ready: Vec<(RawFd, bool, bool)> = Vec::with_capacity(64);
+        // Snapshot readiness (events buffer is reused by the poller);
+        // the scratch Vec is reused across polls (zero alloc).
+        self.ready.clear();
         for ev in self.events.iter() {
             if ev.token() == MioToken(WAKER) {
                 continue;
             }
             let fd = ev.token().0 as RawFd;
-            ready.push((fd, ev.is_readable(), ev.is_writable()));
+            self.ready.push((fd, ev.is_readable(), ev.is_writable()));
         }
-        for (fd, readable, writable) in ready {
+        for i in 0..self.ready.len() {
+            let (fd, readable, writable) = self.ready[i];
             self.dispatch(fd, readable, writable);
         }
+        self.ready.clear();
         out.append(&mut self.cqes);
         Ok(())
     }
