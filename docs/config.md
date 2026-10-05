@@ -383,3 +383,46 @@ source: at startup vane fetches the X.509 SVID from the agent
 a watcher re-materializes on every SVID push from the agent, so
 rotation happens with zero restarts. The first fetch is synchronous —
 startup fails when the agent is unreachable (mesh is TLS-or-nothing).
+
+## `[[routes]] retry` — per-route retries
+
+```toml
+[[routes]]
+pattern = "/api/*rest"
+cluster = "api"
+
+[routes.retry]
+max_attempts = 3        # total dial attempts including the first
+retry_5xx = true        # also retry idempotent requests on 5xx
+```
+
+Retry policy for this route's cluster. `max_attempts` caps the total
+dial attempts (default 3 = 2 retries). `retry_5xx = true` replays the
+request through the failover machinery when an upstream answers 5xx —
+idempotent bodyless requests only (GET/HEAD/PUT/DELETE), capped by
+`max_attempts`. Default (absent): connect failures only, 3 attempts.
+
+## `[[routes]] mirror` — request mirroring (shadow traffic)
+
+```toml
+[[routes]]
+pattern = "/api/*rest"
+cluster = "api"
+mirror = "api-shadow"
+
+[clusters.api-shadow]
+backends = ["10.0.9.7:8080"]
+```
+
+A fire-and-forget copy of each request goes to the named cluster; its
+responses are discarded. Mirroring is best-effort: it never delays or
+fails the real response, and a down shadow is invisible to callers.
+Use for canary validation and load previews.
+
+## Config hot-reload
+
+`vane run -c vane.toml` watches the config file. A valid changed
+config re-applies routes, clusters, and health through the same
+reconciler path as xDS — no restart. Invalid configs keep the
+previous generation (logged). Listener changes are startup-bound and
+logged as restart-required.
