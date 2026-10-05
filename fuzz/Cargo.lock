@@ -3061,7 +3061,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vane-control"
-version = "0.5.3"
+version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
  "envstack",
@@ -3163,10 +3163,11 @@ dependencies = [
 
 [[package]]
 name = "vane-proxy"
-version = "0.5.4"
+version = "0.6.1"
 dependencies = [
  "axum",
  "axum-stack",
+ "breaker",
  "bytes",
  "clap",
  "envstack",
@@ -3209,7 +3210,7 @@ dependencies = [
 
 [[package]]
 name = "vane-router"
-version = "0.5.3"
+version = "0.6.0"
 dependencies = [
  "crossbeam-epoch",
  "serde",
