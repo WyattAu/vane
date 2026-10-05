@@ -207,6 +207,11 @@ struct Conn {
     /// into the upstream response head). Empty for non-CORS requests and
     /// for origins outside the route's policy.
     cors_headers: Vec<(&'static str, String)>,
+    /// Accumulated upstream response head while it is still incomplete.
+    /// TCP carries no message boundaries, so a head can straddle
+    /// segments (or TLS records); empty in the common case where the
+    /// whole head arrives in one read.
+    resp_head: Vec<u8>,
 }
 
 /// Streaming gzip relay state for one response transaction.
@@ -815,12 +820,57 @@ impl HttpProxy {
         let framing = self.conn(slot).body;
         match framing {
             BodyFraming::AwaitingHead => {
-                let (head_len, status, _close) = self.parse_upstream_head(slot, data);
-                if head_len == 0 {
-                    self.respond_full(io, Status::BadGateway, "bad upstream response\n");
-                    io.close();
-                    return;
-                }
+                // A response head can straddle TCP segments (or TLS
+                // records): TCP has no message boundaries, so a backend
+                // with Nagle off, a slow socket, or large headers hands
+                // us a prefix first. Accumulate until the parse
+                // succeeds. The common single-read case copies nothing —
+                // `buf` borrows `data` directly.
+                let had_fragment = self
+                    .conns
+                    .get(&slot)
+                    .is_some_and(|c| !c.resp_head.is_empty());
+                let fragment: Vec<u8> = if had_fragment {
+                    if let Some(c) = self.conns.get_mut(&slot) {
+                        c.resp_head.extend_from_slice(data);
+                    }
+                    std::mem::take(&mut self.conn(slot).resp_head)
+                } else {
+                    Vec::new()
+                };
+                let buf: &[u8] = if had_fragment { &fragment } else { data };
+
+                let (head_len, status) = match self.parse_upstream_head(slot, buf) {
+                    HeadParse::Complete { head_len, status } => (head_len, status),
+                    HeadParse::Partial => {
+                        if buf.len() > RESP_HEAD_CAP {
+                            self.respond_full(io, Status::BadGateway, "upstream head too large\n");
+                            io.close();
+                            return;
+                        }
+                        // Hold the prefix and wait for the rest. Re-arm
+                        // the first-byte deadline: an upstream that
+                        // sends a few bytes and stalls is a
+                        // first-byte problem, not an idle one, and must
+                        // not hold the connection for the full idle
+                        // window.
+                        if let Some(c) = self.conns.get_mut(&slot) {
+                            c.resp_head.clear();
+                            c.resp_head.reserve(buf.len() + data.len());
+                            c.resp_head.extend_from_slice(buf);
+                        }
+                        io.set_deadline(
+                            Some(self.deadline(self.config.first_byte_timeout_ms)),
+                            vane_core::handler::DeadlineReason::FirstByte,
+                        );
+                        return;
+                    }
+                    HeadParse::Malformed => {
+                        self.respond_full(io, Status::BadGateway, "bad upstream response\n");
+                        io.close();
+                        return;
+                    }
+                };
                 // Configured 5xx retry: retry idempotent, bodyless
                 // requests while attempts remain. The response was
                 // never relayed downstream, so the swap is invisible.
@@ -876,11 +926,11 @@ impl HttpProxy {
                     // no chunk wrapper.
                     let compressing = self.conns.get(&slot).is_some_and(|c| c.gzip.is_some());
                     if compressing {
-                        let head_len = data
+                        let head_len = buf
                             .windows(4)
                             .position(|w| w == b"\r\n\r\n")
                             .map_or(0, |p| p + 4);
-                        let (head, rest) = data.split_at(head_len);
+                        let (head, rest) = buf.split_at(head_len);
                         let rewritten = vane_proto::compression::rewrite_head_for_gzip_h2(head);
                         if let Some(mut rewritten) = rewritten {
                             crate::cors::inject_into_head(&mut rewritten, &cors);
@@ -895,16 +945,16 @@ impl HttpProxy {
                     if !cors.is_empty() {
                         // The head must be rewritten in place, so the
                         // body portion goes out as a second write.
-                        let mut head = data[..head_len].to_vec();
+                        let mut head = buf[..head_len].to_vec();
                         crate::cors::inject_into_head(&mut head, &cors);
                         self.h2_write(io, &head);
-                        let rest = &data[head_len..];
+                        let rest = &buf[head_len..];
                         if !rest.is_empty() {
                             self.h2_write(io, rest);
                         }
                         return;
                     }
-                    self.h2_write(io, data);
+                    self.h2_write(io, buf);
                     return;
                 }
                 #[cfg(not(feature = "h2"))]
@@ -915,7 +965,7 @@ impl HttpProxy {
                 // of throughput under `ab`).
                 let gzip_on = self.conns.get(&slot).is_some_and(|c| c.gzip.is_some());
                 let use_gzip = gzip_on && {
-                    let head = &data[..head_len];
+                    let head = &buf[..head_len];
                     let ct = vane_proto::compression::head_header(head, b"content-type");
                     vane_proto::compression::is_compressible(ct)
                         && !vane_proto::compression::head_already_encoded(head)
@@ -924,7 +974,7 @@ impl HttpProxy {
                 if use_gzip {
                     // Rewrite the head: CL out, gzip + chunked in. The
                     // body relay then compresses through GzipRelay.
-                    let head = data[..head_len].to_vec();
+                    let head = buf[..head_len].to_vec();
                     if let Some(mut rewritten) =
                         vane_proto::compression::rewrite_head_for_gzip(&head)
                     {
@@ -946,14 +996,14 @@ impl HttpProxy {
                     let alt = self.config.alt_svc.clone();
                     let alt = alt.filter(|a| !a.is_empty());
                     if alt.is_some() || !cors.is_empty() {
-                        let mut head = data[..head_len].to_vec();
+                        let mut head = buf[..head_len].to_vec();
                         if let Some(alt) = alt.as_deref() {
                             insert_header_once(&mut head, b"alt-svc", alt.as_bytes());
                         }
                         crate::cors::inject_into_head(&mut head, &cors);
                         self.write_downstream(io, &head);
                     } else {
-                        self.write_downstream(io, &data[..head_len]);
+                        self.write_downstream(io, &buf[..head_len]);
                     }
                 }
                 if self.conns.get(&slot).is_some_and(|c| c.tunnel) {
@@ -962,7 +1012,7 @@ impl HttpProxy {
                     let started = self.conns.get(&slot).and_then(|c| c.started);
                     self.access_emit(io, started);
                 }
-                let rest = &data[head_len..];
+                let rest = &buf[head_len..];
                 if !rest.is_empty() {
                     self.relay_body(io, rest);
                 }
@@ -1594,7 +1644,7 @@ impl HttpProxy {
     }
 
     /// Parses the upstream response head and decides body framing.
-    fn parse_upstream_head(&mut self, slot: u32, data: &[u8]) -> (usize, Status, bool) {
+    fn parse_upstream_head(&mut self, slot: u32, data: &[u8]) -> HeadParse {
         let mut storage = [httparse::EMPTY_HEADER; vane_proto::response::MAX_RESPONSE_HEADERS];
         match vane_proto::response::parse_upstream_head(data, &mut storage) {
             Ok(Some(head)) => {
@@ -1627,11 +1677,28 @@ impl HttpProxy {
                 conn.body = framing;
                 conn.remaining = remaining;
                 conn.close_after |= upstream_close;
-                (head_len, status, upstream_close)
+                // `upstream_close` is already folded into the
+                // connection's close_after below.
+                let _ = upstream_close;
+                HeadParse::Complete { head_len, status }
             }
-            _ => (0, Status::BadGateway, true),
+            // Incomplete so far: the caller accumulates and re-parses.
+            Ok(None) => HeadParse::Partial,
+            _ => HeadParse::Malformed,
         }
     }
+}
+
+/// Outcome of parsing an upstream response head.
+enum HeadParse {
+    /// The whole head is present (the head's own `Connection: close` is
+    /// applied to the connection when it parses).
+    Complete { head_len: usize, status: Status },
+    /// A valid prefix: more bytes are needed before anything can be
+    /// decided.
+    Partial,
+    /// Not a response head, or more headers than the parser allows.
+    Malformed,
 }
 
 /// Round-robin cursor for mirror (shadow) backend picks.
@@ -1640,6 +1707,10 @@ static MIRROR_RR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 /// Handler-side cap for body bytes arriving before the upstream
 /// connects. The window is one dial; anything beyond this is abusive.
 const REQ_PENDING_CAP: usize = 1024 * 1024;
+
+/// Cap on an accumulated upstream response head. A head larger than this
+/// is a protocol error, not a slow sender.
+const RESP_HEAD_CAP: usize = 64 * 1024;
 
 /// Hop-by-hop headers the proxy manages itself (ASCII-case-insensitive).
 fn is_hop_by_hop(name: &str) -> bool {
