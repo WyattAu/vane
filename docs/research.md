@@ -70,3 +70,21 @@ Updated per engineering-loop iteration.
 | kernel TLS (kTLS) TX offload | TLS throughput | NIC support check |
 | SO_REUSEPORT + eBPF reuseport hash | accept-path balancing | measured accept-path gap |
 | h3 metadata (QPACK tuning) | h3 header compression | h3 profile |
+
+## eBPF SO_REUSEPORT load balancing
+
+- **Source**: Vincent Bernat (2026), Cloudflare tubular blog, APNIC
+  blog series, ebpf.io BPF_PROG_TYPE_SK_REUSEPORT docs
+- **Finding**: the kernel's default SO_REUSEPORT hashing is a 4-tuple
+  hash — it distributes connections by flow, not by load. An eBPF
+  `sk_reuseport` program can override the selection (consistent
+  hash, least-connections, BPF map lookup). Cloudflare's tubular is
+  a production eBPF reuseport manager.
+- **vane mapping**: vane already uses SO_REUSEPORT per-worker accept
+  (the default 4-tuple hash). The eBPF upgrade would provide
+  connection-level load balancing across workers — relevant when
+  workers have unequal load (e.g., hot upstream connections).
+- **Trigger**: measured accept-path imbalance (one worker
+  saturating while others idle).
+- **Status**: parked (the default hash is sufficient for
+  homogeneous traffic; eBPF adds infrastructure complexity).
