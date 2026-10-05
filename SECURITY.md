@@ -37,3 +37,15 @@ status handling in the h1pool response parser (fixed, 2026-10-03).
 ## Supported versions
 
 The latest release line only. Patches land as patch releases.
+
+## Dependency advisories (cargo audit, 2026-10-04)
+
+| Advisory | Crate | Severity | Status |
+|---|---|---|---|
+| RUSTSEC-2026-0285 | rustls 0.23.44 | 5.3 | **fixed** (0.23.45) |
+| RUSTSEC-2023-0071 | rsa 0.9.10 | 5.9 | transitive (ACME JWT, sha2 feature) — no fix published; the RSA path signs local JWTs, never accepts remote keys |
+| RUSTSEC-2026-0315/0325/0326/0316 | wasmtime 48 | 5.7/5.9/1 | transitive (wasm plugin feature, optional) — no fix published; disable the `wasm` feature to exclude |
+
+cargo audit runs in CI (dependency audit job). Advisories without
+published fixes are reviewed per release; the `wasm` feature is
+opt-in.

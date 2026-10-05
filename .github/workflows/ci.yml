@@ -189,6 +189,15 @@ jobs:
       - name: Run smoke
         run: scripts/kind-smoke.sh
 
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo install cargo-audit --locked
+      # Known unfixed advisories are tracked in SECURITY.md.
+      - run: cargo audit --file Cargo.lock
+
   fuzz-smoke:
     name: fuzz smoke
     runs-on: ubuntu-latest
