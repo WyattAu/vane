@@ -129,7 +129,6 @@ struct Conn {
     /// Matched route for the in-flight request.
     route: Option<Arc<RouteEntry>>,
     /// Rewritten request path.
-    upstream_path: Option<String>,
     /// Pipeline verdict headers to inject.
     inject: Vec<(String, String)>,
     /// `Connection: close` for this transaction.
@@ -169,8 +168,12 @@ struct Conn {
     req_head_copy: Vec<u8>,
     /// Access-log fields for the in-flight transaction.
     req_method: String,
-    req_host: Option<String>,
+    req_host: String,
+    /// Empty = the request carried no Host header.
     req_path: String,
+    /// The rewritten upstream path (take/restore scratch — capacity
+    /// amortized across transactions).
+    upstream_path: String,
     resp_status: u16,
     bytes_out: u64,
     /// Set once the transaction's access record was emitted.
@@ -1388,7 +1391,7 @@ impl HttpProxy {
             client,
             upstream,
             conn.req_method.as_bytes(),
-            conn.req_host.as_deref().unwrap_or_default().as_bytes(),
+            conn.req_host.as_bytes(),
             conn.req_path.as_bytes(),
             &trace_hex[..trace_len],
         );
@@ -1781,7 +1784,7 @@ impl Handler for HttpProxy {
             let conn = self.conn(slot);
             (
                 conn.route.clone().expect("route"),
-                conn.upstream_path.clone().expect("path"),
+                conn.upstream_path.clone(),
                 std::mem::take(&mut conn.inject),
             )
         };
@@ -2146,11 +2149,17 @@ impl HttpProxy {
             let conn = self.conn(slot);
             conn.req_method.clear();
             conn.req_method.push_str(view.method);
-            conn.req_host = view
+            // Reusable buffers: clear+push_str keeps capacity across
+            // requests (zero per-request allocation after warmup).
+            conn.req_host.clear();
+            if let Some(h) = view
                 .header("host")
                 .and_then(|h| std::str::from_utf8(h).ok())
-                .map(|h| h.split(':').next().unwrap_or(h).to_owned());
-            conn.req_path = view.path.to_owned();
+            {
+                conn.req_host.push_str(h.split(':').next().unwrap_or(h));
+            }
+            conn.req_path.clear();
+            conn.req_path.push_str(view.path);
             conn.resp_status = 0;
             conn.bytes_out = 0;
             conn.access_logged = false;
@@ -2295,28 +2304,30 @@ impl HttpProxy {
         // take the streaming relay path instead of re-entering here).
         conn_set_framing(&mut self.conns, slot, view);
 
-        // Path rewrite.
-        let upstream_path = route
-            .strip_prefix
-            .as_ref()
-            .and_then(|p| {
-                view.path.strip_prefix(p.as_str()).map(|rest| {
-                    if rest.starts_with('/') {
-                        rest.to_owned()
-                    } else {
-                        format!("/{rest}")
-                    }
-                })
-            })
-            .unwrap_or_else(|| view.path.to_owned());
+        // Path rewrite (into the connection's reusable scratch).
+        let mut upstream_path = std::mem::take(&mut self.conn(slot).upstream_path);
+        upstream_path.clear();
+        if let Some(p) = &route.strip_prefix {
+            if let Some(rest) = view.path.strip_prefix(p.as_str()) {
+                if rest.starts_with('/') {
+                    upstream_path.push_str(rest);
+                } else {
+                    upstream_path.push('/');
+                    upstream_path.push_str(rest);
+                }
+            } else {
+                upstream_path.push_str(view.path);
+            }
+        } else {
+            upstream_path.push_str(view.path);
+        }
 
-        // Filter pipeline (scoped: ctx borrows `path_mut`).
-        let mut path_mut = upstream_path.clone();
+        // Filter pipeline (scoped: ctx borrows the path buffer).
         let peer = io
             .peer()
             .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
         let (inject, short_circuit, trace) = {
-            let mut ctx = RequestCtx::new(view.method, &mut path_mut, peer, host_only);
+            let mut ctx = RequestCtx::new(view.method, &mut upstream_path, peer, host_only);
             ctx.cluster = Some(&route.cluster);
             ctx.inject("X-Forwarded-For", &peer.ip().to_string());
             // Scheme as this edge saw it: TLS-terminating listeners report
@@ -2441,7 +2452,7 @@ impl HttpProxy {
             let conn = self.conn(slot);
             conn.route = Some(Arc::clone(&route));
             conn.breaker = Some((route.cluster.clone(), Arc::clone(&cached_breaker)));
-            conn.upstream_path = Some(path_mut);
+            conn.upstream_path = upstream_path;
             conn.inject = inject;
             conn.started = Some(started);
             conn.close_after = view.wants_close();
@@ -2638,14 +2649,14 @@ impl HttpProxy {
                 let conn = self.conn(slot);
                 conn.head_buf.clear();
                 conn.route = None;
-                conn.upstream_path = None;
+                conn.upstream_path.clear();
                 conn.body = BodyFraming::AwaitingHead;
                 conn.remaining = 0;
                 conn.close_after = false;
                 conn.attempts = 0;
                 conn.upstream_ready = false;
                 conn.req_method.clear();
-                conn.req_host = None;
+                conn.req_host.clear();
                 conn.req_path.clear();
                 conn.resp_status = 0;
                 conn.bytes_out = 0;

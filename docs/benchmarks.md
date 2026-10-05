@@ -365,7 +365,9 @@ h1/h2c upstream dial now takes the connection buffer (capacity
 preserved across the transaction) instead of cloning head+inline-body
 per request. Measured on the fair-config shape: h1 45.5k/43.9k
 (+2-4%), RSS -4% on the TLS shape / -41% on the plain shape.
-**Next levers by measured cost**: (1) remaining allocation churn
-(inject vecs, RequestCtx, access records), (2) clock-read coalescing
-(~4.7% — one timestamp per event-loop iteration instead of per call
-site).
+**Landed (2026-10-04, tranche 2)**: req_host/req_path/upstream_path
+are reusable buffers (clear+push_str / take+restore — capacity
+amortized across transactions). RSS on the plain shape: 225 → 205 MB;
+throughput unchanged within noise (allocation savings are latency/CPU,
+not throughput, at this concurrency). Remaining: inject-vec strings,
+access-record churn; clock-read coalescing (~4.7%).
