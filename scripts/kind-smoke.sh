@@ -26,6 +26,12 @@ echo "== create cluster"
 # Keep the output: `>/dev/null 2>&1` turned a cluster-creation failure
 # into a bare "exit code 1" at this line, which is how this job stayed
 # unexplained. On failure, print the log before giving up.
+# Clear any cluster left behind first. GitHub reuses runner VMs across
+# jobs and the docker daemon goes with them, so a previous run that was
+# cancelled before its cleanup trap ran leaves `vane-smoke` behind — and
+# the next run then fails with "node(s) already exist for a cluster with
+# the name", which reads like a kind bug rather than leftover state.
+"$KIND" delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
 cluster_log="$(mktemp)"
 if ! "$KIND" create cluster --name "$CLUSTER" --wait 120s >"$cluster_log" 2>&1; then
     echo "!! kind create cluster failed:"
