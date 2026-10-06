@@ -41,6 +41,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "chunked_scanner"
+path = "fuzz_targets/chunked_scanner.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "parse_response"
 path = "fuzz_targets/parse_response.rs"
 test = false

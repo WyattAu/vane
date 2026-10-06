@@ -218,6 +218,8 @@ jobs:
         run: cargo fuzz run xds_decode -- -max_total_time=60 -max_len=16384 -detect_leaks=0
       - name: h1pool response smoke (60s)
         run: cargo fuzz run h1pool_response -- -max_total_time=60 -max_len=8192 -detect_leaks=0
+      - name: chunked scanner smoke (60s)
+        run: cargo fuzz run chunked_scanner -- -max_total_time=60 -max_len=4096 -detect_leaks=0
       # Regression seeds: every fuzz-found bug must stay found.
       # Corpus paths are resolved against the invocation directory, and
       # this job runs from the repo root — `corpus/regression` silently
@@ -228,7 +230,7 @@ jobs:
           seeds="$(ls fuzz/corpus/regression 2>/dev/null | wc -l)"
           echo "regression seeds: ${seeds}"
           test "$seeds" -gt 0
-          for t in parse_request parse_response frame hpack h2_conn_server xds_decode h1pool_response; do
+          for t in parse_request parse_response frame hpack h2_conn_server xds_decode h1pool_response chunked_scanner; do
             cargo fuzz run "$t" fuzz/corpus/regression -- -detect_leaks=0 -runs=5000
           done
       - name: h2 frame smoke (60s)
@@ -254,7 +256,7 @@ jobs:
       # Any artifact uploaded for triage; crashes fail the run.
       - name: deep fuzz (600s per target)
         run: |
-          for t in parse_request parse_response frame hpack h2_conn_server xds_decode h1pool_response route_lookup shm_descriptors access_record; do
+          for t in parse_request parse_response frame hpack h2_conn_server xds_decode h1pool_response chunked_scanner route_lookup shm_descriptors access_record; do
             echo "=== $t ==="
             cargo fuzz run "$t" -- -max_total_time=600 -max_len=16384 -detect_leaks=0 -artifact_prefix=/tmp/artifacts/
           done
