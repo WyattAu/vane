@@ -1856,6 +1856,13 @@ workers = 1
                 }
             }
         }
+        // END_STREAM must terminate the stream, not the connection close:
+        // a gzipped response has no Content-Length for the peer to frame
+        // it with, so without END_STREAM the response is a broken stream.
+        assert!(
+            h2up.response_complete(),
+            "gzip h2 response ended without END_STREAM"
+        );
         let head = String::from_utf8_lossy(&got_head.expect("response head")).into_owned();
         assert!(
             head.to_lowercase().contains("content-encoding: gzip"),

@@ -7,6 +7,76 @@ c8edae3 send_request(None) semantics change (fixed by the h2up
 Some(0) bodyless repair), and chunked_relay's client never flushed
 credit-driven pending_writes (a test bug; the relay was correct).
 
+## ROOT CAUSE FOUND (2026-10-06): one-way upstream read throttle
+
+`tls_h2upstream_large_body` and `h2c_native_engine_large_body` were
+still failing **2 runs in 3 standalone** on an idle host (verified on a
+clean tree at `74b616d3`, so not a regression of the CORS/split-head
+work). The "large body streaming stall" family that this file tracks
+across a dozen earlier attempts finally had its cause.
+
+`WorkerState::arm_upstream_read` throttles itself while the client-bound
+write queue is backed up:
+
+```rust
+// Read throttling: pause while the client-bound write queue is
+// backed up (resumed from the downstream write-completion path).
+if s.pending_down.len() > 2 * self.pool.buf_size() {
+    return;
+}
+```
+
+The completion path (`continue_downstream_write`) only resumed the
+**client** read, and gated that on `pending_up` draining:
+
+```rust
+let drained = self.slab.get(slot)
+    .is_some_and(|s| s.pending_up.len() <= 2 * self.pool.buf_size());
+if drained { self.arm_downstream_read(slot, generation); }
+```
+
+Nothing ever re-armed the *upstream* read, so the throttle was a one-way
+door: once `pending_down` crossed the threshold, upstream reads stopped
+for the rest of the transaction. The client then waited for the rest of
+a body vane would never fetch, until its read timeout fired. The stall
+only ends when the client gives up, which is why it looked like
+scheduling and why `ss -itm` showed empty kernel queues.
+
+The threshold is `2 × DEFAULT_BUF_SIZE` = **8 KiB**, so the trigger is
+not "a 1 MiB response": it is *any* moment where the client reads
+slower than vane writes for 8 KiB worth of data — a mobile link, a GC
+pause, a busy loop, a cold page cache. The earlier forensics ("the
+shim intake trickles 13–17-byte reads", "the response send budget
+trickles take=8193 → 4096 → 13") are the same thing seen from the
+inside: vane had stopped reading, and the trickle was the few bytes
+already queued.
+
+Fixed by resuming upstream reads from the downstream write-completion
+path, mirroring the client-read resume:
+
+```rust
+let downstream_ready = self.slab.get(slot)
+    .is_some_and(|s| s.pending_down.len() <= 2 * self.pool.buf_size());
+if downstream_ready { self.arm_upstream_read(slot, generation); }
+```
+
+`arm_upstream_read` keeps its own guards (`upstream` still attached, no
+read in flight, no splice takeover), so re-arming is safe to do on every
+write completion.
+
+Regression coverage: `crates/vane/tests/downstream_backpressure.rs`
+stalls the reader for 700 ms mid-response (deterministic) and asserts
+the full 4 MiB body arrives with integrity, once and twice over a
+keep-alive connection. Both cases fail on the pre-fix worker and pass
+after. `tls_h2upstream_large_body` and
+`h2c_native_engine_large_body` now pass 6/6 and 4/4 standalone.
+
+Also removed in the same pass: unconditional `eprintln!` debug prints
+in the h2 frame hot path (`CRDBG` on every DATA / HEADERS /
+WINDOW_UPDATE / connection error), which bypassed the `vane_dbg` feature
+gate and took a stderr lock per frame. They now go through
+`dbg_trace!`.
+
 ## Residual known issue: WRITE_PENDING_CAP starvation truncation — FIXED
 
 The final close path (worker close-on-overflow at 1 MiB under CPU

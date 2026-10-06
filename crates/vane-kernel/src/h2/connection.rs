@@ -409,7 +409,7 @@ impl Connection {
     }
 
     fn conn_error(&mut self, code: u32) -> ConnectionError {
-        eprintln!("CRDBG conn_error code={code:#x}");
+        crate::dbg_trace!("conn_error code={code:#x}");
         let err = ConnectionError { code };
         if !self.goaway_sent {
             self.goaway_sent = true;
@@ -553,7 +553,7 @@ impl Connection {
             FrameKind::Settings => self.handle_settings(hdr, payload, events),
             FrameKind::Ping => self.handle_ping(hdr, payload),
             FrameKind::WindowUpdate => {
-                eprintln!("CRDBG wu stream={} len={}", hdr.stream_id, payload.len());
+                crate::dbg_trace!("wu stream={} len={}", hdr.stream_id, payload.len());
                 self.handle_window_update(hdr, payload, events)
             }
             FrameKind::GoAway => {
@@ -589,11 +589,7 @@ impl Connection {
                 Ok(())
             }
             FrameKind::Headers => {
-                eprintln!(
-                    "CRDBG headers stream={} len={}",
-                    hdr.stream_id,
-                    payload.len()
-                );
+                crate::dbg_trace!("headers stream={} len={}", hdr.stream_id, payload.len());
                 self.handle_headers(hdr, payload, events)?;
                 Ok(())
             }
@@ -603,7 +599,7 @@ impl Connection {
                 Err(error_code::PROTOCOL_ERROR)
             }
             FrameKind::Data => {
-                eprintln!("CRDBG data stream={} len={}", hdr.stream_id, payload.len());
+                crate::dbg_trace!("data stream={} len={}", hdr.stream_id, payload.len());
                 self.handle_data(hdr, payload, events)
             }
             FrameKind::Priority => {

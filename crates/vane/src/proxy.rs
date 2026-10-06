@@ -938,6 +938,23 @@ impl HttpProxy {
                             if !rest.is_empty() {
                                 let compressed = self.gzip_feed(slot, rest);
                                 self.h2_write(io, &compressed);
+                                // Account for the inline body: this arm
+                                // bypasses relay_body, so without this the
+                                // declared length is never satisfied, the
+                                // gzip trailer is never flushed, and the
+                                // upstream EOF reads as a truncated body.
+                                let complete = {
+                                    let conn = self.conn(slot);
+                                    conn.remaining =
+                                        conn.remaining.saturating_sub(rest.len() as u64);
+                                    matches!(conn.body, BodyFraming::ContentLength)
+                                        && conn.remaining == 0
+                                };
+                                if complete {
+                                    self.finish_gzip(io);
+                                    self.h2_end_response(io);
+                                    self.conn(slot).body = BodyFraming::Done;
+                                }
                             }
                             return;
                         }
@@ -2803,8 +2820,40 @@ impl HttpProxy {
         }
         if framing_done {
             self.finish_gzip(io);
+            // A gzipped h2 response has no Content-Length (the head
+            // rewrite strips it), so the shim cannot derive END_STREAM
+            // from byte counts — the upstream CL is what says the body
+            // ended. Close the stream here instead of waiting for an
+            // upstream EOF that may never come, or arriving after the
+            // response is logically over.
+            #[cfg(feature = "h2")]
+            if self.conns.get(&slot).is_some_and(|c| c.h2.is_some()) {
+                self.h2_end_response(io);
+            }
             self.conn(slot).body = BodyFraming::Done;
         }
+    }
+
+    /// Ends the h2 response stream (END_STREAM) for a body whose length
+    /// the shim cannot derive — the gzip relay, where the head rewrite
+    /// removes Content-Length and the compressed size is not known up
+    /// front.
+    #[cfg(feature = "h2")]
+    fn h2_end_response(&mut self, io: &mut SessionIo<'_>) {
+        let slot = io.slot_index();
+        let (frames, outcome) = {
+            let Some(h2s) = self.conn(slot).h2.as_mut() else {
+                return;
+            };
+            h2s.response_eof()
+        };
+        for f in frames {
+            self.conn(slot).h2_out.extend_from_slice(&f);
+        }
+        if outcome == crate::h2_server::EofOutcome::Completed {
+            self.conn(slot).body = BodyFraming::Done;
+        }
+        self.h2_flush(io);
     }
 
     /// Flushes the gzip trailer when compressing. h1 adds the terminal

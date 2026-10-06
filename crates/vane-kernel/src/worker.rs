@@ -752,6 +752,21 @@ impl WorkerState {
         if drained {
             self.arm_downstream_read(slot, generation);
         }
+        // Same for UPSTREAM reads: `arm_upstream_read` throttles itself
+        // while the client-bound queue is backed up, so it has to be
+        // re-armed here once that queue drains. Without this the throttle
+        // is a one-way door — a response larger than the queue (the
+        // throttle threshold is only 2 buffer sizes) pauses upstream
+        // reads permanently and the transaction deadlocks: the client
+        // waits for the rest of the body while vane waits for upstream
+        // bytes it will never read again.
+        let downstream_ready = self
+            .slab
+            .get(slot)
+            .is_some_and(|s| s.pending_down.len() <= 2 * self.pool.buf_size());
+        if downstream_ready {
+            self.arm_upstream_read(slot, generation);
+        }
     }
 
     /// Kicks pending_up bytes into the upstream write queue (used after
@@ -877,7 +892,7 @@ impl WorkerState {
             Op::DownstreamRead => {
                 {
                     let Some(s) = self.slab.get_mut(slot) else {
-                        eprintln!("WRKDBG slot gone");
+                        crate::dbg_trace!("slot gone mid-completion");
                         return;
                     };
                     s.read_inflight = false;
