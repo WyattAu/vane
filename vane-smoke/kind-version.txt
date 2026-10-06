@@ -1,0 +1,1 @@
+kind v0.24.0 go1.22.6 linux/amd64

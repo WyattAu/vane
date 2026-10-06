@@ -1,0 +1,62 @@
+Client:
+ Version:    29.8.2
+ Context:    default
+ Debug Mode: false
+ Plugins:
+  buildx: Docker Buildx (Docker Inc.)
+    Version:  v0.29.0
+    Path:     /home/wyatt/.docker/cli-plugins/docker-buildx
+  compose: Docker Compose (Docker Inc.)
+    Version:  5.6.0
+    Path:     /usr/lib/docker/cli-plugins/docker-compose
+
+Server:
+ Containers: 15
+  Running: 3
+  Paused: 0
+  Stopped: 12
+ Images: 592
+ Server Version: 29.8.1
+ Storage Driver: overlayfs
+  driver-type: io.containerd.snapshotter.v1
+ Logging Driver: json-file
+ Cgroup Driver: systemd
+ Cgroup Version: 2
+ Plugins:
+  Volume: local
+  Network: bridge host ipvlan macvlan null overlay
+  Log: awslogs fluentd gcplogs gelf journald json-file local splunk syslog
+ CDI spec directories:
+  /etc/cdi
+  /var/run/cdi
+ Swarm: inactive
+ Runtimes: io.containerd.runc.v2 runc
+ Default Runtime: runc
+ Init Binary: docker-init
+ containerd version: f2551031d7276a770f65f98c9b52e57e7dad07e8.m
+ runc version: 1.5.2-1-0-g17cc947-dirty
+ init version: de40ad0
+ Security Options:
+  seccomp
+   Profile: builtin
+  cgroupns
+ Kernel Version: 7.2.8-1-cachyos
+ Operating System: CachyOS
+ OSType: linux
+ Architecture: x86_64
+ CPUs: 16
+ Total Memory: 31.04GiB
+ Name: msi-ge66
+ ID: 33e775ea-ccdd-4a78-b3a7-13c0cd6d6905
+ Docker Root Dir: /var/lib/docker
+ Debug Mode: false
+ Username: kingstonpeptidesdevops
+ Experimental: false
+ Insecure Registries:
+  ::1/128
+  127.0.0.0/8
+ Live Restore Enabled: false
+ Firewall Backend: iptables+firewalld
+  EnableUserlandProxy: true
+  UserlandProxyPath: /usr/bin/docker-proxy
+

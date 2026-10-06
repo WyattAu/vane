@@ -23,6 +23,8 @@ config:
 
 k8sProvider:
   enabled: true
+  # "*" (or an empty list) watches all namespaces via the cluster-wide
+  # list endpoint. A literal name watches only that namespace.
   namespaces: ["*"]
 
 prometheus:

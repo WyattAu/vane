@@ -22,9 +22,29 @@ const SA_CA: &str = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
 pub struct K8sProvider {
     /// API server root (`https://kubernetes.default.svc` in-cluster).
     pub api: String,
-    /// Namespaces to watch (empty = all).
+    /// Namespaces to watch. Empty, or containing `"*"`, means all
+    /// namespaces (cluster-wide list).
     pub namespaces: Vec<String>,
     client: reqwest::Client,
+}
+
+/// The namespaces to issue HTTPRoute list requests for.
+///
+/// An empty configuration means all namespaces, and so does the `"*"`
+/// wildcard — which is how the Helm chart spells it (`namespaces =
+/// ["*"]`). A single empty string is the cluster-wide list endpoint.
+///
+/// `"*"` used to be forwarded verbatim, so the chart's own default asked
+/// the API server for a namespace literally named `*`, matched nothing,
+/// and the provider silently produced zero routes: every pod stayed 503
+/// on `/readyz` with no error logged anywhere.
+fn list_namespaces(configured: &[String]) -> Vec<String> {
+    let all = configured.is_empty() || configured.iter().any(|n| n == "*");
+    if all {
+        vec![String::new()]
+    } else {
+        configured.to_vec()
+    }
 }
 
 /// Compiled HTTPRoute entry.
@@ -83,11 +103,7 @@ impl K8sProvider {
         let token = self.token()?;
 
         let mut all = Vec::new();
-        let namespaces = if self.namespaces.is_empty() {
-            vec![String::new()] // cluster-wide list endpoint
-        } else {
-            self.namespaces.clone()
-        };
+        let namespaces = list_namespaces(&self.namespaces);
         for ns in namespaces {
             let url = if ns.is_empty() {
                 format!("{}/apis/gateway.networking.k8s.io/v1/httproutes", self.api)
@@ -349,6 +365,30 @@ type Unused = HashMap<String, String>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The namespace list the provider requests. Empty and `"*"` both mean
+    /// all namespaces (the cluster-wide list endpoint); anything else is a
+    /// literal namespace.
+    ///
+    /// `"*"` used to be forwarded verbatim, so the chart's own default
+    /// (`namespaces = ["*"]`) asked the API server for a namespace
+    /// literally named `*`, got nothing, and left every pod 503 on
+    /// /readyz with no error logged.
+    #[test]
+    fn wildcard_namespace_means_all() {
+        let cases: [(&[&str], &[&str]); 4] = [
+            (&[], &[""]),
+            (&["*"], &[""]),
+            (&["a", "*", "b"], &[""]),
+            (&["shop", "misc"], &["shop", "misc"]),
+        ];
+        for (configured, expected) in cases {
+            let owned: Vec<String> = configured.iter().map(|s| (*s).to_owned()).collect();
+            let got: Vec<String> = list_namespaces(&owned);
+            let got_refs: Vec<&str> = got.iter().map(String::as_str).collect();
+            assert_eq!(got_refs, expected, "configured={configured:?}");
+        }
+    }
 
     #[test]
     fn parses_endpoints_json() {
