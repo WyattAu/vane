@@ -67,9 +67,15 @@ vane --version
 
 Automated: pushing a `vX.Y.Z` tag triggers `.github/workflows/
 release.yml`, which builds the Dockerfile and pushes
-`ghcr.io/wyattau/vane:X.Y.Z` (+ `X.Y`) with the workflow-scoped
-`GITHUB_TOKEN` — no PAT, no local credentials. No `latest` tag: charts
-and compose pin exact versions. Backfill an already-cut tag by
-deleting and re-pushing it (or run the workflow manually).
+`ghcr.io/wyattau/vane:X.Y.Z` (+ `X.Y` + `latest`) with the
+workflow-scoped `GITHUB_TOKEN` — no PAT, no local credentials.
+Backfill an already-cut tag by deleting and re-pushing it (or run the
+workflow manually).
+
+`latest` is pushed on every release so it cannot drift. It did once: a
+manually-pushed `latest` outlived several releases because the workflow
+only ever pushed the semver tags, so anyone pulling `:latest` silently
+got an old build. **Pin an exact tag when you need reproducibility** —
+the charts and both compose files do.
 
 Local builds for testing: `docker build -t ghcr.io/wyattau/vane:X.Y.Z .`
