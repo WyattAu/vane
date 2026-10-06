@@ -33,6 +33,10 @@ fn build_router() -> Router {
                 outlier: None,
                 allowed_spiffe_prefixes: Vec::new(),
                 priority: 0,
+                retry: Default::default(),
+                mirror: None,
+                mirror_backends: Vec::new(),
+                cors: None,
             };
             if let Ok(entry) = builder.compile() {
                 editor.insert(entry);

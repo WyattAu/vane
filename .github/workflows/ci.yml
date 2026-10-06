@@ -215,6 +215,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-fuzz --locked
+      # `fuzz/` is a separate workspace, so `cargo check --workspace` never
+      # compiles a fuzz target. A stale literal in one surfaces only as a
+      # sanitizer build error mid-job, naming the wrong thing — a RouteBuilder
+      # that gained a field broke this job exactly that way. Compile them all
+      # first so the failure is a compile error with a file and a line.
+      - name: fuzz targets compile
+        run: cargo +nightly check --manifest-path fuzz/Cargo.toml --all-targets
       # crossbeam-epoch (router) holds allocations until thread exit —
       # LeakSanitizer false-positives there, so leaks stay undetected.
       - name: parser smoke (60s)
