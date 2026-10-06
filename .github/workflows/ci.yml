@@ -160,10 +160,13 @@ jobs:
           version: v3.14.4
       - name: Lint
         run: helm lint charts/vane
+      # `>` does not create parent directories, and a fresh runner has no
+      # /tmp/opencode — the redirect failed and took the step with it.
       - name: Template (default + k8s-provider)
         run: |
-          helm template vane charts/vane --show-only templates/configmap.yaml > /tmp/opencode/cm-default.yaml
-          test -s /tmp/opencode/cm-default.yaml
+          out="$(mktemp -d)"
+          helm template vane charts/vane --show-only templates/configmap.yaml > "$out/cm-default.yaml"
+          test -s "$out/cm-default.yaml"
           helm template vane charts/vane -f charts/vane/values-k8s-provider.yaml | grep -q "kind: ClusterRoleBinding"
       - name: Compose validation
         run: |
@@ -258,5 +261,7 @@ jobs:
         run: |
           for t in parse_request parse_response frame hpack h2_conn_server xds_decode h1pool_response chunked_scanner route_lookup shm_descriptors access_record; do
             echo "=== $t ==="
-            cargo fuzz run "$t" -- -max_total_time=600 -max_len=16384 -detect_leaks=0 -artifact_prefix=/tmp/artifacts/
+            # cargo-fuzz already passes its own artifact prefix; an
+            # explicit /tmp path just risks a missing directory.
+            cargo fuzz run "$t" -- -max_total_time=600 -max_len=16384 -detect_leaks=0
           done
