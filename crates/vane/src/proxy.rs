@@ -234,14 +234,19 @@ enum ReqFraming {
     Done,
 }
 
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Debug, Clone)]
 enum BodyFraming {
     #[default]
     AwaitingHead,
     /// Pass raw bytes until `remaining` bytes forwarded.
     ContentLength,
-    /// Pass chunked bytes until terminal 0-chunk observed (len tracking).
-    Chunked { last_was_lf: bool, seen_zero: bool },
+    /// Pass chunked bytes until the terminal chunk is seen. Framing is
+    /// tracked incrementally (`ChunkedScanner`), not by scanning for
+    /// `0\r\n\r\n`: that sequence is legal inside chunk data and can
+    /// straddle a read.
+    Chunked {
+        scan: vane_proto::chunked::ChunkedScanner,
+    },
     /// WebSocket/protocol tunnel: raw bidirectional pump.
     Tunnel,
     /// Response complete.
@@ -796,7 +801,7 @@ impl HttpProxy {
         self.metrics
             .bytes_out
             .add(&self.config.registry, data.len() as u64);
-        if self.conn(slot).body == BodyFraming::AwaitingHead {
+        if matches!(self.conn(slot).body, BodyFraming::AwaitingHead) {
             // First upstream byte: clear the FirstByte deadline.
             io.set_deadline(None, vane_core::handler::DeadlineReason::FirstByte);
         }
@@ -817,7 +822,7 @@ impl HttpProxy {
         let is_h2 = self.conns.get(&slot).is_some_and(|c| c.h2.is_some());
         #[cfg(not(feature = "h2"))]
         let is_h2 = false;
-        let framing = self.conn(slot).body;
+        let framing = self.conn(slot).body.clone();
         match framing {
             BodyFraming::AwaitingHead => {
                 // A response head can straddle TCP segments (or TLS
@@ -1098,7 +1103,7 @@ impl HttpProxy {
         // trailers) would read as BodyFraming::Done and drop the body —
         // switch to an unbounded relay; the upstream's trailers frame
         // (END_STREAM) completes the response.
-        if self.conn(slot).body == BodyFraming::Done
+        if matches!(self.conn(slot).body, BodyFraming::Done)
             && (!body.is_empty() || trailers.is_some() || !complete)
         {
             let conn = self.conn(slot);
@@ -1126,7 +1131,7 @@ impl HttpProxy {
                 self.h2_flush(io);
             }
         }
-        if complete && self.conn(slot).body != BodyFraming::Done {
+        if complete && !matches!(self.conn(slot).body, BodyFraming::Done) {
             self.conn(slot).body = BodyFraming::Done;
             self.check_done(io);
         }
@@ -1680,8 +1685,7 @@ impl HttpProxy {
                     BodyFraming::Tunnel
                 } else if chunked {
                     BodyFraming::Chunked {
-                        last_was_lf: false,
-                        seen_zero: false,
+                        scan: vane_proto::chunked::ChunkedScanner::new(),
                     }
                 } else {
                     match content_length {
@@ -2232,7 +2236,7 @@ impl Handler for HttpProxy {
         let (framing, remaining, request_sent, ready) = {
             let conn = self.conns.get(&slot).expect("conn exists");
             (
-                conn.body,
+                conn.body.clone(),
                 conn.remaining,
                 io.request_sent_upstream(),
                 conn.upstream_ready,
@@ -2767,7 +2771,22 @@ impl HttpProxy {
 
     fn relay_body(&mut self, io: &mut SessionIo<'_>, data: &[u8]) {
         let slot = io.slot_index();
-        // Compute the relay decision first (avoids overlapping borrows).
+        // Chunked framing first (the scanner needs a mutable borrow).
+        // Completion is decided by the chunked grammar, not by looking
+        // for `0\r\n\r\n` in the buffer: that sequence is legal inside
+        // chunk data (base64, compressed payloads) and can straddle two
+        // reads, so a content scan both truncates and hangs.
+        let chunked_done = {
+            let Some(c) = self.conns.get_mut(&slot) else {
+                return;
+            };
+            if let BodyFraming::Chunked { scan } = &mut c.body {
+                scan.feed(data)
+            } else {
+                false
+            }
+        };
+        // Compute the relay decision (avoids overlapping borrows).
         let (take, framing_done) = {
             let conn = self.conn(slot);
             match conn.body {
@@ -2777,15 +2796,7 @@ impl HttpProxy {
                     let done = conn.remaining == 0;
                     (Some(take), done)
                 }
-                BodyFraming::Chunked { seen_zero, .. } => {
-                    let done = !seen_zero && data.windows(5).any(|w| w == b"0\r\n\r\n");
-                    if done {
-                        if let BodyFraming::Chunked { seen_zero, .. } = &mut conn.body {
-                            *seen_zero = true;
-                        }
-                    }
-                    (Some(data.len()), done)
-                }
+                BodyFraming::Chunked { .. } => (Some(data.len()), chunked_done),
                 _ => (None, false),
             }
         };
@@ -2809,14 +2820,20 @@ impl HttpProxy {
                 let mut out = Vec::with_capacity(compressed.len() + 18);
                 if is_h2 {
                     out.extend_from_slice(&compressed);
-                } else {
+                } else if !compressed.is_empty() {
                     out.extend_from_slice(&vane_proto::compression::chunk(&compressed));
                 }
                 out
             } else {
                 bytes.to_vec()
             };
-            self.write_downstream(io, &out);
+            // A feed can produce nothing (deflate buffering the window),
+            // and `chunk(&[])` is literally the terminal sequence
+            // `0\r\n\r\n` — writing it would truncate the client's
+            // chunked stream mid-body.
+            if !out.is_empty() {
+                self.write_downstream(io, &out);
+            }
         }
         if framing_done {
             self.finish_gzip(io);
@@ -2873,7 +2890,11 @@ impl HttpProxy {
         if is_h2 {
             out.extend_from_slice(&tail);
         } else {
-            out.extend_from_slice(&vane_proto::compression::chunk(&tail));
+            // Same rule as the body relay: an empty trailer is the
+            // terminal sequence, not a chunk.
+            if !tail.is_empty() {
+                out.extend_from_slice(&vane_proto::compression::chunk(&tail));
+            }
             out.extend_from_slice(&vane_proto::compression::final_chunk());
         }
         self.write_downstream(io, &out);
@@ -2896,7 +2917,7 @@ impl HttpProxy {
         let (done, close_after, started) = {
             let conn = self.conns.get(&slot).expect("conn");
             (
-                conn.body == BodyFraming::Done,
+                matches!(conn.body, BodyFraming::Done),
                 conn.close_after,
                 conn.started,
             )
@@ -2980,7 +3001,7 @@ impl HttpProxy {
             if self
                 .conns
                 .get(&io.slot_index())
-                .is_some_and(|c| c.body == BodyFraming::AwaitingHead)
+                .is_some_and(|c| matches!(c.body, BodyFraming::AwaitingHead))
             {
                 self.respond_full(io, Status::BadGateway, "upstream unreachable\n");
             }

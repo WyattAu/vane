@@ -14,6 +14,7 @@
 //! the common cases).
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+pub mod chunked;
 pub mod compression;
 pub mod date;
 pub mod pb;
