@@ -10,10 +10,31 @@ Every PR runs the shared matrix plus vane-specific jobs:
 | tests | `cargo test --workspace` |
 | clippy (pedantic, `-D warnings`) | `cargo clippy --workspace --all-targets` |
 | fmt | `cargo fmt --all --check` |
-| loom (lock-free primitives) | `cargo test -p vane-core --features loom --test loom_spsc` |
-| miri (pure-logic modules) | `cargo +nightly miri test -p vane-core --lib slab::` |
+| vet (dependency supply chain) | `cargo vet --locked` |
+| loom (lock-free primitives) | `cargo test -p vane-kernel --features loom --test loom_spsc` |
+| miri (pure-logic modules) | `cargo +nightly miri test -p vane-kernel --lib slab::` |
 | fuzz smoke | `cargo fuzz run parse_request -- -max_total_time=30` |
 | criterion baselines | `cargo bench -p vane-proto -p vane-router -p vane-shm` |
+
+### After a dependency change
+
+`cargo vet` coverage is generated, not hand-maintained. When you add or
+bump a dependency, `cargo vet --locked` names the packages that lost
+coverage; regenerate the store with:
+
+```sh
+cargo vet init
+python3 ../engineering-standards/scripts/resync-vet-exemptions.py --write
+cargo vet fmt
+```
+
+`cargo vet fmt` owns `supply-chain/config.toml`'s formatting — do not
+hand-edit it. First-party crates are declared `audit-as-crates-io`
+because they publish under those names.
+
+`deny.toml` and `.cargo/audit.toml` carry the reviewed exceptions, each
+with a written justification. A new advisory or a rejected license means
+fixing or justifying it, not deleting the gate.
 
 ## Data-plane rules (`vane-core`, `vane-proto`, `vane-filters`)
 

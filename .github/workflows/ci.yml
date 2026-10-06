@@ -219,11 +219,17 @@ jobs:
       - name: h1pool response smoke (60s)
         run: cargo fuzz run h1pool_response -- -max_total_time=60 -max_len=8192 -detect_leaks=0
       # Regression seeds: every fuzz-found bug must stay found.
+      # Corpus paths are resolved against the invocation directory, and
+      # this job runs from the repo root — `corpus/regression` silently
+      # pointed at a directory that does not exist and every target
+      # exited 1 with "The required directory does not exist".
       - name: regression seeds (all targets)
         run: |
+          seeds="$(ls fuzz/corpus/regression 2>/dev/null | wc -l)"
+          echo "regression seeds: ${seeds}"
+          test "$seeds" -gt 0
           for t in parse_request parse_response frame hpack h2_conn_server xds_decode h1pool_response; do
-            [ -d "fuzz/corpus/regression" ] && [ -n "$(ls fuzz/corpus/regression 2>/dev/null)" ] && \
-              cargo fuzz run "$t" corpus/regression -- -detect_leaks=0 -runs=5000
+            cargo fuzz run "$t" fuzz/corpus/regression -- -detect_leaks=0 -runs=5000
           done
       - name: h2 frame smoke (60s)
         run: cargo fuzz run frame -- -max_total_time=60 -detect_leaks=0

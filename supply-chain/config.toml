@@ -1,16 +1,5 @@
 
 # cargo-vet config file
-#
-# The exemptions are `safe-to-run`/`safe-to-deploy` declarations for
-# third-party dependencies with no individual audit record. They are
-# generated, not hand-maintained: after a dependency change run
-#
-#     cargo vet init
-#     python3 .standards/scripts/resync-vet-exemptions.py --write
-#
-# and the `quality / vet` gate names exactly which packages lost coverage.
-# First-party crates are declared `audit-as-crates-io` below because they
-# are published under those names.
 
 [cargo-vet]
 version = "0.10"
