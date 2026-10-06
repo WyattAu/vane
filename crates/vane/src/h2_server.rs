@@ -858,7 +858,7 @@ mod flow_tests {
             }
             let (cw, sw) = h2s.conn_debug_windows();
             let budget_after = h2s.conn.send_budget(1);
-            eprintln!(
+            vane_core::dbg_trace!(
                 "FLWDBG it={guard} delta={granted_this_iter} emitted={emitted_total} granted={granted_total} cw={cw} sw={sw} budget_after={budget_after} held={} fed={fed}",
                 h2s.held.len()
             );

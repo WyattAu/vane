@@ -221,15 +221,19 @@ struct GzipRelay {
 
 /// Request-side body framing (streaming relay — bodies are never
 /// buffered whole; bytes go upstream as read events arrive).
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Debug, Clone)]
 enum ReqFraming {
     /// Head not yet handled for this connection.
     #[default]
     AwaitingHead,
     /// Content-Length body: bytes remaining to relay.
     ContentLength(u64),
-    /// Chunked request body: relay raw until the terminal 0-chunk.
-    Chunked { seen_zero: bool },
+    /// Chunked request body: relay raw until the terminal chunk. The
+    /// grammar is tracked incrementally — see `ChunkedScanner` for why
+    /// a content scan is wrong (and what it enables).
+    Chunked {
+        scan: vane_proto::chunked::ChunkedScanner,
+    },
     /// No body / body complete.
     Done,
 }
@@ -1322,16 +1326,12 @@ impl HttpProxy {
         // never buffered whole. Until the upstream connects they queue
         // handler-side (req_pending) so ordering with the inline bytes
         // forwarded at connect is preserved.
-        let (framing, upstream_ready) = self
-            .conns
-            .get(&slot)
-            .map(|c| (c.req_framing, c.upstream_ready))
-            .unwrap_or((ReqFraming::AwaitingHead, false));
-        let body_active = match framing {
-            ReqFraming::ContentLength(remaining) => remaining > 0,
-            ReqFraming::Chunked { seen_zero } => !seen_zero,
+        let upstream_ready = self.conns.get(&slot).is_some_and(|c| c.upstream_ready);
+        let body_active = self.conns.get(&slot).is_some_and(|c| match &c.req_framing {
+            ReqFraming::ContentLength(remaining) => *remaining > 0,
+            ReqFraming::Chunked { .. } => true,
             _ => false,
-        };
+        });
         if body_active {
             {
                 let conn = self.conn(slot);
@@ -1351,15 +1351,15 @@ impl HttpProxy {
                             return;
                         }
                     }
-                    ReqFraming::Chunked { seen_zero } => {
-                        vane_core::dbg_trace!(
-                            "CHDBG h1-chunked relay {}B seen_zero={}",
-                            data.len(),
-                            seen_zero
-                        );
-                        if !*seen_zero && data.windows(5).any(|w| w == b"0\r\n\r\n") {
-                            *seen_zero = true;
-                        }
+                    ReqFraming::Chunked { scan } => {
+                        // Completion by chunked grammar, not by scanning
+                        // for `0\r\n\r\n`: that sequence is legal inside
+                        // chunk data, so ending the body there truncates
+                        // the relay and leaves the rest to be parsed as
+                        // the next request head (a desync / smuggling
+                        // vector), and it can straddle two reads, which
+                        // never completes the body at all.
+                        scan.feed(data);
                         if upstream_ready {
                             self.upstream_send(io, data);
                         } else {
@@ -1771,7 +1771,9 @@ fn insert_header_once(head: &mut Vec<u8>, name: &[u8], value: &[u8]) -> bool {
 fn conn_set_framing(conns: &mut ConnMap, slot: u32, view: &RequestView<'_>) {
     if let Some(c) = conns.get_mut(&slot) {
         c.req_framing = if view.is_chunked() {
-            ReqFraming::Chunked { seen_zero: false }
+            ReqFraming::Chunked {
+                scan: vane_proto::chunked::ChunkedScanner::new(),
+            }
         } else if let Some(Some(n)) = view.content_length() {
             if n > 0 {
                 ReqFraming::ContentLength(n)
@@ -1831,13 +1833,15 @@ impl Handler for HttpProxy {
         // h2c: plain listeners speak prior-knowledge HTTP/2 directly.
         #[cfg(feature = "h2")]
         if self.config.h2c && self.config.tls.is_none() {
-            eprintln!("H2CDBG promoting slot={slot}");
             let mut h2s = Box::new(crate::h2_server::H2Server::new(
                 slot,
                 self.config.h2_strict_idle_window_update,
             ));
             let out = h2s.pending_writes();
-            eprintln!("H2CDBG initial settings bytes={}", out.len());
+            vane_core::dbg_trace!(
+                "h2c promoting slot={slot}; initial settings bytes={}",
+                out.len()
+            );
             self.conn(slot).h2 = Some(h2s);
             if !out.is_empty() {
                 self.raw_downstream(io, &out);
@@ -2078,8 +2082,8 @@ impl Handler for HttpProxy {
             // Mirror (fire-and-forget): a detached thread copies the
             // request to the shadow cluster. Every error is ignored —
             // mirroring never delays or fails the real response.
-            eprintln!(
-                "MIRRORDBG: mirror_backends={} head_len={}",
+            vane_core::dbg_trace!(
+                "mirror dispatch: mirror_backends={} head_len={}",
                 route.mirror_backends.len(),
                 head.len()
             );
@@ -2094,17 +2098,13 @@ impl Handler for HttpProxy {
                     .spawn(move || {
                         use std::io::{Read as _, Write as _};
                         let conn_res = std::net::TcpStream::connect(maddr);
-                        eprintln!("MIRRORTHREAD: connect={:?}", conn_res.is_ok());
+                        vane_core::dbg_trace!("mirror connect ok={}", conn_res.is_ok());
                         let Ok(mut s) = conn_res else {
                             return;
                         };
                         let _ = s.set_nodelay(true);
                         let w = s.write_all(&mhead);
-                        eprintln!(
-                            "MIRRORTHREAD: head write {:?} len {}",
-                            w.is_ok(),
-                            mhead.len()
-                        );
+                        vane_core::dbg_trace!("mirror head write ok={}", w.is_ok());
                         if w.is_err() {
                             return;
                         }
@@ -2130,10 +2130,8 @@ impl Handler for HttpProxy {
                 if let ReqFraming::ContentLength(remaining) = &mut conn.req_framing {
                     *remaining = remaining.saturating_sub(body.len() as u64);
                 }
-                if let ReqFraming::Chunked { seen_zero } = &mut conn.req_framing {
-                    if !*seen_zero && body.windows(5).any(|w| w == b"0\r\n\r\n") {
-                        *seen_zero = true;
-                    }
+                if let ReqFraming::Chunked { scan } = &mut conn.req_framing {
+                    scan.feed(body);
                 }
             }
             if !body.is_empty() {
