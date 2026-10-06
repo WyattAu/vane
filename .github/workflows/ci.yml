@@ -180,13 +180,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # /usr/local/bin is not writable on the runner ("Operation not
+      # permitted" on chmod); $HOME/.local/bin already precedes it on PATH.
       - name: Install kind + kubectl + helm
         run: |
-          curl -sLo /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
-          chmod +x /usr/local/bin/kind
-          curl -sLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl
-          chmod +x /usr/local/bin/kubectl
-          curl -sL https://get.helm.sh/helm-v3.14.4-linux-amd64.tar.gz | tar -xz --strip-components=1 -C /usr/local/bin linux-amd64/helm
+          set -euo pipefail
+          bin="$HOME/.local/bin"
+          mkdir -p "$bin"
+          curl -sLo "$bin/kind" https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+          chmod +x "$bin/kind"
+          curl -sLo "$bin/kubectl" https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl
+          chmod +x "$bin/kubectl"
+          curl -sL https://get.helm.sh/helm-v3.14.4-linux-amd64.tar.gz | tar -xz --strip-components=1 -C "$bin" linux-amd64/helm
+          kind version && kubectl version --client=true && helm version --short
       - name: Create kind cluster
         run: kind create cluster --name vane-smoke --wait 120s
       - name: Run smoke
@@ -212,17 +218,17 @@ jobs:
       # crossbeam-epoch (router) holds allocations until thread exit —
       # LeakSanitizer false-positives there, so leaks stay undetected.
       - name: parser smoke (60s)
-        run: cargo fuzz run parse_request -- -max_total_time=60 -max_len=8192 -detect_leaks=0
+        run: cargo +nightly fuzz run parse_request -- -max_total_time=60 -max_len=8192 -detect_leaks=0
       - name: response smoke (60s)
-        run: cargo fuzz run parse_response -- -max_total_time=60 -max_len=8192 -detect_leaks=0
+        run: cargo +nightly fuzz run parse_response -- -max_total_time=60 -max_len=8192 -detect_leaks=0
       - name: h2 connection smoke (60s)
-        run: cargo fuzz run h2_conn_server -- -max_total_time=60 -max_len=16384 -detect_leaks=0
+        run: cargo +nightly fuzz run h2_conn_server -- -max_total_time=60 -max_len=16384 -detect_leaks=0
       - name: xds decode smoke (60s)
-        run: cargo fuzz run xds_decode -- -max_total_time=60 -max_len=16384 -detect_leaks=0
+        run: cargo +nightly fuzz run xds_decode -- -max_total_time=60 -max_len=16384 -detect_leaks=0
       - name: h1pool response smoke (60s)
-        run: cargo fuzz run h1pool_response -- -max_total_time=60 -max_len=8192 -detect_leaks=0
+        run: cargo +nightly fuzz run h1pool_response -- -max_total_time=60 -max_len=8192 -detect_leaks=0
       - name: chunked scanner smoke (60s)
-        run: cargo fuzz run chunked_scanner -- -max_total_time=60 -max_len=4096 -detect_leaks=0
+        run: cargo +nightly fuzz run chunked_scanner -- -max_total_time=60 -max_len=4096 -detect_leaks=0
       # Regression seeds: every fuzz-found bug must stay found.
       # Corpus paths are resolved against the invocation directory, and
       # this job runs from the repo root — `corpus/regression` silently
@@ -234,18 +240,18 @@ jobs:
           echo "regression seeds: ${seeds}"
           test "$seeds" -gt 0
           for t in parse_request parse_response frame hpack h2_conn_server xds_decode h1pool_response chunked_scanner; do
-            cargo fuzz run "$t" fuzz/corpus/regression -- -detect_leaks=0 -runs=5000
+            cargo +nightly fuzz run "$t" fuzz/corpus/regression -- -detect_leaks=0 -runs=5000
           done
       - name: h2 frame smoke (60s)
-        run: cargo fuzz run frame -- -max_total_time=60 -detect_leaks=0
+        run: cargo +nightly fuzz run frame -- -max_total_time=60 -detect_leaks=0
       - name: hpack smoke (60s)
-        run: cargo fuzz run hpack -- -max_total_time=60 -detect_leaks=0
+        run: cargo +nightly fuzz run hpack -- -max_total_time=60 -detect_leaks=0
       - name: shm descriptor smoke (60s)
-        run: cargo fuzz run shm_descriptors -- -max_total_time=60 -detect_leaks=0
+        run: cargo +nightly fuzz run shm_descriptors -- -max_total_time=60 -detect_leaks=0
       - name: access record smoke (60s)
-        run: cargo fuzz run access_record -- -max_total_time=60 -detect_leaks=0
+        run: cargo +nightly fuzz run access_record -- -max_total_time=60 -detect_leaks=0
       - name: router smoke (60s)
-        run: cargo fuzz run route_lookup -- -max_total_time=60 -detect_leaks=0
+        run: cargo +nightly fuzz run route_lookup -- -max_total_time=60 -detect_leaks=0
   fuzz-nightly:
     name: fuzz deep (nightly)
     runs-on: ubuntu-latest
@@ -263,5 +269,5 @@ jobs:
             echo "=== $t ==="
             # cargo-fuzz already passes its own artifact prefix; an
             # explicit /tmp path just risks a missing directory.
-            cargo fuzz run "$t" -- -max_total_time=600 -max_len=16384 -detect_leaks=0
+            cargo +nightly fuzz run "$t" -- -max_total_time=600 -max_len=16384 -detect_leaks=0
           done
