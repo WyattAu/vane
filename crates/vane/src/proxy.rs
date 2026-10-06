@@ -1136,6 +1136,17 @@ impl HttpProxy {
             }
         }
         if complete && !matches!(self.conn(slot).body, BodyFraming::Done) {
+            // An h2 response is framed by h2 rules and normally carries
+            // no Content-Length (h2 forbids framing on it), so the
+            // downstream shim cannot derive END_STREAM from a byte
+            // count. Without this the response is left unterminated and
+            // only the connection close ends it — a broken stream under
+            // RFC 9113 §6. End the stream from the upstream's own
+            // completion instead.
+            #[cfg(feature = "h2")]
+            if self.conns.get(&slot).is_some_and(|c| c.h2.is_some()) {
+                self.h2_end_response(io);
+            }
             self.conn(slot).body = BodyFraming::Done;
             self.check_done(io);
         }
