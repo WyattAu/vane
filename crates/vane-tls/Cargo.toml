@@ -10,7 +10,7 @@ authors.workspace = true
 
 [dependencies]
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
+
 ring = { workspace = true }
 shm-rings = { workspace = true }
 zerocopy = { workspace = true }

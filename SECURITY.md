@@ -43,9 +43,11 @@ The latest release line only. Patches land as patch releases.
 | Advisory | Crate | Severity | Status |
 |---|---|---|---|
 | RUSTSEC-2026-0285 | rustls 0.23.44 | 5.3 | **fixed** (0.23.45) |
-| RUSTSEC-2023-0071 | rsa 0.9.10 | 5.9 | transitive (ACME JWT, sha2 feature) — no fix published; the RSA path signs local JWTs, never accepts remote keys |
-| RUSTSEC-2026-0315/0325/0326/0316 | wasmtime 48 | 5.7/5.9/1 | transitive (wasm plugin feature, optional) — no fix published; disable the `wasm` feature to exclude |
+| RUSTSEC-2026-0315/0316/0325/0326/**0327** | wasmtime 48.0.1 | up to **9.3 (critical)** | **fixed** (48.0.5) — a native stack buffer overflow in the component model's async-lifted callback result count. The `wasm` feature is optional, so none of these were in a default build |
+| RUSTSEC-2025-0134 | rustls-pemfile 2.2 | unmaintained | **removed** — no safe upgrade existed, but the code moved into `rustls-pki-types` behind `PemObject`; all six call sites in `vane-tls` and the integration tests migrated, and the dependency is gone from the graph |
+| RUSTSEC-2023-0071 | rsa 0.9.10 | 5.9 | **dev-dependency only** — `vane-filters` pulls it in to generate an RS256 key so the JWT filter's RS256 verification has real coverage. Not in any shipped build graph. Recorded in `.cargo/audit.toml` and `deny.toml` with that justification; remove both entries if `rsa` ever becomes a normal dependency |
 
-cargo audit runs in CI (dependency audit job). Advisories without
-published fixes are reviewed per release; the `wasm` feature is
-opt-in.
+`cargo audit` runs in CI (`dependency audit`) and `cargo deny` in
+`quality / deny`; both are configured from `.cargo/audit.toml` and
+`deny.toml`, so an exception is recorded once with its justification and
+applies locally and in CI.

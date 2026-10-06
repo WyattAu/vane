@@ -83,11 +83,8 @@ fn spawn_h3_edge_backend(router: Arc<Router>) -> (SocketAddr, String) {
     let certs = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
     let cert_pem = certs.cert.pem();
     let cert_der = certs.cert.der().clone();
-    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
-        certs.signing_key.serialize_pem().as_bytes(),
-    ))
-    .expect("key pem")
-    .expect("key");
+    let key = <rustls::pki_types::PrivateKeyDer<'static> as rustls::pki_types::pem::PemObject>::from_pem_slice(certs.signing_key.serialize_pem().as_bytes())
+        .expect("key pem");
     let mut server_tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key)
@@ -227,20 +224,15 @@ fn h3_bridge_mtls_client_cert() {
     // CA, serving a canned h3 response, on its own runtime thread.
     let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp bind");
     let quic_addr: SocketAddr = udp.local_addr().expect("addr");
-    let srv_certs: Vec<_> =
-        rustls_pemfile::certs(&mut std::io::BufReader::new(srv.pem().as_bytes()))
+    let srv_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        <rustls::pki_types::CertificateDer<'static> as rustls::pki_types::pem::PemObject>::pem_slice_iter(srv.pem().as_bytes())
             .map(Result::unwrap)
             .collect();
-    let server_key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
-        srv_key.serialize_pem().as_bytes(),
-    ))
-    .expect("pem")
-    .expect("key");
-    let client_cas: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(
-        std::fs::File::open(&ca_pem).expect("ca pem"),
-    ))
-    .map(Result::unwrap)
-    .collect();
+    let server_key = <rustls::pki_types::PrivateKeyDer<'static> as rustls::pki_types::pem::PemObject>::from_pem_slice(srv_key.serialize_pem().as_bytes()).expect("pem");
+    let client_cas: Vec<rustls::pki_types::CertificateDer<'static>> = <rustls::pki_types::CertificateDer<'static> as rustls::pki_types::pem::PemObject>::pem_file_iter(&ca_pem)
+        .expect("open pem")
+        .map(Result::unwrap)
+        .collect();
     let mut cas_roots = rustls::RootCertStore::empty();
     for c in client_cas {
         cas_roots.add(c).expect("ca root");
@@ -396,11 +388,8 @@ fn h3_bridge_reuses_one_quic_connection() {
 
     // Raw quinn+h3 backend with an accept counter.
     let certs = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
-    let server_key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
-        certs.signing_key.serialize_pem().as_bytes(),
-    ))
-    .expect("pem")
-    .expect("key");
+    let server_key = <rustls::pki_types::PrivateKeyDer<'static> as rustls::pki_types::pem::PemObject>::from_pem_slice(certs.signing_key.serialize_pem().as_bytes())
+        .expect("pem");
     let mut server_tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![certs.cert.der().clone()], server_key)
@@ -540,14 +529,12 @@ fn h3_bridge_rotates_upstream_material() {
     std::fs::write(&cli_key, &v1_key).expect("write");
 
     // Server: quinn+h3, client-auth required against CA2, canned 200.
-    let srv_certs: Vec<_> = rustls_pemfile::certs(&mut srv.pem().as_bytes())
+    let srv_certs: Vec<rustls::pki_types::CertificateDer<'static>> = <rustls::pki_types::CertificateDer<'static> as rustls::pki_types::pem::PemObject>::pem_slice_iter(srv.pem().as_bytes())
         .map(Result::unwrap)
         .collect();
-    let server_key = rustls_pemfile::private_key(&mut srv_key.serialize_pem().as_bytes())
-        .expect("pem")
-        .expect("key");
+    let server_key = <rustls::pki_types::PrivateKeyDer<'static> as rustls::pki_types::pem::PemObject>::from_pem_slice(srv_key.serialize_pem().as_bytes()).expect("pem");
     let mut cas_roots = rustls::RootCertStore::empty();
-    let ca2_der: Vec<_> = rustls_pemfile::certs(&mut ca2.pem().as_bytes())
+    let ca2_der: Vec<rustls::pki_types::CertificateDer<'static>> = <rustls::pki_types::CertificateDer<'static> as rustls::pki_types::pem::PemObject>::pem_slice_iter(ca2.pem().as_bytes())
         .map(Result::unwrap)
         .collect();
     for c in ca2_der {

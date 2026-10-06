@@ -113,9 +113,8 @@ fn tls_request(
         Some(id) => {
             let cert = CertificateDer::from(pem_to_der(&id.cert_pem));
             let key =
-                rustls_pemfile::private_key(&mut std::io::BufReader::new(id.key_pem.as_bytes()))
-                    .map_err(|e| format!("key pem: {e}"))?
-                    .ok_or_else(|| "no key".to_string())?;
+                <rustls::pki_types::PrivateKeyDer<'static> as rustls::pki_types::pem::PemObject>::from_pem_slice(id.key_pem.as_bytes())
+                    .map_err(|e| format!("key pem: {e}"))?;
             builder
                 .with_client_auth_cert(vec![cert], key)
                 .map_err(|e| format!("client auth: {e}"))?

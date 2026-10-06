@@ -58,18 +58,12 @@ pub fn load_cert_key(
     ),
     TlsError,
 > {
-    let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(
-        std::fs::File::open(cert_path)
-            .map_err(|e| TlsError::Material(format!("{}: {e}", cert_path.display())))?,
-    ))
-    .collect::<Result<_, _>>()
-    .map_err(|e| TlsError::Material(e.to_string()))?;
-    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
-        std::fs::File::open(key_path)
-            .map_err(|e| TlsError::Material(format!("{}: {e}", key_path.display())))?,
-    ))
-    .map_err(|e| TlsError::Material(e.to_string()))?
-    .ok_or_else(|| TlsError::Material("no private key found".into()))?;
+    let certs = <rustls::pki_types::CertificateDer<'static> as rustls::pki_types::pem::PemObject>::pem_file_iter(cert_path)
+        .map_err(|e| TlsError::Material(format!("{}: {e}", cert_path.display())))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| TlsError::Material(e.to_string()))?;
+    let key = <rustls::pki_types::PrivateKeyDer<'static> as rustls::pki_types::pem::PemObject>::from_pem_file(key_path)
+        .map_err(|e| TlsError::Material(format!("{}: {e}", key_path.display())))?;
     Ok((certs, key))
 }
 
@@ -116,17 +110,16 @@ pub fn server_config_from_parts(
     key_pem: &str,
     client_ca_pem: Option<&str>,
 ) -> Result<rustls::ServerConfig, TlsError> {
-    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
-        .collect::<Result<_, _>>()
+    let certs = <rustls::pki_types::CertificateDer<'static> as rustls::pki_types::pem::PemObject>::pem_slice_iter(cert_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
         .map_err(|e| TlsError::Material(e.to_string()))?;
-    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
-        .map_err(|e| TlsError::Material(e.to_string()))?
-        .ok_or_else(|| TlsError::Material("no private key found".into()))?;
+    let key = <rustls::pki_types::PrivateKeyDer<'static> as rustls::pki_types::pem::PemObject>::from_pem_slice(key_pem.as_bytes())
+        .map_err(|e| TlsError::Material(e.to_string()))?;
     let builder = rustls::ServerConfig::builder();
     let builder = match client_ca_pem {
         Some(ca) => {
-            let cas: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(ca.as_bytes()))
-                .collect::<Result<_, _>>()
+            let cas = <rustls::pki_types::CertificateDer<'static> as rustls::pki_types::pem::PemObject>::pem_slice_iter(ca.as_bytes())
+                .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| TlsError::Material(e.to_string()))?;
             let mut roots = rustls::RootCertStore::empty();
             for c in cas {
@@ -376,12 +369,10 @@ pub mod mesh {
             Path::new(&identity.cert_path),
             Path::new(&identity.key_path),
         )?;
-        let cas: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(
-            std::fs::File::open(&identity.ca_path)
-                .map_err(|e| TlsError::Material(format!("{}: {e}", identity.ca_path)))?,
-        ))
-        .collect::<Result<_, _>>()
-        .map_err(|e| TlsError::Material(e.to_string()))?;
+        let cas = <rustls::pki_types::CertificateDer<'static> as rustls::pki_types::pem::PemObject>::pem_file_iter(&identity.ca_path)
+            .map_err(|e| TlsError::Material(format!("{}: {e}", identity.ca_path)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| TlsError::Material(e.to_string()))?;
         let mut roots = rustls::RootCertStore::empty();
         for ca in cas {
             roots

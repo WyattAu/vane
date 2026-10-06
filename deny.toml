@@ -13,6 +13,13 @@ allow = [
     "Zlib",
     "Unicode-3.0",
     "CDLA-Permissive-2.0",
+    # Pulled in by wasmtime (the optional `wasm` feature) and its
+    # toolchain crates: the Apache-2.0 text with the LLVM exception, which
+    # is a permissive, GPL-incompatible license.
+    "Apache-2.0 WITH LLVM-exception",
+    # notify (the config hot-reload watcher) is CC0-1.0 — a public-domain
+    # dedication, no obligations.
+    "CC0-1.0",
 ]
 
 [bans]
@@ -22,6 +29,12 @@ wildcards = "deny"
 [advisories]
 version = 2
 yanked = "deny"
+# RUSTSEC-2023-0071 (Marvin attack): `rsa` is a dev-dependency of
+# vane-filters, used only to generate an RS256 key so the JWT filter's
+# RS256 verification path has real coverage. It is not in any shipped
+# build graph. Tracked in SECURITY.md's advisory register — remove this
+# entry if `rsa` ever becomes a normal dependency.
+ignore = ["RUSTSEC-2023-0071"]
 
 [sources]
 unknown-registry = "deny"

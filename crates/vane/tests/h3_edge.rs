@@ -76,11 +76,8 @@ async fn h3_edge_roundtrip() {
     // Server TLS material (self-signed, DNS localhost) with h3 ALPN.
     let certs = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
     let cert_der = certs.cert.der().clone();
-    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
-        certs.signing_key.serialize_pem().as_bytes(),
-    ))
-    .expect("key pem")
-    .expect("key");
+    let key = <rustls::pki_types::PrivateKeyDer<'static> as rustls::pki_types::pem::PemObject>::from_pem_slice(certs.signing_key.serialize_pem().as_bytes())
+        .expect("key pem");
     let mut server_tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der.clone()], key)
@@ -230,8 +227,8 @@ workers = 1
     let der = {
         let mut buf = Vec::new();
         buf.extend_from_slice(&std::fs::read(&cert_p).expect("cert read"));
-        let mut buf_slice = buf.as_slice();
-        rustls_pemfile::certs(&mut buf_slice)
+        let buf_slice = buf.as_slice();
+        <rustls::pki_types::CertificateDer<'static> as rustls::pki_types::pem::PemObject>::pem_slice_iter(buf_slice)
             .next()
             .expect("cert")
             .expect("cert der")

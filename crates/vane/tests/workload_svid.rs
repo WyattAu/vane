@@ -208,21 +208,15 @@ fn spawn_mtls_upstream(
 ) -> std::sync::mpsc::Receiver<(String, Vec<u8>)> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(
-            std::fs::File::open(&srv_cert).expect("srv cert"),
-        ))
-        .map(Result::unwrap)
-        .collect();
-        let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
-            std::fs::File::open(&srv_key).expect("srv key"),
-        ))
-        .expect("pem")
-        .expect("key");
-        let client_cas: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(
-            std::fs::File::open(&ca).expect("ca"),
-        ))
-        .map(Result::unwrap)
-        .collect();
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> = <rustls::pki_types::CertificateDer<'static> as rustls::pki_types::pem::PemObject>::pem_file_iter(&srv_cert)
+        .expect("open pem")
+            .map(Result::unwrap)
+            .collect();
+        let key = <rustls::pki_types::PrivateKeyDer<'static> as rustls::pki_types::pem::PemObject>::from_pem_file(&srv_key).expect("pem");
+        let client_cas: Vec<rustls::pki_types::CertificateDer<'static>> = <rustls::pki_types::CertificateDer<'static> as rustls::pki_types::pem::PemObject>::pem_file_iter(&ca)
+        .expect("open pem")
+            .map(Result::unwrap)
+            .collect();
         let mut roots = rustls::RootCertStore::empty();
         for c in client_cas {
             roots.add(c).expect("root");

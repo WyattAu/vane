@@ -79,11 +79,8 @@ fn h3_client_roundtrip() {
 
     let certs = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
     let cert_der = certs.cert.der().clone();
-    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
-        certs.signing_key.serialize_pem().as_bytes(),
-    ))
-    .expect("key pem")
-    .expect("key");
+    let key = <rustls::pki_types::PrivateKeyDer<'static> as rustls::pki_types::pem::PemObject>::from_pem_slice(certs.signing_key.serialize_pem().as_bytes())
+        .expect("key pem");
     let mut server_tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key)
