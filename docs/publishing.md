@@ -14,6 +14,10 @@
 > and two missing-END_STREAM paths). Container images publish
 > automatically on `vX.Y.Z` tags (release.yml). Order below unchanged.
 >
+> **v0.7.0 published 2026-10-06** (vane-proto 0.5.5, vane-router
+> 0.6.1, vane-control 0.6.1, vane-proxy 0.7.0) and install-verified:
+> `cargo install vane-proxy --version 0.7.0 --locked` → `vane 0.7.0`.
+>
 > `CHANGELOG.md` is the authoritative per-release record; the summary
 > above is only a pointer.
 
