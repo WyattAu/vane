@@ -41,10 +41,10 @@ expect_used = "allow"
 # Internal
 vane-kernel = { version = "0.5.3", path = "crates/vane-kernel" }
 vane-observe = { version = "0.5.3", path = "crates/vane-observe" }
-vane-proto = { version = "0.5.4", path = "crates/vane-proto" }
-vane-router = { version = "0.6.0", path = "crates/vane-router" }
+vane-proto = { version = "0.5.5", path = "crates/vane-proto" }
+vane-router = { version = "0.6.1", path = "crates/vane-router" }
 vane-filters = { version = "0.5.3", path = "crates/vane-filters" }
-vane-control = { version = "0.6.0", path = "crates/vane-control" }
+vane-control = { version = "0.6.1", path = "crates/vane-control" }
 vane-shm = { version = "0.5.3", path = "crates/vane-shm" }
 vane-client-sdk = { version = "0.5.3", path = "crates/vane-client-sdk" }
 vane-tls = { version = "0.5.3", path = "crates/vane-tls" }

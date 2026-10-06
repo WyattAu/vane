@@ -4,6 +4,183 @@ All notable changes to vane are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 semver.
 
+## [0.7.0] — 2026-10-06
+
+Crate versions: `vane-proxy` 0.7.0, `vane-proto` 0.5.5,
+`vane-router` 0.6.1, `vane-control` 0.6.1.
+
+### Added
+
+- **Per-route CORS at the edge** (`[[routes]] cors`). Preflights
+  (`OPTIONS` + `Access-Control-Request-Method`) are answered at the
+  edge with 204 and the upstream is never dialed; a preflight is exempt
+  from the route's method allowlist, since a browser will not send the
+  real request if the preflight fails. Actual requests are proxied
+  normally with the response headers injected into the upstream's head,
+  and `Vary` is *merged* with the upstream's own rather than
+  duplicated. `allow_origins = ["*"]` emits the wildcard, except with
+  `allow_credentials`, where the fetch spec requires a named origin. A
+  request with no `Origin`, or one outside the policy, is relayed
+  untouched — the browser is the enforcement point, so the common
+  non-CORS path allocates nothing. Per-route, and hot-reload applies
+  with the rest of the routes.
+- `vane_proto::chunked::ChunkedScanner` — incremental chunked-transfer
+  decoder (new public module).
+- `vane_router::CorsPolicy` — a resolved CORS policy (new public type).
+
+### Fixed
+
+- **A client that read slowly could deadlock the relay permanently.**
+  Upstream reads are throttled while the client-bound write queue is
+  backed up, and nothing ever resumed them — the throttle was a one-way
+  door. Once the queue passed 8 KiB the response simply stopped arriving:
+  the client waited for the rest of a body vane would never fetch, until
+  its read timeout fired. Any pause long enough to cover 8 KiB of
+  traffic triggers it (a mobile link, a GC pause, a busy loop). This is
+  the root cause of the "large body streaming stall" family tracked
+  across a dozen earlier attempts in `docs/h2-streaming-flake.md`.
+- **Chunked framing is now decided by the grammar, not a content scan.**
+  Both directions looked for `0\r\n\r\n` inside each read. That
+  sequence is legal *inside* chunk data (any base64 blob, a compressed
+  payload, text with a NUL) and can straddle two reads. On the response
+  side that truncated bodies or hung the relay; on the request side it
+  additionally left the remaining bytes to be parsed as the next request
+  head on the same connection — a desync, and a smuggling vector when
+  the backend frames the same bytes differently.
+- **An upstream response head split across TCP segments returned 502.**
+  TCP carries no message boundaries, so a valid head prefix is now
+  accumulated instead of being treated as a malformed response.
+- **Edge-generated responses replayed on the next keep-alive
+  transaction.** Intake appends the request head to the connection's
+  parse buffer and only the upstream path drains it, so every response
+  generated before that point left the head in place: rate-limit and
+  breaker short-circuits, plugin rejects, no-healthy-upstream,
+  circuit-open and CORS preflights all made the *next* request on that
+  connection re-parse the stale head and receive the previous response.
+  Edge responses now consume the head; a request that declares a body is
+  closed after the reply, since vane never read that body.
+- **A gzipped response never terminated an h2 stream.** The head rewrite
+  strips `Content-Length` (the compressed length is not known up front),
+  so the shim had no way to derive END_STREAM and the response ended
+  with the connection close — a broken stream. The same path also never
+  accounted for body bytes that arrived with the head, so the gzip
+  trailer was dropped and the deflate stream left incomplete.
+- **An h2 upstream response never terminated the downstream stream** —
+  the same missing-END_STREAM class, because an h2 response is framed by
+  h2 rules and normally carries no `Content-Length` for the shim to count
+  against.
+- **A gzip feed that produced no output was framed as a chunk.**
+  `chunk(&[])` is literally the terminal `0\r\n\r\n`, so any response
+  whose input deflate held back was truncated mid-body.
+- Unconditional `eprintln!` debug prints removed from hot paths: one per
+  h2 DATA/HEADERS/WINDOW_UPDATE frame, two per accepted h2c connection,
+  two per mirrored request. They now compile out without the `vane_dbg`
+  feature instead of taking a stderr lock per frame.
+
+### Tests
+
+- **Read-boundary sweeps.** Every response split point across
+  Content-Length, chunked, gzip and an h2 downstream; the same on the
+  request side, twice per keep-alive connection; and across the h2
+  upstream leg with the h2 backend driven by vane's own server shim.
+  Loopback almost always coalesces a small response into one read, so
+  every boundary defect above passed the suite indistinguishably from a
+  correct relay. Reverting each fix fails a distinct sweep.
+
+## [0.6.1] — 2026-10-05 (vane-proxy)
+
+- Allocation tranche 2: reusable path/host buffers on the relay, so the
+  per-request head scratch is allocated once per connection instead of
+  once per request (RSS 225 MB → 205 MB on the plain benchmark shape).
+- Release hygiene: this release corrects the version ordering — a
+  `v0.5.7` tag had been cut after `v0.6.0`, so the tranche above would
+  otherwise have shipped under a patch number that postdated a minor.
+
+## [0.6.0] — 2026-10-04 (vane-control, vane-router, vane-proxy)
+
+The adoption release.
+
+- **Config hot-reload.** `vane run` watches the config file (notify,
+  with a 30 s poll and an mtime debounce). A valid changed config
+  re-applies routes, clusters and health through the same reconciler
+  path as xDS — no restart. An invalid config keeps the previous
+  generation and is logged. Listener changes remain startup-bound and
+  are logged as restart-required.
+- `[[routes]] retry` — `max_attempts` and `retry_5xx`. A 5xx retry
+  replays the stored request head through the existing failover
+  machinery; idempotent bodyless requests only (GET/HEAD/PUT/DELETE),
+  capped by `max_attempts`.
+- `mirror = "shadow-cluster"` — a fire-and-forget copy of each request
+  to a named cluster, on a detached thread. Never delays or fails the
+  real response; a down shadow is invisible to callers.
+
+## [0.5.7] — 2026-10-05, superseded
+
+The `v0.5.7` tag was cut on 2026-10-05, after `v0.6.0`, and re-issued
+as `v0.6.1`,
+which carries the same allocation-tranche work. Kept as a tag because
+it was pushed; crates.io only ever saw 0.6.1.
+
+## [0.5.6] — 2026-10-04 (vane-proxy)
+
+- The circuit breaker `Arc` is cached per connection, keyed by cluster,
+  instead of being resolved per request (~2.5% relay CPU).
+
+## [0.5.5] — 2026-10-04 (vane-proxy)
+
+- Zero-copy relay dial: the request-head buffer is taken and restored
+  rather than cloned per request (+2-4% h1, RSS -4% / -41% depending
+  on shape).
+- Rate limiting is opt-in. The per-request GCRA is not run unless
+  `[rate_limit]` is configured (~2% relay CPU).
+
+## [0.5.4] — 2026-10-03 (vane-proto, vane-proxy)
+
+- Security, from fuzzing: a length-varint overflow in the protobuf
+  decoder and an unvalidated status range in the h1 pool response
+  parser, both fixed with regression tests. Fuzz coverage extended to
+  ten targets, including `h2_conn_server`, `xds_decode` and
+  `h1pool_response`.
+- `SECURITY.md` published with a reporting policy.
+
+## [0.5.3] — 2026-10-03
+
+- Three stacked h2 bugs refused or dropped every request after the
+  first: the kernel counted closed streams without pruning them, the
+  shim and kernel diverged on stream state, and `resp_done` was never
+  reset. The h2 edge went from 1 to 32.7k req/s; h2spec 145/145 in
+  strict mode is preserved.
+
+## [0.5.2] — 2026-10-03 (vane-proxy)
+
+- Pooled h1 upstream client for the h3 edge, shared by the mesh path
+  (+85% on the mesh benchmark).
+
+## [0.5.1] — 2026-10-03 (vane-control, vane-proxy)
+
+- Full LDS: listener decode plus the multi-RDS attachment merge.
+
+## [0.5.0] — 2026-10-02
+
+- Mesh operations: bridge metrics, identity chaining.
+- SDS: control-plane-delivered TLS secrets.
+
+## [0.4.1] — 2026-10-02
+
+- SPIFFE identity propagation for mesh callers, and a multi-listener h3
+  fix.
+
+## [0.4.0] — 2026-10-02
+
+Mesh over QUIC, across all 11 crates: SVID rotation for the h3 bridge,
+`mesh.http3`, and SPIFFE enforcement on the h3 edge. h2spec 145/145 in
+strict mode.
+
+## [0.3.1] — 2026-09-29 (vane-proxy)
+
+- HTTP/3 upstream bridge: h3 to backends, with a shared endpoint,
+  connection reuse and health ownership.
+
 ## [0.3.0] — 2026-09-28
 
 ### Changed

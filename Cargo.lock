@@ -3939,7 +3939,7 @@ dependencies = [
 
 [[package]]
 name = "vane-control"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "base64",
  "envstack",
@@ -4023,7 +4023,7 @@ dependencies = [
 
 [[package]]
 name = "vane-proto"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "bytes",
  "criterion",
@@ -4036,7 +4036,7 @@ dependencies = [
 
 [[package]]
 name = "vane-proxy"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "axum",
  "axum-stack",
@@ -4089,7 +4089,7 @@ dependencies = [
 
 [[package]]
 name = "vane-router"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "criterion",
  "crossbeam-epoch",
