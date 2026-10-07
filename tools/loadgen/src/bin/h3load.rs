@@ -106,15 +106,27 @@ async fn run_conn(
 ) -> Vec<u64> {
     let mut samples: Vec<u64> = Vec::with_capacity(1 << 16);
     'outer: while Instant::now() < end {
+        // The dial await must be bounded by the leg deadline: a QUIC
+        // dial to a dead server retries internally for tens of seconds,
+        // and a leg that cannot end on time corrupts the window
+        // schedule (a dead upstream made one leg run 3x its budget —
+        // found in the first compare run).
         let Ok(connecting) = endpoint.connect(addr, &sni) else {
             counters.conn_err.fetch_add(1, Ordering::Relaxed);
             tokio::time::sleep(Duration::from_millis(5)).await;
             continue;
         };
-        let Ok(quinn_conn) = connecting.await else {
-            counters.conn_err.fetch_add(1, Ordering::Relaxed);
-            tokio::time::sleep(Duration::from_millis(5)).await;
-            continue;
+        let quinn_conn = match tokio::time::timeout_at(end.into(), connecting).await {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(_)) => {
+                counters.conn_err.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                continue;
+            }
+            Err(_) => {
+                counters.conn_err.fetch_add(1, Ordering::Relaxed);
+                break 'outer;
+            }
         };
         let Ok((mut h3_driver, mut send_request)) =
             h3::client::new(h3_quinn::Connection::new(quinn_conn)).await

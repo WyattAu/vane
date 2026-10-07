@@ -235,13 +235,18 @@ echo
 echo "================ MEDIAN OF $WINDOWS WINDOWS ================"
 echo "| proxy | leg | median req/s | median p50 | median p99 | non200(max) |"
 echo "|---|---|---|---|---|---|"
+# Raw row = "proxy leg window" + the loadgen's 13 fields, so loadgen
+# field N sits at awk column N+3: rps=8, non200=12, p50=14, p99=16.
+# (The columns used to line up at 5/9/11/13 when the generator printed
+# 10 fields; the richer line shifted them and the first compare run
+# computed medians over connection counts — caught before publishing.)
 awk '
 {
   k = $1 " " $2
-  req[k] = req[k] " " $5
-  if ($9 + 0 > mx[k] + 0) mx[k] = $9 + 0
-  p50[k] = p50[k] " " $11
-  p99[k] = p99[k] " " $13
+  req[k] = req[k] " " $8
+  if ($12 + 0 > mx[k] + 0) mx[k] = $12 + 0
+  p50[k] = p50[k] " " $14
+  p99[k] = p99[k] " " $16
 }
 function med(str,   n, a, i, j, t) {
   n = split(str, a, " ")
