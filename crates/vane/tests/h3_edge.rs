@@ -186,7 +186,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#,
                 proxy = proxy.port(),
                 cert_p = cert_p.display(),

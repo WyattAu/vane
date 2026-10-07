@@ -65,7 +65,6 @@ path = "{}"
 
 [runtime]
 force_mio = true
-workers = 1
 "#,
         log_path.display()
     );

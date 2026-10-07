@@ -151,7 +151,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 2
 "#
     ));
     spawn_proxy(cfg);
@@ -278,7 +277,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#
     ));
     spawn_proxy(cfg);
@@ -376,7 +374,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 2
 "#
     ));
     spawn_proxy(cfg);
@@ -481,7 +478,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#
         ),
     )

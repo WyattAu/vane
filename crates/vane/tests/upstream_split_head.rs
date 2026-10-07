@@ -148,7 +148,6 @@ cluster = "up"
 
 [runtime]
 force_mio = true
-workers = 1
 "#
     ));
     let guard = spawn_proxy(cfg_path);

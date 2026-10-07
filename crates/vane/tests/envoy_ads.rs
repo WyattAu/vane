@@ -354,7 +354,6 @@ address = "127.0.0.1:{admin}"
 
 [runtime]
 force_mio = true
-workers = 1
 "#,
                 proxy = proxy.port(),
                 fallback_up = fallback_up,

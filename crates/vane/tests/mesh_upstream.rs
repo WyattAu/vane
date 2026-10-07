@@ -221,7 +221,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#,
                 proxy = proxy_addr.port(),
                 upstream = upstream_addr,
@@ -339,7 +338,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#,
                 proxy = proxy_addr.port(),
                 upstream = upstream_addr,

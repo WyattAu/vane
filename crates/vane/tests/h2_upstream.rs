@@ -553,7 +553,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#,
             cert_path.display(),
             key_path.display()
@@ -1104,7 +1103,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#,
             cert_path.display(),
             key_path.display()
@@ -1274,7 +1272,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#,
             cert_path.display(),
             key_path.display()
@@ -1426,7 +1423,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#
             ),
         )
@@ -1599,7 +1595,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#,
             cert_path.display(),
             key_path.display()
@@ -1770,7 +1765,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#,
             cert_path.display(),
             key_path.display()
@@ -1950,7 +1944,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#
         ),
     )
@@ -2151,7 +2144,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#
             ),
         )
