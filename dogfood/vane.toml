@@ -36,9 +36,8 @@ cluster = "web"
 pattern = "/*"
 cluster = "redis"
 
-[runtime]
-workers = 0
-
+# Worker count is per-listener: `workers = 0` on a [[listeners]] entry
+# means one worker per core (the default), so nothing to set here.
 [access_log]
 enabled = true
 

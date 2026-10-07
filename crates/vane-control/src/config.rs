@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 /// HTTP/2 protocol tuning.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Http2Config {
     /// Reject WINDOW_UPDATE on streams the peer has never opened
     /// (RFC 7540 §5.1 idle → PROTOCOL_ERROR connection error).
@@ -77,6 +78,7 @@ pub struct VaneConfig {
 
 /// An ingress listener.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListenerConfig {
     /// Bind address (e.g. `0.0.0.0:8080`).
     pub address: String,
@@ -97,6 +99,7 @@ pub struct ListenerConfig {
 
 /// TLS material for a listener.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListenerTls {
     /// PEM certificate chain path (or ACME-managed path).
     pub cert: String,
@@ -133,6 +136,7 @@ pub enum ListenerMode {
 
 /// An upstream cluster.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterConfig {
     /// Static backend addresses (`host:port`).
     #[serde(default)]
@@ -173,6 +177,7 @@ pub struct ClusterConfig {
 
 /// TLS material for the h3 upstream bridge (`clusters.*.h3_tls`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct H3UpstreamTls {
     /// CA bundle (PEM) the backend's certificate must chain to.
     pub ca: String,
@@ -200,6 +205,7 @@ fn default_h3_server_name() -> String {
 /// the backend's SVID chains to the mesh CA, and enforces the SPIFFE
 /// ID prefix.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct MeshUpstreamConfig {
     /// Client SVID certificate chain (PEM).
     pub cert: String,
@@ -252,6 +258,7 @@ impl From<PolicyConfig> for vane_router::Policy {
 
 /// Per-route retry policy input (`[[routes]] retry`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct RetryInput {
     /// Total dial attempts including the first (default 3).
     #[serde(default = "default_retry_attempts")]
@@ -268,6 +275,7 @@ fn default_retry_attempts() -> u8 {
 
 /// Per-route CORS policy (`[[routes]] cors`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct CorsConfig {
     /// Allowed origins: exact ("https://app.example.com") or "*" for
     /// any. Required.
@@ -295,6 +303,7 @@ fn default_cors_max_age() -> u64 {
 
 /// A statically configured route.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouteConfig {
     /// Host match (empty = any).
     #[serde(default)]
@@ -334,7 +343,7 @@ pub struct RouteConfig {
 
 /// Admin server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AdminConfig {
     /// Bind address (disabled when `enabled = false`).
     pub address: String,
@@ -361,7 +370,7 @@ impl Default for AdminConfig {
 
 /// File provider configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct FileProviderConfig {
     /// Directory of `*.toml` route files.
     pub directory: Option<PathBuf>,
@@ -380,7 +389,7 @@ impl Default for FileProviderConfig {
 
 /// Docker provider configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DockerConfig {
     /// Enabled flag.
     pub enabled: bool,
@@ -399,7 +408,7 @@ impl Default for DockerConfig {
 
 /// Kubernetes provider configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct K8sConfig {
     /// Enabled flag.
     pub enabled: bool,
@@ -421,6 +430,7 @@ impl Default for K8sConfig {
 
 /// ACME section.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AcmeSection {
     /// ACME configuration (disabled when unset).
     pub domains: Vec<AcmeDomain>,
@@ -437,6 +447,7 @@ pub struct AcmeSection {
 
 /// Domains managed by ACME.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AcmeDomain {
     /// DNS identifier.
     pub domain: String,
@@ -458,6 +469,7 @@ pub enum AcmeChallenge {
 
 /// OpenTelemetry export configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {
     /// Service name reported to backends.
     #[serde(default = "default_service_name")]
@@ -499,6 +511,7 @@ impl Default for TelemetryConfig {
 
 /// Access-log configuration (`Default` = disabled, stderr sink).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AccessLogConfig {
     /// Emit one JSON line per completed request.
     #[serde(default)]
@@ -510,7 +523,7 @@ pub struct AccessLogConfig {
 
 /// In-process SHM sidecar transport configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SidecarConfig {
     /// Enabled flag.
     pub enabled: bool,
@@ -598,7 +611,7 @@ pub struct PluginConfig {
 
 /// Runtime tuning knobs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RuntimeConfig {
     /// Buffer pool slots per worker.
     pub pool_slots: usize,
@@ -741,6 +754,18 @@ cluster = "api"
 [admin]
 address = "127.0.0.1:9100"
 "#;
+
+    #[test]
+    fn unknown_runtime_keys_are_rejected() {
+        // A typo'd key must be a startup error, not a silent no-op:
+        // `[runtime] workers = 0` sat in the dogfood config doing
+        // nothing (workers is a listener field) and validate said OK.
+        let typo = SAMPLE.replace("[admin]", "[runtime]\nworkers = 0\n\n[admin]");
+        let cfg = VaneConfig::parse_toml(&typo);
+        assert!(cfg.is_err(), "unknown [runtime] key must fail: {typo}");
+        let err = format!("{}", cfg.expect_err("err"));
+        assert!(err.contains("workers"), "error names the key: {err}");
+    }
 
     #[test]
     fn buffer_size_bounds_are_validated() {
