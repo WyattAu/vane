@@ -14,6 +14,12 @@
 > and two missing-END_STREAM paths). Container images publish
 > automatically on `vX.Y.Z` tags (release.yml). Order below unchanged.
 >
+> **v0.8.0 published 2026-10-07** (vane-kernel 0.6.0 → vane-control
+> 0.7.0 → vane-proxy 0.8.0): two remote-panic parser fixes, `[runtime]
+> buffer_size`, tools/loadgen, tunnel backpressure proof, k8s
+> namespaces fix, and the first valid three-proxy comparison
+> (docs/benchmarks.md).
+>
 > **v0.7.0 published 2026-10-06** (vane-proto 0.5.5, vane-router
 > 0.6.1, vane-control 0.6.1, vane-proxy 0.7.0) and install-verified:
 > `cargo install vane-proxy --version 0.7.0 --locked` → `vane 0.7.0`.
