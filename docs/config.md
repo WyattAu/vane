@@ -5,6 +5,15 @@ parse + semantic checks the binary does at startup. All sections are
 optional except at least one `[[listeners]]` (the binary exits 1 with
 "no listeners configured" otherwise).
 
+**Unknown keys are startup errors.** Every user-authored table
+(`[runtime]`, `[[listeners]`, `[clusters.*]`, `[[routes]`, `[routes.cors]`,
+`[admin]`, provider sections, …) rejects keys it does not define, with
+the key named in the error — a typo'd key must never silently no-op.
+The top level stays permissive so whole new sections can appear across
+versions without breaking old files. ACME challenge values use the
+RFC 8555 spellings (`http-01`, `tls-alpn-01`; the compact `http01`
+forms are accepted as aliases).
+
 ## Minimal example
 
 ```toml
