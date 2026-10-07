@@ -4,6 +4,39 @@ All notable changes to vane are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 semver.
 
+## [Unreleased]
+
+### Fixed
+
+- **HPACK string-length arithmetic overflow** (`vane-kernel` h2). A
+  12-byte crafted header block drove `decode_int` to `u64::MAX - 1`, so
+  `len_pos + len` overflowed: a panic in any overflow-checked build, and
+  in release a wrap to a *valid but wrong* range — the decoder would
+  copy bytes the declared length never described. Found by the 600 s
+  nightly `hpack` fuzz run; fixed with checked arithmetic, and the
+  minimized input is kept as three unit tests plus a tracked regression
+  seed.
+- **DER SAN walk slice overrun** (`vane-tls`). `spiffe_id` — which
+  parses the peer-presented leaf certificate during the TLS handshake —
+  indexed directly at the one step of the DER walk where every sibling
+  used `get()`, so a GeneralName with an over-long length panicked.
+  Found by a same-class sweep after the HPACK fix. `der_header` now
+  rejects any TLV whose declared length exceeds the buffer it was read
+  from, which bounds every caller at the source.
+- New `cert_san` fuzz target covers the DER walk: it takes fully
+  peer-controlled bytes and no target watched it (5.6 M runs clean
+  after the fix).
+
+### Added
+
+- **`tools/loadgen`** — the benchmark load generator now lives in-repo
+  (own workspace, `publish = false`) instead of an untracked scratch
+  crate under `/tmp/opencode`: h1/h2/h3 clients with a shared 13-field
+  output contract, `certgen`, and a configurable upstream. Other
+  projects can clone it standalone. `scripts/bench.sh` moved off `ab`,
+  and `scripts/bench_compare.sh` gained POST 4 KB / GET 64 KB breadth
+  legs routed through every compared proxy.
+
 ## [0.7.0] — 2026-10-06
 
 Crate versions: `vane-proxy` 0.7.0, `vane-proto` 0.5.5,

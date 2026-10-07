@@ -27,12 +27,24 @@ and extendable locally:
 | SHM descriptors | shared-memory transport | `shm_descriptors` |
 | route lookup | host/path matching | `route_lookup` |
 | access-log rendering | JSON escaping | `access_record` |
+| **DER certificate SAN walk** | peer-presented TLS certificates | `cert_san` |
 
 Regression seeds for every fuzz-found bug live in
 `fuzz/corpus/regression/`. Found so far: a protobuf length-varint
 overflow in the xDS decoders (fixed, 2026-10-03), an HPACK dynamic
-table size ordering violation (fixed, 2026-09), and out-of-range
-status handling in the h1pool response parser (fixed, 2026-10-03).
+table size ordering violation (fixed, 2026-09), out-of-range
+status handling in the h1pool response parser (fixed, 2026-10-03), an
+HPACK string-length arithmetic overflow reachable from a 12-byte
+header block (fixed, 2026-10-07, `fuzz` nightly run), and an
+over-long DER GeneralName length in `spiffe_id` — the parser that
+reads peer-presented certificates (fixed, 2026-10-07, found by a
+same-class sweep after the HPACK fix; the DER walk had no fuzz target,
+so `cert_san` was added).
+
+The sweep is the standing lesson: after any parser bug, audit every
+other hand-rolled parser for the same class — unchecked arithmetic on
+wire-derived lengths, direct slice indexing where siblings use `get()`.
+The second bug is always the cheaper one to fix.
 
 ## Supported versions
 

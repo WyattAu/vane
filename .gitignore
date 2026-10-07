@@ -22,6 +22,9 @@ target
 
 # Fuzzing: artifacts (crashes) are triaged + fixed; the regression
 # seeds directory IS tracked (see fuzz/corpus/regression).
+# (19 stale artifacts from already-fixed bugs were untracked on
+# 2026-10-07 — they contradicted this policy and their durable record
+# is the corpus seeds + git history.)
 fuzz/artifacts/
 fuzz/corpus/*
 !fuzz/corpus/regression/
