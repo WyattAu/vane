@@ -182,6 +182,15 @@ pub(crate) struct WorkerState {
     ctx: WorkerCtx,
     engine: Box<dyn Engine>,
     pool: BufferPool,
+    /// Reusable data buffers for the relay hot path: every read event
+    /// hands `buf_size` bytes to the handler, and handing out the pool
+    /// slot itself is impossible (the handler needs `&mut self` while
+    /// the data would borrow it). A LIFO freelist gives the same
+    /// steady state as slot reuse — after warmup, zero allocations per
+    /// event; the previous per-event `to_vec()` malloc'd a fresh Vec
+    /// per read, which is what payload-heavy legs pay 16 times per
+    /// 64 KiB response.
+    data_pool: Vec<Vec<u8>>,
     slab: SessionSlab<Session>,
     listeners: Vec<StdTcpListener>,
     timers: BinaryHeap<Timer>,
@@ -196,6 +205,17 @@ pub(crate) struct WorkerState {
 }
 
 impl WorkerState {
+    /// Returns a relay data buffer to the freelist. The list converges to
+    /// the high-water mark of concurrent handler invocations — one per
+    /// worker, since handlers run synchronously — so this is
+    /// allocation-free in steady state; the small bound only guards a
+    /// pathological future where buffers accumulate.
+    fn return_data_buf(&mut self, buf: Vec<u8>) {
+        if self.data_pool.len() < 8 {
+            self.data_pool.push(buf);
+        }
+    }
+
     fn io_for(&mut self, slot: u32, generation: u16) -> SessionIo<'_> {
         SessionIo {
             worker: self,
@@ -921,12 +941,24 @@ impl WorkerState {
                                 return;
                             };
                             let Some(rs) = s.rslot.take() else { return };
-                            let v = self.pool.slot(rs)[..n as usize].to_vec();
-                            self.pool.release(rs);
-                            v
+                            // Destructure so `pool` and `data_pool` are
+                            // disjoint field borrows: one copy, straight
+                            // into a freelist buffer — no per-event
+                            // allocation (`s`'s borrow ended above).
+                            let WorkerState {
+                                pool, data_pool, ..
+                            } = self;
+                            let mut buf = data_pool
+                                .pop()
+                                .unwrap_or_else(|| Vec::with_capacity(n as usize));
+                            buf.clear();
+                            buf.extend_from_slice(&pool.slot(rs)[..n as usize]);
+                            pool.release(rs);
+                            buf
                         };
                         let mut io = self.io_for(slot, generation);
                         h.on_downstream_data(&mut io, &data);
+                        self.return_data_buf(data);
                         self.arm_downstream_read(slot, generation);
                     }
                     Ok(0) => {
@@ -1089,12 +1121,21 @@ impl WorkerState {
                         return;
                     };
                     let Some(rs) = s.urslot.take() else { return };
-                    let v = self.pool.slot(rs)[..n as usize].to_vec();
-                    self.pool.release(rs);
-                    v
+                    // Same destructure as the downstream site.
+                    let WorkerState {
+                        pool, data_pool, ..
+                    } = self;
+                    let mut buf = data_pool
+                        .pop()
+                        .unwrap_or_else(|| Vec::with_capacity(n as usize));
+                    buf.clear();
+                    buf.extend_from_slice(&pool.slot(rs)[..n as usize]);
+                    pool.release(rs);
+                    buf
                 };
                 let mut io = self.io_for(slot, generation);
                 h.on_upstream_data(&mut io, &data);
+                self.return_data_buf(data);
                 self.arm_upstream_read(slot, generation);
             }
             Ok(0) => {
@@ -1398,6 +1439,7 @@ pub fn spawn(
             }
         }
         let pool = BufferPool::new(pool_slots, buf_size).expect("fixed pool allocation");
+        let data_pool: Vec<Vec<u8>> = Vec::with_capacity(pool_slots);
         let engine: Box<dyn Engine> = if force_mio {
             Box::new(crate::engine::mio_engine::MioEngine::new(&pool).expect("mio engine init"))
         } else {
@@ -1414,6 +1456,7 @@ pub fn spawn(
                 ctx,
                 engine,
                 pool,
+                data_pool,
                 slab,
                 listeners: vec![listener],
                 timers: BinaryHeap::new(),
