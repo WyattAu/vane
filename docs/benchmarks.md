@@ -11,8 +11,63 @@ machine — treat absolute numbers as indicative, ratios as meaningful).
   direct ceiling measured first: **65–72k rps** — the shared client
   bottleneck; proxies are compared against this ceiling, not each
   other's absolute numbers.
-- Client: `ab -k -c <conc> -n <reqs>`; three rounds, medians reported.
+- Client: historical sections used `ab -k -c <conc> -n <reqs>`; the
+  2026-10-07 comparison uses the in-repo `tools/loadgen` (duration-based
+  windows, h1/h2/h3, latency percentiles — see the 13-field output
+  contract in tools/loadgen/README.md).
 - Host: shared multi-tenant Linux box (results vary run-to-run ~±5%).
+  Every number below states its window discipline; runs taken during
+  external build storms (load ≥ 15) were discarded, not adjusted —
+  two full comparative runs died that way and are recorded as such
+  further down.
+
+## vane vs Caddy vs Traefik — 2026-10-07 (v0.8.0, the first valid full run)
+
+`scripts/bench_compare.sh 10` — all three proxies run SIMULTANEOUSLY as
+native processes (this host's docker measures the plumbing, not the
+proxy), each with a plain and a TLS listener, one shared upstream. The
+client is `tools/loadgen` (h1/h2/h3). Load legs cycle proxy × leg three
+times; the published number is the **median of the three windows**, so a
+single-window external spike cannot become the claim. Per-leg spread
+across windows is published below — that is the error bar.
+
+Config: stock defaults for every proxy (vane `buffer_size` default 4096;
+the tuning note below shows what the knob buys). Upstream: 10-byte body
+for the tiny/POST legs, a second 64 KiB upstream for the get64k leg.
+Non-2xx max across all 54 legs: **0**.
+
+| leg (8 conns unless noted) | **vane 0.8.0** | Caddy 2.10.2 | Traefik 3.5.4 | vane vs best other |
+|---|---|---|---|---|
+| h1-8 | **63,223** (p50 121µs) | 21,110 | 30,019 | **2.1×** |
+| h1-64 | **109,131** (p50 493µs) | 37,796 | 51,807 | **2.1×** |
+| h2-8 | **46,038** (p50 158µs) | 16,267 | 18,249 | **2.5×** |
+| h3-8 | **28,100** (p50 265µs) | 12,533 | 14,681 | **1.9×** |
+| h1 POST 4KB | **44,134** (p50 172µs) | 21,257 | 25,778 | **1.7×** |
+| h1 GET 64KB | 15,326 (p50 478µs) | 16,864 | **19,528** | **0.78× — vane loses** |
+
+RSS at rest: vane 502 MB, caddy 41 MB, traefik 69 MB. vane pre-allocates
+`pool_slots × buffer_size` per worker (16 cores × 1024 × 4096 ≈ 64 MB)
+plus per-session slabs — fixed up front by design; the others grow at
+runtime. This is the honest trade vane makes, stated rather than hidden.
+
+Per-window spread (max−min over max, rps): every leg ≤ 5.9% except vane
+h1-8 at 10.7% — its third window dipped and the median comes from the
+two agreeing windows, which is what the median-of-3 methodology is for.
+Raw: `/tmp/opencode/compare_raw.txt` (54 rows, one per proxy×leg×window).
+
+**The breadth leg vane loses is the finding.** A 64 KiB body through a
+4096-byte slot means 16 read+write round trips per response; Traefik and
+Caddy use larger buffers. `[runtime] buffer_size` exists for exactly
+this (added in 0.8.0) — measured vane-only on this same leg, same host,
+same client, interleaved windows (cross-run absolutes are not comparable
+to the table above; the ratios within this experiment are):
+
+| `buffer_size` | 4096 (default) | 8192 | 16384 |
+|---|---|---|---|
+| h1 GET 64KB, median rps | 28,024 | 30,189 | **36,332 (+30%)** |
+
+Envoy remains unmeasured in this environment (see below); nginx
+containerized is invalid for the same docker reason.
 
 ## vane vs nginx (reverse-proxy mode)
 
@@ -138,7 +193,7 @@ Tooling: the load generator is a purpose-built keep-alive client
 environment has no `ab`/`wrk`. Same client both legs, so the delta
 isolates the bridge + QUIC cost.
 
-## Comparative harness (2026-10-03) — numbers pending a quiet machine
+## Comparative harness (2026-10-03) — superseded by the 2026-10-07 run above
 
 `scripts/bench_compare.sh` runs vane vs nginx (1.27, docker) vs Caddy
 (2-alpine) vs Traefik (v3.3) on identical configs (plain + TLS
@@ -161,7 +216,7 @@ deterministic repro test. nginx/Caddy/Traefik h2 legs answered
 correctly under the same client, so this is a vane bug, not client
 noise.
 
-## Comparative run (2026-10-03, native, load 15–24)
+## Comparative run (2026-10-03, native, load 15–24) — superseded by the 2026-10-07 run above
 
 `scripts/bench_compare.sh` — vane vs Caddy 2.10.2 vs Traefik 3.3.6,
 all native processes, identical plain+TLS listeners, same upstream,
