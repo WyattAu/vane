@@ -458,12 +458,13 @@ pub struct AcmeDomain {
 
 /// Supported ACME challenges.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "kebab-case")]
 pub enum AcmeChallenge {
-    /// HTTP-01 (served by vane's listeners).
+    /// HTTP-01 (RFC 8555 §8.3, served by vane's listeners).
     #[default]
+    #[serde(rename = "http-01", alias = "http01")]
     Http01,
     /// TLS-ALPN-01 (planned; rejected at load time for now).
+    #[serde(rename = "tls-alpn-01", alias = "tls-alpn01")]
     TlsAlpn01,
 }
 

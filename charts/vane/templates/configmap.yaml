@@ -47,4 +47,3 @@ data:
 
     [runtime]
     force_mio = true
-    workers = 0
