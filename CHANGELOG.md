@@ -55,7 +55,9 @@ Crate versions: `vane-proxy` 0.8.0, `vane-control` 0.7.0,
   engines and the backpressure thresholds scale with it, so operators
   trade per-connection memory for syscalls-per-byte. Verified with the
   h1 boundary sweep at the 512-byte minimum and io_uring end-to-end at
-  16 KiB.
+  16 KiB. Measured on the one leg the default loses (64 KiB bodies: 16
+  slot round trips per response): +30% median throughput at 16384 —
+  docs/benchmarks.md.
 - **Tunnel backpressure proof**: the 101-upgrade arm (WebSocket et al.)
   now has the same stalled-reader proof the h1 relay has — 8 MiB
   floods in both directions, byte-verified.
