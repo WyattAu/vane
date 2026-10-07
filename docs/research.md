@@ -88,3 +88,31 @@ Updated per engineering-loop iteration.
   saturating while others idle).
 - **Status**: parked (the default hash is sufficient for
   homogeneous traffic; eBPF adds infrastructure complexity).
+
+## WebSocket over HTTP/3 (RFC 9220) — upstream-blocked
+
+- **Source**: RFC 9220 (Bootstrapping WebSockets with HTTP/3); h3
+  crate `ext::Protocol` (all published versions 0.0.3 → current)
+- **Finding**: RFC 9220 bootstraps WebSocket via extended CONNECT with
+  `:protocol = websocket`. The `h3` crate parses `:protocol` through
+  `Protocol::from_str`, which accepts exactly two values —
+  `webtransport` and `connect-udp` — and returns `InvalidProtocol` for
+  anything else. `proto/headers.rs::try_value` turns that into
+  `HeaderError::invalid_value`, so the request is rejected at the
+  HEADERS-frame layer: application code never sees it, and the stream
+  dies with a malformed-header error rather than the 501 the RFC
+  recommends for unsupported protocols (§4: "the server SHOULD respond
+  ... 501"). The wire machinery (SETTINGS_ENABLE_CONNECT_PROTOCOL,
+  full-duplex DATA on CONNECT streams) already exists in h3 0.0.8 —
+  the value enum is the only gap.
+- **vane mapping**: would ride the existing tunnel arm (the h1-side
+  upgrade relay, `parse_upstream_head` → `BodyFraming::Tunnel`) with an
+  h3 bidi stream on the client side; the edge would translate the
+  extended CONNECT into a classic RFC 6455 upgrade toward the upstream.
+  Scoped and ready otherwise.
+- **Unblock paths**: (a) upstream PR adding `websocket` to
+  `Protocol::from_str` — one match arm plus a test; (b) vendored h3
+  with that patch (other projects have done exactly this). Not worth
+  vendoring for one enum value while the crate is pre-1.0 and moving.
+- **Status**: parked upstream-blocked (same calibration as the h3
+  error-code propagation gap). Re-check on any h3 version bump.

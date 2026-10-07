@@ -143,7 +143,7 @@ renewal loop polls expiry and hot-swaps TLS material without restart.
 | `connect_timeout_ms` | int | `5000` | upstream dial |
 | `first_byte_timeout_ms` | int | `30000` | upstream first response byte |
 | `idle_timeout_ms` | int | `75000` | keep-alive idle |
-| `pool_per_backend` | int | (built-in) | retained idle upstream connections per backend per worker |
+| `pool_per_backend` | int | `4` | retained idle upstream connections per backend per worker |
 
 ## `[access_log]` — request logging
 
