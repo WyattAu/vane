@@ -18,6 +18,11 @@ vane-observe = { path = "../crates/vane-observe" }
 vane-kernel = { path = "../crates/vane-kernel" }
 vane-control = { path = "../crates/vane-control" }
 vane-proxy = { path = "../crates/vane", features = ["h3"] }
+vane-tls = { path = "../crates/vane-tls" }
+# `fuzz/` is its own workspace, so it cannot inherit from the root
+# manifest. Mirrors the root pin (ring, not aws_lc_rs) so the CryptoProvider
+# is unambiguous in the fuzz binary the same way it is in vane.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [[bin]]
 name = "parse_request"
@@ -98,3 +103,10 @@ bench = false
 
 [workspace]
 members = ["."]
+
+[[bin]]
+name = "cert_san"
+path = "fuzz_targets/cert_san.rs"
+test = false
+doc = false
+bench = false

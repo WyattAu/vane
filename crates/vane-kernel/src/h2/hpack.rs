@@ -227,7 +227,18 @@ fn decode_string_into(buf: &[u8], pos: &mut usize, out: &mut Vec<u8>) -> Result<
     let huffman = first & 0x80 != 0;
     let mut len_pos = *pos;
     let len = decode_int(buf, &mut len_pos, 7)?;
-    let Some(slice) = buf.get(len_pos..len_pos + len as usize) else {
+    // `decode_int` is checked internally, but a long enough continuation
+    // chain still yields a value near `u64::MAX` (the fuzz corpus reaches
+    // `u64::MAX - 1`), so `len_pos + len` can overflow. That is a panic in
+    // any build with overflow checks — which includes the fuzz profile and
+    // every debug build — and in release it wraps to a *valid but wrong*
+    // range, so the decoder would copy bytes the length never described.
+    // Found by the 600s nightly hpack run; the reproducer is in
+    // `overflow_string_input` below.
+    let end = len_pos
+        .checked_add(usize::try_from(len).map_err(|_| HpackError::InvalidString)?)
+        .ok_or(HpackError::InvalidString)?;
+    let Some(slice) = buf.get(len_pos..end) else {
         return Err(HpackError::Truncated);
     };
     if huffman {
@@ -235,7 +246,7 @@ fn decode_string_into(buf: &[u8], pos: &mut usize, out: &mut Vec<u8>) -> Result<
     } else {
         out.extend_from_slice(slice);
     }
-    *pos = len_pos + len as usize;
+    *pos = end;
     Ok(())
 }
 
@@ -632,6 +643,55 @@ mod tests {
                 data.push(x as u8);
             }
             let _ = decoder.decode(&data);
+        }
+    }
+
+    /// The exact input the 600s nightly hpack run minimized to (see
+    /// `overflow_string_length_is_an_error_not_a_panic`).
+    fn overflow_string_input() -> &'static [u8] {
+        &[
+            0x40, 0x00, 0xff, 0xff, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x1f, 0x00,
+            0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x84, 0x84, 0x84, 0x84, 0x84,
+            0xbe, 0xbf, 0xbe,
+        ]
+    }
+
+    #[test]
+    fn oversized_string_length_is_an_error_not_a_panic() {
+        let mut decoder = HpackDecoder::new(4096);
+        // Must return an error; before the fix this panicked with
+        // "attempt to add with overflow" in decode_string_into.
+        let err = decoder
+            .decode(overflow_string_input())
+            .expect_err("oversized string length must be rejected");
+        assert!(
+            matches!(err, HpackError::Truncated | HpackError::InvalidString),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// The decoder must stay usable afterwards: the overflow must not have
+    /// left the dynamic table or the read cursor in a broken state.
+    #[test]
+    fn decoder_survives_an_oversized_length_and_keeps_working() {
+        let mut decoder = HpackDecoder::new(4096);
+        assert!(decoder.decode(overflow_string_input()).is_err());
+        // A well-formed block still decodes afterwards.
+        let mut out = Vec::new();
+        HpackEncoder::new().encode(&[(b":method".to_vec(), b"GET".to_vec())], &mut out);
+        let headers = decoder.decode(&out).expect("decode after rejection");
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].name, b":method");
+        assert_eq!(headers[0].value, b"GET");
+    }
+
+    /// Every prefix of the crashing input must also be handled without
+    /// panicking — truncation is the common case on a real connection.
+    #[test]
+    fn every_prefix_of_the_overflow_input_is_safe() {
+        for n in 0..=overflow_string_input().len() {
+            let mut decoder = HpackDecoder::new(4096);
+            let _ = decoder.decode(&overflow_string_input()[..n]);
         }
     }
 

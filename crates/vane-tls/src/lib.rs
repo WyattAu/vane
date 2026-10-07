@@ -418,14 +418,45 @@ pub mod mesh {
                     break;
                 };
                 if gtag == 0x86 {
-                    return String::from_utf8(names[spos + ghdr..spos + ghdr + gclen].to_vec())
-                        .ok();
+                    // `der_header` now guarantees these bounds, but slice
+                    // with `get` like every other step of this walk: a
+                    // certificate is peer-supplied, so no step here may
+                    // be able to panic.
+                    let start = spos.checked_add(ghdr)?;
+                    let end = start.checked_add(gclen)?;
+                    let uri = names.get(start..end)?;
+                    return String::from_utf8(uri.to_vec()).ok();
                 }
                 spos += gtotal;
             }
             return None;
         }
         None
+    }
+
+    /// A GeneralName whose declared length runs past the end of the SAN
+    /// sequence must yield `None`, not a slice-index panic.
+    ///
+    /// Every other step of the DER walk uses `get`, so a malformed length
+    /// was already handled — this one site indexed directly. Nothing in the
+    /// suite reached it because every test certificate comes from `rcgen`
+    /// and is therefore well formed. A peer presenting a crafted
+    /// certificate hits it.
+    #[test]
+    fn spiffe_id_rejects_a_general_name_that_overruns_the_san_sequence() {
+        // OID 2.5.29.17, then the wrapping OCTET STRING, whose content is
+        // a SEQUENCE holding one context-[6] GeneralName that claims 200
+        // bytes of URI but supplies 2.
+        //   06 03 55 1d 11          SAN extension OID (2.5.29.17)
+        //   04 08                   OCTET STRING, 8 content bytes
+        //     30 06                 SEQUENCE, 6 content bytes
+        //       86 7f 01 02 03 04   context [6] URI, claims 127 bytes
+        let der: Vec<u8> = vec![
+            0x06, 0x03, 0x55, 0x1D, 0x11, 0x04, 0x08, 0x30, 0x06, 0x86, 0x7F, 0x01, 0x02, 0x03,
+            0x04,
+        ];
+        let cert = CertificateDer::from(der);
+        assert_eq!(spiffe_id(&cert), None);
     }
 
     /// Verifies the peer certificate's SPIFFE ID against `prefix`.
@@ -458,7 +489,16 @@ pub mod mesh {
         let constructed = tag & 0x20 != 0;
         let first = buf[1];
         if first & 0x80 == 0 {
-            Some((2, first as usize, 2 + first as usize, constructed, tag))
+            // A TLV must fit inside the buffer it was read from. Enforcing
+            // that here rather than at each call site is what keeps every
+            // returned length in bounds — the walker in `spiffe_id` slices
+            // with these values, and one over-long length used to panic
+            // (a peer-presented certificate reaches this code).
+            let total = 2 + first as usize;
+            if total > buf.len() {
+                return None;
+            }
+            Some((2, first as usize, total, constructed, tag))
         } else {
             let n = (first & 0x7f) as usize;
             if n == 0 || n > 4 || buf.len() < 2 + n {
@@ -468,7 +508,11 @@ pub mod mesh {
             for b in &buf[2..2 + n] {
                 len = (len << 8) | *b as usize;
             }
-            Some((2 + n, len, 2 + n + len, constructed, tag))
+            let total = match 2usize.checked_add(n).and_then(|h| h.checked_add(len)) {
+                Some(total) if total <= buf.len() => total,
+                _ => return None,
+            };
+            Some((2 + n, len, total, constructed, tag))
         }
     }
 

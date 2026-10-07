@@ -3096,6 +3096,7 @@ dependencies = [
  "bytes",
  "httparse",
  "libfuzzer-sys",
+ "rustls",
  "vane-control",
  "vane-kernel",
  "vane-observe",
@@ -3103,6 +3104,7 @@ dependencies = [
  "vane-proxy",
  "vane-router",
  "vane-shm",
+ "vane-tls",
 ]
 
 [[package]]
