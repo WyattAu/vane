@@ -221,11 +221,11 @@ fn split_response(raw: &[u8]) -> (Vec<u8>, Vec<u8>) {
 }
 
 fn run_h1_sweep(chunked: bool, gzip: bool) {
-    run_h1_sweep_for(BODY, chunked, gzip)
+    run_h1_sweep_for(BODY, chunked, gzip, 4096)
 }
 
 /// Sweeps every response split point for an h1 downstream.
-fn run_h1_sweep_for(payload: &[u8], chunked: bool, gzip: bool) {
+fn run_h1_sweep_for(payload: &[u8], chunked: bool, gzip: bool, buffer_size: usize) {
     let _serial = lock_serial();
     let upstream = spawn_upstream_for(chunked, payload);
     let port = free_port();
@@ -245,6 +245,7 @@ cluster = "up"
 [runtime]
 force_mio = true
 workers = 1
+buffer_size = {buffer_size}
 "#
     ));
     let _guard = spawn_proxy(cfg_path);
@@ -359,6 +360,16 @@ fn content_length_split_sweep() {
     run_h1_sweep(false, false);
 }
 
+/// The same sweep against the smallest configured pool slots: read
+/// lengths derive from `buffer_size`, so 512-byte slots quadruple the
+/// number of reads a response is reassembled from — the strongest
+/// environment for a boundary bug to surface in.
+#[test]
+fn min_buffer_size_split_sweep() {
+    run_h1_sweep_for(BODY, false, false, 512);
+    run_h1_sweep_for(BODY, true, false, 512);
+}
+
 #[test]
 fn chunked_split_sweep() {
     run_h1_sweep(true, false);
@@ -470,5 +481,5 @@ fn chunked_payload_containing_terminal_sequence() {
     let mut payload = b"before-".to_vec();
     payload.extend_from_slice(b"0\r\n\r\n");
     payload.extend_from_slice(b"-after");
-    run_h1_sweep_for(&payload, true, false);
+    run_h1_sweep_for(&payload, true, false, 4096);
 }

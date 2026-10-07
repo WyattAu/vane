@@ -50,6 +50,11 @@ pub struct WorkerConfig {
     pub max_sessions: usize,
     /// Buffer pool slots (double as io_uring fixed buffers).
     pub pool_slots: usize,
+    /// Slot size in bytes (`[runtime] buffer_size`). Both engines derive
+    /// their read/write lengths from this, and the relay's backpressure
+    /// thresholds scale with it (2 * buf_size), so raising it trades
+    /// per-connection memory for fewer syscalls per byte.
+    pub buf_size: usize,
     /// io_uring queue depth.
     pub ring_entries: u32,
     /// Use `IORING_SETUP_SQPOLL` (zero-syscall submission).
@@ -66,6 +71,7 @@ impl Default for WorkerConfig {
             core: None,
             max_sessions: 16_384,
             pool_slots: DEFAULT_POOL_SIZE,
+            buf_size: DEFAULT_BUF_SIZE,
             ring_entries: 4096,
             sqpoll: false,
             force_mio: false,
@@ -1376,6 +1382,7 @@ pub fn spawn(
     let mode = factory.mode();
     let core = config.core;
     let pool_slots = config.pool_slots;
+    let buf_size = config.buf_size;
     let ring_entries = config.ring_entries;
     let sqpoll = config.sqpoll;
     let force_mio = config.force_mio;
@@ -1390,7 +1397,7 @@ pub fn spawn(
                 let _ = core_affinity::set_for_current(*c);
             }
         }
-        let pool = BufferPool::new(pool_slots, DEFAULT_BUF_SIZE).expect("fixed pool allocation");
+        let pool = BufferPool::new(pool_slots, buf_size).expect("fixed pool allocation");
         let engine: Box<dyn Engine> = if force_mio {
             Box::new(crate::engine::mio_engine::MioEngine::new(&pool).expect("mio engine init"))
         } else {

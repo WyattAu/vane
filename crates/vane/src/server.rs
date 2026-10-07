@@ -821,6 +821,7 @@ pub async fn run(opts: RunOptions) -> i32 {
             let worker_cfg = WorkerConfig {
                 core: Some(w % cores),
                 pool_slots: config.runtime.pool_slots,
+                buf_size: config.runtime.buffer_size,
                 ring_entries: config.runtime.ring_entries,
                 sqpoll: config.runtime.sqpoll,
                 force_mio: opts.force_mio || config.runtime.force_mio,

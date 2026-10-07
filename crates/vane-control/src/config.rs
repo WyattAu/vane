@@ -602,6 +602,12 @@ pub struct PluginConfig {
 pub struct RuntimeConfig {
     /// Buffer pool slots per worker.
     pub pool_slots: usize,
+    /// Slot size in bytes. Both engines derive read/write lengths from
+    /// it and the relay's backpressure thresholds scale with it
+    /// (2 × buffer_size): raising it trades per-connection memory
+    /// (pool_slots × buffer_size) for fewer syscalls per byte. Bounded
+    /// to [512, 65536] (validated).
+    pub buffer_size: usize,
     /// io_uring queue depth.
     pub ring_entries: u32,
     /// Enable SQPOLL (zero-syscall submission; needs privileges).
@@ -626,6 +632,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             pool_slots: 1024,
+            buffer_size: 4096,
             ring_entries: 4096,
             sqpoll: false,
             force_mio: false,
@@ -680,6 +687,18 @@ impl VaneConfig {
                 )));
             }
         }
+        // Slot size bounds: both engines derive their read lengths from
+        // it and backpressure thresholds scale with it — a config typo
+        // must be a startup error, not a silent 1-byte-read or
+        // gigabytes-per-worker allocation. Mirrors
+        // vane_kernel::buffer::{MIN_BUF_SIZE, MAX_BUF_SIZE} (kept as
+        // literals here: vane-control does not depend on vane-kernel).
+        if !(512..=65536).contains(&self.runtime.buffer_size) {
+            return Err(ConfigError::Invalid(format!(
+                "runtime.buffer_size {} out of range [512, 65536]",
+                self.runtime.buffer_size
+            )));
+        }
         for d in &self.acme.domains {
             if d.challenge == AcmeChallenge::TlsAlpn01 {
                 return Err(ConfigError::Invalid(
@@ -722,6 +741,17 @@ cluster = "api"
 [admin]
 address = "127.0.0.1:9100"
 "#;
+
+    #[test]
+    fn buffer_size_bounds_are_validated() {
+        let mut cfg = VaneConfig::parse_toml(SAMPLE).expect("parses");
+        cfg.runtime.buffer_size = 16384;
+        cfg.validate().expect("16 KiB is in range");
+        cfg.runtime.buffer_size = 100;
+        assert!(cfg.validate().is_err(), "below the floor");
+        cfg.runtime.buffer_size = 128 * 1024;
+        assert!(cfg.validate().is_err(), "above the ceiling");
+    }
 
     #[test]
     fn parses_and_validates() {

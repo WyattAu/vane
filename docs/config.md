@@ -135,6 +135,7 @@ renewal loop polls expiry and hot-swaps TLS material without restart.
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `pool_slots` | int | `1024` | buffer pool slots per worker |
+| `buffer_size` | int | `4096` | slot size in bytes; read/write lengths derive from it and backpressure thresholds scale with it (2×). Per-worker memory = `pool_slots × buffer_size`. Bounded `[512, 65536]` (startup error outside) |
 | `ring_entries` | int | `4096` | io_uring queue depth |
 | `sqpoll` | bool | `false` | zero-syscall submission (needs privileges) |
 | `force_mio` | bool | `false` | disable io_uring even when available (e.g. seccomp'd containers) |
