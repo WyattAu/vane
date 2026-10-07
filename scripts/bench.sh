@@ -67,11 +67,13 @@ echo "== vane (release, $WORKERS worker(s)) on :$PORT_PROXY =="
 VANE_PID=$!
 sleep 1
 
-echo "== ab: $DURATION s, 64 concurrent, keep-alive =="
-# Fixed request count (ab -t counts deadline-cut responses as failures).
-TOTAL=$((30000))
-timeout "$DURATION" ab -n "$TOTAL" -c 64 -k "http://127.0.0.1:$PORT_PROXY/" 2>&1 |
-  grep -E "Requests per second|Time per request|Failed requests|Complete requests|Non-2xx|HTML transferred" || true
+echo "== loadgen: $DURATION s, 64 concurrent, keep-alive =="
+# Duration-based (ab's fixed-count mode counts deadline-cut responses as
+# failures). Fields: proto conns duration total rps ok conn_err read_err
+# non200 0 p50_us 0 p99_us — rps and the percentiles are what gets quoted.
+LG="$PWD/tools/loadgen/target/release"
+if [ ! -x "$LG/loadgen" ]; then (cd tools/loadgen && cargo build --release) || exit 2; fi
+"$LG/loadgen" "127.0.0.1:$PORT_PROXY" 64 "$DURATION" / bench || true
 
 kill "$VANE_PID" "$UP_PID" 2>/dev/null || true
 wait 2>/dev/null || true
