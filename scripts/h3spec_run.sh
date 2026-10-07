@@ -27,6 +27,7 @@ DIR=$(mktemp -d)
 cat > "$DIR/vane.toml" <<TOML
 [[listeners]]
 address = "127.0.0.1:18443"
+workers = 1
 
 [listeners.tls]
 h3 = true
@@ -46,7 +47,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 TOML
 ./target/release/vane run -c "$DIR/vane.toml" &
 VANE=$!

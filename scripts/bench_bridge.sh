@@ -60,6 +60,7 @@ DIR=$(mktemp -d)
 cat > "$DIR/far.toml" <<TOML
 [[listeners]]
 address = "127.0.0.1:$PORT_FAR"
+workers = 1
 
 [listeners.tls]
 cert = "$DIR/cert.pem"
@@ -78,7 +79,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 TOML
 ./target/release/vane run -c "$DIR/far.toml" &
 FAR=$!
@@ -114,7 +114,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 TOML
 ./target/release/vane run -c "$DIR/near.toml" &
 NEAR=$!

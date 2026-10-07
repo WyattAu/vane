@@ -41,6 +41,7 @@ cat > "$DIR/vane.toml" <<TOML
 [[listeners]]
 address = "127.0.0.1:18445"
 h2c = true
+workers = 1
 
 [clusters.up]
 backends = ["127.0.0.1:18091"]
@@ -57,7 +58,6 @@ strict_idle_window_update = true
 
 [runtime]
 force_mio = true
-workers = 1
 TOML
 ./target/release/vane run -c "$DIR/vane.toml" &
 VANE=$!
