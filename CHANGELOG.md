@@ -4,9 +4,12 @@ All notable changes to vane are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 semver.
 
-## [Unreleased]
+## [0.8.0] — 2026-10-07
 
-### Fixed
+Crate versions: `vane-proxy` 0.8.0, `vane-control` 0.7.0,
+`vane-kernel` 0.6.0.
+
+### Security
 
 - **HPACK string-length arithmetic overflow** (`vane-kernel` h2). A
   12-byte crafted header block drove `decode_int` to `u64::MAX - 1`, so
@@ -27,8 +30,35 @@ semver.
   peer-controlled bytes and no target watched it (5.6 M runs clean
   after the fix).
 
+### Fixed
+
+- **k8s provider ignored the chart's own `namespaces` default**
+  (`vane-control`). `namespaces = ["*"]` (or an empty list) — the
+  documented default in vane's Helm chart — was forwarded as a literal
+  namespace name and matched nothing: zero routes, permanent 503s.
+  `["*"]` and `[]` now watch all namespaces.
+- **CI repairs**: the fuzz regression-seed gate never actually ran
+  (wrong corpus path); fuzz ran on stable where the profile needs
+  nightly; the helm template step redirected into a directory GitHub
+  runners do not have; the fuzz targets were never compiled by any gate
+  (`fuzz/` is its own workspace) and one did not compile; kind-smoke
+  got its first green run (leftover-cluster cleanup, corrected upstream
+  args, diagnosable cluster-creation failure).
+- `h3_client` was compiled even without the `h3` feature — the
+  `--no-default-features` build was broken.
+
 ### Added
 
+- **`[runtime] buffer_size`** (`vane-control` 0.7.0, `vane-kernel`
+  0.6.0). The relay's buffer slot size is now a knob (default 4096,
+  validated `[512, 65536]`): read/write lengths derive from it in both
+  engines and the backpressure thresholds scale with it, so operators
+  trade per-connection memory for syscalls-per-byte. Verified with the
+  h1 boundary sweep at the 512-byte minimum and io_uring end-to-end at
+  16 KiB.
+- **Tunnel backpressure proof**: the 101-upgrade arm (WebSocket et al.)
+  now has the same stalled-reader proof the h1 relay has — 8 MiB
+  floods in both directions, byte-verified.
 - **`tools/loadgen`** — the benchmark load generator now lives in-repo
   (own workspace, `publish = false`) instead of an untracked scratch
   crate under `/tmp/opencode`: h1/h2/h3 clients with a shared 13-field

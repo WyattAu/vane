@@ -49,8 +49,10 @@ fn temp_config(toml: String) -> (tempfile::TempDir, String) {
 }
 
 /// Accepts the upgrade, answers 101, then:
+///
 /// - pumps `TUNNEL_BYTES` of a deterministic pattern downstream,
 /// - echoes everything the client sends upstream (bidirectional proof),
+///
 /// in that order, on the same raw connection.
 fn spawn_tunnel_upstream() -> std::net::SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");

@@ -1,7 +1,10 @@
 [package]
 name = "vane-kernel"
 description = "io_uring/mio dual-backend, thread-per-core transport engine for Vane"
-version.workspace = true
+# 0.6.0 (explicit: overrides the workspace version — WorkerConfig gained
+# `buf_size` and BufferPool slots became size-flexible, both breaking for
+# external constructors).
+version = "0.6.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
