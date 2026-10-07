@@ -222,6 +222,10 @@ jobs:
       # first so the failure is a compile error with a file and a line.
       - name: fuzz targets compile
         run: cargo +nightly check --manifest-path fuzz/Cargo.toml --all-targets
+      # tools/loadgen is a separate workspace too — same gap: a broken
+      # bench script surfaces only when someone benches, mid-measurement.
+      - name: bench tools compile
+        run: cargo check --manifest-path tools/loadgen/Cargo.toml --all-targets
       # crossbeam-epoch (router) holds the snapshot until the process
       # exits, so LeakSanitizer reports it as a leak; leaks stay
       # undetected repo-wide. The route_lookup target used to rebuild the
