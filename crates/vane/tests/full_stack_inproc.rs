@@ -2990,8 +2990,10 @@ force_mio = false
     let failures: std::sync::Arc<std::sync::atomic::AtomicUsize> = Default::default();
     let requests: std::sync::Arc<std::sync::atomic::AtomicUsize> = Default::default();
     let mut hammers = Vec::new();
+    // `proxy: SocketAddr` is Copy — each hammer owns its own value; no
+    // clone (a clone() here trips clippy's copy-clone lint under -D
+    // warnings).
     for _ in 0..4 {
-        let proxy = proxy.clone();
         let stop = std::sync::Arc::clone(&stop);
         let failures = std::sync::Arc::clone(&failures);
         let requests = std::sync::Arc::clone(&requests);
