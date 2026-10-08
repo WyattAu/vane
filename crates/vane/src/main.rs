@@ -373,7 +373,10 @@ enabled = false
                             // The snapshot body rode in this read; capture
                             // it from the tail of `head`.
                             let body = head_str.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
-                            posts_thread.lock().unwrap().push(body);
+                            posts_thread
+                                .lock()
+                                .expect("mock posts mutex poisoned")
+                                .push(body);
                             let r = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
                             if s.write_all(r.as_bytes()).is_err() {
                                 return;
@@ -431,7 +434,7 @@ enabled = false
             "default",
         );
         assert!(rc.is_ok(), "tick failed: {rc:?}");
-        let snap = posts.lock().unwrap();
+        let snap = posts.lock().expect("mock posts mutex poisoned");
         assert!(!snap.is_empty(), "snapshot POSTed");
         let parsed: serde_json::Value = serde_json::from_str(&snap[0]).expect("json");
         assert!(
@@ -607,7 +610,8 @@ fn cmd_gateway_operator(
 ) -> i32 {
     use std::io::BufRead as _;
     use std::sync::Mutex as StdMutex;
-    use vane_control::gateway::GatewayState;
+    // `compile` is still used by the watch-mode snapshot poster; the
+    // poll-mode tick qualifies it fully (extracted function).
     use vane_control::gateway::compile;
     use vane_control::operator::{ResourceKind, WatchCache};
 
