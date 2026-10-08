@@ -143,6 +143,14 @@ jobs:
       # the job exercises them. The release-mode h3 job still gates
       # correctness independently; if the instrumented run proves too
       # slow, the honest fix is a coverage-specific profile, not a skip.
+      #
+      # `llvm-cov clean` first: rust-cache keeps target/ (including the
+      # llvm-cov-target subtree) across commits, and a stale instrumented
+      # binary silently reports "0 tests, N filtered out" — the coverage
+      # number was computed from last week's code (h3 inclusion moved the
+      # total by ONE line until this).
+      - name: Clean coverage artifacts
+        run: cargo llvm-cov clean --workspace
       - name: Generate coverage (serial proxy suites)
         run: |
           cargo llvm-cov --workspace --features vane-plugins/wasm,acme-pebble --lcov \
