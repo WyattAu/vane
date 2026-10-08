@@ -197,6 +197,8 @@ fn cmd_sidecar(config: Option<String>, base: String) -> i32 {
 mod cli_tests {
     use super::*;
     use clap::CommandFactory as _;
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn cli_definition_is_valid() {
@@ -314,6 +316,153 @@ enabled = false
         assert_eq!(super::cmd_validate("/nonexistent/vane/config.toml"), 1);
     }
 
+    /// A minimal keep-alive HTTP/1.1 server: routes GETs to canned
+    /// bodies by path prefix, records POST bodies, responds 200. Runs
+    /// until its handle drops; returns (addr, received-POST-bodies).
+    fn spawn_mock_api(
+        routes_body: &'static str,
+        gateways_body: &'static str,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let posts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let posts_thread = Arc::clone(&posts);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let posts_thread = Arc::clone(&posts_thread);
+                std::thread::spawn(move || {
+                    let mut s = stream;
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        // Read one request head.
+                        let mut head = Vec::new();
+                        loop {
+                            match s.read(&mut buf) {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => head.extend_from_slice(&buf[..n]),
+                            }
+                            if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        let text = String::from_utf8_lossy(&head).into_owned();
+                        let path = text.split(' ').nth(1).unwrap_or("/").to_string();
+                        let clen: usize = text
+                            .lines()
+                            .find_map(|l| {
+                                l.strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        // Drain any request body.
+                        let have = head.len()
+                            - head
+                                .windows(4)
+                                .position(|w| w == b"\r\n\r\n")
+                                .map(|p| p + 4)
+                                .unwrap_or(head.len());
+                        let mut remaining = clen.saturating_sub(have);
+                        while remaining > 0 {
+                            match s.read(&mut buf) {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => remaining -= n.min(remaining),
+                            }
+                        }
+                        let head_str = text;
+                        if head_str.starts_with("POST ") {
+                            // The snapshot body rode in this read; capture
+                            // it from the tail of `head`.
+                            let body = head_str.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+                            posts_thread.lock().unwrap().push(body);
+                            let r = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
+                            if s.write_all(r.as_bytes()).is_err() {
+                                return;
+                            }
+                        } else if path.starts_with("/apis/gateway.networking.k8s.io/v1/httproutes")
+                        {
+                            let r = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{routes_body}",
+                                routes_body.len()
+                            );
+                            if s.write_all(r.as_bytes()).is_err() {
+                                return;
+                            }
+                        } else if path.starts_with("/apis/gateway.networking.k8s.io/v1/gateways") {
+                            let r = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{gateways_body}",
+                                gateways_body.len()
+                            );
+                            if s.write_all(r.as_bytes()).is_err() {
+                                return;
+                            }
+                        } else {
+                            let r = "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n";
+                            if s.write_all(r.as_bytes()).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}"), posts)
+    }
+
+    const MOCK_HTTPROUTES: &str = r#"{"apiVersion":"gateway.networking.k8s.io/v1","kind":"HTTPRouteList","items":[{"metadata":{"name":"shop","namespace":"app"},"spec":{"hostnames":["shop.example.com"],"rules":[{"matches":[{"path":{"type":"PathPrefix","value":"/api"}}],"backendRefs":[{"name":"shop-svc","port":8080,"weight":1}]}]}}]}"#;
+    const MOCK_GATEWAYS: &str =
+        r#"{"apiVersion":"gateway.networking.k8s.io/v1","kind":"GatewayList","items":[]}"#;
+
+    #[test]
+    fn operator_tick_compiles_and_posts_a_snapshot() {
+        let (api, _api_posts_unused) = spawn_mock_api(MOCK_HTTPROUTES, MOCK_GATEWAYS);
+        // The snapshot POST goes to the ADMIN mock; that is the recorder
+        // the assertion reads.
+        let (admin, posts) = spawn_mock_api("", "");
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("client");
+        let rc = super::operator_poll_tick(
+            &client,
+            &format!("{api}/apis/gateway.networking.k8s.io/v1/httproutes"),
+            &format!("{api}/apis/gateway.networking.k8s.io/v1/gateways"),
+            "token",
+            &format!("{admin}/xds/snapshot"),
+            "default",
+        );
+        assert!(rc.is_ok(), "tick failed: {rc:?}");
+        let snap = posts.lock().unwrap();
+        assert!(!snap.is_empty(), "snapshot POSTed");
+        let parsed: serde_json::Value = serde_json::from_str(&snap[0]).expect("json");
+        assert!(
+            parsed.get("routes").is_some() && parsed.get("clusters").is_some(),
+            "snapshot carries routes+clusters: {parsed}"
+        );
+        let route = &parsed["routes"][0];
+        assert_eq!(route["pattern"], "/api/*rest");
+        assert_eq!(route["cluster"], "c-app/shop-0");
+    }
+
+    #[test]
+    fn operator_tick_reports_an_unreachable_api() {
+        // Nothing listens here: the fetch fails, the tick says so (and
+        // the operator loop keeps going).
+        let (admin, _p) = spawn_mock_api("", "");
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_millis(500))
+            .build()
+            .expect("client");
+        let rc = super::operator_poll_tick(
+            &client,
+            "http://127.0.0.1:1/apis/gateway.networking.k8s.io/v1/httproutes",
+            "http://127.0.0.1:1/apis/gateway.networking.k8s.io/v1/gateways",
+            "token",
+            &format!("{admin}/xds/snapshot"),
+            "default",
+        );
+        assert!(rc.is_err(), "unreachable API must surface as Err");
+    }
+
     #[test]
     fn cmd_run_starts_and_shuts_down() {
         let dir = tempfile::tempdir().expect("dir");
@@ -399,6 +548,54 @@ fn cmd_xds_client(management: &str, node_id: &str, admin: &str) -> i32 {
 /// `vane gateway-operator` body: polls the K8s API for Gateway API
 /// resources, compiles them, and POSTs xDS snapshots to the vane admin
 /// plane. v0.2: poll-based, single namespace, SA-token auth.
+/// One gateway-operator poll cycle: fetch HTTPRoutes + Gateways from
+/// the K8s API, compile a snapshot, POST it to the vane admin plane.
+/// Extracted from the loop so the network cycle is unit-testable against
+/// mock servers (the loop itself never returns).
+fn operator_poll_tick(
+    client: &reqwest::blocking::Client,
+    routes_url: &str,
+    gateways_url: &str,
+    token: &str,
+    snapshot_url: &str,
+    namespace: &str,
+) -> Result<(), String> {
+    match (
+        fetch_k8s_json(client, routes_url, token),
+        fetch_k8s_json(client, gateways_url, token),
+    ) {
+        (Ok(routes_json), Ok(gateways_json)) => {
+            let compiled = (|| -> Result<String, String> {
+                let state = vane_control::gateway::GatewayState {
+                    gateways: vane_control::operator::map_gateways(&gateways_json)?,
+                    httproutes: vane_control::operator::map_httproutes(&routes_json, namespace)?,
+                };
+                let snapshot = vane_control::gateway::compile(&state)?;
+                serde_json::to_string(&snapshot).map_err(|e| e.to_string())
+            })();
+            match compiled {
+                Ok(body) => {
+                    let resp = client
+                        .post(snapshot_url)
+                        .header("content-type", "application/json")
+                        .body(body)
+                        .send();
+                    match resp {
+                        Ok(r) if r.status().is_success() => {
+                            eprintln!("gateway-operator: snapshot applied");
+                            Ok(())
+                        }
+                        Ok(r) => Err(format!("snapshot rejected: {}", r.status())),
+                        Err(e) => Err(format!("admin unreachable: {e}")),
+                    }
+                }
+                Err(e) => Err(e),
+            }
+        }
+        (Err(e), _) | (_, Err(e)) => Err(e),
+    }
+}
+
 fn cmd_gateway_operator(
     api_server: String,
     namespace: String,
@@ -532,49 +729,15 @@ fn cmd_gateway_operator(
 
     eprintln!("gateway-operator: ns={namespace} api={api_server} admin={admin} poll={poll_secs}s");
     loop {
-        match (
-            fetch_k8s_json(&client, &routes_url, &token),
-            fetch_k8s_json(&client, &gateways_url, &token),
+        if let Err(e) = operator_poll_tick(
+            &client,
+            &routes_url,
+            &gateways_url,
+            &token,
+            &snapshot_url,
+            &namespace,
         ) {
-            (Ok(routes_json), Ok(gateways_json)) => {
-                let compiled = (|| -> Result<String, String> {
-                    let state = GatewayState {
-                        gateways: vane_control::operator::map_gateways(&gateways_json)?,
-                        httproutes: vane_control::operator::map_httproutes(
-                            &routes_json,
-                            &namespace,
-                        )?,
-                    };
-                    let snapshot = compile(&state)?;
-                    serde_json::to_string(&snapshot).map_err(|e| e.to_string())
-                })();
-                match compiled {
-                    Ok(body) => {
-                        let resp = client
-                            .post(&snapshot_url)
-                            .header("content-type", "application/json")
-                            .body(body)
-                            .send();
-                        match resp {
-                            Ok(r) if r.status().is_success() => {
-                                eprintln!("gateway-operator: snapshot applied");
-                            }
-                            Ok(r) => {
-                                let status = r.status();
-                                let text = r.text().unwrap_or_default();
-                                eprintln!("gateway-operator: snapshot rejected: {status} {text}");
-                            }
-                            Err(e) => {
-                                eprintln!("gateway-operator: admin unreachable: {e}");
-                            }
-                        }
-                    }
-                    Err(e) => eprintln!("gateway-operator: compile: {e}"),
-                }
-            }
-            (Err(e), _) | (_, Err(e)) => {
-                eprintln!("gateway-operator: fetch: {e}");
-            }
+            eprintln!("gateway-operator: poll cycle: {e}");
         }
         std::thread::sleep(std::time::Duration::from_secs(poll_secs));
     }

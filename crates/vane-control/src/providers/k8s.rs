@@ -25,6 +25,9 @@ pub struct K8sProvider {
     /// Namespaces to watch. Empty, or containing `"*"`, means all
     /// namespaces (cluster-wide list).
     pub namespaces: Vec<String>,
+    /// Bearer-token file (the in-cluster service-account path by
+    /// default; injectable so the provider is testable off-cluster).
+    pub token_path: String,
     client: reqwest::Client,
 }
 
@@ -87,12 +90,13 @@ impl K8sProvider {
         Ok(Self {
             api,
             namespaces,
+            token_path: SA_TOKEN.to_owned(),
             client,
         })
     }
 
     fn token(&self) -> Result<String, String> {
-        std::fs::read_to_string(SA_TOKEN).map_err(|e| format!("read token: {e}"))
+        std::fs::read_to_string(&self.token_path).map_err(|e| format!("read token: {e}"))
     }
 
     /// Lists HTTPRoutes across the watched namespaces and compiles them.
@@ -365,6 +369,7 @@ type Unused = HashMap<String, String>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// The namespace list the provider requests. Empty and `"*"` both mean
     /// all namespaces (the cluster-wide list endpoint); anything else is a
@@ -401,6 +406,89 @@ mod tests {
         let addrs = parse_endpoints(doc, 80);
         assert_eq!(addrs.len(), 2);
         assert_eq!(addrs[0].to_string(), "10.1.2.3:8080");
+    }
+
+    /// `list_routes` end-to-end against a mock API server: the
+    /// httproutes GET and the endpoints GET both served, the compiled
+    /// route carries resolved backend IPs. This is the provider's whole
+    /// network contract — previously the watch loop was the only thing
+    /// exercising it, and only in-cluster.
+    #[tokio::test]
+    async fn list_routes_resolves_endpoints_against_a_mock_api() {
+        let routes_doc = r#"{"items":[{
+            "metadata": {"name": "shop", "namespace": "app"},
+            "spec": {"rules": [{"backendRefs": [{"name": "shop-svc", "port": 8080}]}]}
+        }]}"#;
+        let endpoints_doc =
+            r#"{"subsets":[{"addresses":[{"ip":"10.1.2.3"}],"ports":[{"port":8080}]}]}"#;
+
+        // Mock API: serve each path with its canned document.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 8192];
+                while let Ok(n) = sock.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let body = if req.contains("/httproutes") {
+                        routes_doc
+                    } else if req.contains("/endpoints/") {
+                        endpoints_doc
+                    } else {
+                        "{}"
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: keep-alive\r\n\r\n{body}",
+                        body.len()
+                    );
+                    if sock.write_all(resp.as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("client");
+        let provider = K8sProvider {
+            api: format!("http://{addr}"),
+            namespaces: vec!["app".to_string()],
+            token_path: "/dev/null".to_owned(),
+            client,
+        };
+        let routes = provider.list_routes().await.expect("list_routes");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(
+            routes[0].backends,
+            vec!["10.1.2.3:8080".parse().expect("addr")]
+        );
+    }
+
+    /// A failing API surfaces as Err rather than an empty route set —
+    /// an empty Ok would silently clear every route from the router.
+    #[tokio::test]
+    async fn list_routes_surfaces_api_failure() {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(300))
+            .build()
+            .expect("client");
+        let provider = K8sProvider {
+            api: "http://127.0.0.1:1".to_owned(), // nothing listens
+            namespaces: vec!["app".to_string()],
+            token_path: "/dev/null".to_owned(),
+            client,
+        };
+        assert!(provider.list_routes().await.is_err());
     }
 
     /// Compiles a realistic HTTPRoute list into cluster matches.
