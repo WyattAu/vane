@@ -1128,10 +1128,20 @@ pub async fn run(opts: RunOptions) -> i32 {
     let mut opts = opts;
     let ext = opts.shutdown.take();
     let mut ext = ext.map(Box::pin);
+    // `shutdown_after` is the test-hook timer: the shutdown select must
+    // honor it. The Sep 26 refactor that added the channel deleted the
+    // `timeout(d, …)` branch and left the field documented but dead —
+    // every `shutdown_after` caller then hung forever waiting for a
+    // signal that never comes. On CI this was `quality / test` sitting
+    // in_progress for 10+ hours (and, in hindsight, every coverage-job
+    // hang since Sep 26).
+    let shutdown_after = opts.shutdown_after;
     let mut shutdown = Box::pin(wait_for_signal());
     let ext_fut = async {
         if let Some(rx) = ext.as_mut() {
             let _ = rx.as_mut().await;
+        } else if let Some(d) = shutdown_after {
+            tokio::time::sleep(d).await;
         } else {
             std::future::pending::<()>().await;
         }
