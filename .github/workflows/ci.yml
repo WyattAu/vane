@@ -137,18 +137,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-llvm-cov --locked
+      # h3 suites RUN here now: they were skipped as debug-mode QUIC
+      # slow/flaky, but that made h3_edge/h3_bridge/h3_client permanently
+      # uncoverable — the workspace bar counts their lines whether or not
+      # the job exercises them. The release-mode h3 job still gates
+      # correctness independently; if the instrumented run proves too
+      # slow, the honest fix is a coverage-specific profile, not a skip.
       - name: Generate coverage (serial proxy suites)
         run: |
           cargo llvm-cov --workspace --features vane-plugins/wasm,acme-pebble --lcov \
             --output-path lcov.info -- \
-            --include-ignored --test-threads=2 -- --skip hot_upgrade --skip h3_ --skip h3spec
+            --include-ignored --test-threads=2 -- --skip hot_upgrade --skip h3spec
       - name: Chaos suite
         run: cargo test -p vane-proxy --test chaos -- --test-threads=1
       - name: Enforce Tier A threshold
         run: |
           cargo llvm-cov --workspace --features vane-plugins/wasm,acme-pebble --lcov \
             --output-path /dev/null --fail-under-lines 90 -- \
-            --include-ignored --test-threads=2 --skip hot_upgrade --skip large_body_streams_through_edge --skip h3_ --skip h3spec
+            --include-ignored --test-threads=2 --skip hot_upgrade --skip large_body_streams_through_edge --skip h3spec
         # The streaming-family tests run as subprocess servers now
         # (2026-09-19) — the suite-sequence wedge is fixed, no skips
         # needed beyond the retired REUSEPORT-edge probe (kept: it is
