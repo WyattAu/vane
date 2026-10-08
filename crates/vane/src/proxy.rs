@@ -1079,6 +1079,7 @@ impl HttpProxy {
             };
             h2up.handle_read(data, &mut events);
         }
+
         if self.conn(slot).h2up.as_ref().is_some_and(|h| h.failed()) {
             self.log(LogLevel::Warn, "h2 upstream protocol error");
             self.respond_full(io, Status::BadGateway, "upstream unreachable\n");
@@ -1133,6 +1134,20 @@ impl HttpProxy {
                     out.extend_from_slice(&f);
                 }
                 self.h2_flush(io);
+            }
+        }
+        // Credit-driven request-body retries (WINDOW_UPDATEs handled
+        // inside handle_read) queue frames; flush them upstream.
+        #[cfg(feature = "h2")]
+        {
+            let out = self
+                .conn(slot)
+                .h2up
+                .as_mut()
+                .map(|h| h.pending_writes())
+                .unwrap_or_default();
+            if !out.is_empty() {
+                self.upstream_send(io, &out);
             }
         }
         if complete && !matches!(self.conn(slot).body, BodyFraming::Done) {
@@ -1338,6 +1353,8 @@ impl HttpProxy {
         // handler-side (req_pending) so ordering with the inline bytes
         // forwarded at connect is preserved.
         let upstream_ready = self.conns.get(&slot).is_some_and(|c| c.upstream_ready);
+        #[cfg(feature = "h2")]
+        let is_h2up = self.conns.get(&slot).is_some_and(|c| c.h2up.is_some());
         let body_active = self.conns.get(&slot).is_some_and(|c| match &c.req_framing {
             ReqFraming::ContentLength(remaining) => *remaining > 0,
             ReqFraming::Chunked { .. } => true,
@@ -1350,6 +1367,22 @@ impl HttpProxy {
                     ReqFraming::ContentLength(remaining) => {
                         let n = (data.len() as u64).min(*remaining) as usize;
                         *remaining -= n as u64;
+                        // h2 upstream: raw h1 body bytes must become
+                        // DATA frames — sending them raw desyncs the h2
+                        // parser and the upstream waits for a body that
+                        // never completes (POST through an h2up cluster
+                        // 504'd: the head went out as frames, the body
+                        // tail went out as garbage).
+                        #[cfg(feature = "h2")]
+                        if is_h2up {
+                            let frames = conn
+                                .h2up
+                                .as_mut()
+                                .expect("h2up checked")
+                                .request_body(&data[..n]);
+                            self.upstream_send(io, &frames);
+                            return; // held tail retries on WINDOW_UPDATE
+                        }
                         if upstream_ready {
                             self.upstream_send(io, &data[..n]);
                         } else {

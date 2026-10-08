@@ -254,3 +254,32 @@ dispatch in the shim intake.
 The repro is un-ignored and green (50 sequential h2-crate streams);
 h2spec stays 145/145 strict; the external h2load went 1 → 32.7k
 req/s (8 conns).
+
+## OPEN (2026-10-09): h2up POST body — frames emitted, server never sees them
+
+A POST through an `http2 = true` cluster (engine relay, `proxy.rs`
+h2up paths) 504s: the tokio-h2 mock accepts the request HEAD and then
+waits forever for the body (`h2up_engine_relay.rs::post_body_round_
+trips_through_h2_framing`, ignored).
+
+Verified at the `H2Upstream` API level: `send_request(head,
+Some(cl))` + `request_body(inline)` + `request_body(tail)` emit framed
+DATA with END_STREAM and no holds (RBENT/RBHELD instrumentation).
+The frames are handed to `upstream_send` — a byte-logging wire relay
+shows vane's preface + SETTINGS + HEADERS reach the mock, and then
+silence: the mock's `conn.accept()` never resolves on the HEADERS
+ tokio-h2 sends its SETTINGS twice and waits).
+
+Two sub-cases distinguished:
+- The raw-bytes desync (body TAIL sent untranslated as h1 bytes onto
+  the h2 socket) is FIXED — the streaming-body path now routes through
+  `h2up.request_body` when the connection is h2up.
+- What remains is an interop issue between vane's engine h2up client
+  frames and the tokio-h2 SERVER crate's parser — needs frame-level
+  capture (wire relay harness kept in the test file's history) and a
+  byte-by-byte diff against what `h2::client` (the crate client) sends.
+
+Next steps: capture vane's exact HEADERS+DATA bytes from the wire
+relay, replay them at the tokio-h2 server directly, bisect the frame
+that stalls `accept()`; check SETTINGS ACK handling first (vane's
+client-side ACK of the server's SETTINGS was not observed on the wire).

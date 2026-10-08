@@ -152,7 +152,14 @@ impl H2Upstream {
     /// [`Self::handle_read`]. END_STREAM goes out with the final byte
     /// once the declared Content-Length is satisfied.
     pub fn request_body(&mut self, data: &[u8]) -> Vec<u8> {
+        eprintln!(
+            "RBENT data={} rem={:?} stream={:?}",
+            data.len(),
+            self.req_remaining,
+            self.stream
+        );
         let Some(rem) = self.req_remaining else {
+            eprintln!("RBENT no-remaining -> empty");
             return Vec::new();
         };
         let take = (data.len() as u64).min(rem) as usize;
