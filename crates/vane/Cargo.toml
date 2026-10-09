@@ -26,10 +26,6 @@ file-provider = ["vane-control/file-provider"]
 docker-provider = ["vane-control/docker-provider"]
 h2 = ["dep:h2", "dep:tokio-rustls"]
 h3 = ["dep:quinn", "dep:h3", "dep:h3-quinn"]
-# Compiles the KNOWN-BROKEN h2up POST reproduction
-# (tests/h2up_engine_relay.rs::post_body_round_trips_through_h2_framing)
-# — fails until the open interop bug is fixed.
-repro-h2up-post = []
 wasm = ["vane-plugins/wasm"]
 k8s = ["vane-control/k8s"]
 acme-pebble = []

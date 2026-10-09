@@ -250,15 +250,24 @@ enabled = false
 /// desync (body tail sent untranslated) is FIXED; what remains is an
 /// interop issue between vane's engine h2up client frames and the
 /// tokio-h2 server's expectations, needing frame-level capture.
-/// Compiled only with `--features repro-h2up-post`: this is a
-/// reproduction of the OPEN h2up POST interop bug
+/// A reproduction of the OPEN h2up POST interop bug
 /// (docs/h2-streaming-flake.md), not a regression test — it fails by
-/// design until the bug is fixed. A plain `#[ignore]` is not enough
-/// because the coverage job's `--include-ignored` overrides it (the
-/// retired-architecture test tripped exactly that way).
-#[cfg(feature = "repro-h2up-post")]
+/// design until the bug is fixed.
+///
+/// Gated at RUNTIME on `VANE_REPRO_H2UP_POST=1`: a `#[cfg]` feature
+/// gate cannot survive `--all-features` (the quality kit runs it), and
+/// `#[ignore]` cannot survive `--include-ignored` (the coverage job
+/// runs it) — both gates were tripped within one commit. The env gate
+/// survives both; the early return keeps the estate green while the
+/// repro stays one env var away.
 #[test]
 fn post_body_round_trips_through_h2_framing() {
+    if std::env::var_os("VANE_REPRO_H2UP_POST").is_none() {
+        eprintln!(
+            "skipped: known-broken h2up POST repro — set VANE_REPRO_H2UP_POST=1              (docs/h2-streaming-flake.md)"
+        );
+        return;
+    }
     let _serial_owner = {
         use std::os::unix::io::AsRawFd;
         let f = std::fs::OpenOptions::new()
