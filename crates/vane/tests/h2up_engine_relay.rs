@@ -241,6 +241,116 @@ enabled = false
     assert_eq!(body, expected, "multi-frame body byte-exact");
 }
 
+/// Upstream trailers relay: an h2 client (h2c ingress) hitting an h2up
+/// cluster receives the upstream's trailer fields as h2 response
+/// trailers — the gRPC shape. h1 ingress drops them (documented v0.2
+/// limit); the h2→h2 path must not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upstream_trailers_relay_to_an_h2_client() {
+    // h2 upstream: HEADERS(200, no END_STREAM) + DATA + trailing
+    // HEADERS(END_STREAM) carrying grpc-status.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let upstream = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let Ok(mut conn) = h2::server::handshake(stream).await else {
+                    return;
+                };
+                while let Some(request) = conn.accept().await {
+                    let Ok((request, mut respond)) = request else {
+                        break;
+                    };
+                    let _ = request.into_body();
+                    let response = http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/grpc")
+                        .body(())
+                        .expect("static");
+                    let Ok(mut send) = respond.send_response(response, false) else {
+                        break;
+                    };
+                    let _ =
+                        send.send_data(bytes::Bytes::from_static(b"\x00\x00\x00\x00\x00"), false);
+                    let mut trailers = http::HeaderMap::new();
+                    trailers.insert("grpc-status", "0".parse().expect("value"));
+                    let _ = send.send_trailers(trailers);
+                }
+            });
+        }
+    });
+
+    // h2c ingress on the engine: the config's listener speaks prior-
+    // knowledge h2 (h2c) and the cluster is h2up.
+    let port = free_port();
+    let (_dir, cfg_path) = temp_config(format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+h2c = true
+
+[clusters.up]
+backends = ["{upstream}"]
+http2 = true
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+"#
+    ));
+    let _server = spawn_proxy(cfg_path);
+    wait_bound(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+
+    // h2 client over the h2c listener.
+    let io = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("connect");
+    let (mut send_request, connection) = h2::client::handshake(io).await.expect("h2 handshake");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("http://host/rpc")
+        .body(())
+        .expect("request");
+    let (response, flow) = send_request.send_request(request, true).expect("send");
+    let (parts, mut body) = response.await.expect("response").into_parts();
+    assert_eq!(parts.status.as_u16(), 200);
+    let mut got = Vec::new();
+    while let Some(chunk) = body.data().await {
+        match chunk {
+            Ok(b) => {
+                let len = b.len();
+                got.extend_from_slice(&b);
+                let _ = body.flow_control().release_capacity(len);
+            }
+            Err(_) => break,
+        }
+    }
+    assert_eq!(got, b"\x00\x00\x00\x00\x00", "data frame relayed");
+    let trailers = body
+        .trailers()
+        .await
+        .expect("trailers")
+        .expect("trailers present");
+    assert_eq!(
+        trailers.get("grpc-status").map(|v| v.as_bytes()),
+        Some(b"0".as_ref()),
+        "upstream trailers reached the h2 client"
+    );
+    let _ = flow;
+    let _ = send_request;
+}
+
 /// POST through an h2up cluster: KNOWN BROKEN — see
 /// docs/h2-streaming-flake.md ("h2up POST body" section). The mock
 /// accepts the request head and then waits forever for the body; the
