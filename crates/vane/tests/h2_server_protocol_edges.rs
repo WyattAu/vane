@@ -7,7 +7,7 @@
 //! relayed origin response, `pending_writes` for everything the shim
 //! queues back. Every test asserts on frame bytes, not "no panic".
 
-use vane::h2_server::{H2Event, H2Server};
+use vane::h2_server::{EofOutcome, H2Event, H2Server};
 
 /// HTTP/2 client preface (RFC 9113 §3.5).
 const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -273,6 +273,75 @@ fn protocol_violation_surfaces_the_connection_error() {
         parse_frames(&out).iter().any(|(t, ..)| *t == 0x07),
         "GOAWAY queued: {out:?}"
     );
+}
+
+/// A second stream while one is active is REFUSED_STREAM: the shim
+/// serializes (one relayed stream at a time) and resets the overlapping
+/// stream — the client retries it on a fresh connection per the h2
+/// spec. The active stream and its relay are untouched.
+#[test]
+fn overlapping_stream_is_reset_with_refused_stream() {
+    let mut shim = H2Server::new(0, false);
+    start_with_request(&mut shim, "/first", &[]);
+
+    // A second HEADERS on stream 3 while stream 1 is active.
+    let mut input = frame(0x01, 0x05, 3, &{
+        let mut b = Vec::new();
+        let mut emit = |name: &[u8], value: &[u8]| {
+            b.push(0x00);
+            b.push(name.len() as u8);
+            b.extend_from_slice(name);
+            b.push(value.len() as u8);
+            b.extend_from_slice(value);
+        };
+        emit(b":method", b"GET");
+        emit(b":path", b"/second");
+        emit(b":authority", b"t");
+        emit(b":scheme", b"http");
+        b
+    });
+    let mut events = Vec::new();
+    shim.handle_read(&input.drain(..).as_slice(), &mut events);
+
+    // The reset is queued for the peer: RST_STREAM(REFUSED_STREAM = 7).
+    let out = shim.pending_writes();
+    let parsed = parse_frames(&out);
+    let rst = parsed
+        .iter()
+        .find(|(t, _, s, _)| *t == 0x03 && *s == 3)
+        .expect("RST_STREAM for the overlapping stream");
+    assert_eq!(rst.3.len(), 4, "RST_STREAM carries a 4-byte code");
+    assert_eq!(
+        u32::from_be_bytes([rst.3[0], rst.3[1], rst.3[2], rst.3[3]]),
+        7,
+        "REFUSED_STREAM error code"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, H2Event::RequestHead { .. })),
+        "the overlapping head must not surface"
+    );
+}
+
+/// Upstream EOF before a Content-Length body completes is TRUNCATED:
+/// the worker answers 502 to the client instead of silently ending a
+/// short response. (EOF with nothing held and nothing left →
+/// Truncated; EOF with held bytes → Continue, completion comes from
+/// take_held.)
+#[test]
+fn upstream_eof_mid_body_is_reported_truncated() {
+    let mut shim = H2Server::new(0, false);
+    start_with_request(&mut shim, "/trunc", &[]);
+
+    // Head declaring 100 bytes; only 10 arrive; then EOF.
+    let head = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n";
+    let (frames, done) = shim.response_bytes(head);
+    assert!(!done);
+    let _ = frames;
+    let (frames, outcome) = shim.response_eof();
+    assert_eq!(outcome, EofOutcome::Truncated, "mid-body EOF is truncation");
+    assert!(frames.is_empty(), "no trailing END_STREAM on truncation");
 }
 
 /// After a response completes, further upstream bytes are dropped (the
