@@ -50,53 +50,59 @@ async fn spawn_h2_upstream() -> std::net::SocketAddr {
                 let Ok(mut conn) = h2::server::handshake(stream).await else {
                     return;
                 };
+                // Handlers spawn per request: the accept loop must KEEP
+                // POLLING the connection while a handler drains its body.
+                // tokio-h2 dispatches DATA frames to streams only when the
+                // connection is polled, so an accept loop that blocks on
+                // body.data() hangs whenever the body arrives in a later
+                // segment than the head (this hung the POST leg
+                // non-deterministically; vane's wire bytes were identical
+                // in pass and fail runs).
                 while let Some(request) = conn.accept().await {
                     let Ok((request, mut respond)) = request else {
                         break;
                     };
-                    let path = request.uri().path().to_owned();
-                    eprintln!("MOCKUP-ACCEPT path={path}");
-                    let mut body = request.into_body();
-                    // Drain the request body fully (flow-control credit
-                    // release keeps large POSTs alive).
-                    let mut req_bytes = Vec::new();
-                    while let Some(chunk) = body.data().await {
-                        match chunk {
-                            Ok(b) => {
-                                let len = b.len();
-                                req_bytes.extend_from_slice(&b);
-                                let _ = body.flow_control().release_capacity(len);
+                    tokio::spawn(async move {
+                        let path = request.uri().path().to_owned();
+                        let mut body = request.into_body();
+                        // Drain the request body fully (flow-control
+                        // credit release keeps large POSTs alive).
+                        let mut req_bytes = Vec::new();
+                        while let Some(chunk) = body.data().await {
+                            match chunk {
+                                Ok(b) => {
+                                    let len = b.len();
+                                    req_bytes.extend_from_slice(&b);
+                                    let _ = body.flow_control().release_capacity(len);
+                                }
+                                Err(_) => break,
                             }
-                            Err(_) => break,
                         }
-                    }
-                    eprintln!("MOCKUP-DRAIN path={path} reqbytes={}", req_bytes.len());
-                    let payload: Vec<u8> = match path.as_str() {
-                        "/big" => (0..40_960u32).map(|i| (i % 251) as u8).collect(),
-                        "/echo" => req_bytes,
-                        _ => b"h2-up".to_vec(),
-                    };
-                    eprintln!("MOCKUP path={path} payload={}", payload.len());
-                    let response = http::Response::builder()
-                        .status(200)
-                        .header("x-path", path)
-                        .header("content-length", payload.len().to_string())
-                        .body(())
-                        .expect("static");
-                    let Ok(mut send) = respond.send_response(response, false) else {
-                        eprintln!("MOCKUP send_response FAILED");
-                        break;
-                    };
-                    // 16 KiB chunks: force multi-frame DATA on the wire.
-                    for (i, chunk) in payload.chunks(16 * 1024).enumerate() {
-                        if let Err(e) = send.send_data(bytes::Bytes::copy_from_slice(chunk), false)
-                        {
-                            eprintln!("MOCKUP send_data[{i}] err={e}");
+                        let payload: Vec<u8> = match path.as_str() {
+                            "/big" => (0..40_960u32).map(|i| (i % 251) as u8).collect(),
+                            "/echo" => req_bytes,
+                            _ => b"h2-up".to_vec(),
+                        };
+                        let response = http::Response::builder()
+                            .status(200)
+                            .header("x-path", path)
+                            .header("content-length", payload.len().to_string())
+                            .body(())
+                            .expect("static");
+                        let Ok(mut send) = respond.send_response(response, false) else {
                             return;
+                        };
+                        // 16 KiB chunks: force multi-frame DATA on the wire.
+                        for chunk in payload.chunks(16 * 1024) {
+                            if send
+                                .send_data(bytes::Bytes::copy_from_slice(chunk), false)
+                                .is_err()
+                            {
+                                return;
+                            }
                         }
-                    }
-                    eprintln!("MOCKUP chunks sent, ending");
-                    let _ = send.send_data(bytes::Bytes::new(), true);
+                        let _ = send.send_data(bytes::Bytes::new(), true);
+                    });
                 }
             });
         }
@@ -360,24 +366,18 @@ enabled = false
 /// desync (body tail sent untranslated) is FIXED; what remains is an
 /// interop issue between vane's engine h2up client frames and the
 /// tokio-h2 server's expectations, needing frame-level capture.
-/// A reproduction of the OPEN h2up POST interop bug
-/// (docs/h2-streaming-flake.md), not a regression test — it fails by
-/// design until the bug is fixed.
+/// POST through an h2up cluster: the body must survive h1→h2 framing
+/// (the relay's h2up request-body emitter) and come back echoed.
 ///
-/// Gated at RUNTIME on `VANE_REPRO_H2UP_POST=1`: a `#[cfg]` feature
-/// gate cannot survive `--all-features` (the quality kit runs it), and
-/// `#[ignore]` cannot survive `--include-ignored` (the coverage job
-/// runs it) — both gates were tripped within one commit. The env gate
-/// survives both; the early return keeps the estate green while the
-/// repro stays one env var away.
+/// History: this test exposed BOTH halves of the defect — the relay's
+/// raw-bytes desync (body tail sent untranslated, fixed) and a mock
+/// bug that masked the fix for a while: an h2 server accept loop that
+/// blocks on body.data() stops polling the connection, so DATA frames
+/// arriving in later segments never dispatch (the mock's comment has
+/// the details). Vane's wire bytes were identical in pass and fail
+/// runs — the fix was on our side of the test all along.
 #[test]
 fn post_body_round_trips_through_h2_framing() {
-    if std::env::var_os("VANE_REPRO_H2UP_POST").is_none() {
-        eprintln!(
-            "skipped: known-broken h2up POST repro — set VANE_REPRO_H2UP_POST=1              (docs/h2-streaming-flake.md)"
-        );
-        return;
-    }
     let _serial_owner = {
         use std::os::unix::io::AsRawFd;
         let f = std::fs::OpenOptions::new()

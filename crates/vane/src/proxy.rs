@@ -517,6 +517,12 @@ impl HttpProxy {
         }
         let chunk = {
             let conn = self.conn(slot);
+            eprintln!(
+                "UPFLUSH slot={slot} buf={} out={} head={:02x?}",
+                conn.up_buf.len(),
+                conn.up_write_out,
+                &conn.up_buf[..conn.up_buf.len().min(16)]
+            );
             if conn.up_buf.is_empty() {
                 return;
             }
