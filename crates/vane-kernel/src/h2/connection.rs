@@ -1489,6 +1489,72 @@ mod conn_tests {
     }
 
     /// Server: client preface (magic + SETTINGS) → SETTINGS ack queued.
+    /// Frames split across TCP reads: the parser consumes exactly the
+    /// whole frames present and waits for the rest. Feeding a HEADERS
+    /// frame in 1-byte slices must produce the same events as one whole
+    /// read — and never a connection error.
+    #[test]
+    fn partial_frame_reads_parse_when_reassembled() {
+        let mut c = server();
+        // Preface + SETTINGS whole (established state).
+        let mut pre = CLIENT_PREFACE.to_vec();
+        write_header(&mut pre, 6, FrameKind::Settings, FrameFlags::EMPTY, 0);
+        write_setting(&mut pre, 0x3, 128);
+        let mut events = Vec::new();
+        c.handle_read(&pre, &mut events);
+
+        // One HEADERS frame: END_HEADERS|END_STREAM, stream 1, payload
+        // = one indexed :method GET (static 0x82).
+        let payload = [0x82u8];
+        let frame = frame_bytes(FrameKind::Headers, 0x05, 1, &payload);
+
+        // Caller-side backlog contract (mirrors H2Upstream/h2up_intake):
+        // unconsumed bytes stay in the backlog and are re-fed with the
+        // next read. Feed 1 byte at a time and assert the parser never
+        // errors and eventually consumes everything.
+        let mut backlog: Vec<u8> = Vec::new();
+        let mut all_events = Vec::new();
+        for byte in &frame {
+            backlog.push(*byte);
+            loop {
+                let consumed = c.handle_read(&backlog, &mut events);
+                if consumed == 0 {
+                    break;
+                }
+                backlog.drain(..consumed);
+                all_events.append(&mut events);
+            }
+            assert!(
+                !c.connection_error().is_some(),
+                "no connection error from split frames"
+            );
+        }
+        assert!(backlog.is_empty(), "everything consumed: {backlog:?}");
+        // Header CONTENT validity is the shim's concern (h2spec +
+        // fuzzed decoder); this test targets framing only.
+    }
+
+    /// A frame whose header arrived but whose payload has not: the
+    /// parser waits (consumed = header only is NOT reported; it must
+    /// hold the partial frame in its internal accounting and consume
+    /// nothing it cannot fully parse).
+    #[test]
+    fn partial_payload_waits_without_connection_error() {
+        let mut c = client_conn();
+        let mut events = Vec::new();
+        // A DATA frame with a real payload, truncated to just the
+        // 9-byte header: the parser consumes nothing (it waits for the
+        // payload) and reports no error — the caller's backlog re-feeds
+        // it with the payload next.
+        let full = frame_bytes(FrameKind::Data, 0x0, 1, &[1, 2, 3]);
+        let consumed = c.handle_read(&full[..9], &mut events);
+        assert_eq!(consumed, 0, "header with incomplete payload waits");
+        assert!(!c.connection_error().is_some());
+        // The rest completes the frame (the backlog re-presents it all).
+        let consumed = c.handle_read(&full, &mut events);
+        assert_eq!(consumed, full.len(), "payload completes the frame");
+    }
+
     #[test]
     fn server_acknowledges_client_settings() {
         let mut c = server();
