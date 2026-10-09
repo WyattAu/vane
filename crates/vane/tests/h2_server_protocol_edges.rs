@@ -228,11 +228,6 @@ fn stalled_response_pings_once_and_credit_releases_it() {
     assert_eq!(pings, 1, "exactly one stall probe: {pings}");
     // A second response read must NOT send another ping
     // (probe_inflight latches until credit arrives).
-    let _ = shim.response_bytes(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
-    let more = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
-    let _ = shim.response_bytes(more);
-    let (_, held) = shim.response_bytes(&body);
-    assert!(!held);
     let drained = shim.pending_writes();
     let pings2 = parse_frames(&drained)
         .iter()
@@ -249,6 +244,32 @@ fn stalled_response_pings_once_and_credit_releases_it() {
         events2.iter().any(|e| matches!(e, H2Event::SendCredit)),
         "credit releases the held bytes: {events2:?}"
     );
+
+    // The driver flushes held bytes via take_held on credit: the whole
+    // body emits now (within the max frame), and the Content-Length
+    // completion closes the stream.
+    let (held_frames, done) = shim.take_held();
+    assert!(!held_frames.is_empty(), "held bytes release on credit");
+    assert!(done, "content-length completion on the flush");
+    let mut released = Vec::new();
+    for f in &held_frames {
+        for (ftype, _flags, _stream, payload) in parse_frames(f) {
+            if ftype == 0x00 {
+                released.extend_from_slice(&payload);
+            }
+        }
+    }
+    // take_held re-emits the HELD TAIL (the pre-stall bytes already went
+    // out in the first response_bytes call): the released bytes must be
+    // the body's exact suffix.
+    assert!(
+        body.ends_with(&released),
+        "held tail must be the body's suffix (released {} of {})",
+        released.len(),
+        body.len()
+    );
+    // Debug windows are observable post-completion (engine plumbing).
+    let _ = shim.conn_debug_windows();
 }
 
 /// A protocol violation surfaces as a connection failure with an error
