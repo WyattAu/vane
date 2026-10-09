@@ -3099,6 +3099,77 @@ force_mio = false
 }
 
 /// Per-route retries: one upstream that 500s its first two hits then
+/// Retry-to-a-DIFFERENT-backend: backend 1 refuses connections (dial
+/// failure, not a 5xx); the retry policy must pick_except the dead
+/// backend and succeed on backend 2. Covers the balancer's
+/// except-on-retry path, which the single-backend 5xx test cannot
+/// reach.
+#[test]
+fn retry_dials_a_different_backend_on_connect_failure() {
+    let _serial = lock_serial();
+    // Backend 1: closed port (dial refused). Backend 2: serves "alive".
+    let dead_port = free_port(); // nothing binds it
+    let up2 = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let alive_addr = up2.local_addr().expect("addr");
+    let l = up2.try_clone().expect("clone");
+    std::thread::spawn(move || {
+        for stream in l.incoming().flatten() {
+            let mut s = stream;
+            let mut b = [0u8; 4096];
+            let _ = s.read(&mut b);
+            let _ = s.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nalive",
+            );
+        }
+    });
+
+    let port = free_port();
+    let dir = tempfile::tempdir().expect("dir");
+    let path = dir.path().join("vane.toml");
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.up]
+backends = ["127.0.0.1:{dead_port}", "{alive_addr}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+retry = {{ max_attempts = 3 }}
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = false
+"#
+        ),
+    )
+    .expect("write");
+
+    let _server_guard_r = spawn_proxy(path.to_str().expect("utf8").to_owned());
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    let get = |proxy: std::net::SocketAddr| -> String {
+        let mut s = std::net::TcpStream::connect(proxy).expect("connect");
+        s.write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+            .expect("write");
+        let mut r = String::new();
+        s.read_to_string(&mut r).expect("read");
+        r
+    };
+    let resp = get(proxy);
+    assert!(
+        resp.contains("200") && resp.contains("alive"),
+        "the retry must land on the live backend: {resp}"
+    );
+}
+
 /// 200s forever. With `retry = { max_attempts = 3, retry_5xx = true }`
 /// the third attempt must surface "recovered".
 #[test]
