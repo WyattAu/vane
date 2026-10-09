@@ -18,6 +18,12 @@ jobs:
     uses: WyattAu/engineering-standards/.github/workflows/rust-kit.yml@main
     with:
       tier: a
+      # The CLI process surface (main.rs): subcommand dispatch exits the
+      # process and two subcommands run never-returning service loops.
+      # The bodies (cmd_run/validate/sidecar/gateway-operator tick) are
+      # unit-tested; the process boundary itself cannot be covered
+      # in-process (rust-kit ADR-0005).
+      coverage-ignore-regex: "crates/vane/src/main.rs"
     secrets: inherit
 
   e2e:
