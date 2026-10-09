@@ -301,7 +301,7 @@ fn overlapping_stream_is_reset_with_refused_stream() {
         b
     });
     let mut events = Vec::new();
-    shim.handle_read(&input.drain(..).as_slice(), &mut events);
+    shim.handle_read(input.drain(..).as_slice(), &mut events);
 
     // The reset is queued for the peer: RST_STREAM(REFUSED_STREAM = 7).
     let out = shim.pending_writes();
