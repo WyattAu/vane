@@ -170,7 +170,7 @@ jobs:
         run: |
           cargo llvm-cov --workspace --features vane-plugins/wasm,acme-pebble --lcov \
             --output-path /dev/null --fail-under-lines 90 -- \
-            --include-ignored --test-threads=2 --skip hot_upgrade --skip large_body_streams_through_edge --skip h3spec
+            --include-ignored --test-threads=2 --skip hot_upgrade --skip h3spec
         # The streaming-family tests run as subprocess servers now
         # (2026-09-19) — the suite-sequence wedge is fixed, no skips
         # needed beyond the retired REUSEPORT-edge probe (kept: it is
