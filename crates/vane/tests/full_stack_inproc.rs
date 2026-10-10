@@ -3363,3 +3363,111 @@ force_mio = false
         "the shadow cluster received the mirrored request: {captured:?}"
     );
 }
+
+/// `strip_prefix` path rewriting, all three branches: a prefix that
+/// strips to a path (`/api/data` -> `/data`), a prefix that strips to
+/// nothing (`/api` -> `/`), and a path that does not carry the prefix
+/// (forwarded unchanged). The upstream echoes the request line so the
+/// rewrite is observed on the wire, not inferred.
+#[test]
+fn strip_prefix_rewrites_the_upstream_path() {
+    let _serial = lock_serial();
+    // Upstream echoes the request target on every request.
+    let upstream = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let upstream_addr = upstream.local_addr().expect("addr");
+    let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in upstream.incoming().flatten() {
+            let mut s = stream;
+            let mut buf = [0u8; 8192];
+            let Ok(n) = s.read(&mut buf) else { continue };
+            let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let target = req
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("")
+                .to_owned();
+            sink.lock().expect("seen").push(target.clone());
+            let body = format!("upstream-saw:{target}");
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = s.write_all(head.as_bytes());
+            let _ = s.write_all(body.as_bytes());
+        }
+    });
+
+    let port = free_port();
+    let (_dir, cfg) = temp_config(format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.up]
+backends = ["{upstream_addr}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+strip_prefix = "/api"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = false
+"#
+    ));
+    let _server_guard = spawn_proxy(cfg);
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    let get = |target: &str| -> String {
+        let mut s = std::net::TcpStream::connect(proxy).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        s.write_all(
+            format!("GET {target} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .expect("write");
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        out
+    };
+
+    // Strips to a path.
+    let resp = get("/api/data");
+    assert!(
+        resp.contains("upstream-saw:/data"),
+        "prefix stripped: {resp}"
+    );
+    // Strips to nothing: the upstream still gets an absolute path.
+    let resp = get("/api");
+    assert!(resp.contains("upstream-saw:/"), "bare prefix -> /: {resp}");
+    // No match: forwarded untouched.
+    let resp = get("/other/thing");
+    assert!(
+        resp.contains("upstream-saw:/other/thing"),
+        "non-matching path passes through: {resp}"
+    );
+    // The health checker's TCP probe also lands here (connect, no
+    // bytes), so filter to the requests that carried a target.
+    let targets: Vec<String> = seen
+        .lock()
+        .expect("seen")
+        .iter()
+        .filter(|t| !t.is_empty())
+        .cloned()
+        .collect();
+    assert_eq!(
+        targets,
+        vec![
+            "/data".to_owned(),
+            "/".to_owned(),
+            "/other/thing".to_owned()
+        ],
+        "the upstream saw exactly the three rewritten targets"
+    );
+}

@@ -103,6 +103,16 @@ fn tls_request(
     server_ca_pem: &str,
     client: Option<&CallerIdentity>,
 ) -> Result<String, String> {
+    tls_request_with_headers(addr, server_ca_pem, client, &[])
+}
+
+/// Same, with extra request headers appended to the GET.
+fn tls_request_with_headers(
+    addr: SocketAddr,
+    server_ca_pem: &str,
+    client: Option<&CallerIdentity>,
+    extra: &[(&str, &str)],
+) -> Result<String, String> {
     let mut roots = rustls::RootCertStore::empty();
     roots
         .add(CertificateDer::from(pem_to_der(server_ca_pem)))
@@ -133,8 +143,12 @@ fn tls_request(
         .map_err(|e| format!("timeout: {e}"))?;
     let mut tls = rustls::Stream::new(&mut conn, &mut sock);
 
-    tls.write_all(b"GET /data HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n")
-        .map_err(|e| format!("write: {e}"))?;
+    let mut req = b"GET /data HTTP/1.1\r\nhost: t\r\n".to_vec();
+    for (name, value) in extra {
+        req.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+    }
+    req.extend_from_slice(b"connection: close\r\n\r\n");
+    tls.write_all(&req).map_err(|e| format!("write: {e}"))?;
     let mut out = Vec::new();
     match tls.read_to_end(&mut out) {
         Ok(_) => Ok(String::from_utf8_lossy(&out).into_owned()),
@@ -245,5 +259,157 @@ force_mio = true
     assert!(
         resp.is_err() || !resp.expect("resp").contains("200 OK"),
         "cert-less caller must not be relayed"
+    );
+}
+
+/// Mesh identity chaining across hops (XFCC-lite): a verified caller
+/// appends its SPIFFE ID to whatever chain the previous trusted hop
+/// forwarded, oldest first. The chain header is stripped from inbound
+/// requests unconditionally and only re-emitted from identities this
+/// proxy verified — a client cannot inject hops of its own.
+#[test]
+fn verified_caller_extends_the_spiiffe_chain() {
+    let _serial = lock_serial();
+    let dir = tempfile::tempdir().expect("dir");
+    let m = gen_materials(dir.path());
+
+    // Upstream echoes the identity headers it was given.
+    let listener = StdListener::bind("127.0.0.1:0").expect("bind");
+    let upstream = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut s = stream;
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                let Ok(n) = s.read(&mut buf) else { return };
+                let req = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+                let pick = |name: &str| -> String {
+                    req.lines()
+                        .find(|l| l.starts_with(name))
+                        .map(|l| {
+                            l.split_once(':')
+                                .map(|(_, v)| v.trim().to_owned())
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default()
+                };
+                let id = pick("x-vane-spiffe-id:");
+                let chain = pick("x-vane-spiffe-chain:");
+                let body = format!("id={id} chain={chain}");
+                let _ = s.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            });
+        }
+    });
+
+    let proxy_listener = StdListener::bind("127.0.0.1:0").expect("bind");
+    let proxy: SocketAddr = proxy_listener.local_addr().expect("addr");
+    drop(proxy_listener);
+
+    let (dir2, cfg) = {
+        let d = tempfile::tempdir().expect("dir");
+        let path = d.path().join("vane.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+[[listeners]]
+address = "127.0.0.1:{proxy}"
+
+[listeners.tls]
+cert = "{srv_cert}"
+key = "{srv_key}"
+client_ca = "{ca}"
+
+[clusters.up]
+backends = ["{upstream}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+allowed_spiffe_prefixes = ["spiffe://example.org/vane/"]
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = true
+"#,
+                proxy = proxy.port(),
+                srv_cert = m.server_cert_path,
+                srv_key = m.server_key_path,
+                ca = m.ca_path,
+            ),
+        )
+        .expect("write");
+        let p = path.to_str().expect("utf8").to_owned();
+        (d, p)
+    };
+    let _cfg_guard = dir2;
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let _ = rt.block_on(vane::server::run(vane::server::RunOptions {
+            config_path: Some(cfg),
+            handover_from: None,
+            handover_to: None,
+            shutdown_after: None,
+            force_mio: true,
+            shutdown: None,
+        }));
+    });
+    for _ in 0..60 {
+        if std::net::TcpStream::connect(proxy).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // A trusted hop already forwarded a chain; this hop appends itself.
+    let resp = tls_request_with_headers(
+        proxy,
+        &m.ca_pem,
+        Some(&m.allowed),
+        &[(
+            "x-vane-spiffe-chain",
+            "spiffe://example.org/vane/hop-a, spiffe://example.org/vane/hop-b",
+        )],
+    )
+    .expect("chained caller handshake");
+    assert!(
+        resp.contains("id=spiffe://example.org/vane/caller-a"),
+        "verified caller id forwarded: {resp}"
+    );
+    assert!(
+        resp.contains(
+            // vane re-joins the chain canonically (comma, no space).
+            "chain=spiffe://example.org/vane/hop-a,spiffe://example.org/vane/hop-b,spiffe://example.org/vane/caller-a"
+        ),
+        "chain extended oldest-first: {resp}"
+    );
+
+    // An unverifiable caller (no client cert) cannot smuggle a chain:
+    // the header never reaches an upstream because no request is
+    // relayed at all.
+    let resp = tls_request_with_headers(
+        proxy,
+        &m.ca_pem,
+        None,
+        &[("x-vane-spiffe-chain", "spiffe://example.org/vane/forged")],
+    );
+    assert!(
+        resp.is_err()
+            || !resp
+                .expect("resp")
+                .contains("spiffe://example.org/vane/forged"),
+        "an unverified caller must not inject chain hops"
     );
 }
