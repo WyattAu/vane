@@ -21,6 +21,43 @@ cd /home/wyatt/dev/src/github.com/WyattAu/vane
 
 DURATION="${1:-8}"
 WINDOWS=3
+# Artifacts live OUTSIDE /tmp: this host wipes /tmp on restart, which
+# silently turns "binary missing" into "no comparison run". Override
+# with VANE_ARTIFACTS=/path.
+ART=${VANE_ARTIFACTS:-/var/tmp/vane-artifacts}
+PROXIES="$ART/proxies"
+mkdir -p "$ART" "$PROXIES"
+
+# Third-party comparison binaries, pinned + checksum-verified (the
+# published numbers in docs/benchmarks.md name these exact versions).
+fetch_verified() { # url sha256 dest
+  local url=$1 want=$2 dest=$3 got
+  got=$(curl -fsSL -o "$dest.tgz" "$url" && sha256sum "$dest.tgz" | cut -d' ' -f1)
+  if [ "$got" != "$want" ]; then
+    echo "checksum mismatch for $url"
+    echo "  expected $want"
+    echo "  got      $got"
+    rm -f "$dest.tgz"
+    return 1
+  fi
+}
+if [ ! -x "$PROXIES/caddy" ]; then
+  echo "== fetching Caddy 2.10.2 =="
+  fetch_verified \
+    https://github.com/caddyserver/caddy/releases/download/v2.10.2/caddy_2.10.2_linux_amd64.tar.gz \
+    5c218bc34c9197369263da7e9317a83acdbd80ef45d94dca5eff76e727c67cdd \
+    "$PROXIES/caddy" || exit 2
+  tar -xzf "$PROXIES/caddy.tgz" -C "$PROXIES" caddy || exit 2
+fi
+if [ ! -x "$PROXIES/traefik" ]; then
+  echo "== fetching Traefik 3.5.4 =="
+  fetch_verified \
+    https://github.com/traefik/traefik/releases/download/v3.5.4/traefik_v3.5.4_linux_amd64.tar.gz \
+    9f1d30b3f3b547da88bf95e49c416cd898968be6f9157571d000e646b2ef8bae \
+    "$PROXIES/traefik" || exit 2
+  tar -xzf "$PROXIES/traefik.tgz" -C "$PROXIES" traefik || exit 2
+fi
+
 # Load generator lives in-repo now (tools/loadgen): it was previously an
 # untracked scratch crate under /tmp/opencode, which a restart wiped.
 LG="$PWD/tools/loadgen/target/release"
@@ -114,7 +151,7 @@ cat > "$DIR/Caddyfile" <<EOF
   reverse_proxy 127.0.0.1:$FREE_UP
 }
 EOF
-/tmp/opencode/proxies/caddy run --config "$DIR/Caddyfile" > "$DIR/caddy.log" 2>&1 &
+"$PROXIES/caddy" run --config "$DIR/Caddyfile" > "$DIR/caddy.log" 2>&1 &
 CADDY_PID=$!
 
 # ---- traefik ----
@@ -169,7 +206,7 @@ http:
           - url: "http://127.0.0.1:REPLACE_UP64"
 EOF
 sed -i "s|REPLACE_UP64|$FREE_UP64|; s|REPLACE_UP|$FREE_UP|; s|CERTDIR|$DIR|g" "$DIR/rules/dynamic.yml"
-/tmp/opencode/proxies/traefik --configfile "$DIR/traefik.yml" > "$DIR/traefik.log" 2>&1 &
+"$PROXIES/traefik" --configfile "$DIR/traefik.yml" > "$DIR/traefik.log" 2>&1 &
 TRAEFIK_PID=$!
 sleep 3
 
@@ -193,7 +230,7 @@ leg() { # port proto conns
   esac
 }
 
-RAW="/tmp/opencode/compare_raw.txt"
+RAW="$ART/compare_raw.txt"
 : > "$RAW"
 
 run_legs() { # proxy plain_port tls_port window

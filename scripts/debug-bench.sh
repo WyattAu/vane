@@ -3,8 +3,8 @@
 set -u
 PORT_UP=19999
 PORT_PROXY=18080
-LOG=/tmp/opencode/vb-dbg.log
-AB=/tmp/opencode/ab-dbg.log
+LOG=${VANE_ARTIFACTS:-/var/tmp/vane-artifacts}/vb-dbg.log
+AB=${VANE_ARTIFACTS:-/var/tmp/vane-artifacts}/ab-dbg.log
 
 cleanup() {
   [ -n "${V:-}" ] && kill -9 "$V" 2>/dev/null

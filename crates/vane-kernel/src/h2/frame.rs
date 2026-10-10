@@ -336,6 +336,10 @@ pub enum Setting {
     MaxFrameSize(u32),
     /// `SETTINGS_MAX_HEADER_LIST_SIZE` (0x6).
     MaxHeaderListSize(u32),
+    /// `SETTINGS_NO_RFC7540_PRIORITIES` (0x9, RFC 9218 §2.1). Raw
+    /// value — only 0 or 1 are legal; receivers must PROTOCOL_ERROR
+    /// otherwise.
+    NoRfc7540Priorities(u32),
     /// Unknown/extension setting — must be ignored.
     Unknown(u16, u32),
 }
@@ -361,6 +365,7 @@ pub fn parse_settings(data: &[u8]) -> Result<Vec<Setting>, FrameError> {
             0x4 => Setting::InitialWindowSize(value),
             0x5 => Setting::MaxFrameSize(value),
             0x6 => Setting::MaxHeaderListSize(value),
+            0x9 => Setting::NoRfc7540Priorities(value),
             other => Setting::Unknown(other, value),
         });
     }

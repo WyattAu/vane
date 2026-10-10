@@ -303,6 +303,10 @@ impl Connection {
         write_setting(&mut payload, 0x5, self.cfg.max_frame_size);
         write_setting(&mut payload, 0x6, self.cfg.max_header_list_size);
         write_setting(&mut payload, 0x1, self.cfg.header_table_size);
+        // RFC 9218 §2.1: we validate PRIORITY frames but never act on
+        // RFC 7540 priority signals, so declare it once, in the FIRST
+        // SETTINGS frame (the RFC forbids changing it afterwards).
+        write_setting(&mut payload, 0x9, 1);
         // Patch the length.
         let len = payload.len() as u32;
         self.out[hdr_pos] = (len >> 16) as u8;
@@ -677,6 +681,14 @@ impl Connection {
                 }
                 Setting::HeaderTableSize(_) => {
                     // Our encoder is stateless — nothing to apply.
+                }
+                // RFC 9218 §2.1: NO_RFC7540_PRIORITIES is a bool; a
+                // value other than 0 or 1 is a connection error. We
+                // already ignore RFC 7540 priority signals (the frame
+                // is validated, never acted on), so both legal values
+                // are no-ops here.
+                Setting::NoRfc7540Priorities(v) if v > 1 => {
+                    return Err(error_code::PROTOCOL_ERROR);
                 }
                 _ => {}
             }
@@ -1573,10 +1585,10 @@ mod conn_tests {
         c.handle_read(&preface_and_settings, &mut events);
         assert!(events.is_empty());
         let writes = c.take_pending_writes();
-        // Initial server SETTINGS (5 x 6 + 9 hdr) + SETTINGS ACK (9).
-        assert_eq!(writes.len(), 39 + 9, "expected SETTINGS + ACK: {writes:?}");
-        // Second frame (offset 39) is the SETTINGS ACK.
-        assert_eq!(writes[39 + 4] & 0x01, 0x01, "ACK flag");
+        // Initial server SETTINGS (6 x 6 + 9 hdr) + SETTINGS ACK (9).
+        assert_eq!(writes.len(), 45 + 9, "expected SETTINGS + ACK: {writes:?}");
+        // Second frame (offset 45) is the SETTINGS ACK.
+        assert_eq!(writes[45 + 4] & 0x01, 0x01, "ACK flag");
     }
 
     #[test]
@@ -2167,5 +2179,386 @@ mod conn_tests {
         );
         let n = c.send_data(id, &[0u8; 16384], false);
         assert_eq!(n, 16384, "send resumes after credit");
+    }
+
+    /// The credit oracle the drivers read on every event: stream ids,
+    /// send budgets, window probes, and the direct-reserve path used
+    /// for DATA frames the engine never sees.
+    #[test]
+    fn flow_accessors_track_credit() {
+        let mut c = client_conn();
+        let id = c.alloc_stream_id();
+        assert_eq!(id, 1, "client ids start at 1");
+        assert_eq!(c.alloc_stream_id(), 3, "client ids are monotonic odd");
+        assert!(c.stream_is_open(id));
+        assert!(!c.stream_is_open(99), "unknown streams are not open");
+
+        // Unknown stream: only the connection window constrains sends,
+        // and the per-stream probes read zero.
+        assert_eq!(c.send_budget(99), 65_535);
+        assert_eq!(c.stream_send_window_probe(99), 0);
+        assert_eq!(c.debug_send_windows(id), (65_535, 65_535));
+
+        // Direct reservation (frames assembled outside the engine) must
+        // debit BOTH windows, or the peer's accounting drifts.
+        assert_eq!(c.consume_send_budget(id, 1000), 1000);
+        assert_eq!(c.send_budget(id), 65_535 - 1000);
+        // Over-reservation clamps to what is actually available.
+        assert_eq!(c.consume_send_budget(id, 10_000_000), 65_535 - 1000);
+        assert_eq!(c.send_budget(id), 0, "windows clamp at zero");
+        assert_eq!(c.consume_send_budget(99, 10), 0, "no stream, no credit");
+
+        // Credit re-arms both windows.
+        c.grant_send_for_test(id, 4096);
+        assert_eq!(c.send_budget(id), 4096);
+        assert_eq!(c.conn_send_window_probe(), 4096);
+        assert_eq!(c.stream_send_window_probe(id), 4096);
+    }
+
+    /// A retired stream keeps the connection window alive: releasing
+    /// capacity for an unknown stream must still credit the connection
+    /// (body bytes were consumed) and emit no stream-level frame.
+    #[test]
+    fn release_capacity_credits_connection_for_retired_stream() {
+        let mut c = server();
+        let mut events = Vec::new();
+        c.handle_read(CLIENT_PREFACE, &mut events);
+        let _ = c.take_pending_writes();
+        c.release_capacity(12345, 4096);
+        let writes = c.take_pending_writes();
+        assert_eq!(writes.len(), 13, "one connection WINDOW_UPDATE only");
+        assert_eq!(parse_frame_types(&writes), vec![FrameKind::WindowUpdate]);
+    }
+
+    /// GOAWAY from the peer is observable both as an event and through
+    /// the accessor the driver polls on read events.
+    #[test]
+    fn peer_goaway_is_observable() {
+        let mut c = client_conn();
+        let mut events = Vec::new();
+        assert!(c.peer_goaway().is_none());
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&7u32.to_be_bytes()); // last stream id
+        payload.extend_from_slice(&error_code::NO_ERROR.to_be_bytes());
+        c.handle_read(
+            &frame_bytes(FrameKind::GoAway, 0x00, 0, &payload),
+            &mut events,
+        );
+        assert_eq!(c.peer_goaway(), Some((7, error_code::NO_ERROR)));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::GoAway {
+                last_stream_id: 7,
+                error_code: error_code::NO_ERROR
+            }
+        )));
+        // A GOAWAY shorter than 8 octets cannot carry last-stream-id +
+        // code: FRAME_SIZE_ERROR.
+        let mut c = client_conn();
+        let mut events = Vec::new();
+        c.handle_read(
+            &frame_bytes(FrameKind::GoAway, 0x00, 0, &[0u8; 4]),
+            &mut events,
+        );
+        assert_eq!(
+            c.connection_error().map(|e| e.code),
+            Some(error_code::FRAME_SIZE_ERROR)
+        );
+    }
+
+    /// Control frames: RST retires the stream, PING carries an opaque
+    /// payload, and GOAWAY is sent at most once (a second drain attempt
+    /// must not emit a second GOAWAY).
+    #[test]
+    fn control_frames_shape() {
+        let mut c = client_conn();
+        let id = c.alloc_stream_id();
+        let _ = c.take_pending_writes();
+
+        c.send_rst_stream(id, error_code::CANCEL);
+        assert!(!c.stream_is_open(id), "RST retires the stream");
+        c.send_ping(b"opaque!!");
+        c.send_goaway(error_code::NO_ERROR);
+        c.send_goaway(error_code::INTERNAL_ERROR); // idempotent
+        let writes = c.take_pending_writes();
+        assert_eq!(
+            parse_frame_types(&writes),
+            vec![FrameKind::RstStream, FrameKind::Ping, FrameKind::GoAway,]
+        );
+    }
+
+    /// SETTINGS validation edges: max frame size range, ENABLE_PUSH
+    /// being a bool, and unknown identifiers being ignored (RFC 9113
+    /// §6.5.2 requires ignoring unrecognized settings).
+    #[test]
+    fn settings_validation_edges() {
+        let mut c = server();
+        let mut events = Vec::new();
+        c.handle_read(CLIENT_PREFACE, &mut events);
+        let _ = c.take_pending_writes();
+
+        // Unknown setting id: ignored, ACK still queued.
+        let mut payload = Vec::new();
+        write_setting(&mut payload, 0x63, 1);
+        write_setting(&mut payload, 0x1, 4096); // our table size: no-op
+        c.handle_read(
+            &frame_bytes(FrameKind::Settings, 0x00, 0, &payload),
+            &mut events,
+        );
+        assert!(c.connection_error().is_none());
+        assert_eq!(
+            parse_frame_types(&c.take_pending_writes()),
+            vec![FrameKind::Settings]
+        );
+
+        // ENABLE_PUSH is a bool: 2 is a PROTOCOL_ERROR.
+        let mut payload = Vec::new();
+        write_setting(&mut payload, 0x2, 2);
+        let mut c = server();
+        let mut events = Vec::new();
+        c.handle_read(CLIENT_PREFACE, &mut events);
+        c.handle_read(
+            &frame_bytes(FrameKind::Settings, 0x00, 0, &payload),
+            &mut events,
+        );
+        assert_eq!(
+            c.connection_error().map(|e| e.code),
+            Some(error_code::PROTOCOL_ERROR)
+        );
+
+        // MAX_FRAME_SIZE outside 16384..=16777215: PROTOCOL_ERROR.
+        let mut payload = Vec::new();
+        write_setting(&mut payload, 0x5, 1024);
+        let mut c = server();
+        let mut events = Vec::new();
+        c.handle_read(CLIENT_PREFACE, &mut events);
+        c.handle_read(
+            &frame_bytes(FrameKind::Settings, 0x00, 0, &payload),
+            &mut events,
+        );
+        assert_eq!(
+            c.connection_error().map(|e| e.code),
+            Some(error_code::PROTOCOL_ERROR)
+        );
+
+        // RFC 9218 §2.1: SETTINGS_NO_RFC7540_PRIORITIES is a bool.
+        for bad in [2u32, u32::MAX] {
+            let mut payload = Vec::new();
+            write_setting(&mut payload, 0x9, bad);
+            let mut c = server();
+            let mut events = Vec::new();
+            c.handle_read(CLIENT_PREFACE, &mut events);
+            c.handle_read(
+                &frame_bytes(FrameKind::Settings, 0x00, 0, &payload),
+                &mut events,
+            );
+            assert_eq!(
+                c.connection_error().map(|e| e.code),
+                Some(error_code::PROTOCOL_ERROR),
+                "NO_RFC7540_PRIORITIES = {bad}"
+            );
+        }
+        // Both legal values are accepted (we ignore the signal either
+        // way) and acknowledged.
+        for good in [0u32, 1] {
+            let mut payload = Vec::new();
+            write_setting(&mut payload, 0x9, good);
+            let mut c = server();
+            let mut events = Vec::new();
+            c.handle_read(CLIENT_PREFACE, &mut events);
+            let _ = c.take_pending_writes();
+            c.handle_read(
+                &frame_bytes(FrameKind::Settings, 0x00, 0, &payload),
+                &mut events,
+            );
+            assert!(
+                c.connection_error().is_none(),
+                "NO_RFC7540_PRIORITIES = {good}"
+            );
+            assert_eq!(
+                parse_frame_types(&c.take_pending_writes()),
+                vec![FrameKind::Settings]
+            );
+        }
+    }
+
+    /// Our own first SETTINGS frame declares NO_RFC7540_PRIORITIES = 1
+    /// exactly once (RFC 9218 §2.1 requires the setting to appear in
+    /// the FIRST SETTINGS frame and never change afterwards).
+    #[test]
+    fn initial_settings_declare_no_rfc7540_priorities() {
+        for role in [Role::Client, Role::Server] {
+            let mut c = Connection::new(role, ConnectionConfig::default());
+            let writes = c.take_pending_writes();
+            let preface = if role == Role::Client { 24 } else { 0 };
+            let (kind, payload) = split_frame(&writes[preface..]);
+            assert_eq!(kind, FrameKind::Settings, "first frame is SETTINGS");
+            let settings = parse_settings(payload).expect("settings parse");
+            let flags: Vec<&Setting> = settings
+                .iter()
+                .filter(|s| matches!(s, Setting::NoRfc7540Priorities(_)))
+                .collect();
+            assert_eq!(
+                flags,
+                vec![&Setting::NoRfc7540Priorities(1)],
+                "declared exactly once, as 1"
+            );
+            assert!(
+                c.take_pending_writes().is_empty(),
+                "nothing else is queued at construction"
+            );
+        }
+    }
+
+    /// Splits the first frame off a write buffer.
+    fn split_frame(bytes: &[u8]) -> (FrameKind, &[u8]) {
+        fn kind(b: u8) -> FrameKind {
+            match b {
+                0x0 => FrameKind::Data,
+                0x1 => FrameKind::Headers,
+                0x2 => FrameKind::Priority,
+                0x3 => FrameKind::RstStream,
+                0x4 => FrameKind::Settings,
+                0x5 => FrameKind::PushPromise,
+                0x6 => FrameKind::Ping,
+                0x7 => FrameKind::GoAway,
+                0x8 => FrameKind::WindowUpdate,
+                0x9 => FrameKind::Continuation,
+                other => FrameKind::Unknown(other),
+            }
+        }
+        let len = ((bytes[0] as usize) << 16) | ((bytes[1] as usize) << 8) | bytes[2] as usize;
+        (kind(bytes[3]), &bytes[9..9 + len])
+    }
+
+    /// PING payloads are exactly 8 octets, and a WINDOW_UPDATE
+    /// increment of zero is a PROTOCOL_ERROR (RFC 9113 §6.9).
+    #[test]
+    fn ping_and_window_update_validation() {
+        let mut c = server();
+        let mut events = Vec::new();
+        c.handle_read(CLIENT_PREFACE, &mut events);
+        c.handle_read(
+            &frame_bytes(FrameKind::Ping, 0x00, 0, &[0u8; 4]),
+            &mut events,
+        );
+        assert_eq!(
+            c.connection_error().map(|e| e.code),
+            Some(error_code::FRAME_SIZE_ERROR)
+        );
+
+        let mut c = server();
+        let mut events = Vec::new();
+        c.handle_read(CLIENT_PREFACE, &mut events);
+        c.handle_read(
+            &frame_bytes(FrameKind::WindowUpdate, 0x00, 0, &0u32.to_be_bytes()),
+            &mut events,
+        );
+        assert_eq!(
+            c.connection_error().map(|e| e.code),
+            Some(error_code::PROTOCOL_ERROR)
+        );
+    }
+
+    /// Deprecated PRIORITY is still validated (RFC 9113 §6.3): stream 0
+    /// is a PROTOCOL_ERROR, a payload other than 5 octets is a
+    /// FRAME_SIZE_ERROR, and a self-dependency is a PROTOCOL_ERROR.
+    /// Server push is refused, unknown frame types are ignored.
+    #[test]
+    fn priority_push_and_unknown_frame_edges() {
+        let established = || {
+            let mut c = server();
+            let mut events = Vec::new();
+            c.handle_read(CLIENT_PREFACE, &mut events);
+            c.handle_read(
+                &frame_bytes(FrameKind::Headers, 0x05, 1, &[0x82]),
+                &mut events,
+            );
+            (c, events)
+        };
+
+        let (mut c, mut events) = established();
+        c.handle_read(
+            &frame_bytes(FrameKind::Priority, 0x00, 0, &[0u8; 5]),
+            &mut events,
+        );
+        assert_eq!(
+            c.connection_error().map(|e| e.code),
+            Some(error_code::PROTOCOL_ERROR),
+            "PRIORITY on stream 0"
+        );
+
+        let (mut c, mut events) = established();
+        c.handle_read(
+            &frame_bytes(FrameKind::Priority, 0x00, 1, &[0u8; 4]),
+            &mut events,
+        );
+        assert_eq!(
+            c.connection_error().map(|e| e.code),
+            Some(error_code::FRAME_SIZE_ERROR),
+            "PRIORITY payload must be 5 octets"
+        );
+
+        let (mut c, mut events) = established();
+        let mut dep = 3u32.to_be_bytes().to_vec();
+        dep[0] &= 0x7f;
+        dep.extend_from_slice(&[0]);
+        c.handle_read(
+            &frame_bytes(FrameKind::Priority, 0x00, 3, &dep),
+            &mut events,
+        );
+        assert_eq!(
+            c.connection_error().map(|e| e.code),
+            Some(error_code::PROTOCOL_ERROR),
+            "stream depends on itself"
+        );
+
+        let (mut c, mut events) = established();
+        c.handle_read(
+            &frame_bytes(FrameKind::PushPromise, 0x00, 3, &[0u8; 4]),
+            &mut events,
+        );
+        assert_eq!(
+            c.connection_error().map(|e| e.code),
+            Some(error_code::REFUSED_STREAM),
+            "server push is refused"
+        );
+
+        let (mut c, mut events) = established();
+        c.handle_read(
+            &frame_bytes(FrameKind::Unknown(0x1f), 0x00, 0, &[1, 2, 3]),
+            &mut events,
+        );
+        assert!(c.connection_error().is_none(), "unknown frames are ignored");
+    }
+
+    /// Frame types in write order, for shape assertions. FrameKind's
+    /// own `from_u8` is private to the frame module.
+    fn parse_frame_types(bytes: &[u8]) -> Vec<FrameKind> {
+        fn kind(b: u8) -> FrameKind {
+            match b {
+                0x0 => FrameKind::Data,
+                0x1 => FrameKind::Headers,
+                0x2 => FrameKind::Priority,
+                0x3 => FrameKind::RstStream,
+                0x4 => FrameKind::Settings,
+                0x5 => FrameKind::PushPromise,
+                0x6 => FrameKind::Ping,
+                0x7 => FrameKind::GoAway,
+                0x8 => FrameKind::WindowUpdate,
+                0x9 => FrameKind::Continuation,
+                other => FrameKind::Unknown(other),
+            }
+        }
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        while pos + 9 <= bytes.len() {
+            let len = ((bytes[pos] as usize) << 16)
+                | ((bytes[pos + 1] as usize) << 8)
+                | bytes[pos + 2] as usize;
+            out.push(kind(bytes[pos + 3]));
+            pos += 9 + len;
+        }
+        out
     }
 }

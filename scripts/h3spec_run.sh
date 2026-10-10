@@ -15,6 +15,18 @@
 # binary's rc reflects the upstream-blocked transport cases)
 set -uo pipefail
 cd /home/wyatt/dev/src/github.com/WyattAu/vane
+
+# Binary lives OUTSIDE /tmp (this host wipes it on restart, which
+# silently turns this run into "nothing to check"). Override with
+# H3SPEC=/path/to/h3spec.
+H3SPEC=${H3SPEC:-/var/tmp/vane-artifacts/h3spec/h3spec}
+H3SPEC_VERSION=0.1.14
+if [ ! -x "$H3SPEC" ]; then
+  echo "h3spec binary not at $H3SPEC — fetch v${H3SPEC_VERSION} with:"
+  echo "  go install github.com/kazu-yamamoto/h3spec/cmd/h3spec@v${H3SPEC_VERSION}"
+  echo "  (or set H3SPEC=/path/to/h3spec)"
+  exit 2
+fi
 python3 - <<PY &
 import socket, threading
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -61,7 +73,7 @@ TOML
 ./target/release/vane run -c "$DIR/vane.toml" &
 VANE=$!
 sleep 2
-timeout 180 /tmp/opencode/h3spec/h3spec -n 127.0.0.1 18443
+timeout 180 "$H3SPEC" -n 127.0.0.1 18443
 RC=$?
 echo "h3spec exit: $RC"
 kill $VANE $UP 2>/dev/null

@@ -9,11 +9,36 @@
 set -uo pipefail
 cd /home/wyatt/dev/src/github.com/WyattAu/vane
 
-H2SPEC=${H2SPEC:-/tmp/opencode/h2spec/h2spec}
+H2SPEC=${H2SPEC:-/var/tmp/vane-artifacts/h2spec/h2spec}
+# The binary lives OUTSIDE /tmp: this host wipes /tmp on restart, and a
+# gate that silently degrades to "binary missing" is a gate that stops
+# gating. Fetch v2.6.0 on demand, verified against the published
+# checksum.
+H2SPEC_VERSION=2.6.0
+H2SPEC_SHA256=157ee0de702e01ad40e752dbf074b366027e550c8e7504f9450da2809e279318
 if [ ! -x "$H2SPEC" ]; then
-  echo "h2spec binary not at $H2SPEC — fetch v2.6.0:"
-  echo "  curl -sL -o h2spec.tar.gz https://github.com/summerwind/h2spec/releases/download/v2.6.0/h2spec_linux_amd64.tar.gz"
-  exit 2
+  echo "fetching h2spec v${H2SPEC_VERSION} into $(dirname "$H2SPEC")"
+  mkdir -p "$(dirname "$H2SPEC")"
+  TMP_TGZ=$(mktemp -d)/h2spec.tar.gz
+  curl -fsSL -o "$TMP_TGZ" \
+    "https://github.com/summerwind/h2spec/releases/download/v${H2SPEC_VERSION}/h2spec_linux_amd64.tar.gz" || {
+      echo "h2spec download failed — check network access"
+      exit 2
+    }
+  GOT=$(sha256sum "$TMP_TGZ" | cut -d' ' -f1)
+  if [ -n "${H2SPEC_SHA256_OVERRIDE:-}" ]; then
+    # Escape hatch for upstream re-releases with a different digest.
+    H2SPEC_SHA256="$H2SPEC_SHA256_OVERRIDE"
+  fi
+  if [ "$GOT" != "$H2SPEC_SHA256" ]; then
+    echo "h2spec checksum mismatch:"
+    echo "  expected $H2SPEC_SHA256"
+    echo "  got      $GOT"
+    echo "refusing to run an unverified binary"
+    exit 2
+  fi
+  tar -xzf "$TMP_TGZ" -C "$(dirname "$H2SPEC")" h2spec || exit 2
+  chmod +x "$H2SPEC"
 fi
 
 cargo build --release -p vane-proxy --features h2 || exit 2
