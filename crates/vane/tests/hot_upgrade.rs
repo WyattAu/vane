@@ -208,3 +208,107 @@ force_mio = true
 
     drop(standby);
 }
+
+/// Startup failure modes must exit cleanly with a non-zero code, not
+/// hang or panic: a standby pointed at a handover socket nobody is
+/// serving, and a config whose listener port is already taken. Both are
+/// ordinary operator mistakes, and both used to be untested paths.
+#[test]
+fn startup_failures_exit_with_a_code() {
+    let _serial = lock_serial();
+
+    // 1. A handover socket path that cannot be created (its parent
+    //    directory does not exist). A standby pointed at an absent but
+    //    CREATABLE socket is doing its job — it waits for a peer — so
+    //    the error path here is an unbindable path.
+    let dir = tempfile::tempdir().expect("dir");
+    let cfg_path = dir.path().join("vane.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            r#"
+[[listeners]]
+address = "127.0.0.1:{}"
+
+[clusters.up]
+backends = ["127.0.0.1:1"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+"#,
+            {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve");
+                l.local_addr().expect("addr").port()
+            }
+        ),
+    )
+    .expect("write");
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let code = rt.block_on(vane::server::run(vane::server::RunOptions {
+        config_path: Some(cfg_path.display().to_string()),
+        handover_from: Some(
+            dir.path()
+                .join("no-such-dir")
+                .join("handover.sock")
+                .display()
+                .to_string(),
+        ),
+        handover_to: None,
+        shutdown_after: None,
+        shutdown: Some(rx),
+        force_mio: true,
+    }));
+    assert_eq!(
+        code, 1,
+        "an unbindable handover socket must exit 1, not hang"
+    );
+    drop(tx);
+
+    // 2. A listener port already in use: same contract.
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = taken.local_addr().expect("addr").port();
+    let cfg2 = dir.path().join("vane2.toml");
+    std::fs::write(
+        &cfg2,
+        format!(
+            r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.up]
+backends = ["127.0.0.1:1"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+"#
+        ),
+    )
+    .expect("write");
+    let (tx2, rx2) = tokio::sync::oneshot::channel();
+    let rt2 = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let code2 = rt2.block_on(vane::server::run(vane::server::RunOptions {
+        config_path: Some(cfg2.display().to_string()),
+        handover_from: None,
+        handover_to: None,
+        shutdown_after: None,
+        shutdown: Some(rx2),
+        force_mio: true,
+    }));
+    assert_eq!(code2, 1, "a bound port must exit 1, not hang");
+    drop(tx2);
+}
