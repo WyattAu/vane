@@ -1,5 +1,45 @@
 # Tier A coverage closure — work plan
 
+**STATUS (2026-10-11): the bar is met.** quality/coverage reads
+**90.19%** on commit `dafed7fb` and every CI job is green — the first
+fully-green run since the gate started measuring honestly. This
+document stays as the arc: what was dark, what closed it, and the rules
+that got it there.
+
+What actually closed the last ~780 lines was not coverage-chasing but
+the defects the dark lines were hiding:
+
+- **Tunnel bytes coalesced with the 101 head were dropped**
+  (`relay_body` had no Tunnel arm — the catch-all relayed nothing).
+  Invisible on loopback with separate writes; CI's slower runners
+  coalesced the segments and the byte-exact tunnel test failed there.
+  `relay_body` now relays tunnels like chunked, and
+  `upgrade_with_coalesced_tunnel_bytes_loses_nothing` pins the case
+  deterministically (head + first data bytes in ONE write).
+- **The h1 circuit breaker could not see its own failures**: clean EOF
+  before a response head counted as nothing; the gate was per-worker so
+  a dead backend cost `threshold × workers` failures to trip; and
+  breaker 1.0's 5-streak/30 s policy turned a sub-second backend blip
+  into half a minute of hard 503s once the gate was shared. Fixed in
+  all three places; the chaos SLO was rewritten to what a breaker
+  legitimately promises.
+- **RFC 9218**: `SETTINGS_NO_RFC7540_PRIORITIES` values > 1 were
+  silently ignored (must be PROTOCOL_ERROR); the setting is now
+  validated and declared once in our first SETTINGS frame — without a
+  public-enum variant, which cargo-semver-checks correctly flagged as
+  breaking.
+- Real test coverage landed where the dark lines pointed: the h3→h2
+  relay (the only QUIC-meets-HTTP/2 path), the ACME issuance flow
+  against an in-process mock CA that verifies our JWS like a server,
+  `strip_prefix` rewriting observed on the upstream wire, SPIFFE chain
+  extension, the kernel h2 credit oracles, xDS LDS/EDS/SDS decode plus
+  the NACK branch, and startup failure contracts.
+
+The historical gap table below is kept for the record but is stale —
+the live number is the CI job.
+
+---
+
 The coverage gate finally measures honestly (see the history below) and
 reports **87.84% vs the 90% Tier A bar** — a gap of ~780 lines. This
 document is the arc: where the misses are, and the test each needs.
