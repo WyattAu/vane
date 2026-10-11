@@ -149,7 +149,7 @@ version = "0.10.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.breaker]]
-version = "1.0.0"
+version = "2.0.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.bumpalo]]

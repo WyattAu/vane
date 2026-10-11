@@ -71,12 +71,6 @@ pub struct ProxyConfig {
     /// Process-wide GCRA bucket (`Some` replaces the per-worker
     /// limiter so the configured rate is the true aggregate).
     pub shared_rate_limit: Option<std::sync::Arc<vane_shm::ratelimit::SharedGcra>>,
-    /// Process-wide circuit-breaker gate. A breaker protects the
-    /// BACKEND, not the worker that noticed: with one gate per worker a
-    /// dead upstream costs `5 x workers` failures before the whole
-    /// process stops dialing it, and each worker keeps paying a failed
-    /// dial meanwhile. `None` = build a private gate (embedded/test use).
-    pub shared_breaker: Option<std::sync::Arc<BreakerGate>>,
     /// Serve h2c (prior-knowledge HTTP/2) on this plain listener.
     pub h2c: bool,
     /// RFC 7838 `Alt-Svc` header value injected into every response
@@ -304,6 +298,34 @@ struct ClusterMetric {
     errors: MetricHandle,
 }
 
+/// The process's circuit-breaker gate, keyed by the metrics registry.
+///
+/// A breaker protects the BACKEND, not the worker that happened to
+/// notice. With a gate per worker, a dead upstream costs
+/// `threshold x workers` failures before the whole process stops dialing
+/// it, and every worker keeps hammering a backend the others already
+/// ejected.
+///
+/// Keying by registry gives exactly the right scope: `server::run`
+/// builds one registry for the process and shares it with every worker,
+/// so they share one gate; separate embedders and tests each carry
+/// their own registry and therefore get their own breaker state instead
+/// of tripping each other's.
+fn shared_breaker_gate(registry: &Arc<Registry>) -> Arc<BreakerGate> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock, Weak};
+    static GATES: OnceLock<Mutex<HashMap<usize, Weak<BreakerGate>>>> = OnceLock::new();
+    let map = GATES.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = Arc::as_ptr(registry) as *const () as usize;
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(gate) = guard.get(&key).and_then(Weak::upgrade) {
+        return gate;
+    }
+    let gate = Arc::new(BreakerGate::new(Arc::clone(registry)));
+    guard.insert(key, Arc::downgrade(&gate));
+    gate
+}
+
 impl ClusterMetric {
     fn register(registry: &Registry, cluster: &str) -> Self {
         // Prometheus label sanitation: [a-zA-Z0-9_].
@@ -349,10 +371,7 @@ impl HttpProxy {
             bytes_out: registry.register("vane_bytes_out_total", MetricKind::Counter),
             latency: registry.register_histogram("vane_request_duration_us"),
         };
-        let breaker = config
-            .shared_breaker
-            .clone()
-            .unwrap_or_else(|| Arc::new(BreakerGate::new(Arc::clone(&registry))));
+        let breaker = shared_breaker_gate(&registry);
         // Rate limiting is opt-in: `None` removes the per-request
         // GCRA check entirely (~3% of the relay hot path). The
         // shared-bucket aggregate (cross-worker) is enforced in the

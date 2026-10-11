@@ -34,7 +34,6 @@ fn make_proxy(
             access: None,
             jwt: None,
             shared_rate_limit: None,
-            shared_breaker: None,
             h2c: false,
             alt_svc: None,
             l4_splice: false,

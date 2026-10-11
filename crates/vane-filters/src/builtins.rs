@@ -145,6 +145,16 @@ fn vane_breaker_config() -> CircuitBreakerConfig {
         .build()
 }
 
+// `breaker` 2.x guards its state with a parking_lot lock, which is not
+// `UnwindSafe`. The gate is a pure state machine: a panic inside a
+// worker leaves the breaker in whatever state it was in, and the proxy
+// re-records outcomes on the next request, so unwinding through it is
+// sound. Asserting it explicitly also keeps the public type's auto-trait
+// set stable across breaker upgrades (cargo-semver-checks flagged the
+// change when the dependency moved 1.0 -> 2.0).
+impl std::panic::UnwindSafe for BreakerGate {}
+impl std::panic::RefUnwindSafe for BreakerGate {}
+
 impl BreakerGate {
     /// New gate with a default per-cluster config.
     ///
