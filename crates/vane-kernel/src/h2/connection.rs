@@ -687,7 +687,7 @@ impl Connection {
                 // already ignore RFC 7540 priority signals (the frame
                 // is validated, never acted on), so both legal values
                 // are no-ops here.
-                Setting::NoRfc7540Priorities(v) if v > 1 => {
+                s if s.as_no_rfc7540_priorities().is_some_and(|v| v > 1) => {
                     return Err(error_code::PROTOCOL_ERROR);
                 }
                 _ => {}
@@ -2394,15 +2394,11 @@ mod conn_tests {
             let (kind, payload) = split_frame(&writes[preface..]);
             assert_eq!(kind, FrameKind::Settings, "first frame is SETTINGS");
             let settings = parse_settings(payload).expect("settings parse");
-            let flags: Vec<&Setting> = settings
+            let declared: Vec<u32> = settings
                 .iter()
-                .filter(|s| matches!(s, Setting::NoRfc7540Priorities(_)))
+                .filter_map(|s| s.as_no_rfc7540_priorities())
                 .collect();
-            assert_eq!(
-                flags,
-                vec![&Setting::NoRfc7540Priorities(1)],
-                "declared exactly once, as 1"
-            );
+            assert_eq!(declared, vec![1], "declared exactly once, as 1");
             assert!(
                 c.take_pending_writes().is_empty(),
                 "nothing else is queued at construction"
