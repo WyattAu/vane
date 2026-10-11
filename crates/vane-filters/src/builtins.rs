@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use breaker::{CircuitBreaker, CircuitBreakerConfig};
+use breaker::{BackoffStrategy, CircuitBreaker, CircuitBreakerConfig};
 use throttle_kit::{InMemoryBackend, Quota, RateLimiter};
 use vane_observe::metrics::{MetricHandle, MetricKind, Registry};
 
@@ -110,6 +110,41 @@ pub struct BreakerGate {
     registry: std::sync::Arc<Registry>,
 }
 
+/// Tripping policy, deviating from `breaker`'s `standard()` on purpose.
+///
+/// `standard()` trips on a 5-failure STREAK with a 30 s open window.
+/// With the gate shared process-wide (one instance for every worker —
+/// see `ProxyConfig::shared_breaker`), that combination turns a backend
+/// that blips for a few hundred milliseconds into half a minute of hard
+/// 503s: the streak fires during the blip and nothing recovers until the
+/// open window expires. An edge proxy sees short backend blips as a
+/// normal event, so the policy here trips on a failure RATE over a
+/// window that must be substantially full, and re-probes after 5 s
+/// instead of 30 s.
+///
+/// The trade: a backend that fails a handful of requests in isolation
+/// is NOT ejected. A backend failing HALF of 20 consecutive upstream
+/// calls is, and recovery is probed within seconds.
+fn vane_breaker_config() -> CircuitBreakerConfig {
+    CircuitBreakerConfig::builder()
+        // 50% of the window is failures.
+        .failure_rate_threshold(0.5)
+        // Volume gate: the rate is only evaluated once the window holds
+        // this many outcomes, so two failures out of two calls (100% —
+        // "partially-filled window") cannot trip anything.
+        .sliding_window_size(20)
+        .minimum_calls(20)
+        // Streak rule off: this is exactly the rule that turned a
+        // sub-second flap into a long outage.
+        .consecutive_failures(u32::MAX)
+        .backoff(BackoffStrategy::Fixed(std::time::Duration::from_secs(5)))
+        // Stampede guard on recovery: at most 3 probes through while
+        // half-open, 2 successes close the circuit.
+        .half_open_max_calls(3)
+        .success_threshold(2)
+        .build()
+}
+
 impl BreakerGate {
     /// New gate with a default per-cluster config.
     ///
@@ -119,7 +154,7 @@ impl BreakerGate {
     pub fn new(registry: std::sync::Arc<Registry>) -> Self {
         Self {
             breakers: Mutex::new(HashMap::new()),
-            default_config: CircuitBreakerConfig::standard(),
+            default_config: vane_breaker_config(),
             rejected: registry.register("vane_breaker_rejected_total", MetricKind::Counter),
             registry,
         }
@@ -497,5 +532,91 @@ mod edge_tests {
         assert_eq!(Filter::name(&ForwardedHeaders::default()), "forwarded");
         assert_eq!(Filter::name(&AccessLog::new()), "access_log");
         assert_eq!(Filter::name(&AccessLog::default()), "access_log");
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn ctx<'a>(path: &'a mut str, cluster: &'a str) -> RequestCtx<'a> {
+        let mut c = RequestCtx::new("GET", path, "127.0.0.1:1".parse().expect("addr"), None);
+        c.cluster = Some(cluster);
+        c
+    }
+
+    /// The gate is vane's circuit breaker. The policy it enforces is
+    /// the anti-flap one (see `vane_breaker_config`): a handful of
+    /// failures must NOT open it, sustained failure MUST.
+    #[test]
+    fn volume_gate_then_sustained_failure_opens_the_breaker() {
+        let gate = BreakerGate::new(Arc::new(Registry::new()));
+
+        // Below the volume gate: even 100% failure rate trips nothing.
+        // This is the property that keeps a sub-second backend blip from
+        // becoming an outage.
+        for _ in 0..5 {
+            gate.record_failure("up");
+        }
+        assert!(
+            !gate.cluster_breaker("up").is_open(),
+            "five failures in a five-call window must not open the breaker"
+        );
+
+        // A window that is mostly healthy stays closed even with 8
+        // failures in it (40% < 50%).
+        for _ in 0..12 {
+            gate.record_success("up");
+        }
+        gate.record_failure("up");
+        assert!(
+            !gate.cluster_breaker("up").is_open(),
+            "a 40% failure window must not open the breaker"
+        );
+
+        // Sustained failure: fill the 20-call window past 50%.
+        for _ in 0..20 {
+            gate.record_failure("up");
+        }
+        assert!(
+            gate.cluster_breaker("up").is_open(),
+            "sustained upstream failure opens the breaker"
+        );
+    }
+
+    /// Clusters are independent: one bad backend must not gate another.
+    #[test]
+    fn breakers_are_per_cluster() {
+        let gate = BreakerGate::new(Arc::new(Registry::new()));
+        for _ in 0..20 {
+            gate.record_failure("bad");
+        }
+        assert!(gate.cluster_breaker("bad").is_open());
+        assert!(
+            !gate.cluster_breaker("good").is_open(),
+            "an unrelated cluster stays closed"
+        );
+        let mut path = String::from("/");
+        assert!(matches!(
+            gate.run(&mut ctx(&mut path, "good")),
+            Outcome::Continue
+        ));
+    }
+
+    /// The filter rejects with 503 while the cluster's breaker is open,
+    /// and passes through while it is closed.
+    #[test]
+    fn filter_rejects_only_while_open() {
+        let gate = BreakerGate::new(Arc::new(Registry::new()));
+        let mut path = String::from("/");
+        assert_eq!(gate.run(&mut ctx(&mut path, "up")), Outcome::Continue);
+        for _ in 0..20 {
+            gate.record_failure("up");
+        }
+        match gate.run(&mut ctx(&mut path, "up")) {
+            Outcome::Reject(code, _) => assert_eq!(code, 503),
+            other => panic!("expected a 503 rejection, got {other:?}"),
+        }
     }
 }

@@ -224,8 +224,18 @@ force_mio = true
 }
 
 /// Breaker flap: a backend flapping between up and down while traffic
-/// flows must never wedge the pipeline — answers stay 200/502/503 with
-/// 200 always returning once the backend is stably up.
+/// flows must never wedge the pipeline — answers stay 200/502/503, and
+/// 200 returns once the backend is stably up.
+///
+/// SLO note (2026-10-11): a 503 while the backend is UP is now a
+/// legitimate answer. A backend failing half of a 20-call window is
+/// precisely what the circuit breaker exists to stop, and the gate is
+/// shared by every worker, so a 2 Hz flap trips it — see
+/// `vane_breaker_config`. What must hold: traffic keeps flowing, down
+/// windows only produce gateway errors, and recovery happens once the
+/// backend is stably up. The recovery wait below must exceed the
+/// breaker's 5 s open window, otherwise it asserts against a breaker
+/// that is still open by design.
 #[test]
 fn chaos_breaker_flap() {
     let _serial = serial::lock();
@@ -298,12 +308,12 @@ force_mio = true
         }
         match get(proxy, "t.test", "/x") {
             Ok(200) => saw_200 += 1,
+            // 502/503 are gateway errors: the failover path while the
+            // backend is down, the breaker while it is flapping.
+            Ok(502) | Ok(503) => {}
             Ok(c) => {
-                // During "down" windows: failover/breaker answers 502/503.
-                if backend_up || (c != 502 && c != 503) {
-                    other_ok = false;
-                    saw_other.push(c);
-                }
+                other_ok = false;
+                saw_other.push(c);
             }
             Err(_) => {} // conn refused during down windows
         }
@@ -312,9 +322,12 @@ force_mio = true
     assert!(saw_200 > 10, "must serve when up ({saw_200})");
     assert!(other_ok, "invalid statuses during flap: {saw_other:?}");
 
-    // Steady up: 200 must return reliably.
+    // Steady up: 200 must return reliably. The wait exceeds the
+    // breaker's open window (5 s, `vane_breaker_config`) plus the
+    // half-open probe budget, so this measures recovery rather than the
+    // breaker doing exactly what it is supposed to do.
     control.store(true, std::sync::atomic::Ordering::Relaxed);
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    std::thread::sleep(std::time::Duration::from_millis(6500));
     let mut final_200 = 0;
     for _ in 0..10 {
         if matches!(get(proxy, "t.test", "/x"), Ok(200)) {

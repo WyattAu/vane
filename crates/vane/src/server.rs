@@ -754,6 +754,11 @@ pub async fn run(opts: RunOptions) -> i32 {
         .rate_limit
         .as_ref()
         .map(|rl| Arc::new(vane_shm::ratelimit::SharedGcra::new(rl.rps, rl.burst)));
+    // ONE process-wide circuit-breaker gate, same reasoning as the
+    // rate limiter above: the breaker exists to protect the BACKEND, so
+    // its state must aggregate across workers. Per-worker gates made a
+    // dead upstream cost `threshold x workers` failures to trip.
+    let shared_breaker = Arc::new(vane_filters::BreakerGate::new(Arc::clone(&registry)));
     for (li, listener) in bound.into_iter().enumerate() {
         let mode = match config
             .listeners
@@ -885,6 +890,7 @@ pub async fn run(opts: RunOptions) -> i32 {
                 access,
                 jwt,
                 shared_rate_limit: shared_rate_limit.clone(),
+                shared_breaker: Arc::clone(&shared_breaker),
                 h2c: config.listeners.get(li).is_some_and(|l| l.h2c),
                 alt_svc: alt_svc.clone(),
                 mesh: Arc::clone(&mesh_identities),
@@ -1205,6 +1211,8 @@ struct WorkerFactory {
     jwt: Option<Arc<vane_filters::jwt::JwtValidator>>,
     /// Process-wide GCRA bucket (`None` = unlimited).
     shared_rate_limit: Option<Arc<vane_shm::ratelimit::SharedGcra>>,
+    /// Process-wide circuit-breaker gate (shared by every worker).
+    shared_breaker: Arc<vane_filters::BreakerGate>,
     /// Mesh mTLS identities by cluster name.
     mesh: Arc<HashMap<String, vane_control::config::MeshUpstreamConfig>>,
     /// Serve h2c on this plain listener (feature `h2`).
@@ -1228,6 +1236,7 @@ impl vane_core::HandlerFactory for WorkerFactory {
                 events: Arc::clone(&self.events),
                 rate_limit_rps: None,
                 shared_rate_limit: self.shared_rate_limit.clone(),
+                shared_breaker: Some(Arc::clone(&self.shared_breaker)),
                 h2c: self.h2c,
                 alt_svc: self.alt_svc.clone(),
                 connect_timeout_ms: self.runtime.connect_timeout_ms,

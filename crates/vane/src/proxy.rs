@@ -71,6 +71,12 @@ pub struct ProxyConfig {
     /// Process-wide GCRA bucket (`Some` replaces the per-worker
     /// limiter so the configured rate is the true aggregate).
     pub shared_rate_limit: Option<std::sync::Arc<vane_shm::ratelimit::SharedGcra>>,
+    /// Process-wide circuit-breaker gate. A breaker protects the
+    /// BACKEND, not the worker that noticed: with one gate per worker a
+    /// dead upstream costs `5 x workers` failures before the whole
+    /// process stops dialing it, and each worker keeps paying a failed
+    /// dial meanwhile. `None` = build a private gate (embedded/test use).
+    pub shared_breaker: Option<std::sync::Arc<BreakerGate>>,
     /// Serve h2c (prior-knowledge HTTP/2) on this plain listener.
     pub h2c: bool,
     /// RFC 7838 `Alt-Svc` header value injected into every response
@@ -343,7 +349,10 @@ impl HttpProxy {
             bytes_out: registry.register("vane_bytes_out_total", MetricKind::Counter),
             latency: registry.register_histogram("vane_request_duration_us"),
         };
-        let breaker = Arc::new(BreakerGate::new(Arc::clone(&registry)));
+        let breaker = config
+            .shared_breaker
+            .clone()
+            .unwrap_or_else(|| Arc::new(BreakerGate::new(Arc::clone(&registry))));
         // Rate limiting is opt-in: `None` removes the per-request
         // GCRA check entirely (~3% of the relay hot path). The
         // shared-bucket aggregate (cross-worker) is enforced in the
@@ -2299,7 +2308,11 @@ impl Handler for HttpProxy {
         }
         match framing {
             BodyFraming::AwaitingHead => {
-                // Died before producing a response head, request already sent.
+                // Died before producing a response head, request already
+                // sent. A backend that accepts and then closes is exactly
+                // the signature a circuit breaker exists for: count it,
+                // or every request pays a dial + read for the same 502.
+                self.note_upstream_failure(slot);
                 self.upstream_failed(io);
             }
             BodyFraming::ContentLength if remaining > 0 => {
@@ -2325,28 +2338,8 @@ impl Handler for HttpProxy {
     }
 
     fn on_upstream_error(&mut self, io: &mut SessionIo<'_>, err: io::Error) {
-        self.metrics.upstream_errors.inc(&self.config.registry);
         let slot = io.slot_index();
-        if let Some(cluster) = self
-            .conns
-            .get(&slot)
-            .and_then(|c| c.route.as_ref())
-            .map(|r| r.cluster.clone())
-        {
-            self.breaker.record_failure(&cluster);
-            self.cluster_metric(&cluster)
-                .errors
-                .inc(&self.config.registry);
-        }
-        if let (Some(outlier), Some(addr)) = (
-            self.conns
-                .get(&slot)
-                .and_then(|c| c.route.as_ref())
-                .and_then(|r| r.outlier.clone()),
-            self.conns.get(&slot).and_then(|c| c.upstream_addr),
-        ) {
-            outlier.record_failure(addr);
-        }
+        self.note_upstream_failure(slot);
         self.log(LogLevel::Warn, &format!("upstream error: {err}"));
         self.upstream_failed(io);
     }
@@ -3044,6 +3037,27 @@ impl HttpProxy {
     }
     /// Upstream unusable: fail over to another backend while the request
     /// is still unsent, otherwise answer 502/504.
+    /// Records one upstream failure against the cluster breaker, the
+    /// cluster error counter, and the outlier detector. Shared by every
+    /// signature that means "this backend did not answer": connection
+    /// errors, timeouts, and a clean EOF before the response head.
+    fn note_upstream_failure(&mut self, slot: u32) {
+        self.metrics.upstream_errors.inc(&self.config.registry);
+        let Some(route) = self.conns.get(&slot).and_then(|c| c.route.clone()) else {
+            return;
+        };
+        self.breaker.record_failure(&route.cluster);
+        self.cluster_metric(&route.cluster)
+            .errors
+            .inc(&self.config.registry);
+        if let (Some(outlier), Some(addr)) = (
+            &route.outlier,
+            self.conns.get(&slot).and_then(|c| c.upstream_addr),
+        ) {
+            outlier.record_failure(addr);
+        }
+    }
+
     fn upstream_failed(&mut self, io: &mut SessionIo<'_>) {
         if io.request_sent_upstream() {
             if self

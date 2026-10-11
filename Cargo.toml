@@ -54,7 +54,7 @@ vane-plugins = { version = "0.5.3", path = "crates/vane-plugins" }
 shm-rings = "0.1.1"
 slab-pool = "0.1"
 throttle-kit = "1.0"
-breaker = "1.0"
+breaker = "2.0"
 healthkit = "1.0"
 axum-stack = "0.1"
 graceful = "0.1"

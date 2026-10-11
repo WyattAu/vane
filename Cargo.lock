@@ -285,15 +285,13 @@ dependencies = [
 
 [[package]]
 name = "breaker"
-version = "1.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "924a6e88f765c0812138b0967de1105584ae2a4e010ad3186e17c05f163c35ac"
+checksum = "b3878f5a7885dc1ec9f3dcc838693804b03454647ad6fea19e6aab1c9d7077ef"
 dependencies = [
  "loom",
  "parking_lot",
  "thiserror 2.0.20",
- "tokio",
- "tracing",
 ]
 
 [[package]]

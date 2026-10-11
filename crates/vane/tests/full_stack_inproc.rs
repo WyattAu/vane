@@ -3471,3 +3471,91 @@ force_mio = false
         "the upstream saw exactly the three rewritten targets"
     );
 }
+
+/// Circuit breaker over the h1 relay: repeated dial failures trip the
+/// cluster breaker, and the next request is answered AT THE EDGE with
+/// 503 "circuit open" instead of dialing a backend that is known bad.
+/// Without this, a dead backend costs every request a failed dial.
+#[test]
+fn h1_breaker_opens_after_repeated_dial_failures() {
+    let _serial = lock_serial();
+    // The upstream ACCEPTS (so the health checker's TCP probe passes and
+    // the backend stays in rotation), READS the request, then closes
+    // without answering: "backend dropped the request". That counts as
+    // an upstream failure, so sustained occurrences trip the cluster
+    // breaker and later requests are answered at the EDGE.
+    let connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let upstream = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let upstream_addr = upstream.local_addr().expect("addr");
+    let counter = Arc::clone(&connects);
+    std::thread::spawn(move || {
+        for mut stream in upstream.incoming().flatten() {
+            let mut buf = [0u8; 1024];
+            // Count only connections that actually carried a request:
+            // the health checker's TCP probe connects without sending
+            // anything and must not count as upstream work.
+            if stream.read(&mut buf).unwrap_or(0) > 0 {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    });
+
+    let port = free_port();
+    let (_dir, cfg) = temp_config(format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+workers = 1
+
+[clusters.up]
+backends = ["{upstream_addr}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = false
+# No upstream keep-alive: every request dials fresh, so the failure is
+# always "request sent, backend closed" rather than "pooled connection
+# died while idle" (a normal pool event, not an upstream failure).
+pool_per_backend = 0
+"#
+    ));
+    let _server_guard = spawn_proxy(cfg);
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    let mut tripped = None;
+    for i in 0..80 {
+        let before = connects.load(std::sync::atomic::Ordering::Relaxed);
+        let resp = request(
+            proxy,
+            b"GET /data HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        );
+        if resp.contains("503") {
+            // Wire proof the 503 was decided at the edge: the rejected
+            // request never opened a connection upstream.
+            let after = connects.load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                after, before,
+                "an open breaker answers without dialing the backend"
+            );
+            tripped = Some((i, resp));
+            break;
+        }
+        assert!(
+            resp.contains("502"),
+            "a dropped request surfaces as 502 until the breaker trips: {resp}"
+        );
+    }
+    let (i, resp) = tripped.expect("breaker opened within 80 requests");
+    assert!(i > 0, "requests reach the upstream before it trips");
+    assert!(
+        resp.contains("503"),
+        "an open breaker answers at the edge with 503: {resp}"
+    );
+}
