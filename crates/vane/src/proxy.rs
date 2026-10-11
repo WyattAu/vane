@@ -2857,6 +2857,15 @@ impl HttpProxy {
                     (Some(take), done)
                 }
                 BodyFraming::Chunked { .. } => (Some(data.len()), chunked_done),
+                // Tunnel: every byte is the stream. This arm matters
+                // when tunnel bytes arrive in the SAME read as the 101
+                // head — `on_upstream_data_h1` relays subsequent reads
+                // directly, but the head-carrying read funnels its tail
+                // through here, and `(None, false)` silently dropped
+                // it. On loopback the head and the first data usually
+                // land in separate segments, so the drop was invisible
+                // until a peer (or CI runner) coalesced them.
+                BodyFraming::Tunnel => (Some(data.len()), false),
                 _ => (None, false),
             }
         };

@@ -378,3 +378,136 @@ enabled = false
     }
     assert_eq!(echo, probe, "client→upstream echo corrupted");
 }
+
+/// Upgrade with the first tunnel bytes COALESCED into the same write as
+/// the 101 head.
+///
+/// The flood tests upstream answer the head and the tunnel data in
+/// separate writes, so a relay that mishandles bytes arriving in the
+/// same segment as the upgrade head still passes. TCP has no message
+/// boundaries: on loopback with a fast peer the two writes usually
+/// coalesce, but "usually" is an environment property, not a contract —
+/// and CI (slower, busier, different segmentation) is where the
+/// difference shows. This mock makes the coalescing deterministic.
+#[test]
+fn upgrade_with_coalesced_tunnel_bytes_loses_nothing() {
+    let _serial = lock_serial();
+
+    const HEAD: &[u8] =
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+    const LEAD: usize = 3; // bytes sent together with the head
+    const TOTAL: usize = 512 * 1024;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let upstream_addr = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut s = stream;
+                s.set_nodelay(true).ok();
+                let mut req = Vec::new();
+                let mut byte = [0u8; 1];
+                loop {
+                    match s.read(&mut byte) {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => req.push(byte[0]),
+                    }
+                    if req.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                // ONE write carrying the head AND the first LEAD tunnel
+                // bytes: the relay must not drop them.
+                let mut first = HEAD.to_vec();
+                for i in 0..LEAD {
+                    first.push(expected(i));
+                }
+                if s.write_all(&first).is_err() {
+                    return;
+                }
+                let _ = s.flush();
+                let mut sent = LEAD;
+                while sent < TOTAL {
+                    let n = (TOTAL - sent).min(64 * 1024);
+                    // Pattern continues from the current position: the
+                    // LEAD bytes already carried expected(0..LEAD).
+                    let seg: Vec<u8> = (0..n).map(|j| expected(sent + j)).collect();
+                    if s.write_all(&seg).is_err() {
+                        return;
+                    }
+                    sent += n;
+                }
+                let _ = s.flush();
+                // Hold the connection open like a real tunnel peer.
+                let mut sink = [0u8; 1024];
+                let _ = s.read(&mut sink);
+            });
+        }
+    });
+
+    let port = free_port();
+    let (_dir, cfg_path) = temp_config(format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.up]
+backends = ["{upstream_addr}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+"#
+    ));
+    let _server = spawn_proxy(cfg_path);
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    let mut c = std::net::TcpStream::connect(proxy).expect("connect");
+    c.set_nodelay(true).ok();
+    c.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    c.write_all(
+        b"GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+    )
+    .expect("write upgrade");
+
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = c.read(&mut byte).expect("read head");
+        assert!(n > 0, "upstream closed during 101 head");
+        head.push(byte[0]);
+        if head.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    assert!(head.starts_with(b"HTTP/1.1 101"), "expected 101: {head:?}");
+
+    // Every byte, including the LEAD that shared the head's segment.
+    let mut got = 0usize;
+    let mut buf = [0u8; 32 * 1024];
+    while got < TOTAL {
+        let n = match c.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("DIAG got={got} read error {e:?}");
+                break;
+            }
+        };
+        assert!(n > 0, "tunnel closed early at {got}");
+        for (i, b) in buf[..n].iter().enumerate() {
+            assert_eq!(
+                *b,
+                expected(got + i),
+                "byte {got} lost or reordered: got {} want {}",
+                *b,
+                expected(got + i)
+            );
+        }
+        got += n;
+    }
+    assert_eq!(got, TOTAL, "whole stream relayed");
+}
