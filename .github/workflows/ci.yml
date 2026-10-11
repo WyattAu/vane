@@ -173,10 +173,15 @@ jobs:
       - name: Chaos suite
         run: cargo test -p vane-proxy --test chaos -- --test-threads=1
       - name: Enforce Tier A threshold
-        run: |
-          cargo llvm-cov --workspace --features vane-plugins/wasm,acme-pebble --lcov \
-            --output-path /dev/null --fail-under-lines 90 -- \
-            --include-ignored --test-threads=2 --skip hot_upgrade --skip h3spec
+        # `report`, not a second full run: the step above already
+        # produced the measurement, and re-running with `--skip`
+        # flags is the trap documented above — cargo-llvm-cov turns
+        # them into run-only positional filters, so the gate would
+        # score a subset of the suite and fail at a number nobody
+        # else reproduces. `report` reads the same profraw data the
+        # generate step wrote, so the enforced number IS the number
+        # the run measured.
+        run: cargo llvm-cov report --fail-under-lines 90 --summary-only
         # The streaming-family tests run as subprocess servers now
         # (2026-09-19) — the suite-sequence wedge is fixed, no skips
         # needed beyond the retired REUSEPORT-edge probe (kept: it is
