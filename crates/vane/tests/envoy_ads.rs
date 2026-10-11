@@ -21,6 +21,27 @@ const ROUTE_VERSION: &str = "r-1";
 const CLUSTER_NONCE: &str = "n-c1";
 const ROUTE_NONCE: &str = "n-r1";
 
+/// Extracts the NACK reason from a DiscoveryRequest: field 6 is
+/// `google.rpc.Status{message = 2}`, present only on NACKs.
+fn decode_nack_error(msg: &[u8]) -> Option<String> {
+    let mut pos = 0;
+    while pos < msg.len() {
+        let (f, n) = pb::decode_field(&msg[pos..])?;
+        pos += n;
+        if f.number == 6 {
+            let mut p2 = 0;
+            while p2 < f.bytes.len() {
+                let (g, m) = pb::decode_field(&f.bytes[p2..])?;
+                p2 += m;
+                if g.number == 2 {
+                    return Some(String::from_utf8_lossy(g.bytes).into_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
 // ---------- wire encoders (hand-rolled, mirrors envoy.rs's tests) ----------
 
 /// Envoy Cluster: name (1) + load_assignment (4) with one
@@ -104,6 +125,15 @@ struct FakeAdsServer {
     cluster_any: Vec<u8>,
     route_any: Vec<u8>,
     ack_nonces: std::collections::HashMap<String, String>,
+    /// Canned (type_url, version, nonce, resources) the plane serves on
+    /// subscription — LDS/EDS/SDS have no dedicated decode path in the
+    /// default two-type test but must still be decodable end to end.
+    extra_responses: Vec<(&'static str, &'static str, &'static str, Vec<Vec<u8>>)>,
+    /// Nonce echoes we saw an explicit NACK for (error_message set).
+    nack_nonces: std::collections::HashMap<String, String>,
+    /// Undecodable CDS resource served right after the good CDS ACK,
+    /// to drive the NACK branch.
+    malformed_cluster: Option<Vec<u8>>,
 }
 
 impl FakeAdsServer {
@@ -116,7 +146,23 @@ impl FakeAdsServer {
             cluster_any,
             route_any,
             ack_nonces: std::collections::HashMap::new(),
+            extra_responses: Vec::new(),
+            nack_nonces: std::collections::HashMap::new(),
+            malformed_cluster: None,
         }
+    }
+
+    /// `true` once an explicit NACK (a request carrying error_message)
+    /// has been observed on any type.
+    fn saw_nack(&self) -> bool {
+        !self.nack_nonces.is_empty()
+    }
+
+    /// Serves one canned extra response (LDS/EDS/SDS).
+    fn serve_extra(&mut self, type_url: &str, version: &str, nonce: &str, resources: Vec<Vec<u8>>) {
+        let Some(stream) = self.stream else { return };
+        let resp = encode_response(version, type_url, nonce, &resources);
+        self.conn.send_data(stream, &xds::grpc_frame(&resp), false);
     }
 
     fn send_response(&mut self, type_url: &str, version: &str, nonce: &str) {
@@ -169,11 +215,36 @@ impl FakeAdsServer {
                                 self.route_requested = true;
                                 self.serve_route_if_ready();
                             }
-                            _ => {}
+                            t => {
+                                // LDS/EDS/SDS: serve each canned extra
+                                // once, in order, on subscription.
+                                if let Some(idx) =
+                                    self.extra_responses.iter().position(|(ty, ..)| *ty == t)
+                                {
+                                    let (ty, ver, n, res) = self.extra_responses.remove(idx);
+                                    self.serve_extra(ty, ver, n, res);
+                                }
+                            }
                         }
+                    } else if let Some(_err) = decode_nack_error(&msg) {
+                        // Explicit NACK: a response the client could not
+                        // compile. Record it and echo the nonce.
+                        self.nack_nonces.insert(type_url.clone(), nonce.clone());
                     } else if !version.is_empty() {
                         // ACK: echo recorded for the tail assertion.
-                        self.ack_nonces.insert(type_url, nonce);
+                        self.ack_nonces.insert(type_url.clone(), nonce.clone());
+                        // A malformed CDS generation right after the good
+                        // one drives the NACK path.
+                        if type_url == xds::type_url::CLUSTER {
+                            if let Some(bad) = self.malformed_cluster.take() {
+                                self.serve_extra(
+                                    xds::type_url::CLUSTER,
+                                    "c-bad",
+                                    "n-cbad",
+                                    vec![bad],
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -646,4 +717,214 @@ fn xds_client_subcommand_loop_publishes_snapshot() {
     );
 
     server.join().expect("server thread");
+}
+
+// ---------- LDS / EDS / SDS decoding + NACK ----------
+
+/// Envoy Listener (1) with an address (2) and one filter chain (25)
+/// carrying an HCM whose RDS name lands in the filter chain — the
+/// attachment the client uses to name its later RDS subscription.
+fn encode_envoy_listener(name: &str, host: &str, port: u16, rds_name: &str) -> Vec<u8> {
+    let mut sock = Vec::new();
+    pb::string_field(&mut sock, 2, host);
+    pb::varint_field(&mut sock, 3, u64::from(port));
+    let mut address = Vec::new();
+    pb::message_field(&mut address, 1, &sock);
+    let mut listener = Vec::new();
+    pb::string_field(&mut listener, 1, name);
+    pb::message_field(&mut listener, 2, &address);
+
+    // HttpConnectionManager: rds = 3 → config_source = 1; the route
+    // config name arrives via ADS (inline name is out of scope here), so
+    // the HCM carries the name string the decoder reads.
+    let mut config_source = Vec::new();
+    pb::string_field(&mut config_source, 4, rds_name);
+    let mut hcm = Vec::new();
+    pb::message_field(&mut hcm, 3, &config_source);
+    let mut filter = Vec::new();
+    pb::string_field(
+        &mut filter,
+        1,
+        "envoy.filters.network.http_connection_manager",
+    );
+    pb::message_field(&mut filter, 4, &hcm); // typed_config = 4
+    let mut chain = Vec::new();
+    pb::message_field(&mut chain, 3, &filter); // filters = 3
+    pb::message_field(&mut listener, 25, &chain);
+    listener
+}
+
+/// ClusterLoadAssignment (CLA) for EDS: name (1) + endpoints (2).
+fn encode_envoy_cla(name: &str, host: &str, port: u16) -> Vec<u8> {
+    let mut sock = Vec::new();
+    pb::string_field(&mut sock, 2, host);
+    pb::varint_field(&mut sock, 3, u64::from(port));
+    let mut address = Vec::new();
+    pb::message_field(&mut address, 1, &sock);
+    let mut endpoint = Vec::new();
+    pb::message_field(&mut endpoint, 1, &address);
+    let mut lb = Vec::new();
+    pb::message_field(&mut lb, 1, &endpoint);
+    let mut locality = Vec::new();
+    pb::message_field(&mut locality, 2, &lb);
+    let mut cla = Vec::new();
+    pb::string_field(&mut cla, 1, name);
+    pb::message_field(&mut cla, 2, &locality);
+    cla
+}
+
+/// Envoy Secret (SDS): name (1) + tls_certificate (2) with an inline
+/// cert chain (2) and private key (3).
+fn encode_envoy_secret(name: &str, cert: &str, key: &str) -> Vec<u8> {
+    let mut cert_ds = Vec::new();
+    pb::string_field(&mut cert_ds, 3, cert); // inline_string = 3
+    let mut key_ds = Vec::new();
+    pb::string_field(&mut key_ds, 3, key);
+    let mut tls_cert = Vec::new();
+    pb::message_field(&mut tls_cert, 2, &cert_ds); // cert_chain = 2
+    pb::message_field(&mut tls_cert, 3, &key_ds); // private_key = 3
+    let mut secret = Vec::new();
+    pb::string_field(&mut secret, 1, name);
+    pb::message_field(&mut secret, 2, &tls_cert);
+    secret
+}
+
+/// The full ADS surface: LDS attachment, EDS endpoint sets, SDS
+/// secrets, and the named-RDS merge — plus a NACK. The client decodes
+/// every xDS type, and LDS-in particular drives the RDS subscription to
+/// use attached names rather than the wildcard. This drives all of it
+/// through the REAL `xds_client_loop`, and asserts the resulting
+/// snapshot reaches the sink with the merged tables, EDS-overridden
+/// backends, and secrets intact.
+///
+/// The NACK fires on a deliberately malformed EDS resource (`decode_cla`
+/// returns None → validate error → NACK sent, no snapshot applied for
+/// that update).
+#[test]
+fn xds_client_loop_decodes_lds_eds_sds_and_nacks() {
+    let eds_up = spawn_upstream("from-eds");
+
+    let listener_any = encode_any(
+        xds::type_url::LISTENER,
+        &encode_envoy_listener("shop_listener", "127.0.0.1", 8080, "shop-routes"),
+    );
+    // CDS declares the cluster with an inline backend that EDS overrides.
+    let cluster_any = encode_any(
+        xds::type_url::CLUSTER,
+        &encode_envoy_cluster("shop", "127.0.0.1", 1), // port 1 = never up
+    );
+    // A later CDS generation carrying an undecodable Cluster drives the
+    // NACK branch: the client must reject it rather than publish.
+    let bad_cluster_any = encode_any(xds::type_url::CLUSTER, b"\x0a\x03no-name-port");
+    let route_any = encode_any(
+        xds::type_url::ROUTE,
+        &encode_envoy_route_config("shop.example.com", "/api", "shop"),
+    );
+    let eds_any = encode_any(
+        xds::type_url::ENDPOINT,
+        &encode_envoy_cla("shop", "127.0.0.1", eds_up.port()),
+    );
+    let sds_any = encode_any(
+        xds::type_url::SECRET,
+        &encode_envoy_secret("shop_cert", "PEMCERT", "PEMKEY"),
+    );
+
+    let mgmt_listener = StdListener::bind("127.0.0.1:0").expect("bind");
+    let mgmt: SocketAddr = mgmt_listener.local_addr().expect("addr");
+    let server = std::thread::spawn(move || {
+        let mut server = FakeAdsServer::new(cluster_any, route_any);
+        server.malformed_cluster = Some(bad_cluster_any);
+        server.extra_responses = vec![
+            (xds::type_url::LISTENER, "l-1", "n-l1", vec![listener_any]),
+            (xds::type_url::ENDPOINT, "e-1", "n-e1", vec![eds_any]),
+            (xds::type_url::SECRET, "s-1", "n-s1", vec![sds_any]),
+        ];
+        let (mut sock, _) = mgmt_listener.accept().expect("accept");
+        let mut backlog = Vec::new();
+        let mut buf = [0u8; 16 * 1024];
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            if server.saw_nack() {
+                // Let the client settle, then close the stream so the
+                // loop exits deterministically.
+                std::thread::sleep(Duration::from_millis(500));
+                break;
+            }
+            server.drive_once(&mut sock, &mut backlog, &mut buf);
+        }
+        (server.ack_nonces, server.nack_nonces)
+    });
+
+    // Sink: record every snapshot the client publishes.
+    let sink_listener = StdListener::bind("127.0.0.1:0").expect("bind");
+    let sink: SocketAddr = sink_listener.local_addr().expect("addr");
+    let snapshots = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let snapshots_for_server = Arc::clone(&snapshots);
+    let sink_thread = std::thread::spawn(move || {
+        for stream in sink_listener.incoming().flatten() {
+            let mut s = stream;
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if s.read_exact(&mut byte).is_err() {
+                    break;
+                }
+                head.push(byte[0]);
+            }
+            let head_str = String::from_utf8_lossy(&head).to_ascii_lowercase();
+            let len = head_str
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            if s.read_exact(&mut body).is_ok() {
+                snapshots_for_server
+                    .lock()
+                    .expect("sink")
+                    .push(String::from_utf8_lossy(&body).into_owned());
+            }
+            let _ =
+                s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+        }
+    });
+
+    let code = vane::xds_client::xds_client_loop(
+        &format!("127.0.0.1:{}", mgmt.port()),
+        "vane-envoy-e2e",
+        &format!("http://127.0.0.1:{}", sink.port()),
+    );
+    assert_eq!(code, 1, "loop exits on management close after the NACK");
+
+    let (acks, nacks) = server.join().expect("server thread");
+    assert!(
+        !nacks.is_empty(),
+        "an undecodable CDS resource must be NACKed, not applied: {nacks:?}"
+    );
+    assert!(
+        acks.contains_key(xds::type_url::CLUSTER),
+        "the good CDS generation was ACKed first: {acks:?}"
+    );
+
+    // Every xDS type decoded into the published snapshot: the cluster,
+    // its EDS-overridden endpoints, and the SDS secret.
+    let bodies = snapshots.lock().expect("sink").clone();
+    assert!(!bodies.is_empty(), "a snapshot reached the sink");
+    let snapshot: XdsSnapshot = serde_json::from_str(bodies.last().expect("body")).expect("json");
+    assert!(
+        snapshot.clusters.contains_key("shop"),
+        "cluster decoded: {snapshot:?}"
+    );
+    assert!(
+        snapshot.clusters["shop"]
+            .backends
+            .iter()
+            .any(|b| b.contains(&eds_up.port().to_string())),
+        "EDS backends override the inline CDS assignment: {snapshot:?}"
+    );
+    assert!(
+        snapshot.secrets.contains_key("shop_cert"),
+        "SDS secret decoded: {snapshot:?}"
+    );
+    drop(sink_thread);
 }
