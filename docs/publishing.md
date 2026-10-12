@@ -14,6 +14,17 @@
 > and two missing-END_STREAM paths). Container images publish
 > automatically on `vX.Y.Z` tags (release.yml). Order below unchanged.
 >
+> **v0.9.0 published 2026-10-11** (vane-filters 0.6.0 — first version
+> off the workspace train — → vane-control 0.8.0 → vane-kernel 0.7.0 →
+> vane-proxy 0.9.0), install-verified: `cargo install vane-proxy
+> --version 0.9.0 --locked` → `vane 0.9.0`. The relay-correctness
+> release: tunnel bytes coalesced with the 101 head are no longer
+> dropped, the h1 circuit breaker sees every upstream failure and is
+> process-wide with an explicit anti-flap policy (breaker 2.0), RFC
+> 9218 SETTINGS_NO_RFC7540_PRIORITIES is enforced and declared, config
+> tables reject unknown fields. The coverage arc closed: 90.19%
+> against the 90% Tier A bar, every gate green.
+>
 > **v0.8.0 published 2026-10-07** (vane-kernel 0.6.0 → vane-control
 > 0.7.0 → vane-proxy 0.8.0): two remote-panic parser fixes, `[runtime]
 > buffer_size`, tools/loadgen, tunnel backpressure proof, k8s
