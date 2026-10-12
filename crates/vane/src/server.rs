@@ -180,6 +180,7 @@ pub fn load_config(path: Option<&str>) -> Result<VaneConfig, String> {
                 workers: 0,
                 tls: None,
                 h2c: false,
+                proxy_protocol: false,
             });
         }
     }
@@ -886,6 +887,7 @@ pub async fn run(opts: RunOptions) -> i32 {
                 jwt,
                 shared_rate_limit: shared_rate_limit.clone(),
                 h2c: config.listeners.get(li).is_some_and(|l| l.h2c),
+                proxy_protocol: config.listeners.get(li).is_some_and(|l| l.proxy_protocol),
                 alt_svc: alt_svc.clone(),
                 mesh: Arc::clone(&mesh_identities),
                 h2_strict_idle_window_update: config.http2.strict_idle_window_update,
@@ -1209,6 +1211,8 @@ struct WorkerFactory {
     mesh: Arc<HashMap<String, vane_control::config::MeshUpstreamConfig>>,
     /// Serve h2c on this plain listener (feature `h2`).
     h2c: bool,
+    /// Require + trust a PROXY protocol header on every connection.
+    proxy_protocol: bool,
     /// RFC 7838 Alt-Svc value injected into responses (h3 listeners).
     alt_svc: Option<String>,
     /// Strict h2 conformance (`[http2] strict_idle_window_update`).
@@ -1229,6 +1233,7 @@ impl vane_core::HandlerFactory for WorkerFactory {
                 rate_limit_rps: None,
                 shared_rate_limit: self.shared_rate_limit.clone(),
                 h2c: self.h2c,
+                proxy_protocol: self.proxy_protocol,
                 alt_svc: self.alt_svc.clone(),
                 connect_timeout_ms: self.runtime.connect_timeout_ms,
                 idle_timeout_ms: self.runtime.idle_timeout_ms,

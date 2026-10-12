@@ -35,6 +35,7 @@ fn make_proxy(
             jwt: None,
             shared_rate_limit: None,
             h2c: false,
+            proxy_protocol: false,
             alt_svc: None,
             l4_splice: false,
             mesh: Default::default(),

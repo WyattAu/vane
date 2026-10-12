@@ -95,6 +95,16 @@ pub struct ListenerConfig {
     /// listener — containers/service meshes speak h2c without TLS.
     #[serde(default)]
     pub h2c: bool,
+    /// Require a PROXY protocol header (v1 text or v2 binary) at the
+    /// start of every connection and attribute it to the client address
+    /// it carries — the client-IP contract for listeners behind an L4
+    /// load balancer (AWS NLB, HAProxy, Cloudflare). Trust is the
+    /// operator's declaration: enable ONLY where every sender is the
+    /// trusted fronting proxy, because anyone who can open a connection
+    /// can send a spoofed header. The header precedes the TLS
+    /// handshake; malformed or missing headers close the connection.
+    #[serde(default)]
+    pub proxy_protocol: bool,
 }
 
 /// TLS material for a listener.

@@ -18,6 +18,7 @@ pub mod chunked;
 pub mod compression;
 pub mod date;
 pub mod pb;
+pub mod proxy_protocol;
 pub mod request;
 pub mod response;
 pub mod xds;

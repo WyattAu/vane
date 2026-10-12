@@ -236,6 +236,36 @@ Plain listeners with `h2c = true` speak prior-knowledge HTTP/2
 containers and service meshes that terminate TLS elsewhere. Requires
 no TLS material; coexists with plain HTTP/1.1 on other listeners.
 
+## Listener `proxy_protocol` — client IP behind an L4 load balancer
+
+```toml
+[[listeners]]
+address = "0.0.0.0:8080"
+proxy_protocol = true
+```
+
+Every connection must open with a PROXY protocol header (v1 text or
+v2 binary per the HAProxy spec), and vane attributes the connection to
+the address it carries: X-Forwarded-For, access records, and filter
+contexts all name the ORIGINAL client instead of the load balancer.
+The header precedes the TLS handshake on TLS listeners (this is how
+AWS NLB and HAProxy send it), and v1 and v2 may be mixed across
+connections — each is detected on its own connection.
+
+Trust is the operator's declaration. Enable `proxy_protocol` ONLY on
+listeners where every sender is the trusted fronting proxy: anyone who
+can open a connection can send a spoofed header claiming any address.
+Consequences of the flag, by design:
+
+- The header is REQUIRED. A connection whose first bytes are not a
+  valid header — a plain request, a garbage header — is closed with no
+  response ("do not mix modes").
+- A malformed header closes the connection. A v2 LOCAL header (health
+  checks, unproxied internal connections) is accepted but claims no
+  address, so the real socket peer is kept.
+- The header is bounded (a v2 payload over 4 KiB is refused) so a peer
+  cannot pin memory by dribbling a partial header.
+
 ## Listener `tls.h3` — HTTP/3 over QUIC (experimental)
 
 ```toml

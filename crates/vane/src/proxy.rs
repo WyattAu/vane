@@ -73,6 +73,9 @@ pub struct ProxyConfig {
     pub shared_rate_limit: Option<std::sync::Arc<vane_shm::ratelimit::SharedGcra>>,
     /// Serve h2c (prior-knowledge HTTP/2) on this plain listener.
     pub h2c: bool,
+    /// Require a PROXY protocol header on every connection and trust
+    /// the client address it carries (listener config `proxy_protocol`).
+    pub proxy_protocol: bool,
     /// RFC 7838 `Alt-Svc` header value injected into every response
     /// head (e.g. `h3=":8443"; ma=86400` when the h3 edge shares the
     /// TLS listener's port). `None` = no advertisement.
@@ -137,6 +140,15 @@ struct Conn {
     body: BodyFraming,
     /// WebSocket tunnel active (101 switched): raw bidirectional pump.
     tunnel: bool,
+    /// Client address claimed by a PROXY protocol header (`proxy_protocol`
+    /// listeners). `None` until the header parses; then it IS the peer
+    /// for forwarding, metrics, and access logs.
+    proxy_peer: Option<SocketAddr>,
+    /// PROXY protocol header bytes buffered until the header completes.
+    pp_buf: Vec<u8>,
+    /// The header was parsed (or the listener does not require one):
+    /// downstream bytes are connection payload from here on.
+    pp_done: bool,
     remaining: u64,
     started: Option<Instant>,
     /// The route cluster's circuit breaker, keyed by cluster name and
@@ -1585,6 +1597,18 @@ impl HttpProxy {
         }
     }
 
+    /// The address to attribute the connection to: the PROXY protocol
+    /// source when the listener trusts one, otherwise the real socket
+    /// peer. Everything that names the client — X-Forwarded-For,
+    /// access records, filter contexts — reads through this.
+    fn client_peer(&self, io: &SessionIo<'_>, slot: u32) -> SocketAddr {
+        self.conns
+            .get(&slot)
+            .and_then(|c| c.proxy_peer)
+            .or_else(|| io.peer())
+            .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)))
+    }
+
     /// Answers a request at the edge (no upstream dial) and leaves the
     /// connection ready for the next transaction.
     ///
@@ -1625,10 +1649,10 @@ impl HttpProxy {
             .map(|s| s.elapsed().as_micros())
             .unwrap_or(0)
             .min(u128::from(u32::MAX)) as u32;
-        let client = io
-            .peer()
-            .map(|a| (ip16(a.ip()), a.port()))
-            .unwrap_or(([0u8; 16], 0));
+        let client = {
+            let a = self.client_peer(io, io.slot_index());
+            (ip16(a.ip()), a.port())
+        };
         let upstream = conn.upstream_addr.map(|a| (ip16(a.ip()), a.port()));
         let mut trace_hex = [0u8; 32];
         let mut trace_len = 0;
@@ -1960,6 +1984,51 @@ impl Handler for HttpProxy {
         if self.conns.get(&slot).is_some_and(|c| c.l4) {
             self.upstream_send(io, data);
             return;
+        }
+        // PROXY protocol: the header precedes EVERYTHING on the
+        // connection — including the TLS handshake — and is parsed
+        // exactly once. Enabled listeners require it ("do not mix
+        // modes"): a connection whose first bytes are not a valid
+        // header is closed, never guessed at.
+        if self.config.proxy_protocol && self.conns.get(&slot).is_some_and(|c| !c.pp_done) {
+            {
+                let conn = self.conn(slot);
+                conn.pp_buf.extend_from_slice(data);
+            }
+            // Bound a slowloris-style dribble: the largest header vane
+            // accepts is a v2 with a full 4 KiB payload.
+            const PP_CAP: usize = 16 + 4096 + 16;
+            if self.conn(slot).pp_buf.len() > PP_CAP {
+                self.log(LogLevel::Warn, "proxy protocol header too large");
+                io.close();
+                return;
+            }
+            let buf = std::mem::take(&mut self.conn(slot).pp_buf);
+            match vane_proto::proxy_protocol::parse(&buf) {
+                Err(e) => {
+                    self.log(
+                        LogLevel::Warn,
+                        &format!("proxy protocol: closing connection: {e:?}"),
+                    );
+                    io.close();
+                    return;
+                }
+                Ok(None) => {
+                    self.conn(slot).pp_buf = buf; // wait for the rest
+                    return;
+                }
+                Ok(Some(outcome)) => {
+                    let mut rest = buf;
+                    rest.drain(..outcome.header_len);
+                    let conn = self.conn(slot);
+                    conn.proxy_peer = outcome.source;
+                    conn.pp_done = true;
+                    if rest.is_empty() {
+                        return; // header was the whole read
+                    }
+                    return self.on_downstream_data(io, &rest);
+                }
+            }
         }
         // WebSocket tunnel: raw bidirectional relay, no parsing.
         if self.conns.get(&slot).is_some_and(|c| c.tunnel) {
@@ -2626,9 +2695,7 @@ impl HttpProxy {
         }
 
         // Filter pipeline (scoped: ctx borrows the path buffer).
-        let peer = io
-            .peer()
-            .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+        let peer = self.client_peer(io, slot);
         let (inject, short_circuit, trace) = {
             let mut ctx = RequestCtx::new(view.method, &mut upstream_path, peer, host_only);
             ctx.cluster = Some(&route.cluster);
