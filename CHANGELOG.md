@@ -4,6 +4,49 @@ All notable changes to vane are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 semver.
 
+## [0.10.0] — 2026-10-13
+
+Crate versions: `vane-proxy` 0.10.0, `vane-control` 0.9.0,
+`vane-proto` 0.6.0. (`vane-kernel` 0.7.0 and `vane-filters` 0.6.0 are
+unchanged from 0.9.0.)
+
+### Added
+
+- **PROXY protocol v1/v2** (`listeners.proxy_protocol = true`): the
+  client-IP contract for vane deployed behind an L4 load balancer (AWS
+  NLB, HAProxy, Cloudflare). Every connection on an enabled listener
+  must open with a PROXY protocol header, and vane attributes the
+  connection to the address it carries — X-Forwarded-For, access
+  records, and filter contexts name the ORIGINAL client instead of the
+  balancer. The header precedes the TLS handshake (the case that
+  breaks naive implementations), which the e2e suite exercises with a
+  real rustls handshake after the header.
+  - Trust is the operator's declaration, matching vane's
+    untrusted-X-Forwarded-For posture: enable it only where every
+    sender is the trusted fronting proxy.
+  - The header is REQUIRED on an enabled listener (do not mix modes):
+    a plain request or a malformed header closes the connection with
+    no response.
+  - Bounded by design: a v2 payload over 4 KiB is refused (a peer
+    cannot pin memory dribbling a partial header), and a v2 LOCAL
+    header (health checks) claims no address — the real socket peer is
+    kept.
+- `quinn-proto` bumped to 0.11.19 (RustSec advisories against 0.11.17
+  in the QUIC transport layer; vane's h3 suites re-run green on the
+  fix).
+
+### Changed
+
+- `ListenerConfig` is `#[non_exhaustive]` with a `Default`
+  (`vane-control`): config structs grow (h2c, h3, and now
+  `proxy_protocol` were each added after the first release), and this
+  makes the NEXT field addition a non-event instead of a breaking
+  change. Construct with `ListenerConfig::default()` plus field
+  assignment — struct expressions are refused cross-crate by design.
+  Version bumps in this train (`vane-proto` 0.6.0 for the new
+  `proxy_protocol` wire module, `vane-control` 0.9.0,
+  `vane-proxy` 0.10.0) are the semver cost of the feature.
+
 ## [0.9.0] — 2026-10-11
 
 Crate versions: `vane-proxy` 0.9.0, `vane-control` 0.8.0,

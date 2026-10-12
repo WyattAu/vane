@@ -77,8 +77,14 @@ pub struct VaneConfig {
 }
 
 /// An ingress listener.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `#[non_exhaustive]` by design: config structs grow (h2c, h3,
+/// proxy_protocol were each added after the first release), and this
+/// keeps adding a field from breaking downstream `match`/construction.
+/// Construct with `..Default::default()`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ListenerConfig {
     /// Bind address (e.g. `0.0.0.0:8080`).
     pub address: String,

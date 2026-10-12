@@ -1044,6 +1044,10 @@ criteria = "safe-to-deploy"
 version = "0.11.17"
 criteria = "safe-to-deploy"
 
+[[exemptions.quinn-proto]]
+version = "0.11.19"
+criteria = "safe-to-deploy"
+
 [[exemptions.quinn-udp]]
 version = "0.5.15"
 criteria = "safe-to-deploy"
@@ -1589,7 +1593,7 @@ version = "0.6.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.vane-control]]
-version = "0.8.0"
+version = "0.9.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.vane-filters]]
@@ -1613,11 +1617,11 @@ version = "0.5.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.vane-proto]]
-version = "0.5.5"
+version = "0.6.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.vane-proxy]]
-version = "0.9.0"
+version = "0.10.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.vane-router]]

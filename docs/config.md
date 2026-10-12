@@ -266,6 +266,8 @@ Consequences of the flag, by design:
 - The header is bounded (a v2 payload over 4 KiB is refused) so a peer
   cannot pin memory by dribbling a partial header.
 
+Added in v0.10.0 (`vane-proto` 0.6.0 carries the wire parser).
+
 ## Listener `tls.h3` — HTTP/3 over QUIC (experimental)
 
 ```toml

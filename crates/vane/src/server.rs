@@ -174,14 +174,11 @@ pub fn load_config(path: Option<&str>) -> Result<VaneConfig, String> {
         if let Some(l) = cfg.listeners.first_mut() {
             l.address = addr;
         } else {
-            cfg.listeners.push(vane_control::ListenerConfig {
-                address: addr,
-                mode: vane_control::config::ListenerMode::Http,
-                workers: 0,
-                tls: None,
-                h2c: false,
-                proxy_protocol: false,
-            });
+            // non_exhaustive config: construct via Default + field
+            // assignment, never a struct expression.
+            let mut l = vane_control::ListenerConfig::default();
+            l.address = addr;
+            cfg.listeners.push(l);
         }
     }
     if let (Ok(cert), Ok(key)) = (
