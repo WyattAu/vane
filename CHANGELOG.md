@@ -4,6 +4,108 @@ All notable changes to vane are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 semver.
 
+## [0.9.0] — 2026-10-11
+
+Crate versions: `vane-proxy` 0.9.0, `vane-control` 0.8.0,
+`vane-kernel` 0.7.0, `vane-filters` 0.6.0 (first version off the
+workspace train — it is the crate that changed).
+
+The coverage arc closed this release: quality/coverage reads 90.19%
+against the 90% Tier A bar, and every CI gate is green. What closed it
+was not coverage-chasing — the dark lines were hiding the defects
+below.
+
+### Fixed
+
+- **Tunnel bytes that arrived with the 101 response head were dropped**
+  (`vane-proxy`). `relay_body` had no `Tunnel` arm, so its catch-all
+  relayed nothing; bytes coalesced into the same read as the upgrade
+  head vanished, and the stream ended short. On loopback with separate
+  writes the case never occurs — CI's slower runners coalesce segments,
+  which is where the byte-exact tunnel test failed ("pattern mismatch
+  at 0, got 3"). `relay_body` now relays tunnels like chunked, and
+  `upgrade_with_coalesced_tunnel_bytes_loses_nothing` pins the case
+  deterministically (head + first data bytes in one write).
+- **The h1 circuit breaker could not see the failures it exists for**
+  (`vane-proxy`, `vane-filters`). A backend that accepted the request
+  and closed without answering — the most common "backend is gone"
+  signature — counted as nothing; resets, dial failures and timeouts
+  counted. `note_upstream_failure` now serves all of them.
+- **Debug stderr prints in hot paths**: `request_body` (every body
+  through an h2up cluster) and `upstream_flush` printed unconditionally
+  to stderr — leftover instrumentation from the previous release's
+  h2up investigation, invisible to tests because tests never assert on
+  stderr.
+
+### Changed
+
+- **The circuit breaker is process-wide** (`vane-proxy`). The gate was
+  built per worker, so a dead backend cost `threshold × workers`
+  failures before the whole process stopped dialing it, and each worker
+  kept hammering a backend the others had ejected. One gate is now
+  shared by every worker (keyed by the metrics registry, so embedders
+  and tests keep independent state).
+- **Breaker policy is explicit and anti-flap** (`vane-filters`,
+  `breaker` 1.0 → 2.0). Trip on a 50% failure rate over a full 20-call
+  window; the 5-failure-streak rule is off — with the gate shared, a
+  sub-second backend blip used to trip it and hold the circuit open for
+  30 s. Now: 5 s open window, at most 3 half-open probes, 2 successes
+  to close. A handful of failures ejects nothing; a backend failing
+  half its calls is ejected and re-probed within seconds. `chaos_breaker_flap`'s
+  SLO was rewritten to what a breaker legitimately promises (traffic
+  flows, down windows yield gateway errors, recovery happens) — called
+  out because weakening a test is never free.
+- **RFC 9218 SETTINGS_NO_RFC7540_PRIORITIES** (`vane-kernel`): values
+  greater than 1 are now a PROTOCOL_ERROR connection error (RFC 9113
+  §6.5.2 — the setting is a bool); previously every value was silently
+  accepted. vane also declares the setting (value 1) once in its first
+  SETTINGS frame, which is accurate: PRIORITY frames are validated but
+  never acted on. The public `Setting` enum is unchanged (additive
+  accessors only) — an earlier variant addition was correctly rejected
+  by cargo-semver-checks as breaking.
+- **Config tables reject unknown fields** (`vane-control`): every
+  user-authored table (19 of them; the top-level document stays
+  permissive for forward compatibility) now carries
+  `deny_unknown_fields` — a typo like `challenge = "http-01"` (the
+  RFC 8555 spelling the enum then lacked) is a load error naming the
+  field, not a silently ignored line.
+
+### Added
+
+- In-process **mock ACME v2 server** harness: the full issuance flow
+  (directory → newAccount → newOrder → http-01 → finalize → chain
+  download) against a server that decodes and verifies our JWS
+  protected headers the way a real CA would. No docker, ~0.03 s — the
+  pebble e2e stays for the full stack.
+- **h3 → h2 upstream relay** e2e: the only vane path where QUIC meets
+  HTTP/2 had no coverage.
+- **xDS decode matrix through the real client loop**: LDS attachment,
+  EDS endpoint overrides, SDS secrets, and the NACK branch — the loop
+  previously only ever decoded CLUSTER and ROUTE in tests. One
+  asymmetry surfaced and is documented rather than changed: malformed
+  EDS/SDS resources are skipped silently while malformed
+  LDS/CDS/RDS NACKs (an empty endpoint set is a legitimate
+  scale-to-zero, so EDS leniency looks deliberate).
+- Startup failure contracts: a standby pointed at a handover socket it
+  cannot create, and a config whose listener port is already bound,
+  both exit 1 cleanly instead of hanging.
+- `strip_prefix` path rewriting asserted against what the upstream
+  receives (all three branches), and mesh SPIFFE chain extension
+  (verified caller appends to the forwarded chain; unverified callers
+  cannot inject hops).
+- Kernel h2 unit tests for the credit oracles (budgets, windows, direct
+  reserve), peer GOAWAY observability, control-frame shapes, and the
+  SETTINGS validation edges above.
+- `scripts/h2spec_run.sh` fetches h2spec v2.6.0 on demand with a pinned
+  SHA-256, and `bench_compare.sh` fetches Caddy 2.10.2 / Traefik 3.5.4
+  the same way — all spec/bench artifacts now live under
+  `${VANE_ARTIFACTS:-/var/tmp/vane-artifacts}` instead of a `/tmp`
+  path this host wipes on restart (a gate that degrades to "binary
+  missing" is not a gate). The `Enforce Tier A threshold` CI step now
+  uses `cargo llvm-cov report` on the measurement the job actually
+  took instead of re-running the workspace with `--skip` filters that
+  cargo-llvm-cov mangles into run-only filters.
+
 ## [0.8.0] — 2026-10-07
 
 Crate versions: `vane-proxy` 0.8.0, `vane-control` 0.7.0,
