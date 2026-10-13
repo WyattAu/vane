@@ -14,6 +14,17 @@
 > and two missing-END_STREAM paths). Container images publish
 > automatically on `vX.Y.Z` tags (release.yml). Order below unchanged.
 >
+> **v0.10.0 published 2026-10-13** (vane-proto 0.6.0 → vane-control
+> 0.9.0 → vane-proxy 0.10.0), install-verified: `cargo install
+> vane-proxy --version 0.10.0 --locked` → `vane 0.10.0`, plus a
+> dogfood run of the installed binary with `proxy_protocol = true`.
+> Adds PROXY protocol v1/v2 listener support (client IP behind an L4
+> load balancer; the header precedes the TLS handshake; trust is
+> config-gated; malformed or missing headers close the connection).
+> `ListenerConfig` is now `#[non_exhaustive]` so the next config field
+> is not a breaking change. `quinn-proto` 0.11.19 for the QUIC
+> advisories.
+>
 > **v0.9.0 published 2026-10-11** (vane-filters 0.6.0 — first version
 > off the workspace train — → vane-control 0.8.0 → vane-kernel 0.7.0 →
 > vane-proxy 0.9.0), install-verified: `cargo install vane-proxy
