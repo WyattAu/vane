@@ -270,15 +270,13 @@ dependencies = [
 
 [[package]]
 name = "breaker"
-version = "1.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "924a6e88f765c0812138b0967de1105584ae2a4e010ad3186e17c05f163c35ac"
+checksum = "b3878f5a7885dc1ec9f3dcc838693804b03454647ad6fea19e6aab1c9d7077ef"
 dependencies = [
  "loom",
  "parking_lot",
  "thiserror",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -3052,7 +3050,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vane-control"
-version = "0.6.1"
+version = "0.9.0"
 dependencies = [
  "base64 0.22.1",
  "envstack",
@@ -3079,7 +3077,7 @@ dependencies = [
 
 [[package]]
 name = "vane-filters"
-version = "0.5.3"
+version = "0.6.0"
 dependencies = [
  "breaker",
  "jsonwebtoken",
@@ -3109,7 +3107,7 @@ dependencies = [
 
 [[package]]
 name = "vane-kernel"
-version = "0.5.3"
+version = "0.7.0"
 dependencies = [
  "bytes",
  "core_affinity",
@@ -3144,7 +3142,7 @@ dependencies = [
 
 [[package]]
 name = "vane-proto"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "flate2",
@@ -3156,7 +3154,7 @@ dependencies = [
 
 [[package]]
 name = "vane-proxy"
-version = "0.7.0"
+version = "0.10.0"
 dependencies = [
  "axum",
  "axum-stack",
