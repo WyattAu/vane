@@ -324,7 +324,9 @@ jobs:
   fuzz-nightly:
     name: fuzz deep (nightly)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # 13 targets x 600 s of fuzzing plus builds: a 60-minute ceiling
+    # (the push-job default) would kill the job mid-run every night.
+    timeout-minutes: 200
     # The nightly schedule, or a manual dispatch (`gh workflow run ci`)
     # to validate the deep budgets without waiting for 03:00 UTC.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
