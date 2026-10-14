@@ -122,7 +122,14 @@ token is configured it gates the entire plane, probes included.
 | `domains` | list of `{domain, challenge}` | `http-01` supported; `tls-alpn-01` rejected at load |
 
 HTTP-01 tokens are served in-process from the shared token map; the
-renewal loop polls expiry and hot-swaps TLS material without restart.
+renewal loop reads the stored leaf's validity hourly and re-issues only
+once 2/3 of the certificate's lifetime has elapsed, then hot-swaps TLS
+material without restart. Hourly (not daily) matters twice: an
+unconditional daily re-issue runs into Let's Encrypt's 5-duplicates-
+per-week limit within five days of uptime, and short-lived
+certificates (Let's Encrypt's ~6-day offering) need failures noticed
+within hours to leave real margin — at the 2/3 point the hourly loop
+has ~48 attempts before expiry.
 
 ## `[sidecar]` — SHM transport
 

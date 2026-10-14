@@ -32,6 +32,9 @@ loop-retry = { workspace = true }
 rustls-pki-types = { workspace = true }
 rustls = { workspace = true }
 rcgen = { workspace = true }
+# Leaf validity parsing for the renewal decision (already in the tree
+# as a transitive dependency of rustls tooling).
+x509-parser = "0.18"
 ring = { workspace = true }
 base64 = "0.22"
 rand = { workspace = true }

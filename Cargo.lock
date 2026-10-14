@@ -3952,6 +3952,7 @@ dependencies = [
  "vane-proto",
  "vane-router",
  "workspace-hack",
+ "x509-parser",
 ]
 
 [[package]]
