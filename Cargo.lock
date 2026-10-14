@@ -3928,7 +3928,7 @@ dependencies = [
 
 [[package]]
 name = "vane-control"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "base64",
  "envstack",
@@ -4026,7 +4026,7 @@ dependencies = [
 
 [[package]]
 name = "vane-proxy"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "axum",
  "axum-stack",

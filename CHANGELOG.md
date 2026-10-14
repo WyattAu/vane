@@ -4,6 +4,25 @@ All notable changes to vane are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 semver.
 
+## [0.10.1] — 2026-10-14
+
+Crate versions: `vane-proxy` 0.10.1, `vane-control` 0.9.1.
+
+### Fixed
+
+- **The ACME renewal loop re-issued certificates daily with no expiry
+  check** (`vane-control`). `spawn_renewal` slept 24 hours and called
+  `obtain_certificate()` unconditionally — and `renew_at_fraction`,
+  the documented 2/3-lifetime threshold, was dead config: parsed,
+  defaulted, never read. Against Let's Encrypt's duplicate-certificate
+  limit (5 per week for the same names), a deployment broke its own
+  renewals on day 5 of uptime and then failed forever. The loop now
+  reads the stored leaf's validity hourly and re-issues only once the
+  configured fraction of the lifetime has elapsed; missing or
+  unparsable material always renews. Hourly (not daily) is what makes
+  short-lived certificates viable: at the 2/3 point of a 6-day
+  certificate the loop holds ~48 retry opportunities of margin.
+
 ## [0.10.0] — 2026-10-13
 
 Crate versions: `vane-proxy` 0.10.0, `vane-control` 0.9.0,
