@@ -14,6 +14,16 @@
 > and two missing-END_STREAM paths). Container images publish
 > automatically on `vX.Y.Z` tags (release.yml). Order below unchanged.
 >
+> **v0.10.1 published 2026-10-14** (vane-control 0.9.1 →
+> vane-proxy 0.10.1), install-verified: `cargo install vane-proxy
+> --version 0.10.1 --locked` → `vane 0.10.1`. The ACME renewal fix:
+> the loop used to re-issue certificates daily with no expiry check —
+> breaking its own renewals against Let's Encrypt's 5/week duplicate
+> limit on day 5 of uptime. It now reads the stored leaf's validity
+> hourly and re-issues only past renew_at_fraction of the lifetime,
+> which is also what makes Let's Encrypt's ~6-day short-lived
+> certificates viable.
+>
 > **v0.10.0 published 2026-10-13** (vane-proto 0.6.0 → vane-control
 > 0.9.0 → vane-proxy 0.10.0), install-verified: `cargo install
 > vane-proxy --version 0.10.0 --locked` → `vane 0.10.0`, plus a
