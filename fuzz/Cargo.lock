@@ -3050,7 +3050,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vane-control"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "base64 0.22.1",
  "envstack",
@@ -3073,6 +3073,7 @@ dependencies = [
  "vane-proto",
  "vane-router",
  "workspace-hack",
+ "x509-parser",
 ]
 
 [[package]]
@@ -3154,7 +3155,7 @@ dependencies = [
 
 [[package]]
 name = "vane-proxy"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "axum",
  "axum-stack",

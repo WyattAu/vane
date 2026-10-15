@@ -88,6 +88,16 @@ impl ChunkedScanner {
                         return false;
                     };
                     data = &data[consumed..];
+                    // A line whose CRLF sits beyond LINE_CAP is malformed
+                    // exactly like an unterminated one. Checking BOTH ways
+                    // is what makes the verdict segmentation-independent:
+                    // a whole-read line is complete (found CRLF), a
+                    // dribbled one is unterminated (cap on the carry), and
+                    // they must agree.
+                    if line.len() > LINE_CAP {
+                        self.state = State::Done;
+                        return true;
+                    }
                     match parse_chunk_size(&line) {
                         Some(0) => self.state = State::Trailers,
                         Some(n) => {
@@ -140,6 +150,11 @@ impl ChunkedScanner {
                         return false;
                     };
                     data = &data[consumed..];
+                    // Same over-cap rule as the size line (see above).
+                    if line.len() > LINE_CAP {
+                        self.state = State::Done;
+                        return true;
+                    }
                     // An empty line ends the trailer section.
                     if line.is_empty() {
                         self.state = State::Done;
@@ -161,32 +176,47 @@ impl ChunkedScanner {
 /// prefix. Returns the line without its CRLF and how many bytes of
 /// `data` it consumed.
 ///
-/// A CRLF can straddle two reads, so the carry's trailing CR is
-/// completed against the first byte of `data` before searching.
+/// The CRLF search runs over the VIRTUAL join of `carry + data`
+/// without materializing it, and `consumed` accounts exactly the bytes
+/// taken from `data` — so the verdict is identical no matter how the
+/// stream was segmented. An earlier version special-cased a carried CR
+/// against a leading LF and under-counted `consumed` whenever the
+/// found line reached past the join seam: the caller re-fed the same
+/// bytes and the scanner saw content twice — a segmentation-dependent
+/// verdict, which is a request-smuggling primitive (found by the
+/// nightly deep fuzz).
 fn take_line(carry: &mut Vec<u8>, data: &[u8]) -> Option<(Vec<u8>, usize)> {
-    let mut joined = 0usize;
-    if carry.last() == Some(&b'\r') && data.first() == Some(&b'\n') {
-        carry.push(b'\n');
-        joined = 1;
-    }
-    // A CRLF that the carry already holds (just completed from data's
-    // first byte) counts too: the payload may end exactly at a read
-    // boundary.
-    if let Some(n) = find_crlf(carry) {
-        let line: Vec<u8> = carry.drain(..n + 2).collect();
-        return Some((line[..n].to_vec(), joined));
-    }
-    match find_crlf(&data[joined..]) {
-        Some(n) => {
+    let mut i = 0usize;
+    while i + 1 < carry.len() + data.len() {
+        let at = |j: usize| {
+            if j < carry.len() {
+                carry[j]
+            } else {
+                data[j - carry.len()]
+            }
+        };
+        if at(i) == b'\r' && at(i + 1) == b'\n' {
+            if i + 2 <= carry.len() {
+                // The line completed entirely from the carry. Cannot
+                // arise while the carry invariant holds (the carry is
+                // always drained through its first CRLF), but handle it
+                // without looping: consume zero bytes of `data`.
+                let line: Vec<u8> = carry.drain(..i + 2).collect();
+                return Some((line[..i].to_vec(), 0));
+            }
+            // The CRLF straddles the seam or lives in `data`: everything
+            // through it is the line, and the caller advances past it.
+            let from_data = i + 2 - carry.len();
             let mut line = std::mem::take(carry);
-            line.extend_from_slice(&data[..joined + n]);
-            Some((line, joined + n + 2))
+            line.extend_from_slice(&data[..from_data]);
+            return Some((line[..i].to_vec(), from_data));
         }
-        None => {
-            carry.extend_from_slice(data);
-            None
-        }
+        i += 1;
     }
+    // No complete line yet: carry the un-terminated tail (the caller
+    // enforces LINE_CAP on the carry length after this returns None).
+    carry.extend_from_slice(data);
+    None
 }
 
 /// Offset of the next CRLF, if the slice contains one.
