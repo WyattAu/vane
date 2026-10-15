@@ -219,11 +219,6 @@ fn take_line(carry: &mut Vec<u8>, data: &[u8]) -> Option<(Vec<u8>, usize)> {
     None
 }
 
-/// Offset of the next CRLF, if the slice contains one.
-fn find_crlf(data: &[u8]) -> Option<usize> {
-    data.windows(2).position(|w| w == b"\r\n")
-}
-
 /// Parses a chunk-size line: hex digits, optional `;extension`.
 fn parse_chunk_size(line: &[u8]) -> Option<u64> {
     let hex = match line.iter().position(|b| *b == b';') {
