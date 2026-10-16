@@ -25,7 +25,7 @@ Verdict vocabulary:
 | 5 | Outlier detection & circuit breaking | KEEP + ADOPT | ejection_cap_keeps_the_cluster_serving unit test |
 | 6 | TLS: post-quantum & cert lifecycle | ADOPT (feature-gated follow-up) | doc assertion in vane-tls |
 | 7 | Memory & zero-copy data path | KEEP | doc assertion: parked SEND_ZC + ZC Rx triggers in uring.rs |
-| 8 | Control plane (xDS/ADS, hot reload) | (fill) | (fill) |
+| 8 | Control plane (xDS/ADS, hot reload) | KEEP | doc assertion: SotW-vs-delta decision + trigger at the subscription site |
 | 9 | Observability (access logs, traces) | (fill) | (fill) |
 | 10 | Correctness proof methods for parsers | (fill) | (fill) |
 
@@ -297,6 +297,37 @@ thread-per-core handlers do minimal syscall work already).
 
 **Lean proof:** the parked triggers live as a doc assertion in
 `uring.rs` — the integration point where both features would land.
+
+
+## Iteration 8 — Control plane (xDS/ADS, hot reload)
+
+**Pulled:** the xDS protocol spec's four variants (SotW/Incremental ×
+per-type/Aggregated), Envoy's FAQ on incremental-xDS status ("all xDS
+protocols, including ADS, support delta xDS; on-demand for VHDS
+only"), Envoy's xds.md internals (GrpcMux/SubscriptionState/WatchMap),
+delta-xDS wire semantics (DeltaDiscovery{Request,Response}, nonces,
+resource TTLs, reconnect-state hints).
+
+**Analysis:** delta xDS buys wire efficiency at large resource counts,
+lazy loading, and resource TTLs. A vane instance wildcard-subscribes
+to every type, loads everything eagerly, and its snapshot is bounded —
+the delta wins don't apply at vane's scale. vane's ADS client already
+implements the hard parts correctly: per-type state machine with
+nonces, ACK/NACK, RDS held back until CDS is ACKed, LDS-attached
+route-config names, EDS endpoint overrides, SDS.
+
+**Verdict: KEEP** SotW ADS. ADOPT nothing: delta's complexity budget
+(paired nonces per resource, remove semantics, TTL expiry) is
+unjustified for a bounded wildcard subscription. Recorded as a
+decision + trigger AT THE SUBSCRIPTION SITE in `xds_client.rs`
+(revisit at 10k+ resources or when resource TTLs are needed). The
+stale-snapshot hazard is covered differently than Envoy: vane's
+active health checker gates endpoints the management plane stopped
+updating.
+
+**Lean proof:** the doc assertion at the subscription site (quoted
+trigger), plus the existing xDS decode-matrix and subcommand-loop
+tests from the earlier coverage work.
 
 Entries are appended per iteration; the table is filled at the end of
 each so the ledger always reflects verified state.

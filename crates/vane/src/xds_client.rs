@@ -263,6 +263,15 @@ pub fn xds_client_loop(management: &str, node_id: &str, admin: &str) -> i32 {
     // real management planes answer watches independently, so an RDS
     // response can arrive before CDS and would be mapped with an
     // empty cluster set (the snapshot would be rejected).
+    // WIRE-FORMAT DECISION (research loop iteration 8, 2026-10): SotW
+    // ADS, not delta xDS. Delta's wins are wire efficiency at large
+    // resource counts and lazy loading; a vane instance subscribes to
+    // EVERYTHING (wildcard LDS/CDS) and the resource set is bounded —
+    // Envoy's own FAQ keeps SotW ADS fully supported. TRIGGER to
+    // revisit: clusters at delta-xDS scale (10k+ resources) or a
+    // management plane that needs resource TTLs (Envoy carries TTLs on
+    // DeltaDiscoveryResponse; vane's snapshot instead persists until
+    // replaced, and its active health checker gates stale endpoints).
     let mut route_subscribed = false;
     for t in SUBSCRIBED_TYPES {
         if t == vane_proto::xds::type_url::ROUTE {
