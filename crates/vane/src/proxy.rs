@@ -2719,6 +2719,16 @@ impl HttpProxy {
         let (inject, short_circuit, trace) = {
             let mut ctx = RequestCtx::new(view.method, &mut upstream_path, peer, host_only);
             ctx.cluster = Some(&route.cluster);
+            // Trace-log correlation: the pipeline's trace must be the
+            // INBOUND trace when the client supplied a valid
+            // `traceparent` — otherwise the access record carries a
+            // random id while the request span continues the client's
+            // trace, and every log/trace join breaks at this hop.
+            if let Some(h) = view.header("traceparent") {
+                if let Some(tc) = vane_observe::trace::TraceContext::parse(h) {
+                    ctx.trace = tc;
+                }
+            }
             ctx.inject("X-Forwarded-For", &peer.ip().to_string());
             // Scheme as this edge saw it: TLS-terminating listeners report
             // https (the h2 edge path does the same). Never trust an

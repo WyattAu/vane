@@ -26,7 +26,7 @@ Verdict vocabulary:
 | 6 | TLS: post-quantum & cert lifecycle | ADOPT (feature-gated follow-up) | doc assertion in vane-tls |
 | 7 | Memory & zero-copy data path | KEEP | doc assertion: parked SEND_ZC + ZC Rx triggers in uring.rs |
 | 8 | Control plane (xDS/ADS, hot reload) | KEEP | doc assertion: SotW-vs-delta decision + trigger at the subscription site |
-| 9 | Observability (access logs, traces) | (fill) | (fill) |
+| 9 | Observability (access logs, traces) | KEEP + FIX | access_log_correlates_inbound_traceparent e2e |
 | 10 | Correctness proof methods for parsers | (fill) | (fill) |
 
 
@@ -328,6 +328,39 @@ updating.
 **Lean proof:** the doc assertion at the subscription site (quoted
 trigger), plus the existing xDS decode-matrix and subcommand-loop
 tests from the earlier coverage work.
+
+
+## Iteration 9 — Observability (access logs, traces)
+
+**Pulled:** Envoy access-log spec (command operators, format strings
+vs format dictionaries, the Envoy Gateway typed-JSON default set),
+the OpenTelemetry logging data model (TraceId/SpanId fields linking a
+log entry to its trace), and OTel trace-log correlation guidance.
+
+**Analysis:** Envoy Gateway's default typed-JSON record set is the
+industry expectation — and vane's fixed structured record already
+covers the load-bearing fields (ts, duration, status, bytes, client,
+upstream, method/host/path, trace_id) with one architectural
+difference: vane's record shape is FIXED (a bincode-ish struct over a
+lock-free event ring) rather than operator-configurable. For vane's
+position (zero allocation on the hot path, ring-buffered) that is the
+right trade; operator-configurable formats would reintroduce
+formatting work per request.
+
+**Verdict: KEEP + FIX.** The gap the research exposed was
+trace-log CORRELATION: the request span continued the client's
+inbound `traceparent`, but the ACCESS RECORD carried a freshly
+generated trace id — every log/trace join broke at vane's hop, and a
+new correlation e2e caught it immediately. Fixed: the filter
+pipeline's trace is seeded from the parsed inbound `traceparent` when
+present.
+
+**Parked:** response "why" flags in the record (Envoy's
+RESPONSE_FLAGS: breaker-open, upstream-reset...); outbound
+traceparent REWRITE (vane currently forwards the client's traceparent
+verbatim to the upstream — W3C wants a child span id per hop). Both
+are additive record/header work with no correctness impact on
+request framing.
 
 Entries are appended per iteration; the table is filled at the end of
 each so the ledger always reflects verified state.

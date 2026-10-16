@@ -166,3 +166,43 @@ fn access_log_records_routed_request() {
     // Exactly one record for exactly one request.
     assert_eq!(lines.len(), 1, "expected one record: {lines:?}");
 }
+
+/// Trace-log correlation (the OTel logging model: TraceId/SpanId link
+/// a log entry to its trace): an inbound `traceparent` header must
+/// land its trace id in the access record, and the span vane creates
+/// for the request must CONTINUE that trace (not generate a new one).
+/// Without this, a proxy breaks every trace crossing it.
+#[test]
+fn access_log_correlates_inbound_traceparent() {
+    let _serial = lock_serial();
+    let (mut child, proxy_addr, rx, _dir) = run_proxy_with_access_log();
+
+    // A valid W3C traceparent: version 00, trace id 11x32 hex
+    // (non-zero), span id 22x16 hex (non-zero), flags 01.
+    let trace_hex = "11111111111111111111111111111111";
+    let span_hex = "2222222222222222";
+    let tp = format!("00-{trace_hex}-{span_hex}-01");
+
+    let mut s = std::net::TcpStream::connect(proxy_addr).expect("connect");
+    s.write_all(
+        format!("GET /api/traced HTTP/1.1\r\nHost: example.test\r\ntraceparent: {tp}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )
+    .expect("write");
+    let mut buf = String::new();
+    let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = s.read_to_string(&mut buf);
+
+    let text = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("access log written");
+    child.kill().ok();
+    let _ = child.wait();
+
+    let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 1, "one record: {text:?}");
+    assert!(
+        lines[0].contains(&format!("\"trace_id\":\"{trace_hex}\"")),
+        "inbound trace id correlated into the record: {lines:?}"
+    );
+}
