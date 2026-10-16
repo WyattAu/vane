@@ -216,5 +216,18 @@ two detection types).
 cap on a 2-backend cluster, the second backend past its threshold is
 NOT ejected; a 100% cap still allows a full ejection.
 
+
+## Interim release-train note (2026-10-16)
+
+Iterations 1-5 produced config-struct and API changes (non_exhaustive
+across the vane-control config family, OutlierConfig.max_ejection_
+percent, weight-aware P2C in vane-router 0.7.0, the chunked smuggling
+fix in vane-proto 0.7.0). Versions bumped for the train:
+`vane-proto` 0.7.0, `vane-router` 0.7.0, `vane-control` 0.10.0,
+`vane-proxy` 0.11.0 — published when the arc completes. `Listener
+Config`'s non_exhaustive pattern (Default + field assignment) is now
+the family-wide rule; `VaneConfig` stays exempt (parsed, never
+constructed, downstream).
+
 Entries are appended per iteration; the table is filled at the end of
 each so the ledger always reflects verified state.

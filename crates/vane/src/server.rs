@@ -1446,7 +1446,7 @@ cluster = "up"
         }
         let cfg_with_file = vane_control::config::AdminConfig {
             auth_token_file: Some("/nonexistent/token".into()),
-            ..vane_control::config::AdminConfig::default()
+            ..Default::default()
         };
         let tok = resolve_admin_token(&cfg_with_file)
             .expect("env path ok")
@@ -1476,7 +1476,7 @@ cluster = "up"
         std::fs::write(&empty, "  \n\t").expect("write");
         let cfg_empty = vane_control::config::AdminConfig {
             auth_token_file: Some(empty.to_str().expect("utf8").into()),
-            ..vane_control::config::AdminConfig::default()
+            ..Default::default()
         };
         let err = resolve_admin_token(&cfg_empty).unwrap_err();
         assert!(err.contains("is empty"), "{err}");
