@@ -19,7 +19,7 @@ Verdict vocabulary:
 | # | Part | Verdict | Lean proof adjusted |
 |---|---|---|---|
 | 1 | HTTP/1.1 framing & smuggling defense | KEEP + ADOPT | parser: 3 tests; e2e smuggling test |
-| 2 | HTTP/2 conformance & flood defense | (fill) | (fill) |
+| 2 | HTTP/2 conformance & flood defense | ADOPT | 3 kernel tests pinning the flood bounds |
 | 3 | QUIC / HTTP/3 transport | (fill) | (fill) |
 | 4 | Load balancing (P2C) | (fill) | (fill) |
 | 5 | Outlier detection & circuit breaking | (fill) | (fill) |
@@ -73,6 +73,45 @@ e2e `malformed_chunked_request_closes_the_connection` (asserts exactly
 one upstream transaction and that the smuggled request never becomes
 one), scanner `is_malformed` covered by the existing malformed-size
 test plus the new proxy wiring.
+
+
+## Iteration 2 — HTTP/2 conformance & flood defense
+
+**Pulled:** Envoy CVE-2024-30255 (CONTINUATION flood → CPU exhaustion,
+~1 core per 300 Mbit/s), CVE-2024-27919 (the memory variant), Apache
+CVE-2024-27316 (buffering for an informative 413 IS the memory bug),
+Netty CVE-2026-33871 (zero-length CONTINUATIONs bypass size caps),
+Mozilla CVE-2024-3302 (no count limit), plus the RFC 9113 §6.10
+requirements.
+
+**Analysis:** the CONTINUATION-flood literature converged on THREE
+independent bounds, each covering a bypass of the others: total
+assembled size (counters memory), per-frame size (RFC 9113 §4.1
+already requires this per frame), and FRAME COUNT (counters
+zero-length frames, which grow no buffer but each cost parser work).
+The response to a bound must be an immediate connection error, never a
+buffered informative error.
+
+**Prior art:** Envoy's post-fix (max_consecutive_inbound_frames_with
+_empty_payload = 1, header map limits enforced during assembly),
+nghttp2's callbacks-with-early-RETURN design, Netty's post-CVE count
+cap. All arrived at the same triple-bound after being burned.
+
+**Verdict: ADOPT.** vane's h2 kernel had NONE of the three bounds:
+CONTINUATION payloads accumulated without limit, the count was
+uncapped (zero-length frames free), and per-frame size was unvalidated
+on the CONTINUATION path (only on HEADERS). Now: fragments past
+`max_header_list_size` (our advertised setting) are a PROTOCOL_ERROR
+connection error — explicitly NOT a buffered informative response; a
+CONTINUATION larger than `max_frame_size` is FRAME_SIZE_ERROR; and
+more than 64 CONTINUATIONs per block is PROTOCOL_ERROR (legitimate
+maximum is ~8: 128 KiB list / 16 KiB frames).
+
+**Lean proof:** a kernel test pins all three bounds (zero-length flood
+→ PROTOCOL_ERROR at exactly the count cap + 1; oversized frame →
+FRAME_SIZE_ERROR; fragment growth past the advertised size →
+PROTOCOL_ERROR), alongside the existing `continuation_assembles_block`
+test proving legitimate multi-frame blocks still work.
 
 Entries are appended per iteration; the table is filled at the end of
 each so the ledger always reflects verified state.

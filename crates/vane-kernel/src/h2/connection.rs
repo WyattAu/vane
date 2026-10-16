@@ -201,7 +201,19 @@ struct HeaderBlockAssembler {
     stream_id: u32,
     end_stream: bool,
     active: bool,
+    /// CONTINUATION frames seen for this block. The count is capped
+    /// INDEPENDENTLY of the size cap: zero-length CONTINUATIONs grow no
+    /// buffer but each costs parser work — the exact bypass Netty fixed
+    /// for CVE-2026-33871.
+    continuations: u32,
 }
+
+/// CONTINUATION frames allowed per header block. Legitimate blocks
+/// cannot exceed a handful: fragments are capped at max_frame_size
+/// (16 KiB default) and the total at max_header_list_size (128 KiB
+/// default), so 8 frames is the legitimate maximum; 64 leaves slack
+/// for extensions while ending zero-length floods in bounded time.
+const MAX_CONTINUATIONS_PER_BLOCK: u32 = 64;
 
 /// HTTP/2 connection state machine (sans-io).
 pub struct Connection {
@@ -476,6 +488,31 @@ impl Connection {
                 if hdr.kind != FrameKind::Continuation
                     || hdr.stream_id != self.header_block.stream_id
                 {
+                    let _ = self.conn_error(error_code::PROTOCOL_ERROR);
+                    return off;
+                }
+                // Flood defenses (the Envoy CVE-2024-30255 / Netty
+                // CVE-2026-33871 class): bound the FRAME COUNT, the
+                // PER-FRAME size, and the TOTAL assembled size — each
+                // independently, because zero-length frames grow no
+                // buffer and huge frames grow it cheaply.
+                self.header_block.continuations += 1;
+                if self.header_block.continuations > MAX_CONTINUATIONS_PER_BLOCK {
+                    let _ = self.conn_error(error_code::PROTOCOL_ERROR);
+                    return off;
+                }
+                if hdr.length as usize > self.cfg.max_frame_size as usize {
+                    let _ = self.conn_error(error_code::FRAME_SIZE_ERROR);
+                    return off;
+                }
+                if self.header_block.fragments.len() + hdr.length as usize
+                    > self.cfg.max_header_list_size as usize
+                {
+                    // Header blocks past our advertised
+                    // SETTINGS_MAX_HEADER_LIST_SIZE are a connection
+                    // error (RFC 9113 §6.5.2), NOT a buffered 413: the
+                    // Apache CVE-2024-27316 lesson is that buffering
+                    // for an informative error is the memory bug.
                     let _ = self.conn_error(error_code::PROTOCOL_ERROR);
                     return off;
                 }
@@ -965,6 +1002,7 @@ impl Connection {
             stream_id: hdr.stream_id,
             end_stream,
             active: true,
+            continuations: 0,
         };
         Ok(())
     }
@@ -2526,6 +2564,102 @@ mod conn_tests {
             &mut events,
         );
         assert!(c.connection_error().is_none(), "unknown frames are ignored");
+    }
+
+    /// CONTINUATION flood defenses (Envoy CVE-2024-30255, Netty
+    /// CVE-2026-33871, Apache CVE-2024-27316 class). The three
+    /// independent bounds: total assembled size, per-frame size, and
+    /// frame count — the count being the zero-length-frame bypass.
+    #[test]
+    fn continuation_flood_defenses() {
+        // Establishes a connection with a HEADERS frame that STARTS a
+        // header block (no END_HEADERS): flags 0x08 (padded) with a
+        // zero pad length + indexed :method.
+        let start_block = || {
+            let mut c = server();
+            let mut events = Vec::new();
+            c.handle_read(CLIENT_PREFACE, &mut events);
+            let _ = c.take_pending_writes();
+            c.handle_read(
+                &frame_bytes(FrameKind::Headers, 0x08, 1, &[0x00, 0x82]),
+                &mut events,
+            );
+            (c, events)
+        };
+
+        // The zero-length bypass: dozens of EMPTY CONTINUATION frames.
+        // Each grows no buffer; the COUNT cap must end the connection.
+        {
+            let (mut c, mut events) = start_block();
+            for _ in 0..MAX_CONTINUATIONS_PER_BLOCK {
+                c.handle_read(
+                    &frame_bytes(FrameKind::Continuation, 0x00, 1, &[]),
+                    &mut events,
+                );
+            }
+            c.handle_read(
+                &frame_bytes(FrameKind::Continuation, 0x00, 1, &[]),
+                &mut events,
+            );
+            assert_eq!(
+                c.connection_error().map(|e| e.code),
+                Some(error_code::PROTOCOL_ERROR),
+                "zero-length CONTINUATION flood is a connection error"
+            );
+        }
+
+        // Per-frame size: a CONTINUATION larger than OUR advertised
+        // max_frame_size (16 KiB default) is FRAME_SIZE_ERROR.
+        let mut c = server();
+        let mut events = Vec::new();
+        c.handle_read(CLIENT_PREFACE, &mut events);
+        let _ = c.take_pending_writes();
+        c.handle_read(
+            &frame_bytes(FrameKind::Headers, 0x08, 1, &[0x00, 0x82]),
+            &mut events,
+        );
+        c.handle_read(
+            &frame_bytes(
+                FrameKind::Continuation,
+                0x00,
+                1,
+                &vec![0u8; c.peer_max_frame_size() + 1],
+            ),
+            &mut events,
+        );
+        assert_eq!(
+            c.connection_error().map(|e| e.code),
+            Some(error_code::FRAME_SIZE_ERROR),
+            "an oversized CONTINUATION is FRAME_SIZE_ERROR"
+        );
+
+        // Total assembled size: fragments past the advertised
+        // SETTINGS_MAX_HEADER_LIST_SIZE are a connection error, not a
+        // buffered informative error (the Apache CVE-2024-27316
+        // lesson).
+        let mut c = server();
+        let mut events = Vec::new();
+        c.handle_read(CLIENT_PREFACE, &mut events);
+        let _ = c.take_pending_writes();
+        c.handle_read(
+            &frame_bytes(FrameKind::Headers, 0x08, 1, &[0x00, 0x82]),
+            &mut events,
+        );
+        let frag = vec![0x41u8; 16 * 1024]; // max_frame_size each
+        for _ in 0..8 {
+            c.handle_read(
+                &frame_bytes(FrameKind::Continuation, 0x00, 1, &frag),
+                &mut events,
+            );
+            if c.connection_error().is_some() {
+                break;
+            }
+        }
+        assert_eq!(
+            c.connection_error().map(|e| e.code),
+            Some(error_code::PROTOCOL_ERROR),
+            "fragments past the advertised header-list size are a connection error"
+        );
     }
 
     /// Frame types in write order, for shape assertions. FrameKind's

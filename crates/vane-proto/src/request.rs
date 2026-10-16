@@ -194,7 +194,7 @@ fn framing_is_ambiguous(view: &RequestView<'_>) -> bool {
         // HTTP/1.0 has no chunked transfer coding (RFC 9112 §7.1): a 1.0
         // request claiming chunked is ambiguous by construction, and
         // backends disagree on whether to honor it.
-        Some(v) if view.version == 0 => true,
+        Some(_) if view.version == 0 => true,
         // The desync-delusion vector (Kettle 2025): a TE value that
         // OPENS with whitespace ("Transfer-Encoding:\tchunked").
         // RFC 9110 §5.5 says OWS is not part of the value, but parsers
