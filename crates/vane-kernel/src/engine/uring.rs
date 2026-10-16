@@ -7,6 +7,20 @@
 //! `WRITE_FIXED` symmetrically. L4 splice pumping arms multishot `PollAdd`
 //! readiness and runs kernel-only `splice(2)` loops inline — request bytes
 //! never enter user space (`IO-04`).
+//!
+//! PARKED io_uring features (research loop iteration 7, 2026-10; see
+//! docs/research-loop-2026-10.md):
+//!
+//! * `SEND_ZC` (kernel 6.4+): zero-copy send, 1.9-2.4x over msg_zerocopy
+//!   in kernel selftests, best at large payloads. Trigger: a measured
+//!   large-body (≥64 KiB) CPU regression on the chunked relay path.
+//!   Plays well with our registered fixed buffers (the patchset skips
+//!   get/put_page for them).
+//! * Zero-copy RECEIVE (`RECV_ZC`, kernel 6.14+): removes the
+//!   kernel-to-user copy but binds an ifq per NIC hardware queue with
+//!   flow steering — in conflict with vane's SO_REUSEPORT
+//!   thread-per-core accept model, where any worker takes any flow.
+//!   Trigger: NIC + measured memcpy cost on the receive path.
 
 use std::collections::HashMap;
 use std::io;

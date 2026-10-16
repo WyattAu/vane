@@ -24,7 +24,7 @@ Verdict vocabulary:
 | 4 | Load balancing (P2C) | KEEP + ADOPT | p2c_respects_weights unit test |
 | 5 | Outlier detection & circuit breaking | KEEP + ADOPT | ejection_cap_keeps_the_cluster_serving unit test |
 | 6 | TLS: post-quantum & cert lifecycle | ADOPT (feature-gated follow-up) | doc assertion in vane-tls |
-| 7 | Memory & zero-copy data path | (fill) | (fill) |
+| 7 | Memory & zero-copy data path | KEEP | doc assertion: parked SEND_ZC + ZC Rx triggers in uring.rs |
 | 8 | Control plane (xDS/ADS, hot reload) | (fill) | (fill) |
 | 9 | Observability (access logs, traces) | (fill) | (fill) |
 | 10 | Correctness proof methods for parsers | (fill) | (fill) |
@@ -267,6 +267,36 @@ own unit; NOT a drive-by.
 provider-install site recording the decision, the three routes, and
 the trigger (feature work + build-matrix validation). The follow-up
 feature gets its own tests when it lands.
+
+
+## Iteration 7 — Memory & zero-copy data path
+
+**Pulled:** io_uring zero-copy send (LWN 877167/879724 — 1.88-2.44x
+over msg_zerocopy, best with fixed buffers, kernel 6.4+); io_uring
+zero-copy RECEIVE (kernel docs, kernel 6.14+, ifq per NIC queue with
+flow steering); Seastar's asymmetric_io_uring backend (July 2026 —
+I/O offloaded to dedicated networking cores); Google's Snap / eRPC
+lineage for the shared-nothing thread-per-core model.
+
+**Analysis:** vane's relay path is already zero-copy where it pays:
+registered fixed buffers for every read/write, kernel-only splice(2)
+for L4 tunnels (bytes never enter user space), a data-buffer freelist
+(no per-read allocation). The remaining kernel features are SEND_ZC
+(send without the kernel copying out of our registered buffer) and
+ZC Rx (receive without the kernel copying in). SEND_ZC is a clean
+increment; ZC Rx requires per-NIC-queue flow steering that conflicts
+with vane's SO_REUSEPORT thread-per-core accept model.
+
+**Verdict: KEEP.** Registered fixed buffers + splice is the current
+state of the art for this workload shape. Two parked items recorded
+AT THE INTEGRATION POINT (uring.rs module doc): SEND_ZC behind a
+measured large-body CPU regression trigger; ZC Rx behind NIC-support
++ measured receive-memcpy trigger. Seastar's dedicated-I/O-core
+architecture is a different point in the design space (vane's
+thread-per-core handlers do minimal syscall work already).
+
+**Lean proof:** the parked triggers live as a doc assertion in
+`uring.rs` — the integration point where both features would land.
 
 Entries are appended per iteration; the table is filled at the end of
 each so the ledger always reflects verified state.
