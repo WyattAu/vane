@@ -1444,6 +1444,19 @@ impl HttpProxy {
                         // vector), and it can straddle two reads, which
                         // never completes the body at all.
                         scan.feed(data);
+                        if scan.is_malformed() {
+                            // Akamai CVE-2025-66373 class: the peer's
+                            // framing is broken, so any tail bytes are
+                            // attacker-controlled. Relay what arrived
+                            // and close — never parse the tail as the
+                            // next request on this connection.
+                            self.log(LogLevel::Warn, "malformed chunked request; closing");
+                            if upstream_ready {
+                                self.upstream_send(io, data);
+                            }
+                            io.close();
+                            return;
+                        }
                         if upstream_ready {
                             self.upstream_send(io, data);
                         } else {
@@ -2271,8 +2284,17 @@ impl Handler for HttpProxy {
                 if let ReqFraming::ContentLength(remaining) = &mut conn.req_framing {
                     *remaining = remaining.saturating_sub(body.len() as u64);
                 }
-                if let ReqFraming::Chunked { scan } = &mut conn.req_framing {
+                let malformed = if let ReqFraming::Chunked { scan } = &mut conn.req_framing {
                     scan.feed(body);
+                    scan.is_malformed()
+                } else {
+                    false
+                };
+                if malformed {
+                    // Akamai CVE-2025-66373 class: broken framing, close
+                    // instead of parsing the tail as the next request.
+                    self.log(LogLevel::Warn, "malformed chunked request; closing");
+                    io.close();
                 }
             }
             if !body.is_empty() {
@@ -2897,16 +2919,31 @@ impl HttpProxy {
         // for `0\r\n\r\n` in the buffer: that sequence is legal inside
         // chunk data (base64, compressed payloads) and can straddle two
         // reads, so a content scan both truncates and hangs.
-        let chunked_done = {
+        let (chunked_done, chunked_malformed) = {
             let Some(c) = self.conns.get_mut(&slot) else {
                 return;
             };
             if let BodyFraming::Chunked { scan } = &mut c.body {
-                scan.feed(data)
+                let done = scan.feed(data);
+                (done, scan.is_malformed())
             } else {
-                false
+                (false, false)
             }
         };
+        if chunked_malformed {
+            // The upstream sent framing it never closed correctly: the
+            // client and vane now disagree about where the response
+            // ends. Stop relaying, and close instead of reusing either
+            // connection.
+            self.log(LogLevel::Warn, "malformed chunked response; closing");
+            {
+                let conn = self.conn(slot);
+                conn.close_after = true;
+                conn.body = BodyFraming::Done;
+            }
+            io.close();
+            return;
+        }
         // Compute the relay decision (avoids overlapping borrows).
         let (take, framing_done) = {
             let conn = self.conn(slot);

@@ -3559,3 +3559,91 @@ pool_per_backend = 0
         "an open breaker answers at the edge with 503: {resp}"
     );
 }
+
+/// Smuggling defense (Akamai CVE-2025-66373 class): a client whose
+/// chunked request body violates the grammar (an invalid chunk size)
+/// gets the connection CLOSED — the tail bytes are never parsed as a
+/// new request, which is the desync primitive. The upstream receives
+/// exactly what the client sent (verbatim relay) and may reject it on
+/// its own terms; vane's job is to not reuse either connection.
+#[test]
+fn malformed_chunked_request_closes_the_connection() {
+    let _serial = lock_serial();
+    // Upstream that ECHOES each request line it received, so we can
+    // observe exactly what was relayed.
+    let upstream = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let upstream_addr = upstream.local_addr().expect("addr");
+    let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in upstream.incoming().flatten() {
+            let mut s = stream;
+            let sink = Arc::clone(&sink);
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                let Ok(n) = s.read(&mut buf) else { return };
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                sink.lock().expect("seen").push(req);
+                let _ = s.write_all(
+                    b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                );
+            });
+        }
+    });
+
+    let port = free_port();
+    let (_dir, cfg) = temp_config(format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.up]
+backends = ["{upstream_addr}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = false
+"#
+    ));
+    let _server_guard = spawn_proxy(cfg);
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    // POST with an invalid chunk size line ("zz" is not hex) followed
+    // by a smuggled request: vane must close instead of parsing the
+    // smuggled request.
+    let mut c = std::net::TcpStream::connect(proxy).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    c.write_all(
+        b"POST /data HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nzz\r\nGET /smuggled HTTP/1.1\r\nHost: t\r\n\r\n",
+    )
+    .expect("write");
+    let mut out = Vec::new();
+    let _ = c.read_to_end(&mut out);
+    // The connection is closed (EOF) rather than serving the smuggled
+    // request as a second transaction.
+    let _ = c.shutdown(std::net::Shutdown::Both);
+
+    // Exactly ONE request reached the upstream (the health checker's
+    // TCP probe connects without sending), carrying the verbatim
+    // malformed body — and never a second "/smuggled" transaction.
+    let reqs: Vec<String> = seen
+        .lock()
+        .expect("seen")
+        .iter()
+        .filter(|r| !r.is_empty())
+        .cloned()
+        .collect();
+    assert_eq!(reqs.len(), 1, "one upstream request: {reqs:?}");
+    assert!(
+        !reqs[0].contains("GET /smuggled"),
+        "the smuggled request must never be a separate transaction: {:?}",
+        reqs[0]
+    );
+}

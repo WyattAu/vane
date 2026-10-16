@@ -191,6 +191,18 @@ fn framing_is_ambiguous(view: &RequestView<'_>) -> bool {
         return true;
     }
     match te_value {
+        // HTTP/1.0 has no chunked transfer coding (RFC 9112 §7.1): a 1.0
+        // request claiming chunked is ambiguous by construction, and
+        // backends disagree on whether to honor it.
+        Some(v) if view.version == 0 => true,
+        // The desync-delusion vector (Kettle 2025): a TE value that
+        // OPENS with whitespace ("Transfer-Encoding:\tchunked").
+        // RFC 9110 §5.5 says OWS is not part of the value, but parsers
+        // disagree on whether that includes OWS after the colon, and
+        // for this one header the disagreement is the smuggling
+        // primitive. Comma-list separators are unaffected: "gzip,
+        // chunked" stays legitimate.
+        Some(v) if v.first().is_some_and(u8::is_ascii_whitespace) => true,
         Some(v) => !ends_with_chunked(v),
         None => false,
     }
@@ -375,6 +387,32 @@ mod tests {
             RequestView::parse_in(raw, &mut storage),
             Parsed::Error(ParseError::ConflictingFraming)
         );
+    }
+
+    /// Desync-delusion (Kettle 2025): leading OWS in the TE value is
+    /// the obfuscation frontends and backends disagree on. vane rejects
+    /// it rather than trimming into acceptance.
+    #[test]
+    fn te_value_with_leading_whitespace_is_ambiguous() {
+        let raw = b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\nTransfer-Encoding:\tchunked\r\n\r\n";
+        let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
+        match RequestView::parse_in(raw, &mut storage) {
+            Parsed::Error(ParseError::ConflictingFraming) => {}
+            other => panic!("expected ConflictingFraming, got {other:?}"),
+        }
+    }
+
+    /// HTTP/1.0 has no chunked coding (RFC 9112 §7.1); accepting it
+    /// would relay framing the upstream may interpret differently
+    /// (the Pingora CVE-2026-2835 class).
+    #[test]
+    fn http_1_0_with_transfer_encoding_is_ambiguous() {
+        let raw = b"POST /x HTTP/1.0\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
+        match RequestView::parse_in(raw, &mut storage) {
+            Parsed::Error(ParseError::ConflictingFraming) => {}
+            other => panic!("expected ConflictingFraming, got {other:?}"),
+        }
     }
 
     #[test]

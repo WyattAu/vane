@@ -49,6 +49,13 @@ pub struct ChunkedScanner {
     line: Vec<u8>,
     /// Bytes of the post-payload CRLF still expected (2, then 1).
     crlf_left: u8,
+    /// The stream violated the chunked grammar (an invalid size line,
+    /// an over-long line). The scan stops, but the caller MUST close
+    /// the connection instead of parsing the tail as a new message —
+    /// the peer's parser will disagree about where the body ended,
+    /// which is the request-smuggling primitive (Akamai
+    /// CVE-2025-66373 class).
+    malformed: bool,
 }
 
 impl Default for ChunkedScanner {
@@ -66,6 +73,7 @@ impl ChunkedScanner {
             remaining: 0,
             line: Vec::new(),
             crlf_left: 0,
+            malformed: false,
         }
     }
 
@@ -82,6 +90,7 @@ impl ChunkedScanner {
                 State::Size => {
                     let Some((line, consumed)) = take_line(&mut self.line, data) else {
                         if self.line.len() > LINE_CAP {
+                            self.malformed = true;
                             self.state = State::Done;
                             return true;
                         }
@@ -95,6 +104,7 @@ impl ChunkedScanner {
                     // dribbled one is unterminated (cap on the carry), and
                     // they must agree.
                     if line.len() > LINE_CAP {
+                        self.malformed = true;
                         self.state = State::Done;
                         return true;
                     }
@@ -105,8 +115,10 @@ impl ChunkedScanner {
                             self.state = State::Payload;
                         }
                         // A size line that is not hex is a protocol
-                        // error; stop rather than scan on.
+                        // error; stop rather than scan on — and tell
+                        // the caller to close the connection.
                         None => {
+                            self.malformed = true;
                             self.state = State::Done;
                             return true;
                         }
@@ -144,6 +156,7 @@ impl ChunkedScanner {
                 State::Trailers => {
                     let Some((line, consumed)) = take_line(&mut self.line, data) else {
                         if self.line.len() > LINE_CAP {
+                            self.malformed = true;
                             self.state = State::Done;
                             return true;
                         }
@@ -152,6 +165,7 @@ impl ChunkedScanner {
                     data = &data[consumed..];
                     // Same over-cap rule as the size line (see above).
                     if line.len() > LINE_CAP {
+                        self.malformed = true;
                         self.state = State::Done;
                         return true;
                     }
@@ -169,6 +183,15 @@ impl ChunkedScanner {
     #[must_use]
     pub fn is_done(&self) -> bool {
         self.state == State::Done
+    }
+
+    /// The stream violated the chunked grammar. When this is set the
+    /// scan has stopped: the connection MUST be closed rather than
+    /// reused, because the peer's parser disagrees about where the
+    /// body ended and any tail bytes are attacker-controlled.
+    #[must_use]
+    pub fn is_malformed(&self) -> bool {
+        self.malformed
     }
 }
 
