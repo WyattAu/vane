@@ -27,7 +27,7 @@ Verdict vocabulary:
 | 7 | Memory & zero-copy data path | KEEP | doc assertion: parked SEND_ZC + ZC Rx triggers in uring.rs |
 | 8 | Control plane (xDS/ADS, hot reload) | KEEP | doc assertion: SotW-vs-delta decision + trigger at the subscription site |
 | 9 | Observability (access logs, traces) | KEEP + FIX | access_log_correlates_inbound_traceparent e2e |
-| 10 | Correctness proof methods for parsers | (fill) | (fill) |
+| 10 | Correctness proof methods for parsers | KEEP + ADOPT | 2 paper-pinned chunk-size tests; ledger closed |
 
 
 ## Iteration 1 — HTTP/1.1 framing & smuggling defense
@@ -361,6 +361,39 @@ traceparent REWRITE (vane currently forwards the client's traceparent
 verbatim to the upstream — W3C wants a child span id per hop). Both
 are additive record/header work with no correctness impact on
 request framing.
+
+
+## Iteration 10 — Correctness proof methods for parsers
+
+**Pulled:** "The HTTP Garden: Discovering Parsing Vulnerabilities in
+HTTP/1.1 Implementations by Differential Fuzzing of Request Streams"
+(arXiv 2405.17737, Kallus/Anantharaman/Locasto/Smith — 100+ parser
+bugs, 68 fixed, 39 exploitable), T-Reqs and FRAMESHIFTER (related
+differential tools), libFuzzer's structural guidance (corpus as
+regression suite).
+
+**Analysis:** the state of the art is differential testing over
+INTERPRETATIONS (how a server parses a stream), not just outputs —
+and the highest-yield bug class is integer-parser quirks: Python's
+int() ignoring digit-separating underscores, strtol ignoring a 0x
+prefix under an explicit radix. vane's own chunked-scanner
+segmentation bug (fixed in the v0.11.0 train) was exactly a
+differential-invariant bug — the fuzz target's whole-vs-dripped
+assertion is the technique the paper systematizes, applied
+self-differentially instead of across implementations.
+
+**Verdict: KEEP + ADOPT.** The differential-fuzz + property-test
+method stays and is the standing proof method (13 targets, a nightly
+deep run that now completes, and this week's catch as evidence).
+ADOPTED the paper's integer-parser findings as pinned regression
+tests: underscore-separated and 0x-prefixed chunk sizes are rejected
+as malformed (both were silently accepted by the servers the paper
+exploited); whitespace-padded sizes pinned as deliberately tolerated.
+
+**Open:** a coverage-guided differential target pairing vane's h1
+parser with a second implementation (the HTTP Garden transducer
+model) — real value, real scope; parked, with the regression seeds
+already in place.
 
 Entries are appended per iteration; the table is filled at the end of
 each so the ledger always reflects verified state.
