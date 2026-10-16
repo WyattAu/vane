@@ -4,6 +4,62 @@ All notable changes to vane are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 semver.
 
+## [0.11.0] — 2026-10-16
+
+Crate versions: `vane-proxy` 0.11.0, `vane-control` 0.10.0,
+`vane-router` 0.7.0, `vane-proto` 0.7.0. The research-loop release
+(iterations 1-5 of docs/research-loop-2026-10.md).
+
+### Security
+
+- **Chunked-body segmentation could change where a body ends**
+  (`vane-proto`). The nightly deep fuzz found an input where the
+  scanner declared the body complete byte-by-byte but incomplete fed
+  whole — a segmentation-dependent verdict, i.e. a request-smuggling
+  primitive. `take_line` now searches the virtual join of carry+data
+  with exact consumed-accounting, and the LINE_CAP rule is a property
+  of the line rather than of the segmentation. The 10149-byte crash
+  input ships as a regression corpus seed; the whole-vs-dripped
+  assertion is the standing tripwire.
+- **Malformed chunked bodies no longer parse their tails as new
+  messages** (`vane-proxy`, `vane-proto`). An invalid chunk size line
+  or an over-long line now marks the scan malformed and the
+  connection CLOSES — request side, inline-body side, and the
+  response relay side (which also stops reusing either connection).
+  This is the Akamai CVE-2025-66373 class.
+- **HTTP/2 CONTINUATION-flood triple bounds** (`vane-kernel`):
+  fragments past the advertised SETTINGS_MAX_HEADER_LIST_SIZE are a
+  PROTOCOL_ERROR connection error (not a buffered informative
+  response — the Apache CVE-2024-27316 lesson); a CONTINUATION larger
+  than max_frame_size is FRAME_SIZE_ERROR; more than 64
+  CONTINUATIONs per block is PROTOCOL_ERROR (the zero-length-frame
+  bypass, Netty CVE-2026-33871).
+- **TE framing obfuscation rejected** (`vane-proto`): a
+  Transfer-Encoding value OPENING with whitespace (Kettle desync-
+  delusion) or any TE on an HTTP/1.0 request (Pingora CVE-2026-2835
+  class) is ConflictingFraming → 400.
+
+### Changed
+
+- **P2C is weight-aware** (`vane-router`): effective load =
+  in-flight/weight, cross-multiplied; previously `policy = "p2c"`
+  silently ignored backend weights.
+- **Outlier ejection is capped** (`vane-router`,
+  `outlier.max_ejection_percent`, default 50%, at least one host): a
+  shared-cause transient can no longer eject an entire cluster.
+- **ACME renewal is expiry-gated** (`vane-control`): the loop reads
+  the stored leaf's validity hourly and re-issues only past
+  `renew_at_fraction` (previously it re-issued daily with no check,
+  colliding with Let's Encrypt's 5-duplicates-per-week limit).
+- **The h3 edge rejects 0-RTT by design** (documented at the accept
+  path): no replay protection in 0-RTT (RFC 9308 §3.1), and RFC 8740
+  only blesses idempotent methods.
+- **rustls 0.23.46 / wasmtime 48.0.6** advisory bumps.
+- **The nightly deep fuzz now completes**: event-scoped concurrency
+  groups (a push no longer cancels the 2.5 h schedule run), a 200
+  minute ceiling, and workflow_dispatch — and its first completed run
+  found the chunked bug above.
+
 ## [0.10.1] — 2026-10-14
 
 Crate versions: `vane-proxy` 0.10.1, `vane-control` 0.9.1.

@@ -14,6 +14,15 @@
 > and two missing-END_STREAM paths). Container images publish
 > automatically on `vX.Y.Z` tags (release.yml). Order below unchanged.
 >
+> **v0.11.0 published 2026-10-16** (vane-proto 0.7.0 →
+> vane-router 0.7.0 → vane-control 0.10.0 → vane-proxy 0.11.0),
+> install-verified: `cargo install vane-proxy --version 0.11.0
+> --locked` → `vane 0.11.0`. The research-loop release: chunked
+> segmentation fix (fuzz-found), malformed-chunked close, CONTINUATION
+> flood triple bounds, TE framing obfuscation rejection, weight-aware
+> P2C, outlier ejection cap, ACME expiry-gated renewal, 0-RTT
+> rejection documented.
+>
 > **v0.10.1 published 2026-10-14** (vane-control 0.9.1 →
 > vane-proxy 0.10.1), install-verified: `cargo install vane-proxy
 > --version 0.10.1 --locked` → `vane 0.10.1`. The ACME renewal fix:
