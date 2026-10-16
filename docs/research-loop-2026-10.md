@@ -268,6 +268,16 @@ provider-install site recording the decision, the three routes, and
 the trigger (feature work + build-matrix validation). The follow-up
 feature gets its own tests when it lands.
 
+**FOLLOW-UP LANDED (2026-10-16):** the `post-quantum` cargo feature is
+implemented (`vane-tls/post-quantum`, forwarded by `vane-proxy`):
+aws-lc-rs provider + `prefer-post-quantum`, X25519MLKEM768 as the
+highest-priority kx group, installed process-wide at server start.
+Lean proof: `pq_provider_offers_x25519_mlkem768` (the kx leads iff the
+feature is on), and the h3 suites pass over a PQ-negotiated QUIC
+handshake with the feature enabled. Default build unchanged (ring);
+route 1 chosen over mlkem-tls (vendor family, deployment track
+record).
+
 
 ## Iteration 7 — Memory & zero-copy data path
 

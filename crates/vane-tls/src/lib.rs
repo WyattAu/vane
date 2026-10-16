@@ -41,14 +41,16 @@ pub enum TlsError {
 /// rustls without a default provider — client stacks (reqwest) would
 /// otherwise panic with "No provider set".
 pub fn install_crypto_provider() {
-    // PROVIDER NOTE (2026-10 research loop, iteration 6): vane ships
-    // the ring provider. X25519MLKEM768 (the PQ hybrid Chrome and
-    // Cloudflare negotiate by default) requires the aws-lc-rs
-    // provider (`prefer-post-quantum` feature) — an ADOPT verdict
-    // recorded in docs/research-loop-2026-10.md, implemented behind a
-    // `post-quantum` cargo feature in a dedicated change: switching
-    // providers moves the build matrix (cmake/NASM for aws-lc-rs) and
-    // must be validated across CI/docker/musl, not done in passing.
+    // PROVIDER (research loop iteration 6, docs/research-loop-
+    // 2026-10.md): the ring provider is the default build. The
+    // `post-quantum` feature switches to aws-lc-rs with
+    // X25519MLKEM768 as the highest-priority kx group — the PQ hybrid
+    // Chrome and Cloudflare negotiate by default (harvest-now-
+    // decrypt-later defense). aws-lc-rs needs cmake to build; the
+    // switch is opt-in so the default build matrix is untouched.
+    #[cfg(feature = "post-quantum")]
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    #[cfg(not(feature = "post-quantum"))]
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
@@ -542,6 +544,9 @@ pub mod mesh {
         /// through the DER walk.
         #[test]
         fn spiffe_id_roundtrips_through_der() {
+            // With the post-quantum feature, rustls carries two provider
+            // features and refuses to auto-pick: install ours first.
+            crate::install_crypto_provider();
             let ca_key = rcgen::KeyPair::generate().expect("ca key");
             let mut ca_params =
                 rcgen::CertificateParams::new(vec!["mesh-ca".into()]).expect("ca params");
@@ -596,5 +601,36 @@ pub mod mesh {
             );
             assert!(verify_spiffe(&[der], "spiffe://other.org/").is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod pq_tests {
+    /// The lean proof for iteration 6: with the `post-quantum` feature,
+    /// the installed provider offers X25519MLKEM768 (the hybrid PQ kx
+    /// Chrome and Cloudflare negotiate); without it, the ring provider
+    /// does not. Feature-gated to match.
+    #[test]
+    #[cfg(feature = "post-quantum")]
+    fn pq_provider_offers_x25519_mlkem768() {
+        crate::install_crypto_provider();
+        let provider = rustls::crypto::CryptoProvider::get_default()
+            .expect("process default provider installed")
+            .clone();
+        let names: Vec<String> = provider
+            .kx_groups
+            .iter()
+            .map(|g| format!("{:?}", g.name()))
+            .collect();
+        assert!(
+            names.iter().any(|n| n.contains("X25519MLKEM768")),
+            "PQ hybrid kx missing from the provider: {names:?}"
+        );
+        // It must be the HIGHEST priority (first in the list) — the
+        // `prefer-post-quantum` feature's contract.
+        assert!(
+            names[0].contains("X25519MLKEM768"),
+            "PQ kx must lead: {names:?}"
+        );
     }
 }

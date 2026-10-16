@@ -22,6 +22,7 @@ path = "src/main.rs"
 [features]
 default = ["vane-kernel/io-uring", "h2", "h3"]
 vane_dbg = ["vane-kernel/vane_dbg"]
+post-quantum = ["vane-tls/post-quantum"]
 file-provider = ["vane-control/file-provider"]
 docker-provider = ["vane-control/docker-provider"]
 h2 = ["dep:h2", "dep:tokio-rustls"]

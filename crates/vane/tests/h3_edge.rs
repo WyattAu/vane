@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use vane_router::Router;
+use vane_tls::install_crypto_provider;
 
 fn test_router(upstream: std::net::SocketAddr) -> Arc<Router> {
     let router = Arc::new(Router::new());
@@ -64,6 +65,7 @@ fn spawn_upstream() -> std::net::SocketAddr {
 
 #[tokio::test]
 async fn h3_edge_roundtrip() {
+    vane_tls::install_crypto_provider();
     let _ = tracing_subscriber::fmt::try_init();
     let upstream = spawn_upstream();
     let router = test_router(upstream);
@@ -78,6 +80,7 @@ async fn h3_edge_roundtrip() {
     let cert_der = certs.cert.der().clone();
     let key = <rustls::pki_types::PrivateKeyDer<'static> as rustls::pki_types::pem::PemObject>::from_pem_slice(certs.signing_key.serialize_pem().as_bytes())
         .expect("key pem");
+    install_crypto_provider();
     let mut server_tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der.clone()], key)
@@ -145,6 +148,7 @@ async fn h3_edge_roundtrip() {
 /// the same port number.
 #[tokio::test]
 async fn h3_alt_svc_advertised_and_served() {
+    vane_tls::install_crypto_provider();
     let _ = tracing_subscriber::fmt::try_init();
     let upstream = spawn_upstream();
     let proxy_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -291,6 +295,7 @@ force_mio = true
 /// request's method/path and the response status.
 #[tokio::test]
 async fn h3_edge_emits_access_records() {
+    vane_tls::install_crypto_provider();
     let upstream = spawn_upstream();
     let router = test_router(upstream);
     let access = Arc::new(vane_observe::access::AccessLog::new());
@@ -304,6 +309,7 @@ async fn h3_edge_emits_access_records() {
     let cert_der = certs.cert.der().clone();
     let key = <rustls::pki_types::PrivateKeyDer<'static> as rustls::pki_types::pem::PemObject>::from_pem_slice(certs.signing_key.serialize_pem().as_bytes())
         .expect("key pem");
+    install_crypto_provider();
     let mut server_tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der.clone()], key)
@@ -439,6 +445,7 @@ async fn spawn_h2_upstream() -> std::net::SocketAddr {
 /// echo header proves the request crossed the h2 hop intact.
 #[tokio::test]
 async fn h3_edge_relays_to_h2_upstream() {
+    vane_tls::install_crypto_provider();
     let upstream = spawn_h2_upstream().await;
     let router = test_router_h2(upstream);
     let edge = Arc::new(vane::h3_edge::H3Edge::new(
@@ -451,6 +458,7 @@ async fn h3_edge_relays_to_h2_upstream() {
     let cert_der = certs.cert.der().clone();
     let key = <rustls::pki_types::PrivateKeyDer<'static> as rustls::pki_types::pem::PemObject>::from_pem_slice(certs.signing_key.serialize_pem().as_bytes())
         .expect("key pem");
+    install_crypto_provider();
     let mut server_tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der.clone()], key)

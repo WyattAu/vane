@@ -8,6 +8,13 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+# Post-quantum hybrid key exchange: X25519MLKEM768 becomes the
+# highest-priority kx group (aws-lc-rs provider). See install_crypto_
+# provider — the ring provider stays the default build.
+post-quantum = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
+
 [dependencies]
 rustls = { workspace = true }
 

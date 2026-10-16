@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use vane_router::Router;
+use vane_tls::install_crypto_provider;
 
 fn test_router(upstream: std::net::SocketAddr) -> Arc<Router> {
     let router = Arc::new(Router::new());
@@ -81,6 +82,7 @@ fn h3_client_roundtrip() {
     let cert_der = certs.cert.der().clone();
     let key = <rustls::pki_types::PrivateKeyDer<'static> as rustls::pki_types::pem::PemObject>::from_pem_slice(certs.signing_key.serialize_pem().as_bytes())
         .expect("key pem");
+    install_crypto_provider();
     let mut server_tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key)

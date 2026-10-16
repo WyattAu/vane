@@ -321,6 +321,11 @@ pub async fn run(opts: RunOptions) -> i32 {
     }
 
     let registry = Arc::new(Registry::new());
+    // Process-default rustls provider (ring, or aws-lc-rs + X25519MLKEM768
+    // with the post-quantum feature). MUST run before any ServerConfig
+    // is built: with both provider features compiled in, rustls refuses
+    // to auto-pick.
+    vane_tls::install_crypto_provider();
     let router = Arc::new(Router::new());
     let health = Arc::new(vane_control::HealthMap::new());
 

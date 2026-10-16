@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use vane_router::Router;
+use vane_tls::install_crypto_provider;
 
 fn init_log() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -75,6 +76,10 @@ fn spawn_upstream() -> std::net::SocketAddr {
 /// plain OS thread. Returns the QUIC address and the server cert
 /// (DER) for trust material.
 fn spawn_h3_edge_backend(router: Arc<Router>) -> (SocketAddr, String) {
+    // With the post-quantum feature, rustls carries both provider
+    // features and refuses to auto-pick a process default: install ours
+    // before any ServerConfig::builder() call in the tests.
+    vane_tls::install_crypto_provider();
     let edge = Arc::new(vane::h3_edge::H3Edge::new(
         router,
         Arc::new(vane_observe::metrics::Registry::new()),
@@ -85,6 +90,7 @@ fn spawn_h3_edge_backend(router: Arc<Router>) -> (SocketAddr, String) {
     let cert_der = certs.cert.der().clone();
     let key = <rustls::pki_types::PrivateKeyDer<'static> as rustls::pki_types::pem::PemObject>::from_pem_slice(certs.signing_key.serialize_pem().as_bytes())
         .expect("key pem");
+    install_crypto_provider();
     let mut server_tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key)
@@ -240,6 +246,7 @@ fn h3_bridge_mtls_client_cert() {
     let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(cas_roots))
         .build()
         .expect("verifier");
+    install_crypto_provider();
     let mut server_tls = rustls::ServerConfig::builder()
         .with_client_cert_verifier(verifier)
         .with_single_cert(srv_certs, server_key)
@@ -390,6 +397,7 @@ fn h3_bridge_reuses_one_quic_connection() {
     let certs = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
     let server_key = <rustls::pki_types::PrivateKeyDer<'static> as rustls::pki_types::pem::PemObject>::from_pem_slice(certs.signing_key.serialize_pem().as_bytes())
         .expect("pem");
+    install_crypto_provider();
     let mut server_tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![certs.cert.der().clone()], server_key)
@@ -543,6 +551,7 @@ fn h3_bridge_rotates_upstream_material() {
     let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(cas_roots))
         .build()
         .expect("verifier");
+    install_crypto_provider();
     let mut server_tls = rustls::ServerConfig::builder()
         .with_client_cert_verifier(verifier)
         .with_single_cert(srv_certs, server_key)
