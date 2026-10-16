@@ -41,6 +41,14 @@ pub enum TlsError {
 /// rustls without a default provider — client stacks (reqwest) would
 /// otherwise panic with "No provider set".
 pub fn install_crypto_provider() {
+    // PROVIDER NOTE (2026-10 research loop, iteration 6): vane ships
+    // the ring provider. X25519MLKEM768 (the PQ hybrid Chrome and
+    // Cloudflare negotiate by default) requires the aws-lc-rs
+    // provider (`prefer-post-quantum` feature) — an ADOPT verdict
+    // recorded in docs/research-loop-2026-10.md, implemented behind a
+    // `post-quantum` cargo feature in a dedicated change: switching
+    // providers moves the build matrix (cmake/NASM for aws-lc-rs) and
+    // must be validated across CI/docker/musl, not done in passing.
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 

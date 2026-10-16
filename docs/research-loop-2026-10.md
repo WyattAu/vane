@@ -23,7 +23,7 @@ Verdict vocabulary:
 | 3 | QUIC / HTTP/3 transport | KEEP | doc assertion: 0-RTT rejected by design |
 | 4 | Load balancing (P2C) | KEEP + ADOPT | p2c_respects_weights unit test |
 | 5 | Outlier detection & circuit breaking | KEEP + ADOPT | ejection_cap_keeps_the_cluster_serving unit test |
-| 6 | TLS: post-quantum & cert lifecycle | (fill) | (fill) |
+| 6 | TLS: post-quantum & cert lifecycle | ADOPT (feature-gated follow-up) | doc assertion in vane-tls |
 | 7 | Memory & zero-copy data path | (fill) | (fill) |
 | 8 | Control plane (xDS/ADS, hot reload) | (fill) | (fill) |
 | 9 | Observability (access logs, traces) | (fill) | (fill) |
@@ -228,6 +228,45 @@ fix in vane-proto 0.7.0). Versions bumped for the train:
 Config`'s non_exhaustive pattern (Default + field assignment) is now
 the family-wide rule; `VaneConfig` stays exempt (parsed, never
 constructed, downstream).
+
+
+## Iteration 6 — TLS: post-quantum key exchange & cert lifecycle
+
+**Pulled:** rustls defaults manual (X25519MLKEM768 via aws-lc-rs;
+`prefer-post-quantum` feature makes it top-priority), rustls-post-
+quantum 0.2.x (aws-lc-rs based; ML-KEM moved INTO rustls 0.23.22+),
+draft-ietf-tls-mlkem-05 (ML-KEM-512/768/1024 NamedGroups, Nov 2025),
+the X25519MLKEM768 I-D, and the deployment picture (Chrome +
+Cloudflare default since 2024).
+
+**Analysis:** harvest-now-decrypt-later makes PQ hybrid KEX relevant
+to a proxy NOW — the frontend TLS leg carries exactly the traffic an
+adversary would capture. Chrome/Cloudflare negotiate X25519MLKEM768 by
+default; a rustls server on the ring provider (vane today) simply
+never offers it. ACME lifecycle is already current: expiry-gated
+hourly renewal (iteration 0 of this train), short-lived certificates
+viable; OCSP stapling deliberately NOT built (LE retired OCSP Aug
+2025 — researched and ruled out).
+
+**Prior art:** Caddy (on-demand TLS, but no PQ), nginx (no PQ),
+Envoy (PQ via BoringSSL X25519MLKEM768, default since 2024) — Envoy
+is ahead here; rustls-based proxies need the provider switch.
+
+**Verdict: ADOPT, feature-gated.** Three implementation routes exist:
+(1) aws-lc-rs provider + `prefer-post-quantum` (official, but adds
+cmake/NASM build requirements to every downstream build);
+(2) `rustls-post-quantum` crate (aws-lc-rs based, official);
+(3) `mlkem-tls` (ring-compatible kx group, third-party).
+Route 1 is the defensible one (same vendor family as rustls, widely
+deployed), implemented as a `post-quantum` cargo feature so the
+default ring build is untouched — the switch changes the build matrix
+(CI, docker, musl) and deserves its own gate cycle. Scheduled as its
+own unit; NOT a drive-by.
+
+**Lean proof (this iteration):** doc assertion in `vane-tls` at the
+provider-install site recording the decision, the three routes, and
+the trigger (feature work + build-matrix validation). The follow-up
+feature gets its own tests when it lands.
 
 Entries are appended per iteration; the table is filled at the end of
 each so the ledger always reflects verified state.
