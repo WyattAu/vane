@@ -21,7 +21,7 @@ Verdict vocabulary:
 | 1 | HTTP/1.1 framing & smuggling defense | KEEP + ADOPT | parser: 3 tests; e2e smuggling test |
 | 2 | HTTP/2 conformance & flood defense | ADOPT | 3 kernel tests pinning the flood bounds |
 | 3 | QUIC / HTTP/3 transport | KEEP | doc assertion: 0-RTT rejected by design |
-| 4 | Load balancing (P2C) | (fill) | (fill) |
+| 4 | Load balancing (P2C) | KEEP + ADOPT | p2c_respects_weights unit test |
 | 5 | Outlier detection & circuit breaking | (fill) | (fill) |
 | 6 | TLS: post-quantum & cert lifecycle | (fill) | (fill) |
 | 7 | Memory & zero-copy data path | (fill) | (fill) |
@@ -148,6 +148,40 @@ is already implemented on h3 listeners.
 0-RTT rejection, with the RFC 8740 rationale) and the quickstart note;
 re-opening 0-RTT is an explicit, reviewed change (it would require the
 HTTP-REPLAY analysis for every upstream semantic vane relays).
+
+
+## Iteration 4 — Load balancing (P2C)
+
+**Pulled:** Mitzenmacher, "The Power of Two Choices in Randomized Load
+Balancing" (IEEE TPDS 2001; thesis 1996) — d=2 gives an exponential
+max-load improvement over d=1, d=3 only a constant factor more; Envoy
+least-request (P2C over active requests, "the host with the highest
+active-request count never receives new requests and drains"); Envoy's
+Peak EWMA balancer (2025 — latency-aware P2C, the Finagle PeakEWMA
+lineage); Envoy weighted least-request (bias=1: weight/(active+1)).
+
+**Analysis:** the load SIGNAL is the whole game — the classic model
+uses queue length; Envoy uses active requests; the cutting edge adds
+per-host latency EWMA. vane's P2C compares `ConnGauges`, which ARE
+in-flight request counts — the Envoy least-request signal, correct.
+The genuine gap: **backend weights were ignored by P2C** (only
+LeastConn divided by weight) — a `policy = "p2c"` cluster with
+weighted backends silently served everything with equal probability.
+
+**Verdict: KEEP + ADOPT.** P2C stays (theory-backed, O(1)). ADOPTED
+weight-awareness via Envoy's bias=1 formulation: effective load =
+in-flight / weight, compared by cross-multiplication (no float,
+weight-0 clamps to 1, exact ties break toward the first pick —
+matching pre-change behavior for equal-weight clusters).
+
+**Open (parked):** latency-aware P2C (Peak EWMA) would need per-host
+RTT sampling wired through the relay hot path — a real feature with a
+measurable cost; trigger: measured tail-latency imbalance across
+homogeneous backends.
+
+**Lean proof:** `p2c_respects_weights` unit test on the pure
+comparison (equal gauges favor higher weight; cross-multiplied
+tradeoffs; zero-weight clamp; tie-break).
 
 Entries are appended per iteration; the table is filled at the end of
 each so the ledger always reflects verified state.

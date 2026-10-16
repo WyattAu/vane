@@ -99,6 +99,22 @@ impl ConnGauges {
     }
 }
 
+/// P2C's comparison, weight-aware: the effective load of a backend is
+/// its in-flight count divided by its weight, compared via
+/// cross-multiplication (no float). Weight 0 is clamped to 1 — a
+/// zero-weight backend still serves if the pool demands it. Equal
+/// effective loads break toward `a`, matching the pre-weight behavior
+/// for equal-weight clusters.
+///
+/// This is Envoy's weighted least-request formulation (bias = 1):
+/// without it, `policy = "p2c"` silently ignored backend weights.
+#[must_use]
+fn p2c_prefer(ga: u64, wa: u32, gb: u64, wb: u32) -> bool {
+    let wa = u64::from(wa.max(1));
+    let wb = u64::from(wb.max(1));
+    ga * wb <= gb * wa
+}
+
 /// Per-worker balancer over a fixed backend list.
 pub struct Balancer {
     backends: Vec<Backend>,
@@ -172,9 +188,13 @@ impl Balancer {
                 if a == b {
                     return Some(a);
                 }
-                let la = self.gauges.get(a);
-                let lb = self.gauges.get(b);
-                if la <= lb { Some(a) } else { Some(b) }
+                let (ga, gb) = (self.gauges.get(a), self.gauges.get(b));
+                let (wa, wb) = (self.backends[a].weight, self.backends[b].weight);
+                if p2c_prefer(ga, wa, gb, wb) {
+                    Some(a)
+                } else {
+                    Some(b)
+                }
             }
             Policy::LeastConn => healthy.into_iter().min_by_key(|&i| {
                 self.gauges
@@ -224,6 +244,30 @@ impl Balancer {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// Weight-aware P2C: equal gauges favor the HIGHER weight backend
+    /// (its effective load is lower), and a lower gauge beats a higher
+    /// weight only by enough.
+    #[test]
+    fn p2c_respects_weights() {
+        // Equal gauges, 3:1 weights: the weight-3 backend wins.
+        assert!(p2c_prefer(10, 3, 10, 1));
+        assert!(!p2c_prefer(10, 1, 10, 3));
+        // Cross-multiplication: gauge 9 at weight 3 (effective 3) loses
+        // to gauge 5 at weight 1 (effective 5)? No — 3 <= 5, so the
+        // weighted backend still wins.
+        assert!(p2c_prefer(9, 3, 5, 1));
+        // But gauge 18 at weight 3 (effective 6) loses to 5 at 1.
+        assert!(!p2c_prefer(18, 3, 5, 1));
+        // Zero weights clamp to 1 (never divide by zero); the clamped
+        // pair is an exact tie, which breaks toward a.
+        assert!(p2c_prefer(1, 0, 1, 1));
+        assert!(p2c_prefer(1, 1, 1, 0));
+        // Exact ties break toward a.
+        assert!(p2c_prefer(5, 1, 5, 1));
+    }
+
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
