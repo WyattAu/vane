@@ -424,6 +424,28 @@ mod tests {
         assert!(scan(&[b"1\r\nx\r", b"\n0\r\n\r\n"]));
     }
 
+    /// The HTTP Garden paper (arXiv 2405.17737) found real servers
+    /// accepting chunk sizes their integer parsers mangled: Python's
+    /// int() ignored digit-separating underscores ("1_0" -> 10) and
+    /// strtol-family parsers ignored a "0x" prefix with an explicit
+    /// radix 16. Both shapes MUST be rejected outright - the desync is
+    /// the smuggling primitive.
+    #[test]
+    fn integer_parser_quirks_from_the_http_garden_are_rejected() {
+        let mut s = ChunkedScanner::new();
+        // Underscore-separated size: rejected, scan stops.
+        assert!(s.feed(b"1_0\r\n\r\n"));
+        assert!(s.is_malformed());
+        // Hex-prefix size with an implied decimal radix: rejected.
+        let mut s = ChunkedScanner::new();
+        assert!(s.feed(b"0x10\r\n\r\n"));
+        assert!(s.is_malformed());
+        // Whitespace-padded size is tolerated ONLY as ASCII-whitespace
+        // trim (" 10\r\n" is a valid 16) - pinned as deliberate.
+        let mut s = ChunkedScanner::new();
+        assert!(!s.feed(b" 10\r\n"), " 10 is a legal hex size 16");
+    }
+
     #[test]
     fn malformed_size_ends_the_scan() {
         let mut s = ChunkedScanner::new();
