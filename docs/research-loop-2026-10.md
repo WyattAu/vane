@@ -20,7 +20,7 @@ Verdict vocabulary:
 |---|---|---|---|
 | 1 | HTTP/1.1 framing & smuggling defense | KEEP + ADOPT | parser: 3 tests; e2e smuggling test |
 | 2 | HTTP/2 conformance & flood defense | ADOPT | 3 kernel tests pinning the flood bounds |
-| 3 | QUIC / HTTP/3 transport | (fill) | (fill) |
+| 3 | QUIC / HTTP/3 transport | KEEP | doc assertion: 0-RTT rejected by design |
 | 4 | Load balancing (P2C) | (fill) | (fill) |
 | 5 | Outlier detection & circuit breaking | (fill) | (fill) |
 | 6 | TLS: post-quantum & cert lifecycle | (fill) | (fill) |
@@ -112,6 +112,42 @@ maximum is ~8: 128 KiB list / 16 KiB frames).
 FRAME_SIZE_ERROR; fragment growth past the advertised size →
 PROTOCOL_ERROR), alongside the existing `continuation_assembles_block`
 test proving legitimate multi-frame blocks still work.
+
+
+## Iteration 3 — QUIC / HTTP/3 transport
+
+**Pulled:** RFC 9000 §8/§9 (address validation, migration, anti-
+amplification), RFC 9308 §3 (0-RTT applicability + replay), RFC 8740
+(HTTP 0-RTT replay profile), draft-seemann-quic-nat-traversal (NAT
+traversal via CONNECT-UDP + path validation), "How Resilient is QUIC
+to Security and Privacy Attacks?" (arXiv 2401.06657, 2025).
+
+**Analysis:** the QUIC server-side risk set is 0-RTT replay
+(non-idempotent requests can be silently duplicated), spoofed
+connection migration (CMRF), and amplification via replayed
+validation tokens. ALL THREE live in the transport layer — quinn —
+not in vane's application code. A proxy relaying POST bodies must
+treat 0-RTT with suspicion: RFC 8740 only blesses idempotent methods.
+
+**Prior art:** ngtcp2/quiche/haproxy-quic all expose 0-RTT acceptance
+as an explicit server-side choice, defaulting to reject. quinn's
+`Connecting::into_0rtt()` is the same gate; quinn-proto 0.11.19's
+`ValidationTokenConfig` (14-day tokens, bloom-filter log) implements
+the anti-amplification token validation.
+
+**Verdict: KEEP.** vane's h3 accept path never calls `into_0rtt()` —
+by construction quinn rejects 0-RTT early data, which eliminates the
+replay class entirely (the correct posture for a proxy relaying
+non-idempotent requests). Address validation, retry tokens, path
+validation on NAT rebinding, and version negotiation are all
+transport-layer (quinn 0.11 + RFC 9368), inherited and audited by the
+quinn-proto bump in v0.10.1. alt-svc advertisement (RFC 7838/9308 §5)
+is already implemented on h3 listeners.
+
+**Lean proof:** doc assertion in `h3_edge::spawn` (the deliberate
+0-RTT rejection, with the RFC 8740 rationale) and the quickstart note;
+re-opening 0-RTT is an explicit, reviewed change (it would require the
+HTTP-REPLAY analysis for every upstream semantic vane relays).
 
 Entries are appended per iteration; the table is filled at the end of
 each so the ledger always reflects verified state.
