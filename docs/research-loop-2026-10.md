@@ -22,7 +22,7 @@ Verdict vocabulary:
 | 2 | HTTP/2 conformance & flood defense | ADOPT | 3 kernel tests pinning the flood bounds |
 | 3 | QUIC / HTTP/3 transport | KEEP | doc assertion: 0-RTT rejected by design |
 | 4 | Load balancing (P2C) | KEEP + ADOPT | p2c_respects_weights unit test |
-| 5 | Outlier detection & circuit breaking | (fill) | (fill) |
+| 5 | Outlier detection & circuit breaking | KEEP + ADOPT | ejection_cap_keeps_the_cluster_serving unit test |
 | 6 | TLS: post-quantum & cert lifecycle | (fill) | (fill) |
 | 7 | Memory & zero-copy data path | (fill) | (fill) |
 | 8 | Control plane (xDS/ADS, hot reload) | (fill) | (fill) |
@@ -182,6 +182,39 @@ homogeneous backends.
 **Lean proof:** `p2c_respects_weights` unit test on the pure
 comparison (equal gauges favor higher weight; cross-multiplied
 tradeoffs; zero-weight clamp; tie-break).
+
+
+## Iteration 5 — Outlier detection & circuit breaking
+
+**Pulled:** Envoy outlier detection spec (v1.7 → v1.40 evolution):
+consecutive-5xx (inline), success-rate (periodic sweep, mean −
+stdev×factor, min-hosts + min-volume gates), consecutive-gateway,
+failure-percentage; max_ejection_percent (10%, at-least-one);
+split_external_local_origin_errors; base_ejection_time × ejection-count
+backoff. Plus the breaker work already done in iteration 0 of this
+train (breaker 2.0, process-wide gate, anti-flap policy).
+
+**Analysis:** vane's outlier set had consecutive-failure ejection with
+a fixed duration — but NO ejection cap. A shared-cause transient (a
+network blip during a config push) could eject EVERY backend of a
+cluster into a guaranteed total outage, exactly when the capacity is
+most needed. Envoy's rule — cap ejections at a percent of the cluster,
+always allowing at least one — is the cluster-survival guard.
+
+**Prior art:** Envoy (consecutive + success-rate + percentage, capped,
+at-least-one), Finagle/resilience4j breakers (windowed, half-open).
+
+**Verdict: KEEP + ADOPT.** Consecutive-failure ejection stays (Envoy's
+default-on type). ADOPTED `max_ejection_percent` (default 50% for
+vane's typically small clusters where Envoy's 10% would usually mean
+"eject nobody"; always at least one host): the cap-gated ejection
+keeps the last healthy backend in rotation. Success-rate sweeps and
+ejection-time backoff stay parked (trigger: measured flapping between
+two detection types).
+
+**Lean proof:** `ejection_cap_keeps_the_cluster_serving` — with a 50%
+cap on a 2-backend cluster, the second backend past its threshold is
+NOT ejected; a 100% cap still allows a full ejection.
 
 Entries are appended per iteration; the table is filled at the end of
 each so the ledger always reflects verified state.

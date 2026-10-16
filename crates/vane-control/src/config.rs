@@ -572,6 +572,16 @@ pub struct OutlierConfig {
     /// Ejection duration in milliseconds.
     #[serde(default = "default_outlier_ejection_ms")]
     pub ejection_ms: u64,
+    /// Maximum share of the cluster's backends that may be ejected at
+    /// once (percent, 1-100; always allows at least one). A shared-cause
+    /// transient (a network blip) must not eject the whole cluster —
+    /// Envoy caps at 10% with the same at-least-one rule.
+    #[serde(default = "default_outlier_max_ejection_percent")]
+    pub max_ejection_percent: u32,
+}
+
+fn default_outlier_max_ejection_percent() -> u32 {
+    50
 }
 
 fn default_outlier_threshold() -> u32 {

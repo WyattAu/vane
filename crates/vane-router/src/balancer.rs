@@ -268,7 +268,6 @@ mod tests {
         assert!(p2c_prefer(5, 1, 5, 1));
     }
 
-    use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
     fn be(port: u16) -> Backend {

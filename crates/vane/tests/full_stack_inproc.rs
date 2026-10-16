@@ -3630,9 +3630,11 @@ force_mio = false
     // request as a second transaction.
     let _ = c.shutdown(std::net::Shutdown::Both);
 
-    // Exactly ONE request reached the upstream (the health checker's
-    // TCP probe connects without sending), carrying the verbatim
-    // malformed body — and never a second "/smuggled" transaction.
+    // The invariant: the smuggled request never becomes its own
+    // upstream transaction. Whether the head reached the upstream
+    // before the close depends on read segmentation (head+body in one
+    // read → nothing forwarded; split reads → the head went out and
+    // only the malformed tail was dropped) — BOTH are safe outcomes.
     let reqs: Vec<String> = seen
         .lock()
         .expect("seen")
@@ -3640,10 +3642,12 @@ force_mio = false
         .filter(|r| !r.is_empty())
         .cloned()
         .collect();
-    assert_eq!(reqs.len(), 1, "one upstream request: {reqs:?}");
     assert!(
-        !reqs[0].contains("GET /smuggled"),
-        "the smuggled request must never be a separate transaction: {:?}",
-        reqs[0]
+        reqs.iter().all(|r| !r.contains("GET /smuggled")),
+        "the smuggled request must never be a separate transaction: {reqs:?}"
+    );
+    assert!(
+        reqs.len() <= 1,
+        "at most the head ever reached upstream: {reqs:?}"
     );
 }

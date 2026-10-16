@@ -1447,13 +1447,11 @@ impl HttpProxy {
                         if scan.is_malformed() {
                             // Akamai CVE-2025-66373 class: the peer's
                             // framing is broken, so any tail bytes are
-                            // attacker-controlled. Relay what arrived
-                            // and close — never parse the tail as the
-                            // next request on this connection.
+                            // attacker-controlled. Close without
+                            // forwarding — never parse the tail as the
+                            // next request on this connection, and
+                            // never forward a body we know is garbage.
                             self.log(LogLevel::Warn, "malformed chunked request; closing");
-                            if upstream_ready {
-                                self.upstream_send(io, data);
-                            }
                             io.close();
                             return;
                         }
