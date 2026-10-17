@@ -267,4 +267,33 @@ are queued on the next quiet window (the first attempt was fully
 discarded — load 32, build storm, the discipline working as
 designed).
 
-**Verdict: OPEN — profile decides between 1 and 2 (or both).**
+**Engine findings from the code walk (the implementation map):**
+
+- The io_uring engine ALREADY pipelines: `arm_upstream_read`
+  throttles upstream reads only while `pending_down` exceeds
+  2 x buffer_size, so response relay is not lockstep — a 64 KiB body
+  is ~16 read+write pairs with the writes queued behind each other.
+  The per-chunk cost is handler dispatch + write submission, not
+  waiting.
+- True-splice machinery exists for L4 mode: `engine.splice_pump`
+  arms readiness on both fds and the worker issues splice(2) in the
+  read dispatchers (`splice_forward_inflight` is the registered-
+  buffer read-forward variant). What is MISSING for HTTP: a byte CAP
+  (the L4 pump runs to EOF; an HTTP body must stop exactly at
+  Content-Length, which splice(2)'s len parameter gives directly)
+  and transaction-completion plumbing (the completion path must run
+  access emit, the adaptive release, and the pool park when the cap
+  is reached, and error the transaction if upstream EOF arrives
+  short).
+- Eligibility inventory for candidate 1: plain TCP both legs, identity
+  Content-Length response, no gzip, no wasm body inspection, not h2
+  (framing). TLS legs and everything else stay on the copied path by
+  construction — which is also why candidate 2 (read-ahead) is not
+  redundant even if candidate 1 wins: only candidate 2 helps TLS.
+
+**Verdict: OPEN — profile decides between 1 and 2 (or both).
+Implementation order if 1 wins: byte-capped readiness splice in the
+worker (splice_remaining in the slab; completion event on reaching
+zero; short-EOF is a 502), eligibility at head parse, behind an
+opt-in flag until measured — the same dark-launch posture
+pool_per_backend had before load_pooled validated it.**
