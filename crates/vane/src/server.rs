@@ -1241,6 +1241,7 @@ impl vane_core::HandlerFactory for WorkerFactory {
                 idle_timeout_ms: self.runtime.idle_timeout_ms,
                 first_byte_timeout_ms: self.runtime.first_byte_timeout_ms,
                 pool_per_backend: self.runtime.pool_per_backend,
+                pool_idle_ms: self.runtime.pool_idle_ms,
                 tls: self.tls.clone(),
                 plugins: self.plugins.clone(),
                 http01_tokens: self.http01_tokens.clone(),

@@ -161,6 +161,13 @@ has ~48 attempts before expiry.
 | `first_byte_timeout_ms` | int | `30000` | upstream first response byte |
 | `idle_timeout_ms` | int | `75000` | keep-alive idle |
 | `pool_per_backend` | int | `4` | retained idle upstream connections per backend per worker |
+| `pool_idle_ms` | int | `30000` | how long a pooled upstream connection stays reusable after it was parked; past this it is reaped instead of handed out (backends enforce their own idle timeouts — nginx `keepalive_timeout` 60 s, most LBs 60 s — so a stale parked connection would cost the next request a failed attach plus a fresh dial) |
+
+Pool metrics (`/metrics`): `vane_upstream_pool_hits_total`,
+`vane_upstream_pool_misses_total`, `vane_upstream_dials_total`,
+`vane_upstream_pool_idle`. The reuse ratio
+`hits / (hits + misses)` is the health of the pool; see
+[docs/perf-arc-2026-10.md](perf-arc-2026-10.md) for the analysis.
 
 ## `[access_log]` — request logging
 

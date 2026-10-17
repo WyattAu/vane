@@ -53,6 +53,8 @@ pub struct ProxyConfig {
     pub first_byte_timeout_ms: u64,
     /// Idle upstream connections kept per backend (per worker).
     pub pool_per_backend: usize,
+    /// How long a parked upstream connection stays reusable.
+    pub pool_idle_ms: u64,
     /// TLS termination config (`None` = plaintext listener). Shared slot:
     /// hot reload swaps the inner Arc without touching workers.
     pub tls: Option<Arc<std::sync::RwLock<Arc<rustls::ServerConfig>>>>,
@@ -87,6 +89,19 @@ pub struct ProxyConfig {
     /// Mesh mTLS identities by cluster name (absent entry = plaintext
     /// upstream).
     pub mesh: Arc<HashMap<String, vane_control::config::MeshUpstreamConfig>>,
+}
+
+/// An upstream connection parked in the idle pool.
+///
+/// The descriptor is DETACHED from the engine while parked, so the fd
+/// is owned outright by this struct (and closed by `Drop` on the
+/// proxy). `parked_at` is what makes the pool honest: a connection
+/// the backend has already closed is worse than no connection, because
+/// the request that checks it out pays a failed attach plus a fresh
+/// dial (see `RuntimeConfig::pool_idle_ms`).
+struct PooledConn {
+    fd: RawFd,
+    parked_at: Instant,
 }
 
 /// Worker-side per-slot connection state. Slots are dense worker
@@ -282,7 +297,16 @@ pub struct HttpProxy {
     /// Per-worker date cache (one refresh/second, zero alloc otherwise).
     date: vane_proto::date::DateCache,
     /// Idle upstream connection pool (per backend, worker-local).
-    pool: HashMap<SocketAddr, Vec<RawFd>>,
+    ///
+    /// Worker-local like nginx's and Envoy's pools, and deliberately
+    /// NOT shared across workers: a shared pool needs cross-thread
+    /// handoff of live connections, which trades the connection-churn
+    /// win for contention on the hot path. Pingora shares pools
+    /// (multithreaded, work-stealing) and wins big at Cloudflare's
+    /// scale; the trigger for revisiting that here is a measured low
+    /// reuse ratio with many workers — the metrics above are what
+    /// makes it measurable. See docs/perf-arc-2026-10.md.
+    pool: HashMap<SocketAddr, Vec<PooledConn>>,
     /// Per-cluster request counters (lazily registered, one per cluster).
     cluster_metrics: HashMap<String, ClusterMetric>,
     /// Loaded plugin instances (one set per worker; instances are !Sync).
@@ -299,6 +323,17 @@ struct ProxyMetrics {
     bytes_in: MetricHandle,
     bytes_out: MetricHandle,
     latency: MetricHandle,
+    /// Upstream keep-alive pool: a checkout that found a live
+    /// connection, one that had to dial, the dial count itself, and
+    /// the idle population right now.
+    ///
+    /// Without these the reuse ratio is invisible — and reuse is the
+    /// single biggest lever on proxy throughput, so an operator
+    /// cannot tell a healthy pool from a churning one.
+    pool_hits: MetricHandle,
+    pool_misses: MetricHandle,
+    dials: MetricHandle,
+    pool_idle: MetricHandle,
 }
 
 /// Lazily-registered per-cluster counters. Registration takes a brief
@@ -382,6 +417,10 @@ impl HttpProxy {
             bytes_in: registry.register("vane_bytes_in_total", MetricKind::Counter),
             bytes_out: registry.register("vane_bytes_out_total", MetricKind::Counter),
             latency: registry.register_histogram("vane_request_duration_us"),
+            pool_hits: registry.register("vane_upstream_pool_hits_total", MetricKind::Counter),
+            pool_misses: registry.register("vane_upstream_pool_misses_total", MetricKind::Counter),
+            dials: registry.register("vane_upstream_dials_total", MetricKind::Counter),
+            pool_idle: registry.register("vane_upstream_pool_idle", MetricKind::Gauge),
         };
         let breaker = shared_breaker_gate(&registry);
         // Rate limiting is opt-in: `None` removes the per-request
@@ -2894,17 +2933,22 @@ impl HttpProxy {
         }
         // Checkout a pooled keep-alive connection, else dial fresh.
         if self.config.pool_per_backend > 0 {
-            let pooled = self.pool.get_mut(&addr).and_then(Vec::pop);
-            if let Some(fd) = pooled {
-                if io.attach_upstream(fd) {
-                    // Pooled conn is already connected: drive the head now.
-                    self.on_upstream_connected(io);
-                    return;
+            match self.take_pooled(addr) {
+                Some(fd) => {
+                    self.metrics.pool_hits.inc(&self.config.registry);
+                    if io.attach_upstream(fd) {
+                        // Pooled conn is already connected: drive the head now.
+                        self.on_upstream_connected(io);
+                        return;
+                    }
+                    // Stale pooled fd (the peer went away between park
+                    // and checkout): discard, fall through to a fresh dial.
+                    self.close_fd(fd);
                 }
-                // Stale pooled fd: discard, fall through to a fresh dial.
-                self.close_fd(fd);
+                None => self.metrics.pool_misses.inc(&self.config.registry),
             }
         }
+        self.metrics.dials.inc(&self.config.registry);
         if !io.connect_upstream(addr) {
             self.metrics.upstream_errors.inc(&self.config.registry);
             self.breaker.record_failure(&route.cluster);
@@ -3276,18 +3320,100 @@ impl HttpProxy {
         let Some(fd) = io.detach_upstream() else {
             return;
         };
+        self.park_fd(addr, fd);
+    }
+
+    /// Parks a DETACHED upstream descriptor in the idle pool, or
+    /// closes it: the single place a pooled connection is created or
+    /// discarded.
+    fn park_fd(&mut self, addr: SocketAddr, fd: RawFd) {
         let cap = self.config.pool_per_backend;
-        let idle = self.pool.entry(addr).or_default();
-        if idle.len() < cap {
-            idle.push(fd);
-        } else {
+        let ttl = Duration::from_millis(self.config.pool_idle_ms);
+        let now = Instant::now();
+        let mut reaped: Vec<RawFd> = Vec::new();
+        let mut parked = false;
+        {
+            // `entry`, not `get_mut`: the first connection to a backend
+            // has to create its list, or pooling silently does nothing.
+            let idle = self.pool.entry(addr).or_default();
+            // Reap expired entries BEFORE deciding the connection has
+            // nowhere to go: a burst that filled the pool must not push
+            // out a connection the next burst would have reused.
+            if idle.len() >= cap {
+                let mut keep: Vec<PooledConn> = Vec::with_capacity(idle.len());
+                for c in idle.drain(..) {
+                    if now.duration_since(c.parked_at) < ttl {
+                        keep.push(c);
+                    } else {
+                        reaped.push(c.fd);
+                    }
+                }
+                *idle = keep;
+            }
+            if idle.len() < cap {
+                idle.push(PooledConn { fd, parked_at: now });
+                parked = true;
+            }
+        }
+        if !parked {
             self.close_fd(fd);
         }
+        for stale in reaped {
+            self.close_fd(stale);
+        }
+        self.refresh_pool_gauge();
+    }
+
+    /// Takes the freshest still-reusable idle connection for `addr`,
+    /// closing anything past its idle deadline on the way.
+    fn take_pooled(&mut self, addr: SocketAddr) -> Option<RawFd> {
+        let ttl = Duration::from_millis(self.config.pool_idle_ms);
+        let mut reaped: Vec<RawFd> = Vec::new();
+        let mut taken = None;
+        if let Some(idle) = self.pool.get_mut(&addr) {
+            // Parked in order, so walking back yields the freshest
+            // first; stop at the first live one and leave the rest.
+            while let Some(conn) = idle.pop() {
+                if conn.parked_at.elapsed() < ttl {
+                    taken = Some(conn.fd);
+                    break;
+                }
+                reaped.push(conn.fd);
+            }
+        }
+        for stale in reaped {
+            self.close_fd(stale);
+        }
+        self.refresh_pool_gauge();
+        taken
+    }
+
+    /// Republishes the idle population (a gauge summed across this
+    /// worker's backend pools).
+    fn refresh_pool_gauge(&self) {
+        let idle: usize = self.pool.values().map(Vec::len).sum();
+        self.metrics
+            .pool_idle
+            .set(&self.config.registry, idle as u64);
     }
 
     fn close_fd(&mut self, fd: RawFd) {
         // SAFETY: single ownership of a detached descriptor.
         unsafe { libc::close(fd) };
+    }
+}
+
+impl Drop for HttpProxy {
+    fn drop(&mut self) {
+        // Parked descriptors are detached from the engine, so nothing
+        // else closes them: a dropped worker (embedder teardown, a
+        // failed restart) would otherwise leak every idle connection
+        // it was holding.
+        for (_, idle) in std::mem::take(&mut self.pool) {
+            for conn in idle {
+                self.close_fd(conn.fd);
+            }
+        }
     }
 }
 
@@ -3307,4 +3433,252 @@ pub fn flatten_routes(router: &Router) -> Vec<RouteRecord> {
             strip_prefix: r.strip_prefix,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod pool_tests {
+    //! The idle-pool contract, proved without a clock: `pool_idle_ms`
+    //! is the only time input, so a deadline of 0 means "everything is
+    //! already expired" and a large deadline means "everything is
+    //! live" — no sleeping, no flakes, and the assertions mean the
+    //! same thing on a loaded CI box.
+    //!
+    //! Liveness is observed THROUGH the peer end of each socketpair
+    //! (a 1-byte write succeeds iff the other end still exists), never
+    //! through the descriptor number: closed fds free their numbers
+    //! and a parallel test can re-adopt one mid-assertion, which would
+    //! make `fcntl(F_GETFD)` lie.
+
+    use super::*;
+    use std::os::fd::RawFd;
+    use std::time::Duration;
+
+    fn addr() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 9_001))
+    }
+
+    /// A connected socket pair as raw descriptors — a parked upstream
+    /// connection stand-in whose fate we can observe via `peer`.
+    fn pair() -> (RawFd, RawFd) {
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: socketpair fills both descriptors or fails.
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair");
+        (fds[0], fds[1])
+    }
+
+    /// True iff the OTHER end of the pair is still open. The peer's
+    /// descriptor number is held for the whole test, so this cannot be
+    /// fooled by fd-number reuse.
+    fn peer_alive(peer: RawFd) -> bool {
+        // SAFETY: write to an owned, connected descriptor; EPIPE (rc
+        // -1) is the "other end is closed" answer, not a crash.
+        unsafe { libc::write(peer, "x".as_ptr().cast(), 1) == 1 }
+    }
+
+    fn close(fd: RawFd) {
+        // SAFETY: single ownership of a test descriptor.
+        unsafe { libc::close(fd) };
+    }
+
+    fn config(registry: &Arc<Registry>, pool_per_backend: usize, pool_idle_ms: u64) -> ProxyConfig {
+        ProxyConfig {
+            router: Arc::new(Router::new()),
+            registry: Arc::clone(registry),
+            events: Arc::new(EventRing::new()),
+            rate_limit_rps: None,
+            connect_timeout_ms: 5_000,
+            idle_timeout_ms: 75_000,
+            first_byte_timeout_ms: 30_000,
+            pool_per_backend,
+            pool_idle_ms,
+            tls: None,
+            plugins: Vec::new(),
+            access: None,
+            jwt: None,
+            shared_rate_limit: None,
+            proxy_protocol: false,
+            alt_svc: None,
+            h2_strict_idle_window_update: false,
+            h2c: false,
+            l4_splice: false,
+            mesh: Arc::new(HashMap::new()),
+            http01_tokens: None,
+        }
+    }
+
+    /// Metric value as the operator sees it (Prometheus text): the
+    /// value is the LAST whitespace-separated field of the line, with
+    /// or without a label set.
+    fn metric(registry: &Registry, name: &str) -> u64 {
+        registry
+            .render_prometheus()
+            .lines()
+            .filter(|line| line.starts_with(name))
+            .find_map(|line| line.split_whitespace().last())
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|v| v as u64)
+            .unwrap_or_else(|| {
+                panic!(
+                    "metric {name} not published:\n{}",
+                    registry.render_prometheus()
+                )
+            })
+    }
+
+    /// Ages every pooled entry for `addr` past the deadline.
+    fn age_all(proxy: &mut HttpProxy, by: Duration) {
+        for idle in proxy.pool.get_mut(&addr()).expect("pool entry") {
+            idle.parked_at -= by;
+        }
+    }
+
+    /// A live deadline hands the connection back; the pool is empty
+    /// afterwards and the connection is untouched.
+    #[test]
+    fn checkout_within_deadline_reuses_the_connection() {
+        let registry = Arc::new(Registry::new());
+        let mut proxy = HttpProxy::new(config(&registry, 4, 60_000), 0);
+        let (mine, peer) = pair();
+        proxy.park_fd(addr(), mine);
+        assert_eq!(metric(&registry, "vane_upstream_pool_idle"), 1);
+        let got = proxy.take_pooled(addr()).expect("live connection");
+        assert!(peer_alive(peer), "the handed-out connection must be alive");
+        assert_eq!(metric(&registry, "vane_upstream_pool_idle"), 0);
+        close(got);
+        close(peer);
+    }
+
+    /// Past the deadline the connection is closed, not handed out: no
+    /// request may pay for a connection the backend already retired.
+    #[test]
+    fn checkout_past_deadline_closes_instead_of_handing_out() {
+        let registry = Arc::new(Registry::new());
+        let mut proxy = HttpProxy::new(config(&registry, 4, 0), 0);
+        let (mine, peer) = pair();
+        proxy.park_fd(addr(), mine);
+        assert!(
+            proxy.take_pooled(addr()).is_none(),
+            "an expired connection must not be handed out"
+        );
+        assert!(
+            !peer_alive(peer),
+            "the expired connection must be closed, not parked"
+        );
+        close(peer);
+    }
+
+    /// Freshest first — and once the freshest is taken, the next
+    /// checkout still refuses the aged entry instead of serving a
+    /// connection that is past its deadline.
+    #[test]
+    fn checkout_takes_the_freshest_and_the_stale_below_it_is_reaped() {
+        let registry = Arc::new(Registry::new());
+        let mut proxy = HttpProxy::new(config(&registry, 4, 60_000), 0);
+        let (aged, aged_peer) = pair();
+        proxy.park_fd(addr(), aged);
+        age_all(&mut proxy, Duration::from_secs(120));
+        let (fresh, fresh_peer) = pair();
+        proxy.park_fd(addr(), fresh);
+        assert_eq!(metric(&registry, "vane_upstream_pool_idle"), 2);
+
+        let got = proxy.take_pooled(addr()).expect("the fresh connection");
+        assert_eq!(got, fresh, "freshest is handed out");
+        assert!(peer_alive(fresh_peer));
+        assert!(proxy.take_pooled(addr()).is_none(), "the aged one is not");
+        assert!(!peer_alive(aged_peer), "the aged connection is reaped");
+
+        close(got);
+        close(aged_peer);
+        close(fresh_peer);
+    }
+
+    /// A burst that filled the pool must not push out a connection the
+    /// next burst would reuse: park reaps expired entries first.
+    #[test]
+    fn park_reaps_expired_entries_before_refusing_room() {
+        let registry = Arc::new(Registry::new());
+        let mut proxy = HttpProxy::new(config(&registry, 2, 0), 0);
+        let (a, a_peer) = pair();
+        let (b, b_peer) = pair();
+        proxy.park_fd(addr(), a);
+        proxy.park_fd(addr(), b);
+        // Reaping is lazy by design — there is no background sweeper,
+        // so a parked connection holds its slot until either a
+        // checkout or a full pool needs the room.
+        assert!(
+            peer_alive(a_peer) && peer_alive(b_peer),
+            "nothing reaped while idle"
+        );
+        let (c, c_peer) = pair();
+        proxy.park_fd(addr(), c);
+        assert!(
+            !peer_alive(a_peer) && !peer_alive(b_peer),
+            "the full pool reaped its expired entries to make room"
+        );
+        assert!(peer_alive(c_peer), "the live arrival is pooled");
+        assert_eq!(metric(&registry, "vane_upstream_pool_idle"), 1);
+        close(c);
+        close(a_peer);
+        close(b_peer);
+        close(c_peer);
+    }
+
+    /// A full pool closes the arriving connection rather than growing.
+    #[test]
+    fn park_closes_the_arriving_connection_when_full() {
+        let registry = Arc::new(Registry::new());
+        let mut proxy = HttpProxy::new(config(&registry, 1, 60_000), 0);
+        let (a, a_peer) = pair();
+        proxy.park_fd(addr(), a);
+        let (b, b_peer) = pair();
+        proxy.park_fd(addr(), b);
+        assert!(!peer_alive(b_peer), "the pool is full: close the arrival");
+        assert!(peer_alive(a_peer), "the resident stays");
+        assert_eq!(metric(&registry, "vane_upstream_pool_idle"), 1);
+        close(a);
+        close(a_peer);
+        close(b_peer);
+    }
+
+    /// A dropped worker must not leak its detached descriptors.
+    #[test]
+    fn dropping_the_proxy_closes_pooled_descriptors() {
+        let registry = Arc::new(Registry::new());
+        let (mine, peer) = pair();
+        {
+            let mut proxy = HttpProxy::new(config(&registry, 4, 60_000), 0);
+            proxy.park_fd(addr(), mine);
+            assert!(peer_alive(peer));
+        }
+        assert!(
+            !peer_alive(peer),
+            "a dropped proxy leaked a pooled connection"
+        );
+        close(peer);
+    }
+
+    /// Reuse has to be observable, or an operator cannot tell a
+    /// healthy pool from a churning one.
+    #[test]
+    fn pool_metrics_are_published() {
+        let registry = Arc::new(Registry::new());
+        let mut proxy = HttpProxy::new(config(&registry, 4, 60_000), 0);
+        let (mine, peer) = pair();
+        proxy.park_fd(addr(), mine);
+        let taken = proxy.take_pooled(addr()).expect("live");
+        close(taken);
+        close(peer);
+        assert_eq!(metric(&registry, "vane_upstream_pool_idle"), 0);
+        for name in [
+            "vane_upstream_pool_hits_total",
+            "vane_upstream_pool_misses_total",
+            "vane_upstream_dials_total",
+        ] {
+            assert!(
+                registry.render_prometheus().contains(name),
+                "missing pool metric {name}"
+            );
+        }
+    }
 }

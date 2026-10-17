@@ -27,6 +27,7 @@ fn make_proxy(
             idle_timeout_ms: 75_000,
             first_byte_timeout_ms: 30_000,
             pool_per_backend: 4,
+            pool_idle_ms: 30_000,
             tls: None,
             h2_strict_idle_window_update: false,
             plugins,

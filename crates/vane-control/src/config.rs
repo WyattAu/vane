@@ -666,6 +666,18 @@ pub struct RuntimeConfig {
     pub idle_timeout_ms: u64,
     /// Idle upstream connections retained per backend per worker.
     pub pool_per_backend: usize,
+    /// How long a pooled (idle) upstream connection stays reusable
+    /// after it was parked (ms).
+    ///
+    /// A pooled connection is a promise to the backend that we will
+    /// speak on it again; the backend usually enforces its own idle
+    /// timeout (nginx `keepalive_timeout` 60 s, most LBs 60 s). A
+    /// connection we keep past that point is a promise we cannot
+    /// keep: the first request that checks it out pays a failed
+    /// attach and a fresh dial. This deadline is what makes the pool
+    /// honest — after it, the connection is reaped instead of
+    /// handed to a request that would fail on it.
+    pub pool_idle_ms: u64,
 }
 
 impl Default for RuntimeConfig {
@@ -681,9 +693,14 @@ impl Default for RuntimeConfig {
             connect_timeout_ms: 5_000,
             first_byte_timeout_ms: 30_000,
             idle_timeout_ms: 75_000,
-            // Upstream keep-alive pooling: 4 idle connections per backend
-            // per worker. Validated under sustained load (load_pooled).
+            // Upstream keep-alive pooling: idle connections per backend
+            // per worker, each reusable for `pool_idle_ms`. Reuse is the
+            // single biggest lever on proxy throughput (a fresh upstream
+            // connection costs a TCP (and TLS) handshake per request),
+            // and the honest cap is time, not count: see docs/perf-arc-
+            // 2026-10.md, iteration 1.
             pool_per_backend: 4,
+            pool_idle_ms: 30_000,
         }
     }
 }

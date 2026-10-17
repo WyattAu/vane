@@ -756,6 +756,11 @@ mod flow_tests {
     /// simulated WINDOW_UPDATE grants), for a 1 MiB response fed in
     /// 4096-byte upstream chunks with a 65535-initial-window client.
     #[test]
+    // The window variables below feed `dbg_trace!`, which is a no-op
+    // without `vane_dbg` — without the allow, a default-features clippy
+    // run fails on variables and assignments that only exist for the
+    // forensic trace.
+    #[allow(unused_variables, unused_assignments)]
     fn emitted_bytes_never_exceed_granted_window() {
         const BODY: usize = 1024 * 1024;
         let mut h2s = H2Server::new(0, false);
