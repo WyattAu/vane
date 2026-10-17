@@ -159,21 +159,24 @@ are faster):
 | Keep-alive pool (opt-in) | 1 upstream conn across 5 sequential requests | — |
 | Config generation swap | one `Release` store + epoch retire | `CP-02` < 1 ms |
 
-### Comparison against nginx (same box, same upstream)
+### Throughput (measured on the dev host, loadgen, keep-alive c=64)
 
-Full matrix, methodology, and reproduction commands:
-[docs/benchmarks.md](docs/benchmarks.md). Summary — the nginx
-configuration is the hidden variable in every proxy benchmark:
+Full matrix, methodology, nginx/Caddy/Traefik history, and
+reproduction commands: [docs/benchmarks.md](docs/benchmarks.md).
+Current snapshot (2026-10-17, v0.13.0, 2 workers, 10 s x 3 windows,
+medians, quiet host):
 
-| Scenario | vane (2 workers, pool) | nginx + upstream keepalive | nginx stock |
-|---|---|---|---|
-| keep-alive c=64 | 33–35k rps | 50–51k rps | 9–10k rps |
-| short connections c=64 | 6.1k rps | 10.5k rps | — |
+| Scenario | vane 0.13.0 | pool reuse under load |
+|---|---|---|
+| h1 keep-alive c=64 | **86.7–91.1k rps** (p50 ~129 us) | 92.9% hits (1.24M hits / 94k dials) |
 
-Honest reading: vane beats **stock** nginx ~3.5x on keep-alive, but a
-tuned nginx (upstream keepalive) holds a ~1.4x lead over vane's current
-proxy loop — that loop is v0.4's main optimization target. The upstream
-ceiling (shared `ab` client) is 65-72k rps.
+Historical: stock nginx (no upstream keepalive) measured 9–10k rps
+and tuned nginx (upstream keepalive 64) 50–51k on this host
+(2026-10-07); nginx is no longer installable here, so that row stands
+as measured and cross-day comparisons carry a host-drift caveat
+(~3% day-of, larger across days). The honest reading stands: upstream
+connection reuse is the dominant lever — the same upstream serves
+9–10k rps without keep-alive and 50k+ with it.
 
 ## Admin plane & metrics
 

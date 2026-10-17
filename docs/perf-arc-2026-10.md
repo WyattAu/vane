@@ -111,11 +111,26 @@ sleeps on a race):**
   checker TCP-probes every backend on a fixed 5 s interval, so raw
   accept counts are noisy by design.
 
-**Measurement contract:** the throughput claim (does the tuned
-default close the 1.4× gap?) is gated on a quiet window on this host
-per docs/benchmarks.md — the ledger row is filled when that run
-happens, not before. Runs taken under load are discarded, not
-averaged.
+**Measured (2026-10-17, quiet windows, load 4-7):** c=64 keep-alive,
+2 workers, `tools/loadgen`, 10 s x 3 windows, medians: v0.13.0
+86.7k rps (p50 129 us, 0 non-200 in 2.6M requests); the published
+v0.12.0 binary 89.0k on the same workload. Interleaved re-runs put
+v0.13.0 at 88.8k and 91.1k — the block-to-block difference is host
+drift, NOT a pool regression; the pool work is throughput-neutral
+here and the honest claim is "within run-to-run variance (~3%)".
+The iteration's real payload is the telemetry: at c=64 the pool
+logged 1,236,283 hits vs 94,394 misses/dials — a 92.9% reuse ratio,
+13.6x more reuses than dials, visible for the first time. Little's
+law explains why cap 4/worker suffices at this concurrency: 85k rps
+x 129 us = ~11 requests in flight, so 8 parked slots plus in-flight
+churn covers it. The cap-vs-concurrency question (raise the default?
+scale by workers?) is parked with THIS metric as the trigger: touch
+the default only when hits/(hits+misses) sags at higher concurrency.
+The README's stale comparison table (33-35k vs tuned nginx, a v0.4-era
+snapshot) is superseded by docs/benchmarks.md; nginx is not
+installable on this host any more, so the historical tuned-nginx row
+stands as measured 2026-10-07 and cross-day comparisons carry a
+host-drift caveat.
 
 **Open:** the health checker TCP-probes every backend every 5 s even
 when no `health_path` is configured (documented as "empty disables

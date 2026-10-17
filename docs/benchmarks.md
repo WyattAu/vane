@@ -69,6 +69,33 @@ to the table above; the ratios within this experiment are):
 Envoy remains unmeasured in this environment (see below); nginx
 containerized is invalid for the same docker reason.
 
+## vane 0.13.0 — pool telemetry under load (2026-10-17)
+
+Single-proxy legs, `tools/loadgen`, 10 s x 3 windows, medians,
+upstream = the threaded 10-byte keep-alive server, load 4-7 (quiet):
+
+| leg | rps (median) | p50 | p99 | non-200 |
+|---|---|---|---|---|
+| h1 c=64, 2 workers | **86,715** | 129 us | ~9 ms | 0 / 2.6M |
+| h1 c=64, 2 workers (re-run) | **91,051** | 121 us | 8.7 ms | 0 |
+
+Run-to-run spread across the day's blocks was ~3% (86.7k .. 91.1k),
+which is the error bar for any cross-block comparison on this host.
+
+The new pool telemetry, scraped after the c=64 block:
+`vane_upstream_dials_total` 94,394, `vane_upstream_pool_hits_total`
+1,236,283, `vane_upstream_pool_misses_total` 94,394 — a **92.9%
+reuse ratio** (13.6 reuses per dial) under concurrent load, the
+first time this has been measurable. Little's law checks out:
+85k rps x 129 us = ~11 requests in flight, so the 4-per-worker idle
+cap covers the steady state. Metric-driven trigger recorded in
+docs/perf-arc-2026-10.md: revisit the default cap only if the reuse
+ratio sags at higher concurrency.
+
+The published v0.12.0 binary on the identical workload: 89.0k
+(median of 3) — the pool changes are throughput-neutral within the
+~3% variance, stated rather than tuned around.
+
 ## vane vs nginx (reverse-proxy mode)
 
 nginx configuration matters enormously and is often the hidden variable
