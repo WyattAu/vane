@@ -416,6 +416,14 @@ criteria = "safe-to-run"
 version = "0.1.7"
 criteria = "safe-to-deploy"
 
+[[exemptions.ctor]]
+version = "0.4.3"
+criteria = "safe-to-deploy"
+
+[[exemptions.ctor-proc-macro]]
+version = "0.0.6"
+criteria = "safe-to-deploy"
+
 [[exemptions.dashmap]]
 version = "6.2.1"
 criteria = "safe-to-deploy"
@@ -454,6 +462,14 @@ criteria = "safe-to-deploy"
 
 [[exemptions.displaydoc]]
 version = "0.2.7"
+criteria = "safe-to-deploy"
+
+[[exemptions.dtor]]
+version = "0.0.6"
+criteria = "safe-to-deploy"
+
+[[exemptions.dtor-proc-macro]]
+version = "0.0.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.dunce]]
