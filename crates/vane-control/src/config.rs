@@ -153,6 +153,7 @@ pub enum ListenerMode {
 /// An upstream cluster.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ClusterConfig {
     /// Static backend addresses (`host:port`).
     #[serde(default)]
@@ -212,6 +213,7 @@ pub struct ClusterConfig {
 /// queue 4, smoothing 0.2, tolerance 1.5).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct AdaptiveConcurrencyConfig {
     /// Floor for the estimated limit — prevents death spirals where a
     /// burst sheds so much that the cluster never recovers.
@@ -257,6 +259,27 @@ impl Default for AdaptiveConcurrencyConfig {
             queue_size: default_adaptive_queue_size(),
             smoothing: default_adaptive_smoothing(),
             rtt_tolerance: default_adaptive_rtt_tolerance(),
+        }
+    }
+}
+
+impl Default for ClusterConfig {
+    /// An empty, disabled cluster: no backends, no features. Exists
+    /// for `#[non_exhaustive]` downstream construction (tests,
+    /// embedders) — parsed configs fill fields from TOML instead.
+    fn default() -> Self {
+        Self {
+            backends: Vec::new(),
+            unix_socket: None,
+            policy: PolicyConfig::default(),
+            health_path: None,
+            compression: false,
+            outlier: None,
+            http2: false,
+            http3: false,
+            h3_tls: None,
+            mesh: None,
+            adaptive: None,
         }
     }
 }
@@ -707,8 +730,13 @@ pub struct PluginConfig {
 }
 
 /// Runtime tuning knobs.
+///
+/// `#[non_exhaustive]` per the config-struct family rule: new knobs
+/// must not break downstream constructors; `Default` carries the
+/// documented defaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct RuntimeConfig {
     /// Buffer pool slots per worker.
     pub pool_slots: usize,

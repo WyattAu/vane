@@ -174,13 +174,15 @@ mod tests {
     use vane_control::config::AdaptiveConcurrencyConfig;
 
     fn cfg() -> AdaptiveConcurrencyConfig {
-        AdaptiveConcurrencyConfig {
-            min_limit: 2,
-            max_limit: 200,
-            queue_size: 1,
-            smoothing: 0.2,
-            rtt_tolerance: 1.5,
-        }
+        // `AdaptiveConcurrencyConfig` is `#[non_exhaustive]` (it is a
+        // parsed config struct), so tests build it by mutation.
+        let mut cfg = AdaptiveConcurrencyConfig::default();
+        cfg.min_limit = 2;
+        cfg.max_limit = 200;
+        cfg.queue_size = 1;
+        cfg.smoothing = 0.2;
+        cfg.rtt_tolerance = 1.5;
+        cfg
     }
 
     /// A controller warmed up at `base` us, with `inflight` requests

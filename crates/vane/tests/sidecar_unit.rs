@@ -12,22 +12,13 @@ use vane_shm::transport::{SidecarClient, SidecarConfig};
 
 fn config_with_cluster(cluster: &str, backends: &[&str]) -> VaneConfig {
     let mut clusters = BTreeMap::new();
-    clusters.insert(
-        cluster.to_string(),
-        ClusterConfig {
-            backends: backends.iter().map(|s| (*s).to_string()).collect(),
-            unix_socket: None,
-            policy: Default::default(),
-            health_path: None,
-            http2: false,
-            http3: false,
-            h3_tls: None,
-            mesh: None,
-            adaptive: None,
-            compression: false,
-            outlier: None,
-        },
-    );
+    clusters.insert(cluster.to_string(), {
+        // `#[non_exhaustive]`: mutate the default instead of a
+        // struct expression.
+        let mut c = ClusterConfig::default();
+        c.backends = backends.iter().map(|s| (*s).to_string()).collect();
+        c
+    });
     VaneConfig {
         clusters,
         routes: vec![RouteConfig {
@@ -64,22 +55,11 @@ fn stub_upstream(response: &'static [u8]) -> std::net::SocketAddr {
 #[test]
 fn resolve_bridge_prefers_route_cluster() {
     let mut cfg = config_with_cluster("b", &["127.0.0.1:1"]);
-    cfg.clusters.insert(
-        "a".into(),
-        ClusterConfig {
-            backends: vec!["127.0.0.1:2".into()],
-            unix_socket: None,
-            policy: Default::default(),
-            health_path: None,
-            http2: false,
-            http3: false,
-            h3_tls: None,
-            mesh: None,
-            adaptive: None,
-            compression: false,
-            outlier: None,
-        },
-    );
+    cfg.clusters.insert("a".into(), {
+        let mut c = ClusterConfig::default();
+        c.backends = vec!["127.0.0.1:2".into()];
+        c
+    });
     cfg.routes = vec![RouteConfig {
         host: None,
         pattern: "/*rest".into(),

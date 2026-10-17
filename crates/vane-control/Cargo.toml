@@ -5,7 +5,7 @@ name = "vane-control"
 # (deny_unknown_fields on every table but the top-level document), and
 # ACME challenge names accept the RFC 8555 spellings with legacy
 # aliases.
-version = "0.10.1"
+version = "0.11.0"
 description = "Configuration, discovery providers, ACME, and health checks for Vane"
 edition.workspace = true
 rust-version.workspace = true

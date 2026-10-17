@@ -36,6 +36,13 @@ use vane_router::{RouteEntry, Router};
 use vane_shm::handover::RouteRecord;
 
 /// Proxy handler configuration shared across workers.
+///
+/// This one stays exhaustively constructible ON PURPOSE: unlike the
+/// parsed config structs (the `#[non_exhaustive]` family rule — serde
+/// builds those in-crate), `ProxyConfig` is the programmatic embedder
+/// API, and downstream code constructs it with struct literals.
+/// Growth is covered by the minor train bump; `Default` exists so
+/// tests and embedders can write struct-update literals anyway.
 pub struct ProxyConfig {
     /// Router (EBR snapshot source).
     pub router: Arc<Router>,
@@ -106,6 +113,38 @@ pub struct ProxyConfig {
 struct PooledConn {
     fd: RawFd,
     parked_at: Instant,
+}
+
+impl Default for ProxyConfig {
+    /// A usable-for-tests default: real (empty) router, registry and
+    /// event ring, every optional feature off, documented-default pool
+    /// and timeout knobs.
+    fn default() -> Self {
+        Self {
+            router: Arc::new(Router::new()),
+            registry: Arc::new(Registry::new()),
+            events: Arc::new(EventRing::new()),
+            rate_limit_rps: None,
+            connect_timeout_ms: 5_000,
+            idle_timeout_ms: 75_000,
+            first_byte_timeout_ms: 30_000,
+            pool_per_backend: 4,
+            pool_idle_ms: 30_000,
+            adaptive: Arc::new(HashMap::new()),
+            tls: None,
+            plugins: Vec::new(),
+            access: None,
+            jwt: None,
+            shared_rate_limit: None,
+            proxy_protocol: false,
+            alt_svc: None,
+            h2_strict_idle_window_update: false,
+            h2c: false,
+            l4_splice: false,
+            mesh: Arc::new(HashMap::new()),
+            http01_tokens: None,
+        }
+    }
 }
 
 /// Worker-side per-slot connection state. Slots are dense worker
@@ -3578,28 +3617,10 @@ mod pool_tests {
 
     fn config(registry: &Arc<Registry>, pool_per_backend: usize, pool_idle_ms: u64) -> ProxyConfig {
         ProxyConfig {
-            router: Arc::new(Router::new()),
             registry: Arc::clone(registry),
-            events: Arc::new(EventRing::new()),
-            rate_limit_rps: None,
-            connect_timeout_ms: 5_000,
-            idle_timeout_ms: 75_000,
-            first_byte_timeout_ms: 30_000,
             pool_per_backend,
             pool_idle_ms,
-            tls: None,
-            plugins: Vec::new(),
-            access: None,
-            jwt: None,
-            shared_rate_limit: None,
-            proxy_protocol: false,
-            alt_svc: None,
-            h2_strict_idle_window_update: false,
-            h2c: false,
-            l4_splice: false,
-            mesh: Arc::new(HashMap::new()),
-            http01_tokens: None,
-            adaptive: Arc::new(HashMap::new()),
+            ..Default::default()
         }
     }
 
