@@ -291,12 +291,37 @@ designed).
   construction — which is also why candidate 2 (read-ahead) is not
   redundant even if candidate 1 wins: only candidate 2 helps TLS.
 
-**Verdict: OPEN — profile decides between 1 and 2 (or both).
-Implementation order if 1 wins: byte-capped readiness splice in the
-worker (splice_remaining in the slab; completion event on reaching
-zero; short-EOF is a 502), eligibility at head parse, behind an
-opt-in flag until measured — the same dark-launch posture
-pool_per_backend had before load_pooled validated it.**
+**Profiled (2026-10-17 21:32Z, load 7, perf record at 999 Hz during
+the get64k leg):** the top TWO symbols are both libc at the same
+offset (0x1b0049 — the memmove page) at **14.82% + 14.51% = 29.3%
+of on-CPU time**: the 64 KiB body being copied through userland,
+sixteen times per response. Everything else is far behind
+(on_upstream_data_h1 4.8% across workers, h1_plain_request_data
+3.4%, check_done 2.1%, malloc ~1.8%, vdso clock_gettime 2.5%,
+httparse 1.4%, io_uring submit/poll ~2.3%). The copies ARE the
+deficit — this is the profile evidence the verdict needed.
+(Also visible for a later allocation tranche: on_upstream_connected
+~1.9% — the upstream head build allocates.)
+
+And a measurement-hygiene data point from the same hour: the
+identical binary measured 12.4-15.3k rps at "load 7 with finishing
+builds in the ps output" and 17.3-18.9k rps at true quiet (load 5-6)
+— a ~25% swing that load average alone did not predict. Cross-window
+comparisons on this host need equal-quiet windows, and the earlier
+12.4k median was NOT the binary's number.
+
+**Verdict: ADOPT candidate 1 — socket-to-socket splice for eligible
+response bodies** (plain TCP both legs, identity Content-Length, no
+gzip, no wasm body inspection, not h2). It targets the 29.3%
+directly; read-ahead cannot (it still copies). Implementation is
+queued with the full map above: byte-capped readiness splice in the
+worker (`splice_remaining` in the slab; splice(2)'s len parameter
+IS the cap), completion event to the handler on reaching zero
+(access emit, adaptive release, pool park, keep-alive continuation),
+short-EOF is a 502, behind an opt-in flag until measured — the same
+dark-launch posture pool_per_backend had before load_pooled
+validated it. Candidate 2 (read-ahead) stays OPEN as the TLS-leg
+follow-up.**
 
 **Base windows (2026-10-17 20:47Z, load 7):** get64k c=8, 2 workers,
 10 s x 3: 12.4k / 12.5k / 15.3k rps (p50 ~440 us, non-200 = 0) —
