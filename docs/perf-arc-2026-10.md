@@ -297,3 +297,14 @@ worker (splice_remaining in the slab; completion event on reaching
 zero; short-EOF is a 502), eligibility at head parse, behind an
 opt-in flag until measured — the same dark-launch posture
 pool_per_backend had before load_pooled validated it.**
+
+**Base windows (2026-10-17 20:47Z, load 7):** get64k c=8, 2 workers,
+10 s x 3: 12.4k / 12.5k / 15.3k rps (p50 ~440 us, non-200 = 0) —
+today's median 12.5k against the 2026-10-07 record's 15.3k and
+Traefik's 19.5k; the deficit reproduces and is the iteration's
+target. A c=64 recheck started at load 7 but ran into rising load
+(9 -> 12): 34-38k vs the quiet-window 86.7-91.1k — DISCARDED as
+storm-contaminated, exactly what the >= 15 threshold plus trend
+discrimination is for; the reuse ratio held at 85.5% even there
+(449k hits / 76k dials). The perf profile of the leg is queued on
+the next quiet window and decides splice vs read-ahead.
