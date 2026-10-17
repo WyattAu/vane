@@ -219,3 +219,52 @@ headers item from the previous arc.
 Entries are appended per iteration; each one names its sources, the
 verdict, the implementation and the proof, so the ledger always
 reflects verified state.
+
+
+## Iteration 3 — the large-body relay (IN PROGRESS)
+
+**The deficit:** the 2026-10-07 comparison's one losing leg: GET
+64 KiB, vane 15.3k rps vs Traefik 19.5k (0.78x). A 64 KiB body
+through a 4096-byte slot means 16 read+write round trips per
+response, each a userland copy plus an engine completion — the
+leg where per-byte overhead, not per-request overhead, dominates.
+
+**Pulled:** the splice/sendfile literature (kernel-internals.org's
+splice survey: MSG_ZEROCOPY breaks even around 10-100 KB, below that
+the per-send notification cost dominates; the Go proxy case study —
+io.CopyBuffer's default 32 KiB chunks cost "24x the fast path" in
+syscall wall time, and a socket-to-socket splice collapsed 10,677
+read/write pairs into splice calls at 70 us each; the 2013
+"Rethinking Sendfile Support in Unix Kernel" paper; Netflix's CDN
+finding that sendfile took memcpy from 15% to 2% of CPU), plus
+in-repo prior art: `vane-kernel::splice::pump` already implements
+the socket->pipe->socket splice loop with SPLICE_F_NONBLOCK EAGAIN
+handling for the L4 mode.
+
+**Candidate designs (verdict pending the profile):**
+
+1. **Socket-to-socket splice fast path** for responses where BOTH
+   legs are plain TCP, the response head declares identity
+   Content-Length (no gzip, no chunked scanning), and no wasm body
+   inspection is configured. The kernel moves bytes through a pipe;
+   userland sees one completion per pipe-buffer (64 KiB) instead of
+   sixteen slot round trips. Metrics survive: splice(2) returns the
+   moved count. TLS legs, compression, and body inspection stay on
+   the copied path by construction.
+2. **Pipelined relay read-ahead**: submit the next slot read before
+   the previous write completes — halves the round trips without
+   splice, keeps body inspection, costs a second buffer per
+   relaying connection (conditional read-ahead once the body proves
+   larger than one slot).
+3. **Bigger slots** (`buffer_size` already bounds to 65536): the
+   documented trade is per-worker memory (pool_slots x buffer_size);
+   the 2026-10-07 tuning note quantifies what the knob buys.
+
+The decision input is a profile of the get64k leg, not taste: if the
+time is in the copies, splice wins; if it is in completion-handling
+round trips, read-ahead wins even for TLS legs. Base get64k windows
+are queued on the next quiet window (the first attempt was fully
+discarded — load 32, build storm, the discipline working as
+designed).
+
+**Verdict: OPEN — profile decides between 1 and 2 (or both).**
