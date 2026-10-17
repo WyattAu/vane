@@ -438,6 +438,14 @@ pub async fn run(opts: RunOptions) -> i32 {
             return 1;
         }
     }
+    let adaptive_limits: Arc<HashMap<String, vane_control::config::AdaptiveConcurrencyConfig>> =
+        Arc::new(
+            config
+                .clusters
+                .iter()
+                .filter_map(|(name, c)| c.adaptive.as_ref().map(|a| (name.clone(), a.clone())))
+                .collect(),
+        );
     let mesh_identities: Arc<HashMap<String, vane_control::config::MeshUpstreamConfig>> =
         Arc::new(mesh_map);
 
@@ -892,6 +900,7 @@ pub async fn run(opts: RunOptions) -> i32 {
                 proxy_protocol: config.listeners.get(li).is_some_and(|l| l.proxy_protocol),
                 alt_svc: alt_svc.clone(),
                 mesh: Arc::clone(&mesh_identities),
+                adaptive: Arc::clone(&adaptive_limits),
                 h2_strict_idle_window_update: config.http2.strict_idle_window_update,
             };
             match spawn_worker(
@@ -1211,6 +1220,8 @@ struct WorkerFactory {
     shared_rate_limit: Option<Arc<vane_shm::ratelimit::SharedGcra>>,
     /// Mesh mTLS identities by cluster name.
     mesh: Arc<HashMap<String, vane_control::config::MeshUpstreamConfig>>,
+    /// Per-cluster adaptive concurrency config (startup-bound).
+    adaptive: Arc<HashMap<String, vane_control::config::AdaptiveConcurrencyConfig>>,
     /// Serve h2c on this plain listener (feature `h2`).
     h2c: bool,
     /// Require + trust a PROXY protocol header on every connection.
@@ -1241,6 +1252,7 @@ impl vane_core::HandlerFactory for WorkerFactory {
                 idle_timeout_ms: self.runtime.idle_timeout_ms,
                 first_byte_timeout_ms: self.runtime.first_byte_timeout_ms,
                 pool_per_backend: self.runtime.pool_per_backend,
+                adaptive: Arc::clone(&self.adaptive),
                 pool_idle_ms: self.runtime.pool_idle_ms,
                 tls: self.tls.clone(),
                 plugins: self.plugins.clone(),

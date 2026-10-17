@@ -214,6 +214,7 @@ baseline regressions. CI mirrors [`WyattAu/engineering-standards`].
 | `k8s` | Gateway API provider |
 | `rkyv` | zero-copy route snapshots for handover |
 | `post-quantum` | aws-lc-rs provider with X25519MLKEM768 leading the key-exchange list — [docs/post-quantum.md](docs/post-quantum.md) |
+| adaptive concurrency | opt-in per cluster: latency-gradient load shedding (503 before queueing collapse) — [docs/perf-arc-2026-10.md](docs/perf-arc-2026-10.md) |
 
 ## Documentation
 

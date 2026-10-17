@@ -189,6 +189,76 @@ pub struct ClusterConfig {
     /// Mesh mTLS upstream (SPIFFE-verified). Absent = plaintext.
     #[serde(default)]
     pub mesh: Option<MeshUpstreamConfig>,
+    /// Gradient-based adaptive concurrency limiting (Netflix
+    /// Gradient2 / Envoy adaptive-concurrency family). Absent =
+    /// disabled: the cluster admits everything and relies on the
+    /// circuit breaker.
+    #[serde(default)]
+    pub adaptive: Option<AdaptiveConcurrencyConfig>,
+}
+
+/// Adaptive concurrency limits for one cluster, tuned by measuring the
+/// gradient of request latency against its own no-load baseline.
+///
+/// The controller (crates/vane/src/adaptive.rs) keeps a per-cluster
+/// in-flight count and an exponentially-smoothed latency baseline; a
+/// request is shed with 503 when the count is at the current limit.
+/// The limit itself is recomputed on every completion: the gradient
+/// clamps to 0.5..1.0 (tolerance x baseline / latest), the new limit
+/// is `limit * gradient + queue_size`, then smoothed toward it by
+/// `smoothing`.
+///
+/// Defaults follow Netflix's Gradient2 defaults (min 20, max 200,
+/// queue 4, smoothing 0.2, tolerance 1.5).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptiveConcurrencyConfig {
+    /// Floor for the estimated limit — prevents death spirals where a
+    /// burst sheds so much that the cluster never recovers.
+    #[serde(default = "default_adaptive_min_limit")]
+    pub min_limit: u32,
+    /// Ceiling — a failsafe; the gradient never grows past this.
+    #[serde(default = "default_adaptive_max_limit")]
+    pub max_limit: u32,
+    /// How much may queue while latencies stay low (the gradient adds
+    /// this on every update, so it bounds growth per update).
+    #[serde(default = "default_adaptive_queue_size")]
+    pub queue_size: u32,
+    /// 0.0..1.0 — how much of each new estimate is adopted per update.
+    #[serde(default = "default_adaptive_smoothing")]
+    pub smoothing: f64,
+    /// At least 1.0: how much baseline drift is tolerated before the
+    /// gradient starts shedding (2.0 = a 2x latency rise is acceptable).
+    #[serde(default = "default_adaptive_rtt_tolerance")]
+    pub rtt_tolerance: f64,
+}
+
+fn default_adaptive_min_limit() -> u32 {
+    20
+}
+fn default_adaptive_max_limit() -> u32 {
+    200
+}
+fn default_adaptive_queue_size() -> u32 {
+    4
+}
+fn default_adaptive_smoothing() -> f64 {
+    0.2
+}
+fn default_adaptive_rtt_tolerance() -> f64 {
+    1.5
+}
+
+impl Default for AdaptiveConcurrencyConfig {
+    fn default() -> Self {
+        Self {
+            min_limit: default_adaptive_min_limit(),
+            max_limit: default_adaptive_max_limit(),
+            queue_size: default_adaptive_queue_size(),
+            smoothing: default_adaptive_smoothing(),
+            rtt_tolerance: default_adaptive_rtt_tolerance(),
+        }
+    }
 }
 
 /// TLS material for the h3 upstream bridge (`clusters.*.h3_tls`).

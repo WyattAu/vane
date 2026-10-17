@@ -116,6 +116,7 @@ mod resolve_tests {
             compression: false,
             outlier: None,
             mesh: None,
+            adaptive: None,
         };
         let backends = resolve_backends(&cluster, &health);
         assert_eq!(backends.len(), 2);
@@ -135,6 +136,7 @@ mod resolve_tests {
             compression: false,
             outlier: None,
             mesh: None,
+            adaptive: None,
         };
         let backends = resolve_backends(&cluster, &health);
         assert_eq!(backends.len(), 1, "localhost must resolve");
@@ -155,6 +157,7 @@ mod resolve_tests {
             compression: false,
             outlier: None,
             mesh: None,
+            adaptive: None,
         };
         let backends = resolve_backends(&cluster, &health);
         assert!(

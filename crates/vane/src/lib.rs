@@ -3,6 +3,7 @@
 //! The binary (`main.rs`) is a thin CLI over [`server::run`].
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+pub mod adaptive;
 pub mod admin;
 pub mod cors;
 pub mod h1pool;

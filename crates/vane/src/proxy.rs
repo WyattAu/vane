@@ -53,6 +53,10 @@ pub struct ProxyConfig {
     pub first_byte_timeout_ms: u64,
     /// Idle upstream connections kept per backend (per worker).
     pub pool_per_backend: usize,
+    /// Adaptive concurrency limits per cluster name (absent =
+    /// unlimited; startup-bound like the pool — reloads rebuild
+    /// routes, not worker config).
+    pub adaptive: Arc<HashMap<String, vane_control::config::AdaptiveConcurrencyConfig>>,
     /// How long a parked upstream connection stays reusable.
     pub pool_idle_ms: u64,
     /// TLS termination config (`None` = plaintext listener). Shared slot:
@@ -193,6 +197,10 @@ struct Conn {
     attempts: u8,
     /// Request head bytes kept for response-phase retry (5xx failover).
     req_head_copy: Vec<u8>,
+    /// Cluster this connection's request was admitted to by adaptive
+    /// concurrency (`None` = nothing to release; `take()`-based so
+    /// release is idempotent across the terminal paths).
+    inflight: Option<String>,
     /// Access-log fields for the in-flight transaction.
     req_method: String,
     req_host: String,
@@ -314,6 +322,9 @@ pub struct HttpProxy {
     plugins: Vec<vane_plugins::PluginInstance>,
     metrics: ProxyMetrics,
     worker_id: usize,
+    /// Adaptive concurrency controllers, created on first sight of a
+    /// cluster that configures one (see `adaptive_limit`).
+    adaptive: HashMap<String, crate::adaptive::AdaptiveLimit>,
 }
 
 struct ProxyMetrics {
@@ -343,6 +354,10 @@ struct ProxyMetrics {
 struct ClusterMetric {
     requests: MetricHandle,
     errors: MetricHandle,
+    /// Requests refused by adaptive concurrency (503, never dialed).
+    shed: MetricHandle,
+    /// The controller's current limit for this cluster (this worker).
+    concurrency_limit: MetricHandle,
 }
 
 /// The process's circuit-breaker gate, keyed by the metrics registry.
@@ -388,6 +403,14 @@ impl ClusterMetric {
             errors: registry.register(
                 &format!("vane_cluster_{safe}_upstream_errors_total"),
                 MetricKind::Counter,
+            ),
+            shed: registry.register(
+                &format!("vane_cluster_{safe}_overload_shed_total"),
+                MetricKind::Counter,
+            ),
+            concurrency_limit: registry.register(
+                &format!("vane_cluster_{safe}_concurrency_limit"),
+                MetricKind::Gauge,
             ),
         }
     }
@@ -467,6 +490,7 @@ impl HttpProxy {
             date: vane_proto::date::DateCache::new(),
             pool: HashMap::new(),
             cluster_metrics: HashMap::new(),
+            adaptive: HashMap::new(),
             #[cfg(feature = "wasm")]
             plugins,
             metrics,
@@ -1559,6 +1583,30 @@ impl HttpProxy {
     /// Lazily registers and returns a cluster's metric handles. First sight
     /// of a cluster takes the registry's control-plane lock once; later
     /// requests are lock-free handle lookups.
+    /// Releases one adaptive-concurrency slot, feeding the latency
+    /// sample when the transaction actually completed. Idempotent: the
+    /// slot is `take()`n, so the terminal paths (access emit, session
+    /// reset) can both call this without double-releasing.
+    fn release_inflight(&mut self, slot: u32, sample_us: Option<u64>) {
+        let Some(cluster) = self.conn(slot).inflight.take() else {
+            return;
+        };
+        let (new_limit, sampled) = {
+            let Some(limit) = self.adaptive.get_mut(&cluster) else {
+                return;
+            };
+            match sample_us {
+                Some(us) => limit.exit(us),
+                None => limit.abandon(),
+            }
+            (limit.limit(), sample_us.is_some())
+        };
+        if sampled {
+            let gauge = self.cluster_metric(&cluster).concurrency_limit;
+            gauge.set(&self.config.registry, u64::from(new_limit));
+        }
+    }
+
     fn cluster_metric(&mut self, cluster: &str) -> ClusterMetric {
         if let Some(m) = self.cluster_metrics.get(cluster) {
             return m.clone();
@@ -1685,10 +1733,21 @@ impl HttpProxy {
     /// Emits the transaction's access record (once). No-op when the
     /// access log is disabled or the record was already written.
     fn access_emit(&mut self, io: &SessionIo<'_>, started: Option<Instant>) {
+        // Release the adaptive-concurrency slot FIRST, on every
+        // terminal path, regardless of whether access logging is on:
+        // a leak here would shed everything once inflight stuck at the
+        // limit. The slot must also survive the access-log-disabled
+        // early return below.
+        let slot = io.slot_index();
+        let sample_us = started
+            .map(|s| s.elapsed().as_micros())
+            .unwrap_or(0)
+            .min(u128::from(u64::MAX)) as u64;
+        self.release_inflight(slot, Some(sample_us));
+
         let Some(access) = self.config.access.as_ref() else {
             return;
         };
-        let slot = io.slot_index();
         let Some(conn) = self.conns.get(&slot) else {
             return;
         };
@@ -1935,6 +1994,10 @@ fn conn_set_framing(conns: &mut ConnMap, slot: u32, view: &RequestView<'_>) {
 impl Handler for HttpProxy {
     fn on_connected(&mut self, io: &mut SessionIo<'_>) {
         let slot = io.slot_index();
+        // A transaction can die with its session (client vanished
+        // mid-flight): release its adaptive slot or the count sticks
+        // at the limit and the cluster sheds forever.
+        self.release_inflight(slot, None);
         // Fresh per-session state: worker slots are reused across
         // connections and must not inherit the previous session's
         // buffered bytes, route, or timers (stale head_buf replays the
@@ -2914,6 +2977,38 @@ impl HttpProxy {
             });
         }
 
+        // Adaptive concurrency (opt-in per cluster): shed BEFORE
+        // dialing when the latency gradient says the cluster is past
+        // its healthy concurrency. A shed request never reaches a
+        // backend, so rejections cannot poison the latency baseline.
+        if self.config.adaptive.contains_key(&route.cluster) {
+            let admitted = {
+                let limit = self
+                    .adaptive
+                    .entry(route.cluster.clone())
+                    .or_insert_with(|| {
+                        crate::adaptive::AdaptiveLimit::new(
+                            self.config.adaptive[&route.cluster].clone(),
+                        )
+                    });
+                limit.enter()
+            };
+            if !admitted {
+                self.cluster_metric(&route.cluster)
+                    .shed
+                    .inc(&self.config.registry);
+                self.respond_edge(
+                    io,
+                    Status::ServiceUnavailable,
+                    "overloaded\n",
+                    head_len,
+                    req_has_body,
+                );
+                return;
+            }
+            self.conn(slot).inflight = Some(route.cluster.clone());
+        }
+
         if cached_breaker.is_open() {
             self.respond_edge(
                 io,
@@ -3504,6 +3599,7 @@ mod pool_tests {
             l4_splice: false,
             mesh: Arc::new(HashMap::new()),
             http01_tokens: None,
+            adaptive: Arc::new(HashMap::new()),
         }
     }
 

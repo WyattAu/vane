@@ -124,6 +124,83 @@ iteration's test harness and it is worth a `health.enabled` or a
 probe-interval knob if a deployment ever needs a fully silent proxy;
 parked until then.
 
+## Iteration 2 — adaptive concurrency (overload shedding)
+
+**Pulled:** Netflix's `concurrency-limits` Gradient2 (the full Java
+source: exponential-average baseline — deliberately NOT a minimum,
+"RPC methods can be very bursty"; gradient clamped to [0.5, 1.0];
+queue allowance; smoothing; the app-limited rule; the fast-recovery
+decay when baseline > 2x the latest sample), the Netflix Tech Blog
+"Performance Under Load" (gradient = RTT_noload / RTT_actual,
+newLimit = currentLimit x gradient + queueSize), Envoy's adaptive-
+concurrency filter (the same family; per-worker, latency-window
+based), and the USENIX SREcon 2023 adaptive-concurrency survey
+(additive increase / multiplicative decrease as the family ancestor).
+
+**Analysis:** vane had two blunt overload instruments — the circuit
+breaker (failure-COUNT triggered: it only opens after backends start
+FAILING) and GCRA rate limiting (client-keyed, workload-blind). What
+it lacked was the middle instrument: shedding load when a cluster is
+still succeeding but its latency says it is past capacity. Every
+proxy in this family converged on latency-gradient concurrency
+limits for exactly that gap. The algorithm is small (one EWMA, one
+gradient, one clamp), which is why the verdict is ADOPT rather than
+KEEP-and-park: it is ~150 lines, opt-in per cluster, worker-local
+(shared-nothing like the pool — no atomics on the request path), and
+the floor (`min_limit`) bounds the worst case.
+
+**Verdict: ADOPT (opt-in per cluster), worker-local, Gradient2.**
+
+**Implemented (this iteration):**
+
+- `crates/vane/src/adaptive.rs`: the controller. Baseline = running
+  average for 10 samples then exponential decay (600-sample memory);
+  gradient clamped to [0.5, 1.0]; queue allowance; smoothing; floor
+  and ceiling; the fast-recovery baseline decay; the app-limited rule.
+- `runtime` wiring: `[clusters.<name>.adaptive]` (deny_unknown_
+  fields, Netflix defaults), shed = 503 "overloaded" BEFORE dialing,
+  per-cluster `vane_cluster_<name>_overload_shed_total` counter and
+  `vane_cluster_<name>_concurrency_limit` gauge.
+- Slot lifecycle: `Conn.inflight` is `take()`-based and released on
+  EVERY terminal path (access emit runs before the access-log early
+  return) plus the session reset — a leak would shed forever once the
+  count stuck at the limit.
+- Rejected requests never sample: shedding cannot poison the
+  baseline (Netflix's own rule).
+
+**The bug the lean proof caught (worth recording):** the first e2e
+run never recovered — the limit stayed at the floor through 160
+healthy requests. The probe trace showed `update_limit` ran ONCE in
+the whole test: the app-limited rule sampled the in-flight count
+AFTER the slot was released, and on a fast cluster completions
+rarely overlap enough to clear `limit / 2`, so almost every update
+was skipped. Netflix passes the PRE-release in-flight count for
+exactly this reason; with that ordering the limit recovered 2 → 7
+and shedding stopped. A post-release sample is a different
+algorithm — the release instant is the one instant guaranteed to
+understate concurrency.
+
+**Lean proof:**
+
+- 8 clock-free unit tests on the controller: steady traffic never
+  sheds and growth converges (app-limited); a 4x collapse sheds to
+  the floor; recovery grows back bounded; one outlier cannot halve
+  the limit; an idle cluster stops growing; sustained overload does
+  not raise the limit; enter/exit bookkeeping is exact; 2000
+  pseudo-random latencies stay within [min, max].
+- 1 e2e (`tests/adaptive_concurrency.rs`): a switchable-delay
+  backend, four concurrent clients. Healthy → zero sheds. Collapsed
+  (300 ms/responses) → sheds while the admitted requests still ride
+  (shedding is never total). Recovered → the ramp grows the limit,
+  the tail serves all four clients with the shed counter FROZEN.
+
+**Operational notes:** the limit is per worker — read the gauge as
+"per worker" and multiply by workers. Cluster config is
+startup-bound (like the pool); xDS-driven adaptive changes are
+parked behind the same route-table trigger as the other cluster
+knobs. Retry-After on the 503 is parked with the response-"why"
+headers item from the previous arc.
+
 Entries are appended per iteration; each one names its sources, the
 verdict, the implementation and the proof, so the ledger always
 reflects verified state.

@@ -176,6 +176,7 @@ pub fn apply_snapshot(
             http2: cluster.http2,
             http3: false,
             h3_tls: None,
+            adaptive: None,
             mesh: None,
         };
         let backends = resolve_backends(&cluster_cfg, health);

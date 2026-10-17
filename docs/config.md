@@ -163,6 +163,27 @@ has ~48 attempts before expiry.
 | `pool_per_backend` | int | `4` | retained idle upstream connections per backend per worker |
 | `pool_idle_ms` | int | `30000` | how long a pooled upstream connection stays reusable after it was parked; past this it is reaped instead of handed out (backends enforce their own idle timeouts — nginx `keepalive_timeout` 60 s, most LBs 60 s — so a stale parked connection would cost the next request a failed attach plus a fresh dial) |
 
+### `clusters.<name>.adaptive` — adaptive concurrency limiting
+
+Opt-in gradient-based load shedding (Netflix Gradient2 / Envoy
+adaptive-concurrency family; analysis in
+[docs/perf-arc-2026-10.md](perf-arc-2026-10.md), iteration 2). The
+controller tracks each cluster's latency baseline and its in-flight
+request count; past the current limit, requests are shed with 503
+`overloaded` instead of queueing behind a collapsed backend. Absent
+= disabled.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `min_limit` | int | `20` | floor — prevents death spirals |
+| `max_limit` | int | `200` | ceiling — the gradient never grows past this |
+| `queue_size` | int | `4` | growth allowance per update while healthy |
+| `smoothing` | float | `0.2` | 0.0..1.0, adoption rate of each new estimate |
+| `rtt_tolerance` | float | `1.5` | >= 1.0; baseline drift tolerated before shedding |
+
+Metrics: `vane_cluster_<name>_overload_shed_total` (alerts on this)
+and `vane_cluster_<name>_concurrency_limit` (per worker).
+
 Pool metrics (`/metrics`): `vane_upstream_pool_hits_total`,
 `vane_upstream_pool_misses_total`, `vane_upstream_dials_total`,
 `vane_upstream_pool_idle`. The reuse ratio
