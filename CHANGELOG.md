@@ -4,6 +4,72 @@ All notable changes to vane are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 semver.
 
+## [0.13.0] — 2026-10-17
+
+Crate versions: `vane-proxy` 0.13.0, `vane-control` 0.11.0.
+The performance-arc release (iterations 1-2 of
+docs/perf-arc-2026-10.md): upstream connection reuse becomes
+first-class and observable, and clusters gain gradient-based load
+shedding.
+
+### Added
+
+- **Upstream pool telemetry** (`vane-proxy`): `vane_upstream_pool_
+  hits_total`, `vane_upstream_pool_misses_total`,
+  `vane_upstream_dials_total` and the `vane_upstream_pool_idle`
+  gauge. Reuse is the single biggest lever on proxy throughput, and
+  until now the reuse ratio was invisible. Measured under c=64 load:
+  92.9% reuse (1.24M hits vs 94k dials), zero non-200 in 2.6M
+  requests.
+- **`runtime.pool_idle_ms`** (default 30000): a pooled upstream
+  connection is reusable for this long after it was parked, then
+  reaped — a connection the backend has already retired (nginx
+  `keepalive_timeout` 60 s, most LBs 60 s) used to be handed out
+  anyway, costing the next request a failed attach plus a fresh
+  dial. Park reaps expired entries BEFORE refusing room, so a burst
+  can no longer evict a connection the next burst would reuse.
+- **Adaptive concurrency** (`vane-control` 0.11.0 + `vane-proxy`,
+  opt-in per cluster): `[clusters.<name>.adaptive]` installs a
+  Netflix-Gradient2 controller (also Envoy's adaptive-concurrency
+  family) that tracks the cluster's latency baseline and sheds with
+  503 `overloaded` when in-flight requests reach the current limit —
+  instead of queueing behind a collapsed backend. Worker-local
+  (shared-nothing, no atomics on the request path); rejected requests
+  never sample, so shedding cannot poison the baseline. Metrics:
+  `vane_cluster_<name>_overload_shed_total` and
+  `vane_cluster_<name>_concurrency_limit` (per worker). The lean
+  proof caught a real algorithm bug before it shipped: sampling the
+  in-flight count AFTER releasing the slot lets the app-limited rule
+  eat ~289 of 290 updates on a fast cluster — a limit that never
+  grows never recovers; the pre-release count is what Netflix passes.
+
+### Fixed
+
+- **A dropped worker no longer leaks pooled descriptors** — parked
+  upstream fds are detached from the engine, so `Drop` now closes
+  every idle connection an embedder teardown or failed restart was
+  holding.
+
+### Changed
+
+- `RuntimeConfig` and `ClusterConfig` are `#[non_exhaustive]` (the
+  config-struct family rule; both are parsed structs, serde builds
+  them in-crate). `ProxyConfig` deliberately stays exhaustively
+  constructible — it is the programmatic embedder API — and gains a
+  `Default` so tests and embedders can write struct-update literals.
+- The development pool test suite caught a silent-total-failure bug
+  during development: `get_mut` instead of `entry` disabled parking
+  for every backend's first connection — pooling would have done
+  nothing while every test that only checked "it runs" stayed green.
+
+### Benchmarks
+
+Fresh quiet-window runs (load 4-7, loadgen, h1 c=64, 2 workers,
+medians of 3): 86.7-91.1k rps (p50 ~129 us), zero non-200 across all
+windows; the pool changes are throughput-neutral within the ~3%
+host drift, stated rather than tuned around. Full table and the
+reuse evidence in docs/benchmarks.md.
+
 ## [0.12.0] — 2026-10-17
 
 Crate versions: `vane-proxy` 0.12.0, `vane-tls` 0.6.0,

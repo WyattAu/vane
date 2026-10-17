@@ -14,6 +14,13 @@
 > and two missing-END_STREAM paths). Container images publish
 > automatically on `vX.Y.Z` tags (release.yml). Order below unchanged.
 >
+> **v0.13.0 published 2026-10-17** (`vane-control` 0.11.0 →
+> `vane-proxy` 0.13.0), install-verified: `cargo install
+> vane-proxy --version 0.13.0 --locked` → `vane 0.13.0`. The
+> performance-arc release: pool telemetry (92.9% reuse measured under
+> load), `pool_idle_ms` reaping, adaptive concurrency (Gradient2),
+> and the drop-hygiene fix for pooled descriptors.
+>
 > **v0.12.0 published 2026-10-17** (`vane-tls` 0.6.0 →
 > `vane-control` 0.10.1 → `vane-proxy` 0.12.0), install-verified:
 > `cargo install vane-proxy --version 0.12.0 --locked` →
