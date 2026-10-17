@@ -213,6 +213,18 @@ baseline regressions. CI mirrors [`WyattAu/engineering-standards`].
 | `wasm` | wasmtime plugin sandbox |
 | `k8s` | Gateway API provider |
 | `rkyv` | zero-copy route snapshots for handover |
+| `post-quantum` | aws-lc-rs provider with X25519MLKEM768 leading the key-exchange list — [docs/post-quantum.md](docs/post-quantum.md) |
+
+## Documentation
+
+| Doc | What it covers |
+|---|---|
+| [docs/config.md](docs/config.md) | configuration reference (validated by `vane validate`) |
+| [docs/post-quantum.md](docs/post-quantum.md) | the `post-quantum` feature, verification recipe, measured negotiation table |
+| [docs/security.md](docs/security.md) | threat model, hardening, disclosure |
+| [docs/benchmarks.md](docs/benchmarks.md) | measured comparison vs nginx, methodology |
+| [docs/research-loop-2026-10.md](docs/research-loop-2026-10.md) | the ten-iteration research arc: sources, prior art, verdicts |
+| [docs/publishing.md](docs/publishing.md) | crates.io publish order, install verification |
 
 ## Deploy
 
