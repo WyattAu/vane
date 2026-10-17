@@ -52,6 +52,19 @@ pub fn install_crypto_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     #[cfg(not(feature = "post-quantum"))]
     let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // With the post-quantum feature, rustls carries BOTH provider
+    // features and refuses to auto-pick a process default. This ctor
+    // installs aws-lc-rs BEFORE main in every binary that links this
+    // crate — production (the startup install becomes a no-op) and,
+    // critically, test binaries, which build rustls configs directly
+    // and would otherwise panic on first use. The default (ring-only)
+    // build keeps rustls's own auto-pick.
+    #[cfg(feature = "post-quantum")]
+    #[::ctor::ctor]
+    fn vane_install_provider_before_main() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
 }
 
 /// Loads PEM cert chain + key from disk.

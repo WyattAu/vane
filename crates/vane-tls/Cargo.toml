@@ -16,6 +16,7 @@ default = []
 post-quantum = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
 
 [dependencies]
+ctor = "0.4"
 rustls = { workspace = true }
 
 ring = { workspace = true }
