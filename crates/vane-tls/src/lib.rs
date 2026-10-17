@@ -61,8 +61,12 @@ pub fn install_crypto_provider() {
     // and would otherwise panic on first use. The default (ring-only)
     // build keeps rustls's own auto-pick.
     #[cfg(feature = "post-quantum")]
-    #[::ctor::ctor]
+    #[::ctor::ctor(unsafe)]
     fn vane_install_provider_before_main() {
+        // SAFETY (ctor 1.x asks for the explicit claim): the ctor takes
+        // no arguments and does nothing but a safe, idempotent
+        // provider install; it runs before main with no other
+        // thread- or state-safety obligations.
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     }
 }

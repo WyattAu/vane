@@ -217,6 +217,18 @@ cap on a 2-backend cluster, the second backend past its threshold is
 NOT ejected; a 100% cap still allows a full ejection.
 
 
+## Release-train note (2026-10-16 interim, 2026-10-17 closed)
+
+**Closed (2026-10-17):** the arc shipped as two trains —
+`vane-proto` 0.7.0 / `vane-router` 0.7.0 / `vane-control` 0.10.0 /
+`vane-proxy` 0.11.0 for iterations 1-5, then `vane-tls` 0.6.0 /
+`vane-control` 0.10.1 / `vane-proxy` 0.12.0 for iterations 6-10
+(the post-quantum feature, the nameless-xDS-cluster fix, the trace
+correlation fix). `vane-tls` took an explicit version instead of
+inheriting the workspace train: only it moved, and the workspace
+dependency requirement was bumped in the same commit so the published
+proxy resolves the published tls crate, not the old one.
+
 ## Interim release-train note (2026-10-16)
 
 Iterations 1-5 produced config-struct and API changes (non_exhaustive

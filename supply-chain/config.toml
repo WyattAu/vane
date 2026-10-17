@@ -420,6 +420,10 @@ criteria = "safe-to-deploy"
 version = "0.4.3"
 criteria = "safe-to-deploy"
 
+[[exemptions.ctor]]
+version = "1.0.13"
+criteria = "safe-to-deploy"
+
 [[exemptions.ctor-proc-macro]]
 version = "0.0.6"
 criteria = "safe-to-deploy"
@@ -846,6 +850,14 @@ criteria = "safe-to-deploy"
 
 [[exemptions.libredox]]
 version = "0.1.23"
+criteria = "safe-to-deploy"
+
+[[exemptions.link-section]]
+version = "0.19.3"
+criteria = "safe-to-deploy"
+
+[[exemptions.linktime-proc-macro]]
+version = "0.2.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.linux-raw-sys]]
@@ -1700,6 +1712,10 @@ criteria = "safe-to-deploy"
 version = "0.10.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.vane-control]]
+version = "0.10.1"
+criteria = "safe-to-deploy"
+
 [[exemptions.vane-filters]]
 version = "0.6.0"
 criteria = "safe-to-deploy"
@@ -1736,6 +1752,10 @@ criteria = "safe-to-deploy"
 version = "0.11.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.vane-proxy]]
+version = "0.12.0"
+criteria = "safe-to-deploy"
+
 [[exemptions.vane-router]]
 version = "0.6.1"
 criteria = "safe-to-deploy"
@@ -1750,6 +1770,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.vane-tls]]
 version = "0.5.3"
+criteria = "safe-to-deploy"
+
+[[exemptions.vane-tls]]
+version = "0.6.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.venial]]

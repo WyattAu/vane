@@ -44,10 +44,10 @@ vane-observe = { version = "0.5.3", path = "crates/vane-observe" }
 vane-proto = { version = "0.7.0", path = "crates/vane-proto" }
 vane-router = { version = "0.7.0", path = "crates/vane-router" }
 vane-filters = { version = "0.6.0", path = "crates/vane-filters" }
-vane-control = { version = "0.10.0", path = "crates/vane-control" }
+vane-control = { version = "0.10.1", path = "crates/vane-control" }
 vane-shm = { version = "0.5.3", path = "crates/vane-shm" }
 vane-client-sdk = { version = "0.5.3", path = "crates/vane-client-sdk" }
-vane-tls = { version = "0.5.3", path = "crates/vane-tls" }
+vane-tls = { version = "0.6.0", path = "crates/vane-tls" }
 vane-plugins = { version = "0.5.3", path = "crates/vane-plugins" }
 
 # WyattAu kit ecosystem (reuse, do not reinvent)

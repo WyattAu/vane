@@ -14,6 +14,16 @@
 > and two missing-END_STREAM paths). Container images publish
 > automatically on `vX.Y.Z` tags (release.yml). Order below unchanged.
 >
+> **v0.12.0 published 2026-10-17** (`vane-tls` 0.6.0 →
+> `vane-control` 0.10.1 → `vane-proxy` 0.12.0), install-verified:
+> `cargo install vane-proxy --version 0.12.0 --locked` →
+> `vane 0.12.0`. The post-quantum train: the `post-quantum` cargo
+> feature switches the process rustls provider to aws-lc-rs with
+> X25519MLKEM768 leading the kx list (default build still ring), plus
+> the fuzz-found nameless-xDS-cluster rejection and the access-log /
+> trace correlation fix. `vane-tls` leaves the workspace train with an
+> explicit version — the rest of the train had no reason to move.
+>
 > **v0.11.0 published 2026-10-16** (vane-proto 0.7.0 →
 > vane-router 0.7.0 → vane-control 0.10.0 → vane-proxy 0.11.0),
 > install-verified: `cargo install vane-proxy --version 0.11.0

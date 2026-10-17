@@ -4,6 +4,61 @@ All notable changes to vane are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 semver.
 
+## [0.12.0] — 2026-10-17
+
+Crate versions: `vane-proxy` 0.12.0, `vane-tls` 0.6.0,
+`vane-control` 0.10.1. The research-loop release, part two
+(iterations 6-10 of docs/research-loop-2026-10.md): the post-quantum
+feature train, two fuzz-found fixes, and the closed ten-iteration
+verdict ledger.
+
+### Added
+
+- **`post-quantum` cargo feature** (`vane-tls` 0.6.0, forwarded by
+  `vane-proxy` 0.12.0): installs the aws-lc-rs crypto provider with
+  rustls's `prefer-post-quantum`, making X25519MLKEM768 the
+  highest-priority key-exchange group on every TLS listener AND the
+  h3/QUIC endpoint. This is the harvest-now-decrypt-later defense
+  Chrome and Cloudflare negotiate by default, applied to the leg that
+  actually carries attacker-visible plaintext. Off by default — the
+  ring build is unchanged, and switching providers needs cmake to
+  build, so the switch is a deliberate build choice.
+  - With both provider features compiled, rustls refuses to auto-pick
+    a process default, so a `ctor` in `vane-tls` installs aws-lc-rs
+    before `main` in every binary that links the crate (production
+    startup installs it explicitly too; the test binaries needed it
+    and now cannot forget it).
+  - Lean proof: `pq_provider_offers_x25519_mlkem768` asserts the PQ
+    hybrid leads the installed provider's kx list iff the feature is
+    on; the h3 suites pass over a PQ-negotiated QUIC handshake.
+
+### Fixed
+
+- **Nameless xDS clusters are rejected at decode** (`vane-control`,
+  fuzz-found). A `Cluster` message with an empty `name` has no valid
+  proto (field 1 is required) but previously produced a snapshot keyed
+  by `""` — two such clusters collapsed onto one key, and the
+  resulting route pointed nowhere. `decode_cluster` now returns `None`
+  for an empty name. Regression seed in
+  `fuzz/corpus/regression/xds_nameless_cluster`.
+- **Access records now carry the client's inbound trace id**
+  (`vane-proxy`). The request span continued an inbound
+  `traceparent`, but the access log emitted a freshly generated id —
+  so log records and spans could not be joined for any request that
+  arrived with tracing. `ctx.trace` is now seeded from the parsed
+  header. E2E proof: `access_log_correlates_inbound_traceparent`.
+
+### Research ledger (docs/research-loop-2026-10.md)
+
+Iterations 6-10 closed the arc: post-quantum KEX (ADOPT, shipped
+above), the zero-copy path (KEEP — registered fixed buffers + splice
+stay; SEND_ZC and ZC-Rx parked with measured triggers), xDS
+subscriptions (KEEP SotW ADS; delta parked behind a 10k-resource or
+resource-TTL trigger), observability (KEEP + the trace fix above),
+and proof methods (KEEP + the HTTP Garden integer-parser quirks
+pinned as regression tests). Every parked item names the measurement
+that would reopen it.
+
 ## [0.11.0] — 2026-10-16
 
 Crate versions: `vane-proxy` 0.11.0, `vane-control` 0.10.0,
