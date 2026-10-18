@@ -350,6 +350,33 @@ corruption with a failing minimal case first.
 
 Candidate 2 (read-ahead) stays OPEN as the TLS-leg follow-up.
 
+**Second attempt + second rollback (2026-10-18, same iteration):**
+the fast path was rebuilt with the two obvious fixes — a queue-
+drain ordering barrier (the splice arms only after the queued
+head/first-read bytes have flushed, since it writes the socket
+directly and would jump the queue) and read re-arm gates while a
+splice is active (an in-flight upstream read double-delivers; an
+in-flight downstream read STEALS the spliced bytes as fake client
+data). Result: the happy path now moves the right COUNT of bytes —
+the worker trace shows ingress 61506, egress 61506 into the
+verified-correct client fd (session peer matches the client's
+local port) — and the client still starves: FIONREAD = 0 on its
+receive queue, first mismatch never even reached. The splice
+reports success; the bytes vanish between the socket accept and
+the peer's receive queue. That is an engine-interaction layer this
+iteration has not earned the right to debug blindly.
+
+**Standing state:** dark, reverted from the tree twice; the
+engineering primitives (exhaustive op decode, watch/unwatch, the
+two-firing contract test) are permanent keepers. Re-entry criteria
+are now sharper: reproduce the vanishing bytes in a STANDALONE
+kernel-level test (two TCP sockets + one pipe + the exact
+splice(2) sequence the worker issues) before touching the worker
+again — if the standalone sequence delivers the bytes, the loss is
+in the worker's interaction with concurrent uring ops on the same
+socket, and the next suspect is the still-armed upstream READ that
+the splice races with at arm time.
+
 **Base windows (2026-10-17 20:47Z, load 7):** get64k c=8, 2 workers,
 10 s x 3: 12.4k / 12.5k / 15.3k rps (p50 ~440 us, non-200 = 0) —
 today's median 12.5k against the 2026-10-07 record's 15.3k and
