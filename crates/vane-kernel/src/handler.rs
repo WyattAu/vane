@@ -69,7 +69,8 @@ pub enum UpstreamDial {
 /// worker (single-threaded dispatch; per-connection state lives in the
 /// session, reached through [`SessionIo`]).
 pub trait Handler: Send + 'static {
-    /// A new downstream connection was accepted.
+    /// A downstream connection was accepted and its session created:
+    /// dial upstreams, enter passthrough modes, or arm deadlines.
     fn on_connected(&mut self, io: &mut SessionIo<'_>) {
         let _ = io;
     }

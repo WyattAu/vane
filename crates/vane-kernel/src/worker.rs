@@ -153,6 +153,7 @@ struct Session {
     /// Half-close (FIN) requested while writes are still flushing.
     fin_queued: bool,
     splice: bool,
+
     deadline: Option<Instant>,
 }
 
@@ -433,6 +434,11 @@ impl WorkerState {
     /// next debug session can re-enable the trace in one line).
     pub(crate) fn close_session(&mut self, slot: u32, generation: u16, reason: &str) {
         // vane-core stays dependency-light: no tracing here.
+        #[cfg(feature = "vane_dbg")]
+        eprintln!(
+            "[close] slot={slot} gen={generation} valid={} reason={reason}",
+            self.valid(slot, generation)
+        );
         let _ = reason;
         if !self.valid(slot, generation) {
             return;
@@ -903,6 +909,9 @@ impl WorkerState {
             return; // stale token for a closed/reused session
         }
         match cqe.token.op() {
+            // Body-splice watch events: the fast path is dark (the
+            // handler never arms these today); a stray event is a no-op.
+            Op::BodySpliceIn | Op::BodySpliceOut | Op::BodySpliceCancel => {}
             Op::Accept => {}
             Op::Connect => match cqe.result {
                 Ok(_) => {

@@ -25,6 +25,15 @@ pub enum Op {
     Connect = 6,
     /// Splice pump progress (L4 passthrough).
     Splice = 7,
+    /// Body-splice: the upstream socket is readable — move bytes
+    /// upstream -> pipe -> downstream (capped by Content-Length).
+    BodySpliceIn = 8,
+    /// Body-splice: the downstream socket is writable — drain the
+    /// pipe (backpressure resumed).
+    BodySpliceOut = 9,
+    /// Body-splice watch cancellation completion (never dispatched to
+    /// a handler; the engine filters it).
+    BodySpliceCancel = 10,
 }
 
 /// Uniquely identifies an in-flight engine operation.
@@ -62,8 +71,12 @@ impl Token {
     #[must_use]
     #[inline]
     pub fn op(self) -> Op {
-        // SAFETY-free: all byte patterns 0..=7 are valid `Op` discriminants
-        // we ever encode; anything else maps to a panic-free fallback.
+        // SAFETY-free: every byte pattern maps to its discriminant; the
+        // catch-all keeps unknown bits panic-free. NOTE: adding an Op
+        // variant REQUIRES extending this match — the fallback silently
+        // re-routes its completions (a new body-splice op once landed
+        // here as Splice and starved its own fast path; the standalone
+        // watch test caught it).
         match self.0 & ((1 << Self::OP_BITS) - 1) {
             1 => Op::Accept,
             2 => Op::DownstreamRead,
@@ -71,6 +84,10 @@ impl Token {
             4 => Op::UpstreamRead,
             5 => Op::UpstreamWrite,
             6 => Op::Connect,
+            7 => Op::Splice,
+            8 => Op::BodySpliceIn,
+            9 => Op::BodySpliceOut,
+            10 => Op::BodySpliceCancel,
             _ => Op::Splice,
         }
     }

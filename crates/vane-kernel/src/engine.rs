@@ -97,6 +97,22 @@ pub trait Engine {
         addr: std::net::SocketAddr,
     ) -> io::Result<(std::os::fd::RawFd, Poll)>;
 
+    /// Arms a multishot readiness watch for arbitrary `POLL*` events.
+    /// Completions carry the event mask (`result >= 0`); cancellations
+    /// (`ECANCELED`, e.g. after the fd closes) are filtered by the
+    /// backend. Used by the body-splice fast path.
+    ///
+    /// # Errors
+    /// Submission failure.
+    fn watch(&mut self, fd: std::os::fd::RawFd, token: Token, events: u32) -> io::Result<()>;
+
+    /// Cancels a readiness watch. Cancellation completions are
+    /// filtered by the backend and never surface as CQEs.
+    ///
+    /// # Errors
+    /// Submission failure.
+    fn unwatch(&mut self, fd: std::os::fd::RawFd, token: Token) -> io::Result<()>;
+
     /// Starts a nonblocking UDS `connect(2)` to `path`.
     ///
     /// # Errors

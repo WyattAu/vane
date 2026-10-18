@@ -210,6 +210,31 @@ impl UringEngine {
 }
 
 impl Engine for UringEngine {
+    fn watch(&mut self, fd: RawFd, token: Token, events: u32) -> io::Result<()> {
+        // SAFETY contract for `push`: fd live until session close;
+        // multishot poll re-arms itself.
+        let entry = io_uring::opcode::PollAdd::new(Fd(fd), events)
+            .multi(true)
+            .build();
+        self.push(entry, token);
+        Ok(())
+    }
+
+    fn unwatch(&mut self, fd: RawFd, token: Token) -> io::Result<()> {
+        // PollRemove targets the poll's OWN user_data; the completion
+        // comes back under the cancel token and is filtered.
+        let _ = fd;
+        let remove = io_uring::opcode::PollRemove::new(token.bits()).build();
+        let done = Token::new(
+            crate::token::Op::BodySpliceCancel,
+            token.slot(),
+            token.generation(),
+            0,
+        );
+        self.push(remove, done);
+        Ok(())
+    }
+
     fn kind(&self) -> &'static str {
         "io_uring"
     }
@@ -400,31 +425,47 @@ impl Engine for UringEngine {
                         out.push(Cqe { token, result });
                     }
                 }
-                crate::token::Op::Splice => {
+                crate::token::Op::BodySpliceCancel => {
+                    // Removal completion: Ok(0) removed, -ENOENT nothing
+                    // was armed. Either way, nothing to dispatch.
+                }
+                op @ (crate::token::Op::Splice
+                | crate::token::Op::BodySpliceIn
+                | crate::token::Op::BodySpliceOut) => {
                     if raw < 0 {
                         if -raw != libc::ECANCELED {
                             out.push(Cqe { token, result });
                         }
-                    } else if let Some(&(from, to)) = self.splice_dirs.get(&token.bits()) {
-                        match splice::pump(from, to, 1 << 20) {
-                            splice::PumpResult::Moved(n) => {
-                                out.push(Cqe {
+                    } else if op == crate::token::Op::Splice {
+                        if let Some(&(from, to)) = self.splice_dirs.get(&token.bits()) {
+                            match splice::pump(from, to, 1 << 20) {
+                                splice::PumpResult::Moved(n) => {
+                                    out.push(Cqe {
+                                        token,
+                                        result: Ok(n as u32),
+                                    });
+                                }
+                                splice::PumpResult::Eof => {
+                                    out.push(Cqe {
+                                        token,
+                                        result: Ok(0),
+                                    });
+                                }
+                                splice::PumpResult::WouldBlock => {}
+                                splice::PumpResult::Err(code) => out.push(Cqe {
                                     token,
-                                    result: Ok(n as u32),
-                                });
+                                    result: Err(io::Error::from_raw_os_error(code)),
+                                }),
                             }
-                            splice::PumpResult::Eof => {
-                                out.push(Cqe {
-                                    token,
-                                    result: Ok(0),
-                                });
-                            }
-                            splice::PumpResult::WouldBlock => {}
-                            splice::PumpResult::Err(code) => out.push(Cqe {
-                                token,
-                                result: Err(io::Error::from_raw_os_error(code)),
-                            }),
                         }
+                    } else {
+                        // Body-splice readiness: the worker issues the
+                        // capped splices itself (it owns the pipe and
+                        // the remaining-byte budget).
+                        out.push(Cqe {
+                            token,
+                            result: Ok(raw as u32),
+                        });
                     }
                 }
                 _ => out.push(Cqe { token, result }),
@@ -684,5 +725,76 @@ mod fault_tests {
         // No panic; op state dropped.
         close(a);
         close(b);
+    }
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::*;
+    use crate::token::{Op, Token};
+    use std::os::fd::RawFd;
+
+    /// A multishot watch must fire when the watched socket becomes
+    /// readable — the body-splice fast path hangs forever if it does
+    /// not (this is the exact failure the e2e suite saw first).
+    #[test]
+    fn watch_fires_on_readability() {
+        let mut engine = UringEngine::new(64, None, false).expect("engine");
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: socketpair fills both descriptors or fails.
+        unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        let (a, b) = (fds[0], fds[1]);
+        // Nonblocking both ends.
+        // SAFETY: fcntl on owned descriptors.
+        for fd in [a, b] {
+            // SAFETY: fcntl on owned descriptors.
+            unsafe {
+                let fl = libc::fcntl(fd, libc::F_GETFL);
+                libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+            }
+        }
+        let token = Token::new(Op::BodySpliceIn, 0, 1, 0);
+        engine.watch(a, token, libc::POLLIN as u32).expect("watch");
+
+        // Write from b: `a` becomes readable.
+        // SAFETY: write to an owned connected descriptor.
+        let n = unsafe { libc::write(b, "x".as_ptr().cast(), 1) };
+        assert_eq!(n, 1);
+
+        // First readiness.
+        let mut out = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline && out.is_empty() {
+            engine
+                .poll(Some(std::time::Duration::from_millis(200)), &mut out)
+                .expect("poll");
+        }
+        assert!(
+            out.iter().any(|c| c.token.op() == Op::BodySpliceIn),
+            "the watch never fired the first time: {out:?}"
+        );
+
+        // MULTISHOT contract: a second readiness on the same watch must
+        // also fire — EOF detection depends on it (after the body
+        // bytes, the FIN is the next event).
+        // SAFETY: write to an owned connected descriptor.
+        let n = unsafe { libc::write(b, "y".as_ptr().cast(), 1) };
+        assert_eq!(n, 1);
+        out.clear();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline && out.is_empty() {
+            engine
+                .poll(Some(std::time::Duration::from_millis(200)), &mut out)
+                .expect("poll");
+        }
+        assert!(
+            out.iter().any(|c| c.token.op() == Op::BodySpliceIn),
+            "the watch never fired a SECOND time (multishot broken): {out:?}"
+        );
+        // SAFETY: owned test descriptors.
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
     }
 }

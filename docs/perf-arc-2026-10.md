@@ -313,15 +313,42 @@ comparisons on this host need equal-quiet windows, and the earlier
 **Verdict: ADOPT candidate 1 — socket-to-socket splice for eligible
 response bodies** (plain TCP both legs, identity Content-Length, no
 gzip, no wasm body inspection, not h2). It targets the 29.3%
-directly; read-ahead cannot (it still copies). Implementation is
-queued with the full map above: byte-capped readiness splice in the
-worker (`splice_remaining` in the slab; splice(2)'s len parameter
-IS the cap), completion event to the handler on reaching zero
-(access emit, adaptive release, pool park, keep-alive continuation),
-short-EOF is a 502, behind an opt-in flag until measured — the same
-dark-launch posture pool_per_backend had before load_pooled
-validated it. Candidate 2 (read-ahead) stays OPEN as the TLS-leg
-follow-up.**
+directly; read-ahead cannot (it still copies).
+
+**Implementation ATTEMPTED AND ROLLED BACK (2026-10-18) — the honest
+state of this iteration:** the full fast path was built (worker
+readiness-splice with a per-session byte budget, handler
+eligibility, completion event, opt-in `response_splice` flag) and
+the lean proofs refused to pass. Two findings, both real:
+
+1. **`Token::op()` had a silent catch-all**: the op byte was decoded
+   through a match that only knew ops 1..=7 and mapped EVERYTHING
+   ELSE to `Op::Splice`. Any future op would silently re-route its
+   completions. The new body-splice ops landed exactly in that trap —
+   watch completions arrived as `Splice` and were dropped, starving
+   the fast path. FIXED: the match is exhaustive, with a comment that
+   adding an Op variant requires extending it, and a standalone
+   engine test (`watch_fires_on_readability`) proves a watch fires
+   TWICE (first readiness + EOF), which is what catches this class.
+2. **The relayed body came back corrupted** (right length, wrong
+   content — duplicated prefix, missing tail) and the truncated
+   case hung. The interaction between the slot-based relay that
+   already consumed `rest` and the splice's socket offset is not
+   understood well enough to ship; the machinery (worker readiness
+   splice, byte budget, completion plumbing) is reverted to keep
+   main clean while the failure analysis continues.
+
+**What LANDED from the attempt (all gate-green):** the exhaustive
+`Token::op` fix (a latent bug for ANY future op, now provably
+round-tripped by test), the `Engine::watch`/`unwatch` primitives
+(generic multishot readiness with cancellation filtering) plus the
+two-firing contract test, and `ClusterConfig`/`RuntimeConfig`
+`#[non_exhaustive]` hardening from the semver gate. The splice
+feature itself is DARK: reverted from the tree, design + failure
+analysis recorded here, re-entry criteria = explain the offset
+corruption with a failing minimal case first.
+
+Candidate 2 (read-ahead) stays OPEN as the TLS-leg follow-up.
 
 **Base windows (2026-10-17 20:47Z, load 7):** get64k c=8, 2 workers,
 10 s x 3: 12.4k / 12.5k / 15.3k rps (p50 ~440 us, non-200 = 0) —

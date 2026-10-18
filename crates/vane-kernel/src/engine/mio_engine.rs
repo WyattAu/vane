@@ -335,6 +335,19 @@ impl Engine for MioEngine {
         "mio"
     }
 
+    fn watch(&mut self, _fd: RawFd, _token: Token, _events: u32) -> io::Result<()> {
+        // The body-splice fast path is io_uring-only; callers degrade to
+        // the copied relay when arming fails.
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "body splice is io_uring-only",
+        ))
+    }
+
+    fn unwatch(&mut self, _fd: RawFd, _token: Token) -> io::Result<()> {
+        Ok(())
+    }
+
     fn add_listener(&mut self, fd: RawFd, token: Token) -> io::Result<()> {
         let mut src = mio::unix::SourceFd(&fd);
         self.poller
