@@ -14,6 +14,13 @@
 > and two missing-END_STREAM paths). Container images publish
 > automatically on `vX.Y.Z` tags (release.yml). Order below unchanged.
 >
+> **v0.14.0 published 2026-10-18** (`vane-kernel` 0.8.0 →
+> `vane-proxy` 0.14.0). Kernel internals: `Op` is
+> `#[non_exhaustive]` with the exhaustive `Token::op` decode fix,
+> and generic readiness-watch primitives land with contract tests.
+> Cut because the semver gate caught the new `Op` variants breaking
+> downstream matches at the same minor — the gate doing its job.
+>
 > **v0.13.0 published 2026-10-17** (`vane-control` 0.11.0 →
 > `vane-proxy` 0.13.0), install-verified: `cargo install
 > vane-proxy --version 0.13.0 --locked` → `vane 0.13.0`. The

@@ -4041,7 +4041,7 @@ dependencies = [
 
 [[package]]
 name = "vane-kernel"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "bytes",
  "core_affinity",
@@ -4094,7 +4094,7 @@ dependencies = [
 
 [[package]]
 name = "vane-proxy"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "axum",
  "axum-stack",

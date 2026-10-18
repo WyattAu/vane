@@ -39,7 +39,7 @@ expect_used = "allow"
 
 [workspace.dependencies]
 # Internal
-vane-kernel = { version = "0.7.0", path = "crates/vane-kernel" }
+vane-kernel = { version = "0.8.0", path = "crates/vane-kernel" }
 vane-observe = { version = "0.5.3", path = "crates/vane-observe" }
 vane-proto = { version = "0.7.0", path = "crates/vane-proto" }
 vane-router = { version = "0.7.0", path = "crates/vane-router" }

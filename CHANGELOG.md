@@ -4,6 +4,43 @@ All notable changes to vane are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 semver.
 
+## [0.14.0] — 2026-10-18
+
+Crate versions: `vane-kernel` 0.8.0, `vane-proxy` 0.14.0. A
+kernel-internals release that exists because the semver gate caught
+what a performance experiment did to the public API — exactly what
+that gate is for.
+
+### Changed
+
+- **`Op` is `#[non_exhaustive]`** (`vane-kernel` 0.8.0). The engine's
+  operation enum is routing-internal: handlers interact through
+  `SessionIo` methods and `Handler` callbacks, never by matching
+  `Op`, so new operations must not break downstream matches.
+  Shipping it with the exhaustive `Token::op` fix below.
+- **`Token::op()` decodes every operation** (`vane-kernel`): the
+  match previously knew ops 1..=7 and silently mapped anything else
+  to `Op::Splice` — a latent trap where any new operation's
+  completions would vanish into the wrong dispatcher. It is now
+  exhaustive, and a standalone engine test
+  (`watch_fires_on_readability`) proves a readiness watch fires
+  twice (first data + EOF), pinning the round-trip.
+- **`Engine::watch`/`unwatch`** (`vane-kernel` 0.8.0): generic
+  multishot readiness primitives with cancellation filtering, with
+  the two-firing contract test. Added for (and currently only used
+  by) the kernel test suite; the body-splice fast path they were
+  built for is recorded as rolled-back in
+  docs/perf-arc-2026-10.md, iteration 3 — the lean proofs refused
+  it (corrupted relay + truncated hang) and the honest state is
+  dark until the offset interaction is understood.
+
+### Breaking
+
+- `vane-kernel` 0.8.0: `Op` gained three variants and
+  `#[non_exhaustive]` — downstream `match`es over `Op` need a
+  wildcard arm.
+- `vane-proxy` 0.14.0 tracks it.
+
 ## [0.13.0] — 2026-10-17
 
 Crate versions: `vane-proxy` 0.13.0, `vane-control` 0.11.0.

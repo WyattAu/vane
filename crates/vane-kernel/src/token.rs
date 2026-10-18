@@ -8,8 +8,13 @@
 use std::fmt;
 
 /// Operation kind encoded in a [`Token`].
+///
+/// `#[non_exhaustive]`: new operations are internal additions, and
+/// downstream `match`es must carry a wildcard (the engine routes new
+/// ops itself; handlers only ever see their own callback methods).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum Op {
     /// Listener readiness (a new connection can be accepted).
     Accept = 1,
