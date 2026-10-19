@@ -797,4 +797,150 @@ mod watch_tests {
             libc::close(b);
         }
     }
+
+}
+
+#[cfg(test)]
+mod body_splice_mechanism_tests {
+    //! The re-entry criterion from docs/perf-arc-2026-10.md, iteration
+    //! 3: reproduce (or refute) the vanishing bytes with the exact
+    //! splice(2) sequence the worker issues — two TCP legs, one pipe,
+    //! ingress then egress — WITHOUT the worker. If this delivers, the
+    //! loss lives in the worker's interaction with concurrent uring
+    //! ops on the same socket; if it does not, the mechanism itself is
+    //! the bug.
+
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::os::fd::{AsRawFd, RawFd};
+    use std::time::Duration;
+
+    /// Connected TCP pair (backend_leg, client_leg) with both sockets
+    /// nonblocking — the two fds the worker splices between.
+    fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(addr).expect("connect");
+        let (backend, _) = listener.accept().expect("accept");
+        for fd in [backend.as_raw_fd(), client.as_raw_fd()] {
+            // SAFETY: fcntl on owned descriptors.
+            unsafe {
+                let fl = libc::fcntl(fd, libc::F_GETFL);
+                libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+            }
+        }
+        (backend, client)
+    }
+
+    fn pipe_nonblocking() -> (RawFd, RawFd) {
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: pipe2 with valid out-array.
+        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        assert_eq!(rc, 0, "pipe2");
+        (fds[0], fds[1])
+    }
+
+    fn splice(from: RawFd, to: RawFd, want: usize) -> isize {
+        // SAFETY: live nonblocking descriptors; null offsets = current
+        // position (sockets/pipes).
+        unsafe {
+            libc::splice(
+                from,
+                std::ptr::null_mut(),
+                to,
+                std::ptr::null_mut(),
+                want,
+                libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK,
+            )
+        }
+    }
+
+    /// The worker's exact sequence: 4 KiB relayed normally FIRST (the
+    /// head + first-read body bytes), then the 61506-byte tail via
+    /// pipe splice. The client must see body[0..65536] in order.
+    ///
+    /// Wiring: `up_leg` is the proxy's upstream socket (the response
+    /// is written to its peer), `down_leg` is the proxy's client
+    /// socket (the splice writes into it), and `test_reader` is
+    /// `down_leg`'s peer.
+    #[test]
+    fn splice_after_normal_write_delivers_the_tail_in_order() {
+        let body = (0..65536)
+            .map(|i| b'a' + (i % 26) as u8)
+            .collect::<Vec<_>>();
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\n".to_vec();
+        let (up_leg, resp_writer) = tcp_pair();
+        let (down_leg, mut test_reader) = tcp_pair();
+        let (rp, wp) = pipe_nonblocking();
+
+        // The backend application writes the response; it becomes
+        // readable on the upstream leg.
+        // SAFETY: write to an owned connected descriptor.
+        let all = [head.as_slice(), body.as_slice()].concat();
+        unsafe { libc::write(resp_writer.as_raw_fd(), all.as_ptr().cast(), all.len()) };
+
+        // Worker read #1: 4096 bytes (slot-sized) off the upstream.
+        let mut slot = [0u8; 4096];
+        // SAFETY: read into an owned buffer.
+        let n1 = unsafe { libc::read(up_leg.as_raw_fd(), slot.as_mut_ptr().cast(), slot.len()) };
+        assert_eq!(n1 as usize, 4096, "first read must fill the slot");
+        assert_eq!(&slot[..head.len()], &head[..], "head first");
+        // The handler relays those bytes to the real client socket.
+        // SAFETY: write to an owned connected descriptor.
+        unsafe { libc::write(down_leg.as_raw_fd(), slot.as_ptr().cast(), 4096) };
+
+        // Splice the tail: ingress (upstream -> pipe) then egress
+        // (pipe -> downstream), exactly the worker's pump rounds.
+        let mut moved_in = 0u64;
+        let tail = (body.len() - (4096 - head.len())) as u64;
+        while moved_in < tail {
+            let n = splice(
+                up_leg.as_raw_fd(),
+                wp,
+                (tail - moved_in).min(1 << 16) as usize,
+            );
+            assert!(n > 0, "ingress: {n}");
+            moved_in += n as u64;
+        }
+        let mut moved_out = 0u64;
+        while moved_out < moved_in {
+            let n = splice(rp, down_leg.as_raw_fd(), (moved_in - moved_out) as usize);
+            eprintln!("[mech] egress n={n} moved_in={moved_in}");
+            assert!(n > 0, "egress: {n}");
+            moved_out += n as u64;
+        }
+        // How much did the reader's side actually receive?
+        std::thread::sleep(Duration::from_millis(200));
+        let mut pending: i32 = 0;
+        // SAFETY: FIONREAD ioctl on an owned socket.
+        unsafe {
+            libc::ioctl(test_reader.as_raw_fd(), libc::FIONREAD, &mut pending);
+        }
+        eprintln!("[mech] after egress: test_reader FIONREAD={pending}");
+
+        // The client reads everything and hashes it.
+        let mut got = Vec::new();
+        test_reader
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let mut tmp = [0u8; 16384];
+        let expected = head.len() + body.len();
+        while got.len() < expected {
+            let n = test_reader.read(&mut tmp).expect("client read");
+            assert!(n > 0, "eof at {} of {expected}", got.len());
+            got.extend_from_slice(&tmp[..n]);
+        }
+        assert_eq!(&got[..head.len()], &head[..], "head intact");
+        assert_eq!(got[head.len()], b'a', "body starts at 'a'");
+        assert_eq!(
+            &got[head.len()..],
+            &body[..],
+            "the spliced tail is the body, in order, complete"
+        );
+        // SAFETY: owned pipe ends.
+        unsafe {
+            libc::close(rp);
+            libc::close(wp);
+        }
+    }
 }

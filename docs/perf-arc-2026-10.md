@@ -366,16 +366,30 @@ reports success; the bytes vanish between the socket accept and
 the peer's receive queue. That is an engine-interaction layer this
 iteration has not earned the right to debug blindly.
 
-**Standing state:** dark, reverted from the tree twice; the
+**Standing state (updated 2026-10-19):** dark, reverted twice; the
 engineering primitives (exhaustive op decode, watch/unwatch, the
-two-firing contract test) are permanent keepers. Re-entry criteria
-are now sharper: reproduce the vanishing bytes in a STANDALONE
-kernel-level test (two TCP sockets + one pipe + the exact
-splice(2) sequence the worker issues) before touching the worker
-again — if the standalone sequence delivers the bytes, the loss is
-in the worker's interaction with concurrent uring ops on the same
-socket, and the next suspect is the still-armed upstream READ that
-the splice races with at arm time.
+two-firing contract test) are permanent keepers. The re-entry
+criterion — a standalone kernel-level reproduction — is now WRITTEN
+AND PASSES: `body_splice_mechanism_tests` in the uring engine drives
+the exact sequence (normal 4 KiB write first, then capped ingress
+upstream -> pipe, then egress pipe -> downstream, 64 KiB tail) and
+**delivers every byte, in order, to the reader** (verified by count
+and content). The mechanism is sound.
+
+The loss is therefore confirmed to live in the WORKER INTEGRATION —
+the splice coexisting with the session's other state (the still-
+armed upstream read the splice races at arm time, the downstream
+read that can steal spliced bytes as fake client data, and the
+truncated-EOF path where the close raced the client's read). The
+second attempt's instrumentation showed both splices succeed into
+the verified client fd while the client's receive queue stayed
+empty — an interaction, not a kernel issue. The next attempt should
+enter the splice through a CLEAN session-mode handoff (upstream
+reads disarmed at the engine level before the pipe is created, the
+same way L4 mode takes over) instead of gating the existing mixed
+mode, and should carry the truncated-EOF e2e from the first
+attempt, which exposed a close-vs-read race on the client socket
+that the full_stack_inproc truncated-body test does not hit.
 
 **Base windows (2026-10-17 20:47Z, load 7):** get64k c=8, 2 workers,
 10 s x 3: 12.4k / 12.5k / 15.3k rps (p50 ~440 us, non-200 = 0) —
