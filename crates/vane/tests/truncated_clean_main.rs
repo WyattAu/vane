@@ -6,13 +6,6 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
-fn free_addr() -> std::net::SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").expect("probe");
-    let a = l.local_addr().expect("addr");
-    drop(l);
-    a
-}
-
 fn main_test() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
     let backend = listener.local_addr().expect("addr");

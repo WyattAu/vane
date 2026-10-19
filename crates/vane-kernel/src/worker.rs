@@ -148,6 +148,12 @@ struct Session {
     upstream_epoch: u8,
     /// Request head already serialized to the upstream (no failover past it).
     request_sent: bool,
+    /// `on_upstream_connected` was already delivered for this dial. A
+    /// connect can complete inline (submission-time Done) AND post its
+    /// CQE, and the inline path ALSO queues a deferred delivery —
+    /// without this guard the callback runs up to three times, and the
+    /// repeated `s.upstream = Some(StreamFd(fd))` closes the dial
+    /// socket out from under the live session.
     upstream_connected_delivered: bool,
     downstream_eof: bool,
     upstream_eof: bool,
@@ -335,6 +341,8 @@ impl WorkerState {
                     return false;
                 };
                 crate::dbg_trace!("DIAL fd={fd} slot={slot}");
+                // A NEW dial: the delivered-guard is per-dial.
+                s.upstream_connected_delivered = false;
                 s.upstream = Some(StreamFd(fd));
                 if poll == crate::engine::Poll::Done(0) {
                     self.do_upstream_connected(slot, generation);
@@ -362,6 +370,8 @@ impl WorkerState {
                     return false;
                 };
                 crate::dbg_trace!("DIAL fd={fd} slot={slot}");
+                // A NEW dial: the delivered-guard is per-dial.
+                s.upstream_connected_delivered = false;
                 s.upstream = Some(StreamFd(fd));
                 if poll == crate::engine::Poll::Done(0) {
                     self.do_upstream_connected(slot, generation);
@@ -590,6 +600,8 @@ impl WorkerState {
             return false;
         };
         crate::dbg_trace!("DIAL fd={fd} slot={slot}");
+        // Attach is a NEW upstream: reset the per-dial delivered-guard.
+        s.upstream_connected_delivered = false;
         s.upstream = Some(StreamFd(fd));
         if s.urslot.is_none() {
             if let Some(uslot) = self.pool.take() {
@@ -1306,13 +1318,6 @@ impl WorkerState {
             connect_inflight: false,
             upstream_epoch: 0,
             request_sent: false,
-            /// `on_upstream_connected` was already delivered for this
-            /// dial. A connect can complete inline (submission-time
-            /// Done) AND post its CQE, and the inline path ALSO queues
-            /// a deferred delivery — without this guard the callback
-            /// runs up to three times, and the repeated `s.upstream =
-            /// Some(StreamFd(fd))` closes the dial socket out from
-            /// under the live session.
             upstream_connected_delivered: false,
             downstream_eof: false,
             upstream_eof: false,
