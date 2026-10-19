@@ -383,6 +383,23 @@ ungated run documents the bug and exits green). This bug also
 explains yesterday's truncated e2e failure: the splice path was
 never reached — the client hangs on the NORMAL relay path first.
 
+**BONUS FIX FROM THE REPRO (2026-10-19, landed):** the minimal
+repro's failure led to a REAL second bug on main — the
+`upstream_connected_delivered` idempotence guard (added for the
+inline+CQE double-callback) was per-SESSION, but a cluster swap or
+failover legitimately re-dials the same address; the guard then
+blocked the fresh `do_upstream_connected`, the new upstream's read
+slot never armed, and every request on the connection failed. The
+flag now resets at all three dial/attach sites. The guard is
+per-DIAL because the double-delivery it prevents is per-dial too
+(inline Done + CQE + deferred queue). Caught by
+`config_hot_reload_under_concurrent_load` failing under storm load
+— a test that also got hardened: its `total > 100` throughput floor
+became a ran-at-all sanity check (the reload contract — ZERO
+failures across the live swap — is unchanged), because a storm-
+loaded host completes fewer hammer iterations and that says nothing
+about reload correctness.
+
 **Standing state (updated 2026-10-19):** dark, reverted twice; the
 engineering primitives (exhaustive op decode, watch/unwatch, the
 two-firing contract test) are permanent keepers. The re-entry
