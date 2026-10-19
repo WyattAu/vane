@@ -797,7 +797,6 @@ mod watch_tests {
             libc::close(b);
         }
     }
-
 }
 
 #[cfg(test)]
@@ -810,7 +809,7 @@ mod body_splice_mechanism_tests {
     //! ops on the same socket; if it does not, the mechanism itself is
     //! the bug.
 
-    use std::io::{Read, Write};
+    use std::io::Read;
     use std::net::{TcpListener, TcpStream};
     use std::os::fd::{AsRawFd, RawFd};
     use std::time::Duration;
@@ -875,8 +874,8 @@ mod body_splice_mechanism_tests {
 
         // The backend application writes the response; it becomes
         // readable on the upstream leg.
-        // SAFETY: write to an owned connected descriptor.
         let all = [head.as_slice(), body.as_slice()].concat();
+        // SAFETY: write to an owned connected descriptor.
         unsafe { libc::write(resp_writer.as_raw_fd(), all.as_ptr().cast(), all.len()) };
 
         // Worker read #1: 4096 bytes (slot-sized) off the upstream.
