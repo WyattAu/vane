@@ -95,6 +95,8 @@ cluster = "up"
                         Ok(v) => v,
                         Err(_) => continue,
                     };
+                    // SAFETY: zeroed sockaddr_storage is valid before
+                    // getsockname fills it (ss_family checked after).
                     let mut sa: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
                     let mut len = std::mem::size_of::<libc::sockaddr_storage>() as u32;
                     // SAFETY: getsockname on an owned fd with a sized out-param.
@@ -108,6 +110,8 @@ cluster = "up"
                     if rc != 0 || sa.ss_family as i32 != libc::AF_INET {
                         continue;
                     }
+                    // SAFETY: sa holds an AF_INET sockaddr; reading the
+                    // v4 port field is in-bounds for the family written.
                     let port = u16::from_be(unsafe {
                         std::ptr::addr_of!(sa)
                             .cast::<libc::sockaddr_in>()
@@ -117,6 +121,8 @@ cluster = "up"
                     if port != my_port {
                         continue;
                     }
+                    // SAFETY: zeroed sockaddr_storage is valid before
+                    // getpeername fills it.
                     let mut peer_sa: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
                     let mut peer_len = std::mem::size_of::<libc::sockaddr_storage>() as u32;
                     // SAFETY: getpeername on an owned fd with a sized out-param.
@@ -127,6 +133,7 @@ cluster = "up"
                             &mut peer_len,
                         )
                     };
+                    // SAFETY: peer_sa holds an AF_INET sockaddr.
                     let peer_port = u16::from_be(unsafe {
                         std::ptr::addr_of!(peer_sa)
                             .cast::<libc::sockaddr_in>()
