@@ -261,6 +261,8 @@ impl WorkerState {
                 }
                 s.wq.push_back((ws, n as u32, 0));
                 s.write_inflight = true;
+                #[cfg(feature = "vane_dbg")]
+                eprintln!("[dwrite] direct submit n={n} fd={}", s.downstream.fd());
                 let fd = s.downstream.fd();
                 let token = Token::new(Op::DownstreamWrite, slot, generation, 0);
                 let _ = self.engine.write(token, fd, ws, n, 0);

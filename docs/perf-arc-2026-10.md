@@ -400,6 +400,17 @@ failures across the live swap — is unchanged), because a storm-
 loaded host completes fewer hammer iterations and that says nothing
 about reload correctness.
 
+**Repro hardening (2026-10-19, later):** the gated test now
+deterministically characterizes the bug: the client receives the
+head (61 B) and ZERO body bytes — the queued body write is dropped
+by `close_session` (it releases `wq`/`pending_down` without
+flushing) — and the downstream socket close is unreliable on the
+io_uring path (FIN either never arrives or only at process
+shutdown; runs vary). Both variants fail while the bug lives and
+pass once the close flushes queued bytes + FIN. The procfs
+diagnostic in the WouldBlock arm identifies the proxy-side socket
+by matching `getsockname` against the client's ephemeral port.
+
 **Standing state (updated 2026-10-19):** dark, reverted twice; the
 engineering primitives (exhaustive op decode, watch/unwatch, the
 two-firing contract test) are permanent keepers. The re-entry

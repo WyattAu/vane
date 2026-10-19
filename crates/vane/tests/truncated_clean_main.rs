@@ -73,7 +73,8 @@ cluster = "up"
     eprintln!("[diag] force_mio={force_mio}");
 
     let mut s = TcpStream::connect(listener).expect("connect");
-    s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    // 60 s: a wide inspection window for /proc while the hang is live.
+    s.set_read_timeout(Some(Duration::from_secs(60))).ok();
     s.write_all(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
         .expect("req");
     let mut got = Vec::new();
@@ -83,35 +84,68 @@ cluster = "up"
             Ok(0) => break,
             Ok(n) => got.extend_from_slice(&tmp[..n]),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Is the connection even still alive? A successful
-                // write means the proxy leaked the session open.
-                let alive: String = s
-                    .write(b"?")
-                    .map(|_| "alive (write ok)".to_string())
-                    .unwrap_or_else(|e| format!("dead ({e})"));
-                // The server shares this process: if its downstream
-                // fd was closed, /proc/self/fd shrinks accordingly.
-                let socket_fds: Vec<String> = std::fs::read_dir("/proc/self/fd")
-                    .expect("procfs")
-                    .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        std::fs::read_link(e.path())
-                            .map(|l| l.to_string_lossy().contains("socket"))
-                            .unwrap_or(false)
-                    })
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .collect();
-                let head_end = got
-                    .windows(4)
-                    .position(|w| w == b"\r\n\r\n")
-                    .map_or(0, |p| p + 4);
+                // Ground truth: find the PROXY-side socket of THIS
+                // connection (its local port == our ephemeral port) and
+                // report whether the proxy still holds it open.
+                let my_port = s.local_addr().expect("local").port();
+                let mut proxy_side: Option<String> = None;
+                for entry in std::fs::read_dir("/proc/self/fd").expect("procfs") {
+                    let Ok(entry) = entry else { continue };
+                    let fd_num: i32 = match entry.file_name().to_string_lossy().parse() {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let mut sa: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+                    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as u32;
+                    // SAFETY: getsockname on an owned fd with a sized out-param.
+                    let rc = unsafe {
+                        libc::getsockname(
+                            fd_num,
+                            &mut sa as *mut _ as *mut libc::sockaddr,
+                            &mut len,
+                        )
+                    };
+                    if rc != 0 || sa.ss_family as i32 != libc::AF_INET {
+                        continue;
+                    }
+                    let port = u16::from_be(unsafe {
+                        std::ptr::addr_of!(sa)
+                            .cast::<libc::sockaddr_in>()
+                            .read_unaligned()
+                            .sin_port
+                    });
+                    if port != my_port {
+                        continue;
+                    }
+                    let mut peer_sa: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+                    let mut peer_len = std::mem::size_of::<libc::sockaddr_storage>() as u32;
+                    // SAFETY: getpeername on an owned fd with a sized out-param.
+                    unsafe {
+                        libc::getpeername(
+                            fd_num,
+                            &mut peer_sa as *mut _ as *mut libc::sockaddr,
+                            &mut peer_len,
+                        )
+                    };
+                    let peer_port = u16::from_be(unsafe {
+                        std::ptr::addr_of!(peer_sa)
+                            .cast::<libc::sockaddr_in>()
+                            .read_unaligned()
+                            .sin_port
+                    });
+                    proxy_side = Some(format!(
+                        "proxy-side fd {fd_num} STILL OPEN (local :{port}, peer :{peer_port})"
+                    ));
+                    break;
+                }
+                let detail =
+                    proxy_side.unwrap_or_else(|| "proxy-side fd CLOSED (not found)".to_string());
                 panic!(
-                    "BUG CONFIRMED: truncated upstream hangs the client. got {} \
-                     bytes (head {} B, body {} B); peer={alive}; expected the tail \
-                     then FIN within 10s; open socket fds: {socket_fds:?}",
+                    "BUG CONFIRMED: truncated upstream discards the relayed body. \
+                     got {} bytes (head only, body 0 B); client local port {my_port}; \
+                     {detail}; the queued body write was dropped at close instead of \
+                     flushed + FIN",
                     got.len(),
-                    head_end,
-                    got.len().saturating_sub(head_end),
                 );
             }
             Err(e) => panic!("read: {e}"),
