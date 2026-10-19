@@ -2560,6 +2560,8 @@ impl Handler for HttpProxy {
             }
             BodyFraming::ContentLength if remaining > 0 => {
                 self.log(LogLevel::Warn, "upstream truncated body; closing");
+                #[cfg(feature = "vane_dbg")]
+                eprintln!("[trunc] calling io.close() slot={}", io.slot_index());
                 io.close();
             }
             _ => {

@@ -200,6 +200,8 @@ impl<'a> SessionIo<'a> {
 
     /// Closes the whole session.
     pub fn close(&mut self) {
+        #[cfg(feature = "vane_dbg")]
+        eprintln!("[trunc] SessionIo::close slot={}", self.slot);
         self.worker
             .close_session(self.slot, self.generation, "handler");
     }

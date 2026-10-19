@@ -148,6 +148,7 @@ struct Session {
     upstream_epoch: u8,
     /// Request head already serialized to the upstream (no failover past it).
     request_sent: bool,
+    upstream_connected_delivered: bool,
     downstream_eof: bool,
     upstream_eof: bool,
     /// Half-close (FIN) requested while writes are still flushing.
@@ -635,6 +636,15 @@ impl WorkerState {
             let Some(s) = self.slab.get_mut(slot) else {
                 return;
             };
+            // Idempotence gate: a connect that completed inline gets
+            // its callback from BOTH the inline path and the CQE (and
+            // the deferred queue). Without this, `s.upstream` is
+            // re-assigned, dropping the first StreamFd — closing the
+            // live dial socket out from under the session.
+            if s.upstream_connected_delivered {
+                return;
+            }
+            s.upstream_connected_delivered = true;
             if s.urslot.is_none() && !s.splice {
                 if let Some(uslot) = self.pool.take() {
                     let epoch = u16::from(s.upstream_epoch);
@@ -1296,6 +1306,14 @@ impl WorkerState {
             connect_inflight: false,
             upstream_epoch: 0,
             request_sent: false,
+            /// `on_upstream_connected` was already delivered for this
+            /// dial. A connect can complete inline (submission-time
+            /// Done) AND post its CQE, and the inline path ALSO queues
+            /// a deferred delivery — without this guard the callback
+            /// runs up to three times, and the repeated `s.upstream =
+            /// Some(StreamFd(fd))` closes the dial socket out from
+            /// under the live session.
+            upstream_connected_delivered: false,
             downstream_eof: false,
             upstream_eof: false,
             fin_queued: false,

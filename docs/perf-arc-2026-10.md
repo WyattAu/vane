@@ -366,6 +366,23 @@ reports success; the bytes vanish between the socket accept and
 the peer's receive queue. That is an engine-interaction layer this
 iteration has not earned the right to debug blindly.
 
+**A PRE-EXISTING MAIN BUG FOUND BY THE REPRO (2026-10-19, top
+priority):** while building the standalone repro against clean main
+(no body-splice code), the minimal truncated-upstream shape HANGS
+THE CLIENT on the io_uring engine: backend sends head (61 B,
+Content-Length: 65536, Connection: close) + 8 B body + FIN in one
+write; the client receives the head and then NOTHING — no tail, no
+FIN, forever (peer stays alive; 10 s read timeout). The mio engine
+handles the identical shape correctly (the inproc truncated-body
+test passes — it runs with force_mio = true, which is why it never
+caught this). Unrelated to the body splice: it reproduces on clean
+main. Regression test landed:
+`tests/truncated_clean_main.rs`, runtime-gated per the known-broken
+discipline (`VANE_KNOWN_BROKEN_TRUNCATED=1` asserts the fix; the
+ungated run documents the bug and exits green). This bug also
+explains yesterday's truncated e2e failure: the splice path was
+never reached — the client hangs on the NORMAL relay path first.
+
 **Standing state (updated 2026-10-19):** dark, reverted twice; the
 engineering primitives (exhaustive op decode, watch/unwatch, the
 two-firing contract test) are permanent keepers. The re-entry
@@ -374,7 +391,10 @@ AND PASSES: `body_splice_mechanism_tests` in the uring engine drives
 the exact sequence (normal 4 KiB write first, then capped ingress
 upstream -> pipe, then egress pipe -> downstream, 64 KiB tail) and
 **delivers every byte, in order, to the reader** (verified by count
-and content). The mechanism is sound.
+and content). The mechanism is sound. (An earlier version of this
+test failed with a wrong expected-total constant — 65602 vs the
+correct 65578 — a test arithmetic bug, fixed before drawing any
+conclusion from it.)
 
 The loss is therefore confirmed to live in the WORKER INTEGRATION —
 the splice coexisting with the session's other state (the still-
