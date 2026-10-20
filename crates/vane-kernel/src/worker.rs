@@ -471,6 +471,24 @@ impl WorkerState {
         for (ws, _, _) in s.uwq {
             self.pool.release(ws);
         }
+        // Shut both sockets down BEFORE closing: an io_uring op still
+        // submitted on a socket (a keep-alive downstream read, an
+        // upstream read awaiting the peer) holds a kernel reference to
+        // the struct file, so close(2) alone frees the fd NUMBER but
+        // not the socket — no FIN, and the op blocks forever waiting
+        // for data that will never come. shutdown(2) forces every
+        // in-flight op to complete/cancel immediately; queued send-
+        // buffer data still delivers, then the FIN goes out.
+        // SAFETY: shutdown on live, owned, connected descriptors.
+        unsafe {
+            libc::shutdown(s.downstream.fd(), libc::SHUT_RDWR);
+        }
+        if let Some(up) = &s.upstream {
+            // SAFETY: same — live owned connected descriptor.
+            unsafe {
+                libc::shutdown(up.fd(), libc::SHUT_RDWR);
+            }
+        }
         // Drain unread downstream bytes before close: closing a socket
         // with pending receive data sends RST, which wipes any frames
         // we just wrote (e.g. GOAWAY/RST_STREAM error responses) before

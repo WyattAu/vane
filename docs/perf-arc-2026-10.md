@@ -400,6 +400,37 @@ failures across the live swap — is unchanged), because a storm-
 loaded host completes fewer hammer iterations and that says nothing
 about reload correctness.
 
+**ROOT-CAUSED AND FIXED (2026-10-19, late):** the instrumented run
+finally captured the full CQE/write sequence, and the bug is exactly
+what the ordering evidence pointed at, in TWO halves:
+
+1. **io_uring + close(2) socket-lifetime race:** on the io_uring
+   engine, a keep-alive downstream READ is perpetually armed. At
+   truncation the session closed via close(2) — but an io_uring op
+   still submitted on that socket holds a kernel reference to the
+   struct file, so close(2) freed the fd NUMBER without closing the
+   SOCKET: no FIN, the in-flight read blocks forever waiting for
+   data that never comes, and the client hangs with a live
+   connection ("peer=alive (write ok)"). The mio engine cannot hit
+   this (readiness polling holds no ops). Fix: close_session now
+   shutdown(SHUT_RDWR)s both sockets BEFORE closing — shutdown
+   forces every in-flight op to complete/cancel immediately, queued
+   send-buffer data still delivers, then the FIN goes out.
+
+2. **The queued body write was dropped:** close_session releases
+   wq/pending_down without flushing, so the response tail that rode
+   the first read's wake never reached the client (head-only
+   delivery). Fix: the truncation path now half-closes
+   (downstream_eof_write) instead of hard-closing — the existing
+   queue mechanics flush the relayed bytes, then the FIN; the
+   client's close completes the session normally.
+
+Both fixed; the gated repro passes (partial body + EOF delivered
+correctly), the inproc mio truncated test still passes, and the
+door re-opens for the body-splice fast path (its e2e hang was this
+same close-semantics bug amplified by the splice's direct socket
+writes).
+
 **Repro hardening (2026-10-19, later):** the gated test now
 deterministically characterizes the bug: the client receives the
 head (61 B) and ZERO body bytes — the queued body write is dropped
@@ -413,16 +444,12 @@ by matching `getsockname` against the client's ephemeral port.
 
 **Standing state (updated 2026-10-19):** dark, reverted twice; the
 engineering primitives (exhaustive op decode, watch/unwatch, the
-two-firing contract test) are permanent keepers. The re-entry
-criterion — a standalone kernel-level reproduction — is now WRITTEN
-AND PASSES: `body_splice_mechanism_tests` in the uring engine drives
-the exact sequence (normal 4 KiB write first, then capped ingress
-upstream -> pipe, then egress pipe -> downstream, 64 KiB tail) and
-**delivers every byte, in order, to the reader** (verified by count
-and content). The mechanism is sound. (An earlier version of this
-test failed with a wrong expected-total constant — 65602 vs the
-correct 65578 — a test arithmetic bug, fixed before drawing any
-conclusion from it.)
+two-firing contract test, the splice mechanism proof) are permanent
+keepers. With the truncated-hang bug fixed, the body-splice e2e
+should be re-added (its hang was this bug amplified by the splice's
+direct socket writes) and the fast path re-proven — the mechanism
+test already passes and the ordering barrier design is recorded
+above.
 
 The loss is therefore confirmed to live in the WORKER INTEGRATION —
 the splice coexisting with the session's other state (the still-

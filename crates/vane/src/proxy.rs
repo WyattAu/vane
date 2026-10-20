@@ -2559,10 +2559,19 @@ impl Handler for HttpProxy {
                 self.upstream_failed(io);
             }
             BodyFraming::ContentLength if remaining > 0 => {
-                self.log(LogLevel::Warn, "upstream truncated body; closing");
-                #[cfg(feature = "vane_dbg")]
-                eprintln!("[trunc] calling io.close() slot={}", io.slot_index());
-                io.close();
+                self.log(
+                    LogLevel::Warn,
+                    "upstream truncated body; relaying what arrived, then FIN",
+                );
+                // Half-close the downstream AFTER the queued bytes
+                // flush: whatever body bytes arrived before the
+                // truncation are already relayed/queued and must reach
+                // the client (nginx-style partial relay), then FIN.
+                // A hard close here would drop queued bytes AND — on
+                // the io_uring engine — leave the client hanging,
+                // because in-flight ops hold the socket alive past
+                // close(2) without ever producing a FIN.
+                io.downstream_eof_write();
             }
             _ => {
                 #[cfg(not(feature = "h2"))]
