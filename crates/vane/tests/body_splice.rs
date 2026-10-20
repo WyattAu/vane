@@ -57,15 +57,6 @@ fn cl_backend(head: String, payload: Vec<u8>) -> std::net::SocketAddr {
 }
 
 /// A backend that serves head + a SHORT body, then closes: the
-/// truncated-upstream case (EOF short of Content-Length).
-#[cfg(feature = "response_splice")]
-fn free_addr() -> std::net::SocketAddr {
-    let probe = TcpListener::bind("127.0.0.1:0").expect("probe");
-    let addr = probe.local_addr().expect("addr");
-    drop(probe);
-    addr
-}
-
 fn free_addr() -> std::net::SocketAddr {
     let probe = TcpListener::bind("127.0.0.1:0").expect("probe");
     let addr = probe.local_addr().expect("addr");
