@@ -59,22 +59,6 @@ fn cl_backend(head: String, payload: Vec<u8>) -> std::net::SocketAddr {
 /// A backend that serves head + a SHORT body, then closes: the
 /// truncated-upstream case (EOF short of Content-Length).
 #[cfg(feature = "response_splice")]
-fn truncating_backend(head: String, partial: Vec<u8>) -> std::net::SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
-    let addr = listener.local_addr().expect("addr");
-    std::thread::spawn(move || {
-        let response = [head.into_bytes(), partial].concat();
-        // One connection, one response, then close — the FIN is what
-        // makes this upstream "truncated".
-        if let Some(Ok(mut s)) = listener.incoming().next() {
-            let _ = s.write_all(&response);
-            let _ = s.shutdown(std::net::Shutdown::Write);
-            let _ = s.read(&mut [0u8; 1]);
-        }
-    });
-    addr
-}
-
 fn free_addr() -> std::net::SocketAddr {
     let probe = TcpListener::bind("127.0.0.1:0").expect("probe");
     let addr = probe.local_addr().expect("addr");
