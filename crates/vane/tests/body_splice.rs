@@ -66,6 +66,13 @@ fn free_addr() -> std::net::SocketAddr {
     addr
 }
 
+fn free_addr() -> std::net::SocketAddr {
+    let probe = TcpListener::bind("127.0.0.1:0").expect("probe");
+    let addr = probe.local_addr().expect("addr");
+    drop(probe);
+    addr
+}
+
 fn spawn_proxy(config: &str, listener: std::net::SocketAddr) {
     let dir = tempfile::tempdir().expect("dir");
     let path = dir.path().join("vane.toml");
