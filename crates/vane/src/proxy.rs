@@ -37,12 +37,13 @@ use vane_shm::handover::RouteRecord;
 
 /// Proxy handler configuration shared across workers.
 ///
-/// This one stays exhaustively constructible ON PURPOSE: unlike the
-/// parsed config structs (the `#[non_exhaustive]` family rule — serde
-/// builds those in-crate), `ProxyConfig` is the programmatic embedder
-/// API, and downstream code constructs it with struct literals.
-/// Growth is covered by the minor train bump; `Default` exists so
-/// tests and embedders can write struct-update literals anyway.
+/// Proxy handler configuration shared across workers.
+///
+/// Deliberately exhaustively constructible (unlike the parsed config
+/// structs): this is the programmatic embedder API, and downstream
+/// code constructs it with struct literals. Field growth is covered
+/// by the minor train bump; `Default` exists so tests and embedders
+/// can write struct-update literals anyway.
 pub struct ProxyConfig {
     /// Router (EBR snapshot source).
     pub router: Arc<Router>,
