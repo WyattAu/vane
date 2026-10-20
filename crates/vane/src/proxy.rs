@@ -2625,6 +2625,10 @@ impl Handler for HttpProxy {
                     LogLevel::Warn,
                     "upstream truncated body; relaying what arrived, then FIN",
                 );
+                #[cfg(feature = "vane_dbg")]
+                eprintln!("[trunc] eof-truncation remaining={remaining}");
+                #[cfg(feature = "vane_dbg")]
+                eprintln!("[trunc-diag] eof truncation, remaining={remaining}");
                 // Half-close the downstream AFTER the queued bytes
                 // flush: whatever body bytes arrived before the
                 // truncation are already relayed/queued and must reach

@@ -1371,8 +1371,12 @@ impl WorkerState {
             }
             #[cfg(feature = "body-splice")]
             Op::BodySpliceIn | Op::BodySpliceOut => {
+                #[cfg(feature = "vane_dbg")]
+                eprintln!("[bsplice] CQE");
                 self.pump_body_splice(slot, generation, h);
             }
+            #[cfg(not(feature = "body-splice"))]
+            Op::BodySpliceIn | Op::BodySpliceOut | Op::BodySpliceCancel => {}
             #[cfg(feature = "body-splice")]
             Op::BodySpliceCancel => {}
             #[cfg(not(feature = "body-splice"))]

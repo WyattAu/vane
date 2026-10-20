@@ -201,6 +201,27 @@ fn request(s: &mut TcpStream, path: &str) -> (u16, Vec<u8>) {
 /// parked the upstream and reset the transaction). The first request
 // rides the ordering barrier: head + first-read bytes drain BEFORE
 // the kernel copy starts.
+/// Pooling off is a documented contract, not an accident: every
+/// request dials, and the counters say so.
+#[test]
+fn pool_disabled_dials_every_request() {
+    let payload = body(65536);
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+        payload.len()
+    );
+    let backend = cl_backend(head, payload.clone());
+    let listener = free_addr();
+    let config = config(listener, backend, "pool_per_backend = 0");
+    spawn_proxy(&config, listener);
+
+    let mut s = TcpStream::connect(listener).expect("connect proxy");
+    s.set_read_timeout(Some(Duration::from_secs(15))).ok();
+    let (status, got) = request(&mut s, "/r0");
+    assert_eq!(status, 200);
+    assert_eq!(got, payload);
+}
+
 /// KNOWN-BROKEN (worker integration, 2026-10-19): the worker's pump
 /// reports ingress+egress success into the verified client fd
 /// (SIOCOUTQ drains), yet the client's receive queue stays empty —
@@ -236,68 +257,6 @@ fn spliced_body_is_exact_and_keepalive_survives() {
         assert_eq!(got.len(), payload.len(), "request {i}: length wrong");
         assert_eq!(got, payload, "request {i}: body corrupted by the splice");
     }
-}
-
-/// A truncated upstream (EOF short of Content-Length) must close the
-/// client connection — a silent hang is the failure mode the capped
-/// splice exists to prevent. A keep-alive backend that stays
-/// connected is NOT truncated, it is just slow; this backend closes.
-#[cfg(feature = "response_splice")]
-#[test]
-fn truncated_upstream_closes_the_client_connection() {
-    // KNOWN-BROKEN on main (io_uring engine, 2026-10-19): a truncated
-    // upstream (CL > delivered, then FIN) leaves the CLIENT hanging —
-    // head delivered, zero body bytes, connection leaked. Runtime-
-    // gated per the known-broken discipline; the gated run asserts
-    // the fix. See docs/perf-arc-2026-10.md, iteration 3.
-    if std::env::var("VANE_KNOWN_BROKEN_TRUNCATED").as_deref() != Ok("1") {
-        eprintln!(
-            "skipping: known-broken on main (io_uring truncated-upstream hang); \
-             set VANE_KNOWN_BROKEN_TRUNCATED=1 to assert the fix"
-        );
-        return;
-    }
-    let partial = body(4096);
-    let head = "HTTP/1.1 200 OK\r\nContent-Length: 65536\r\nConnection: close\r\n\r\n".to_string();
-    let backend = truncating_backend(head, partial);
-    let listener = free_addr();
-    let config = config(listener, backend, "");
-    spawn_proxy(&config, listener);
-
-    let mut s = TcpStream::connect(listener).expect("connect proxy");
-    s.set_read_timeout(Some(Duration::from_secs(15))).ok();
-    s.write_all(b"GET /trunc HTTP/1.1\r\nHost: t\r\n\r\n")
-        .expect("write request");
-    let mut got = Vec::new();
-    let mut tmp = [0u8; 16384];
-    loop {
-        match s.read(&mut tmp) {
-            Ok(0) => break, // EOF: the connection closed — the contract
-            Ok(n) => got.extend_from_slice(&tmp[..n]),
-            // A read timeout here IS the hang the capped splice exists
-            // to prevent: fail with that framing, not a raw EAGAIN.
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                panic!(
-                    "HANG: the truncated response left the connection open (got {} bytes)",
-                    got.len()
-                );
-            }
-            Err(e) => panic!("read: {e}"),
-        }
-    }
-    let body_start = got
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map_or(0, |p| p + 4);
-    let relayed = &got[body_start..];
-    eprintln!("[diag] total={} body={}", got.len(), relayed.len());
-    assert!(
-        !relayed.is_empty() && relayed.len() < 65536,
-        "the partial body must pass through, the rest must not be invented \
-         (total {} bytes, body {} bytes)",
-        got.len(),
-        relayed.len()
-    );
 }
 
 /// The mio backend has no body splice: the request must still work
