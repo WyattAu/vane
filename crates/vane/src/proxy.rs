@@ -68,7 +68,11 @@ pub struct ProxyConfig {
     /// How long a parked upstream connection stays reusable.
     pub pool_idle_ms: u64,
     /// Relay eligible response bodies with splice(2) (kernel pipe):
-    /// identity Content-Length over plain TCP on both legs.
+    /// identity Content-Length over plain TCP on both legs. Requires
+    /// the `body-splice` cargo feature (and vane-kernel's kernel-side
+    /// support) to have any effect; without it the config parses but
+    /// the fast path is inert.
+    #[cfg(feature = "body-splice")]
     pub response_splice: bool,
     /// TLS termination config (`None` = plaintext listener). Shared slot:
     /// hot reload swaps the inner Arc without touching workers.
@@ -134,6 +138,7 @@ impl Default for ProxyConfig {
             first_byte_timeout_ms: 30_000,
             pool_per_backend: 4,
             pool_idle_ms: 30_000,
+            #[cfg(feature = "body-splice")]
             response_splice: false,
             adaptive: Arc::new(HashMap::new()),
             tls: None,
@@ -1196,6 +1201,7 @@ impl HttpProxy {
                 // worker parks the splice until the queued head/rest
                 // bytes have drained — it writes the socket directly
                 // and must not jump the queue.
+                #[cfg(feature = "response_splice")]
                 if matches!(self.conn(slot).body, BodyFraming::ContentLength) {
                     let remaining = self.conn(slot).remaining;
                     let close_after = self.conn(slot).close_after;
@@ -2060,6 +2066,7 @@ fn conn_set_framing(conns: &mut ConnMap, slot: u32, view: &RequestView<'_>) {
 }
 
 impl Handler for HttpProxy {
+    #[cfg(feature = "body-splice")]
     fn on_body_spliced(&mut self, io: &mut SessionIo<'_>, moved: u64) {
         self.on_body_spliced(io, moved);
     }
@@ -3313,6 +3320,7 @@ impl HttpProxy {
     /// Account them, mark the body complete, and let the normal tail
     /// run (access emit, adaptive release, breaker success, pool
     /// park, keep-alive reset).
+    #[cfg(feature = "body-splice")]
     fn on_body_spliced(&mut self, io: &mut SessionIo<'_>, moved: u64) {
         let slot = io.slot_index();
         {

@@ -30,6 +30,11 @@ h3 = ["dep:quinn", "dep:h3", "dep:h3-quinn"]
 wasm = ["vane-plugins/wasm"]
 k8s = ["vane-control/k8s"]
 acme-pebble = []
+# Kernel-side body-splice fast path support. Default off: the fast
+# path is dark while its e2e byte-loss is being root-caused
+# (docs/perf-arc-2026-10.md, iteration 3).
+body-splice = ["vane-kernel/body-splice"]
+response_splice = ["body-splice"]
 
 [dependencies]
 vane-kernel = { workspace = true }

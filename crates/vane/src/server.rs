@@ -1254,6 +1254,7 @@ impl vane_core::HandlerFactory for WorkerFactory {
                 pool_per_backend: self.runtime.pool_per_backend,
                 adaptive: Arc::clone(&self.adaptive),
                 pool_idle_ms: self.runtime.pool_idle_ms,
+                #[cfg(feature = "response_splice")]
                 response_splice: self.runtime.response_splice,
                 tls: self.tls.clone(),
                 plugins: self.plugins.clone(),

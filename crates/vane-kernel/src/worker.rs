@@ -160,9 +160,11 @@ struct Session {
     /// Half-close (FIN) requested while writes are still flushing.
     fin_queued: bool,
     splice: bool,
+    #[cfg(feature = "body-splice")]
     /// HTTP body splice (see `start_body_splice`): armed, or pending
     /// until the downstream write queue drains.
     body_splice: Option<BodySpliceState>,
+    #[cfg(feature = "body-splice")]
     body_splice_pending: Option<u64>,
 
     deadline: Option<Instant>,
@@ -172,6 +174,7 @@ impl Session {
     /// True while a body splice is armed or parked: the engine reads
     /// for this session belong to the splice — the handler must not
     /// be dispatched and reads must not re-arm.
+    #[cfg(feature = "body-splice")]
     fn body_splice_active(&self) -> bool {
         self.body_splice.is_some() || self.body_splice_pending.is_some()
     }
@@ -179,6 +182,7 @@ impl Session {
 
 /// State of an in-progress HTTP body splice (see `WorkerState::
 /// start_body_splice`).
+#[cfg(feature = "body-splice")]
 struct BodySpliceState {
     /// Bytes still owed to the downstream (the Content-Length tail).
     remaining: u64,
@@ -484,6 +488,7 @@ impl WorkerState {
     /// drained the request is parked as pending and armed by the
     /// write-completion drain instead. Returns `false` when the fast
     /// path is unavailable — the caller relays through slots as usual.
+    #[cfg(feature = "body-splice")]
     pub(crate) fn start_body_splice(&mut self, slot: u32, generation: u16, max: u64) -> bool {
         if !self.valid(slot, generation) || max == 0 {
             return false;
@@ -514,6 +519,7 @@ impl WorkerState {
     }
 
     /// Converts a pending body splice into an armed one (queue empty).
+    #[cfg(feature = "body-splice")]
     fn arm_body_splice(&mut self, slot: u32, generation: u16, max: u64) -> bool {
         let Some(s) = self.slab.get_mut(slot) else {
             return false;
@@ -544,6 +550,7 @@ impl WorkerState {
 
     /// Tears the body splice down (closes the pipe, drops state).
     /// Idempotent; called from completion, session close, and reset.
+    #[cfg(feature = "body-splice")]
     fn teardown_body_splice(&mut self, slot: u32) {
         if let Some(bs) = self.slab.get_mut(slot).and_then(|s| s.body_splice.take()) {
             // SAFETY: the pipe ends are owned by this state and no
@@ -563,6 +570,7 @@ impl WorkerState {
     /// The body-splice pump: moves upstream bytes into the pipe, then
     /// drains the pipe into the downstream socket, honouring the byte
     /// cap and backpressure. Called on either readiness event.
+    #[cfg(feature = "body-splice")]
     fn pump_body_splice(&mut self, slot: u32, generation: u16, h: &mut dyn Handler) {
         let (ufd, dfd) = {
             let Some(s) = self.slab.get(slot) else {
@@ -602,6 +610,7 @@ impl WorkerState {
                 if err == libc::EINTR {
                     continue;
                 }
+                #[cfg(feature = "body-splice")]
                 self.teardown_body_splice(slot);
                 self.close_session(slot, generation, "body-splice-in");
                 return;
@@ -694,6 +703,7 @@ impl WorkerState {
     /// Hands the completed splice back to the handler: bytes are on
     /// the wire, the transaction completes through the normal tail
     /// (access emit, adaptive release, pool park, keep-alive).
+    #[cfg(feature = "body-splice")]
     fn finish_body_splice(&mut self, slot: u32, generation: u16, h: &mut dyn Handler) {
         let Some(s) = self.slab.get_mut(slot) else {
             return;
@@ -728,6 +738,7 @@ impl WorkerState {
         if !self.valid(slot, generation) {
             return;
         }
+        #[cfg(feature = "body-splice")]
         self.teardown_body_splice(slot);
         let Some(s) = self.slab.remove(slot) else {
             return;
@@ -946,6 +957,7 @@ impl WorkerState {
             // the deferred queue). Without this, `s.upstream` is
             // re-assigned, dropping the first StreamFd — closing the
             // live dial socket out from under the session.
+            #[cfg(feature = "body-splice")]
             if s.upstream_connected_delivered {
                 return;
             }
@@ -983,7 +995,11 @@ impl WorkerState {
         let Some(s) = self.slab.get_mut(slot) else {
             return;
         };
-        if s.read_inflight || s.splice || s.body_splice_active() {
+        #[cfg(feature = "body-splice")]
+        let splice_busy = s.body_splice_active();
+        #[cfg(not(feature = "body-splice"))]
+        let splice_busy = false;
+        if s.read_inflight || s.splice || splice_busy {
             crate::dbg_trace!(
                 "ARMDbg skip slot={slot} inflight={} splice={}",
                 s.read_inflight,
@@ -1021,7 +1037,11 @@ impl WorkerState {
         if s.pending_down.len() > 2 * self.pool.buf_size() {
             return;
         }
-        if s.upstream_read_inflight || s.splice || s.body_splice_active() {
+        #[cfg(feature = "body-splice")]
+        let splice_busy = s.body_splice_active();
+        #[cfg(not(feature = "body-splice"))]
+        let splice_busy = false;
+        if s.upstream_read_inflight || s.splice || splice_busy {
             return;
         }
         if s.urslot.is_none() {
@@ -1077,18 +1097,23 @@ impl WorkerState {
             // would have jumped is now empty, so the kernel-side copy
             // starts at the right socket position. Without this the
             // parked splice is never converted and the client starves.
-            let pending = self.slab.get(slot).and_then(|s| s.body_splice_pending);
-            if let Some(max) = pending {
-                self.slab
-                    .get_mut(slot)
-                    .map(|s| s.body_splice_pending.take());
-                if !self.arm_body_splice(slot, generation, max) {
-                    // Arm failure here cannot fall back (the handler
-                    // already returned "splicing"): the only safe state
-                    // is a closed session.
-                    self.teardown_body_splice(slot);
-                    self.close_session(slot, generation, "body-splice-arm");
-                    return;
+            // (Feature-gated in vane-kernel; see the body-splice
+            // feature docs.)
+            #[cfg(feature = "body-splice")]
+            {
+                let pending = self.slab.get(slot).and_then(|s| s.body_splice_pending);
+                if let Some(max) = pending {
+                    self.slab
+                        .get_mut(slot)
+                        .map(|s| s.body_splice_pending.take());
+                    if !self.arm_body_splice(slot, generation, max) {
+                        // Arm failure here cannot fall back (the handler
+                        // already returned "splicing"): the only safe
+                        // state is a closed session.
+                        self.teardown_body_splice(slot);
+                        self.close_session(slot, generation, "body-splice-arm");
+                        return;
+                    }
                 }
             }
             // Queue fully flushed: complete a deferred FIN.
@@ -1344,15 +1369,14 @@ impl WorkerState {
                     _ => self.dispatch_upstream_write(cqe, slot, generation, h),
                 }
             }
-            Op::BodySpliceIn => {
-                #[cfg(feature = "vane_dbg")]
-                eprintln!("[bsplice] CQE in");
+            #[cfg(feature = "body-splice")]
+            Op::BodySpliceIn | Op::BodySpliceOut => {
                 self.pump_body_splice(slot, generation, h);
             }
-            Op::BodySpliceOut => {
-                self.pump_body_splice(slot, generation, h);
-            }
+            #[cfg(feature = "body-splice")]
             Op::BodySpliceCancel => {}
+            #[cfg(not(feature = "body-splice"))]
+            Op::BodySpliceIn | Op::BodySpliceOut | Op::BodySpliceCancel => {}
             Op::Splice => match cqe.result {
                 Ok(0) => {
                     let aux = cqe.token.aux();
@@ -1619,7 +1643,9 @@ impl WorkerState {
         }
         let guard = FdGuard(fd);
         let session = Session {
+            #[cfg(feature = "body-splice")]
             body_splice: None,
+            #[cfg(feature = "body-splice")]
             body_splice_pending: None,
             downstream: StreamFd(-1),
             peer,

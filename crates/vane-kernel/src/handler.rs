@@ -223,6 +223,8 @@ impl<'a> SessionIo<'a> {
     /// is unavailable (backend, state) — the caller relays through
     /// slots as usual. On success the handler receives exactly one
     /// [`Handler::on_body_spliced`] with the bytes moved.
+    /// Fast path unavailable in this build: relays through slots.
+    #[cfg(feature = "body-splice")]
     pub fn splice_response_body(&mut self, max: u64) -> bool {
         self.worker
             .start_body_splice(self.slot, self.generation, max)

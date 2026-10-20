@@ -19,6 +19,13 @@ vane_dbg = []
 default = ["io-uring"]
 io-uring = ["dep:io-uring"]
 loom = ["dep:loom"]
+# Kernel-side support for the HTTP body-splice fast path (worker pump,
+# readiness watches). Default off: the fast path is dark while its e2e
+# byte-loss is being root-caused (docs/perf-arc-2026-10.md, iteration 3).
+# Kernel-side support for the HTTP body-splice fast path (worker pump,
+# readiness watches). Default off: the fast path is dark while its e2e
+# byte-loss is being root-caused (docs/perf-arc-2026-10.md, iteration 3).
+body-splice = []
 
 [lib]
 name = "vane_core"
