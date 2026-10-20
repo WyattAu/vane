@@ -17,16 +17,7 @@ fn make_proxy(
     events: Arc<EventRing<LogEvent, { vane_observe::EVENT_RING_CAPACITY }>>,
     plugins: Vec<String>,
 ) -> HttpProxy {
-    HttpProxy::new(
-        ProxyConfig {
-            router,
-            registry,
-            events,
-            plugins,
-            ..ProxyConfig::default()
-        },
-        0,
-    )
+    HttpProxy::new(ProxyConfig::new(router, registry, events, plugins), 0)
 }
 
 /// Plugins configured without the `wasm` feature: construction must

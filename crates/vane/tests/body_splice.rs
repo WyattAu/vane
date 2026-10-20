@@ -58,6 +58,7 @@ fn cl_backend(head: String, payload: Vec<u8>) -> std::net::SocketAddr {
 
 /// A backend that serves head + a SHORT body, then closes: the
 /// truncated-upstream case (EOF short of Content-Length).
+#[cfg(feature = "response_splice")]
 fn truncating_backend(head: String, partial: Vec<u8>) -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
     let addr = listener.local_addr().expect("addr");
@@ -207,6 +208,7 @@ fn request(s: &mut TcpStream, path: &str) -> (u16, Vec<u8>) {
 /// io_uring+TCP worker context, unlike the raw-libc context the
 /// mechanism test proves. Runtime-gated per the known-broken
 /// discipline: VANE_KNOWN_BROKEN_SPLICE=1 asserts the fix.
+#[cfg(feature = "response_splice")]
 #[test]
 fn spliced_body_is_exact_and_keepalive_survives() {
     if std::env::var("VANE_KNOWN_BROKEN_SPLICE").as_deref() != Ok("1") {
@@ -240,6 +242,7 @@ fn spliced_body_is_exact_and_keepalive_survives() {
 /// client connection — a silent hang is the failure mode the capped
 /// splice exists to prevent. A keep-alive backend that stays
 /// connected is NOT truncated, it is just slow; this backend closes.
+#[cfg(feature = "response_splice")]
 #[test]
 fn truncated_upstream_closes_the_client_connection() {
     // KNOWN-BROKEN on main (io_uring engine, 2026-10-19): a truncated

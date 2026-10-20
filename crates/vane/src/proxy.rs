@@ -39,11 +39,10 @@ use vane_shm::handover::RouteRecord;
 ///
 /// Proxy handler configuration shared across workers.
 ///
-/// Deliberately exhaustively constructible (unlike the parsed config
-/// structs): this is the programmatic embedder API, and downstream
-/// code constructs it with struct literals. Field growth is covered
-/// by the minor train bump; `Default` exists so tests and embedders
-/// can write struct-update literals anyway.
+/// `#[non_exhaustive]` per the config-struct family rule (feature-
+/// compat R2): fields can be feature-gated, so downstream code must
+/// construct via [`ProxyConfig::new`] plus field assignment.
+#[non_exhaustive]
 pub struct ProxyConfig {
     /// Router (EBR snapshot source).
     pub router: Arc<Router>,
@@ -121,6 +120,29 @@ pub struct ProxyConfig {
 struct PooledConn {
     fd: RawFd,
     parked_at: Instant,
+}
+
+impl ProxyConfig {
+    /// Constructs a config with the four required wiring handles set
+    /// (router, metrics, event ring, plugins) and every other knob at
+    /// its documented default. The embedder-facing constructor: with
+    /// the struct `#[non_exhaustive]`, downstream code cannot use
+    /// struct literals.
+    #[must_use]
+    pub fn new(
+        router: Arc<Router>,
+        registry: Arc<Registry>,
+        events: Arc<EventRing<LogEvent, { vane_observe::EVENT_RING_CAPACITY }>>,
+        plugins: Vec<String>,
+    ) -> Self {
+        Self {
+            router,
+            registry,
+            events,
+            plugins,
+            ..Default::default()
+        }
+    }
 }
 
 impl Default for ProxyConfig {
