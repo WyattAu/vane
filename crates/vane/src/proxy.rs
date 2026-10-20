@@ -66,6 +66,9 @@ pub struct ProxyConfig {
     pub adaptive: Arc<HashMap<String, vane_control::config::AdaptiveConcurrencyConfig>>,
     /// How long a parked upstream connection stays reusable.
     pub pool_idle_ms: u64,
+    /// Relay eligible response bodies with splice(2) (kernel pipe):
+    /// identity Content-Length over plain TCP on both legs.
+    pub response_splice: bool,
     /// TLS termination config (`None` = plaintext listener). Shared slot:
     /// hot reload swaps the inner Arc without touching workers.
     pub tls: Option<Arc<std::sync::RwLock<Arc<rustls::ServerConfig>>>>,
@@ -130,6 +133,7 @@ impl Default for ProxyConfig {
             first_byte_timeout_ms: 30_000,
             pool_per_backend: 4,
             pool_idle_ms: 30_000,
+            response_splice: false,
             adaptive: Arc::new(HashMap::new()),
             tls: None,
             plugins: Vec::new(),
@@ -1184,6 +1188,30 @@ impl HttpProxy {
                 if !rest.is_empty() {
                     self.relay_body(io, rest);
                 }
+                // Body-splice fast path: everything the head parse left
+                // has been relayed; if a capped kernel splice can take
+                // the rest, the transaction completes via
+                // `on_body_spliced` instead of slot round trips. The
+                // worker parks the splice until the queued head/rest
+                // bytes have drained — it writes the socket directly
+                // and must not jump the queue.
+                if matches!(self.conn(slot).body, BodyFraming::ContentLength) {
+                    let remaining = self.conn(slot).remaining;
+                    let close_after = self.conn(slot).close_after;
+                    if remaining > 0
+                        && self.config.response_splice
+                        && !close_after
+                        && self.conn(slot).tls.is_none()
+                        && self.conn(slot).tls_up.is_none()
+                        && io.splice_response_body(remaining)
+                    {
+                        #[cfg(feature = "vane_dbg")]
+                        eprintln!("[bsplice] handler: splice accepted ({remaining})");
+                        // The worker owns the body until the cap is
+                        // met; check_done runs on the completion event.
+                        return;
+                    }
+                }
                 self.check_done(io);
             }
             BodyFraming::ContentLength | BodyFraming::Chunked { .. } => {
@@ -2031,6 +2059,10 @@ fn conn_set_framing(conns: &mut ConnMap, slot: u32, view: &RequestView<'_>) {
 }
 
 impl Handler for HttpProxy {
+    fn on_body_spliced(&mut self, io: &mut SessionIo<'_>, moved: u64) {
+        self.on_body_spliced(io, moved);
+    }
+
     fn on_connected(&mut self, io: &mut SessionIo<'_>) {
         let slot = io.slot_index();
         // A transaction can die with its session (client vanished
@@ -3274,6 +3306,21 @@ impl HttpProxy {
             .unwrap_or_else(|| bytes.to_vec());
         self.conn(slot).gzip = gz;
         compressed
+    }
+
+    /// The body splice finished: `moved` bytes reached the client.
+    /// Account them, mark the body complete, and let the normal tail
+    /// run (access emit, adaptive release, breaker success, pool
+    /// park, keep-alive reset).
+    fn on_body_spliced(&mut self, io: &mut SessionIo<'_>, moved: u64) {
+        let slot = io.slot_index();
+        {
+            let conn = self.conn(slot);
+            conn.bytes_out += moved;
+            conn.body = BodyFraming::Done;
+        }
+        self.metrics.bytes_out.add(&self.config.registry, moved);
+        self.check_done(io);
     }
 
     fn check_done(&mut self, io: &mut SessionIo<'_>) {

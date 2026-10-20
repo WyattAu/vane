@@ -69,6 +69,11 @@ pub enum UpstreamDial {
 /// worker (single-threaded dispatch; per-connection state lives in the
 /// session, reached through [`SessionIo`]).
 pub trait Handler: Send + 'static {
+    /// The response body requested via `SessionIo::splice_response_
+    /// body` completed: `moved` bytes reached the downstream socket.
+    /// Default does nothing: handlers that never splice never see it.
+    fn on_body_spliced(&mut self, _io: &mut SessionIo<'_>, _moved: u64) {}
+
     /// A downstream connection was accepted and its session created:
     /// dial upstreams, enter passthrough modes, or arm deadlines.
     fn on_connected(&mut self, io: &mut SessionIo<'_>) {
@@ -210,6 +215,17 @@ impl<'a> SessionIo<'a> {
     pub fn set_deadline(&mut self, at: Option<Instant>, reason: DeadlineReason) {
         self.worker
             .set_deadline(self.slot, self.generation, at, reason);
+    }
+
+    /// Asks the worker to move up to `max` bytes of this response's
+    /// body upstream -> downstream entirely in the kernel (splice(2)
+    /// through an internal pipe). Returns `false` when the fast path
+    /// is unavailable (backend, state) — the caller relays through
+    /// slots as usual. On success the handler receives exactly one
+    /// [`Handler::on_body_spliced`] with the bytes moved.
+    pub fn splice_response_body(&mut self, max: u64) -> bool {
+        self.worker
+            .start_body_splice(self.slot, self.generation, max)
     }
 
     /// Detaches the upstream fd without closing it (connection pooling).

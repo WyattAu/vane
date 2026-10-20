@@ -764,6 +764,12 @@ pub struct RuntimeConfig {
     pub idle_timeout_ms: u64,
     /// Idle upstream connections retained per backend per worker.
     pub pool_per_backend: usize,
+    /// Relay eligible response bodies with splice(2) (kernel pipe,
+    /// zero user-space copies): identity Content-Length over plain
+    /// TCP on both legs. Opt-in while the fast path is being proven
+    /// (docs/perf-arc-2026-10.md, iteration 3).
+    #[serde(default)]
+    pub response_splice: bool,
     /// How long a pooled (idle) upstream connection stays reusable
     /// after it was parked (ms).
     ///
@@ -798,6 +804,7 @@ impl Default for RuntimeConfig {
             // and the honest cap is time, not count: see docs/perf-arc-
             // 2026-10.md, iteration 1.
             pool_per_backend: 4,
+            response_splice: false,
             pool_idle_ms: 30_000,
         }
     }

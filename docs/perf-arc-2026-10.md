@@ -431,6 +431,22 @@ door re-opens for the body-splice fast path (its e2e hang was this
 same close-semantics bug amplified by the splice's direct socket
 writes).
 
+**KNOWN-BROKEN status formalized (2026-10-20):** the spliced-body
+e2e is runtime-gated (`VANE_KNOWN_BROKEN_SPLICE=1`) alongside the
+truncated repro (`VANE_KNOWN_BROKEN_TRUNCATED=1`). The final
+instrumented evidence: with the ordering barrier and gates in
+place, the worker trace is CORRECT end to end — parked pending,
+drain-converted, armed on the verified client fd (peer port
+matches the client's local port), ingress 61506, egress 61506,
+SIOCOUTQ drains to 0 — and the client still starves with
+FIONREAD=0. The splice's page-moved data is accepted by the
+kernel into the target socket and is not surfacing in the peer's
+receive queue in this io_uring worker context, while the identical
+raw-libc sequence delivers perfectly (mechanism test). Next
+session: drive UringEngine directly with two TCP sockets + pipe
+(no full proxy) to isolate whether io_uring-held socket state is
+the difference, before any further worker changes.
+
 **Repro hardening (2026-10-19, later):** the gated test now
 deterministically characterizes the bug: the client receives the
 head (61 B) and ZERO body bytes — the queued body write is dropped

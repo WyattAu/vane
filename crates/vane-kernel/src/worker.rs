@@ -160,8 +160,36 @@ struct Session {
     /// Half-close (FIN) requested while writes are still flushing.
     fin_queued: bool,
     splice: bool,
+    /// HTTP body splice (see `start_body_splice`): armed, or pending
+    /// until the downstream write queue drains.
+    body_splice: Option<BodySpliceState>,
+    body_splice_pending: Option<u64>,
 
     deadline: Option<Instant>,
+}
+
+impl Session {
+    /// True while a body splice is armed or parked: the engine reads
+    /// for this session belong to the splice — the handler must not
+    /// be dispatched and reads must not re-arm.
+    fn body_splice_active(&self) -> bool {
+        self.body_splice.is_some() || self.body_splice_pending.is_some()
+    }
+}
+
+/// State of an in-progress HTTP body splice (see `WorkerState::
+/// start_body_splice`).
+struct BodySpliceState {
+    /// Bytes still owed to the downstream (the Content-Length tail).
+    remaining: u64,
+    /// The kernel pipe the bytes flow through: (read end, write end).
+    pipe: (RawFd, RawFd),
+    /// Bytes currently sitting in the pipe.
+    pipe_len: u64,
+    /// Bytes that have reached the downstream socket.
+    moved: u64,
+    /// A POLLOUT watch is armed on the downstream (backpressure).
+    watching_out: bool,
 }
 
 /// Timer heap entry.
@@ -445,6 +473,250 @@ impl WorkerState {
     /// Closes and drops a session. `reason` documents the call site for
     /// crash triage (compiled out in release... kept as a parameter so the
     /// next debug session can re-enable the trace in one line).
+    /// Starts the capped body splice for one HTTP response: moves up
+    /// to `max` bytes upstream -> pipe -> downstream entirely in the
+    /// kernel, then delivers [`Handler::on_body_spliced`].
+    ///
+    /// Ordering: any bytes still queued toward the downstream (the
+    /// response head, the part of the body that rode the first read)
+    /// must reach the socket FIRST — the splice writes the socket
+    /// directly and would jump the queue. When the queue is not
+    /// drained the request is parked as pending and armed by the
+    /// write-completion drain instead. Returns `false` when the fast
+    /// path is unavailable — the caller relays through slots as usual.
+    pub(crate) fn start_body_splice(&mut self, slot: u32, generation: u16, max: u64) -> bool {
+        if !self.valid(slot, generation) || max == 0 {
+            return false;
+        }
+        // io_uring-only: the mio backend degrades to the copied relay.
+        if self.engine.kind() != "io_uring" {
+            return false;
+        }
+        let Some(s) = self.slab.get_mut(slot) else {
+            return false;
+        };
+        // An in-flight upstream read would double-deliver bytes the
+        // splice will also move, and a busy splice is not re-entrant.
+        if s.upstream_read_inflight || s.splice || s.body_splice.is_some() {
+            return false;
+        }
+        let queue_busy = !s.wq.is_empty() || !s.pending_down.is_empty() || s.write_inflight;
+        if queue_busy {
+            // Park until the write queue drains; the drain converts it.
+            #[cfg(feature = "vane_dbg")]
+            eprintln!("[bsplice] parked pending={max}");
+            s.body_splice_pending = Some(max);
+            return true;
+        }
+        #[cfg(feature = "vane_dbg")]
+        eprintln!("[bsplice] arm immediate max={max}");
+        self.arm_body_splice(slot, generation, max)
+    }
+
+    /// Converts a pending body splice into an armed one (queue empty).
+    fn arm_body_splice(&mut self, slot: u32, generation: u16, max: u64) -> bool {
+        let Some(s) = self.slab.get_mut(slot) else {
+            return false;
+        };
+        let Some(up) = &s.upstream else {
+            return false;
+        };
+        let ufd = up.fd();
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: pipe2 with valid out-array; both ends nonblocking +
+        // close-on-exec (closed explicitly at completion/teardown).
+        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        if rc != 0 {
+            return false;
+        }
+        s.body_splice = Some(BodySpliceState {
+            remaining: max,
+            pipe: (fds[0], fds[1]),
+            pipe_len: 0,
+            moved: 0,
+            watching_out: false,
+        });
+        let up_token = Token::new(Op::BodySpliceIn, slot, generation, 0);
+        self.engine
+            .watch(ufd, up_token, libc::POLLIN as u32)
+            .is_ok()
+    }
+
+    /// Tears the body splice down (closes the pipe, drops state).
+    /// Idempotent; called from completion, session close, and reset.
+    fn teardown_body_splice(&mut self, slot: u32) {
+        if let Some(bs) = self.slab.get_mut(slot).and_then(|s| s.body_splice.take()) {
+            // SAFETY: the pipe ends are owned by this state and no
+            // longer referenced by any engine watch (watches on a
+            // closed fd complete with ECANCELED, filtered by the
+            // engine).
+            unsafe {
+                libc::close(bs.pipe.0);
+                libc::close(bs.pipe.1);
+            }
+        }
+        self.slab
+            .get_mut(slot)
+            .map(|s| s.body_splice_pending.take());
+    }
+
+    /// The body-splice pump: moves upstream bytes into the pipe, then
+    /// drains the pipe into the downstream socket, honouring the byte
+    /// cap and backpressure. Called on either readiness event.
+    fn pump_body_splice(&mut self, slot: u32, generation: u16, h: &mut dyn Handler) {
+        let (ufd, dfd) = {
+            let Some(s) = self.slab.get(slot) else {
+                return;
+            };
+            let Some(up) = &s.upstream else {
+                return;
+            };
+            (up.fd(), s.downstream.fd())
+        };
+        // Ingress: upstream -> pipe, capped by the remaining budget.
+        loop {
+            let Some(bs) = self.slab.get_mut(slot).and_then(|s| s.body_splice.as_mut()) else {
+                return;
+            };
+            let want = (bs.remaining - bs.pipe_len).min(1 << 16) as usize;
+            if want == 0 {
+                break;
+            }
+            // SAFETY: all fds live and nonblocking; null offsets mean
+            // current file position (sockets/pipes).
+            let n = unsafe {
+                libc::splice(
+                    ufd,
+                    std::ptr::null_mut(),
+                    bs.pipe.1,
+                    std::ptr::null_mut(),
+                    want,
+                    libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK,
+                )
+            };
+            if n < 0 {
+                let err = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
+                    break;
+                }
+                if err == libc::EINTR {
+                    continue;
+                }
+                self.teardown_body_splice(slot);
+                self.close_session(slot, generation, "body-splice-in");
+                return;
+            }
+            if n == 0 {
+                // Upstream EOF. Bytes still owed means the response is
+                // truncated (the head is already on the wire — no 502
+                // possible): kill the session so the client sees a
+                // short body instead of a silent hang.
+                let bs = self
+                    .slab
+                    .get(slot)
+                    .and_then(|s| s.body_splice.as_ref())
+                    .map(|b| (b.remaining, b.pipe_len));
+                match bs {
+                    Some((0, 0)) => { /* exact fit: the drain completes it */ }
+                    _ => {
+                        self.teardown_body_splice(slot);
+                        self.close_session(slot, generation, "body-splice-truncated");
+                        return;
+                    }
+                }
+                break;
+            }
+            let bs = self
+                .slab
+                .get_mut(slot)
+                .and_then(|s| s.body_splice.as_mut())
+                .expect("checked");
+            bs.pipe_len += u64::try_from(n).unwrap_or(0);
+        }
+
+        // Egress: pipe -> downstream, drain fully or park on EAGAIN.
+        loop {
+            let Some(bs) = self.slab.get_mut(slot).and_then(|s| s.body_splice.as_mut()) else {
+                return;
+            };
+            if bs.pipe_len == 0 {
+                break;
+            }
+            // SAFETY: live nonblocking descriptors; positions null.
+            let n = unsafe {
+                libc::splice(
+                    bs.pipe.0,
+                    std::ptr::null_mut(),
+                    dfd,
+                    std::ptr::null_mut(),
+                    bs.pipe_len as usize,
+                    libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK,
+                )
+            };
+            if n < 0 {
+                let err = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
+                    let need_out = !bs.watching_out;
+                    if need_out {
+                        bs.watching_out = true;
+                        let out_token = Token::new(Op::BodySpliceOut, slot, generation, 0);
+                        let _ = self.engine.watch(dfd, out_token, libc::POLLOUT as u32);
+                    }
+                    return;
+                }
+                if err == libc::EINTR {
+                    continue;
+                }
+                self.teardown_body_splice(slot);
+                self.close_session(slot, generation, "body-splice-out");
+                return;
+            }
+            let bs = self
+                .slab
+                .get_mut(slot)
+                .and_then(|s| s.body_splice.as_mut())
+                .expect("checked");
+            bs.pipe_len -= u64::try_from(n).unwrap_or(0);
+            bs.moved += u64::try_from(n).unwrap_or(0);
+        }
+
+        // Completion: the cap is met and the pipe is empty.
+        let done = self
+            .slab
+            .get(slot)
+            .and_then(|s| s.body_splice.as_ref())
+            .is_some_and(|bs| bs.remaining == 0 && bs.pipe_len == 0);
+        if done {
+            self.finish_body_splice(slot, generation, h);
+        }
+    }
+
+    /// Hands the completed splice back to the handler: bytes are on
+    /// the wire, the transaction completes through the normal tail
+    /// (access emit, adaptive release, pool park, keep-alive).
+    fn finish_body_splice(&mut self, slot: u32, generation: u16, h: &mut dyn Handler) {
+        let Some(s) = self.slab.get_mut(slot) else {
+            return;
+        };
+        let dfd = s.downstream.fd();
+        // Disarm the watches BEFORE the handler runs: completion may
+        // park the upstream (detach it) and the session continues.
+        let up_token = Token::new(Op::BodySpliceIn, slot, generation, 0);
+        let _ = self.engine.unwatch(dfd, up_token);
+        let out_token = Token::new(Op::BodySpliceOut, slot, generation, 0);
+        let _ = self.engine.unwatch(dfd, out_token);
+        let moved = s.body_splice.as_ref().map_or(0, |bs| bs.moved);
+        if let Some(bs) = s.body_splice.take() {
+            // SAFETY: owned pipe ends; watches cancelled above.
+            unsafe {
+                libc::close(bs.pipe.0);
+                libc::close(bs.pipe.1);
+            }
+        }
+        let mut io = self.io_for(slot, generation);
+        h.on_body_spliced(&mut io, moved);
+    }
+
     pub(crate) fn close_session(&mut self, slot: u32, generation: u16, reason: &str) {
         // vane-core stays dependency-light: no tracing here.
         #[cfg(feature = "vane_dbg")]
@@ -456,6 +728,7 @@ impl WorkerState {
         if !self.valid(slot, generation) {
             return;
         }
+        self.teardown_body_splice(slot);
         let Some(s) = self.slab.remove(slot) else {
             return;
         }; // generation bumps inside
@@ -710,7 +983,7 @@ impl WorkerState {
         let Some(s) = self.slab.get_mut(slot) else {
             return;
         };
-        if s.read_inflight || s.splice {
+        if s.read_inflight || s.splice || s.body_splice_active() {
             crate::dbg_trace!(
                 "ARMDbg skip slot={slot} inflight={} splice={}",
                 s.read_inflight,
@@ -748,7 +1021,7 @@ impl WorkerState {
         if s.pending_down.len() > 2 * self.pool.buf_size() {
             return;
         }
-        if s.upstream_read_inflight || s.splice {
+        if s.upstream_read_inflight || s.splice || s.body_splice_active() {
             return;
         }
         if s.urslot.is_none() {
@@ -800,6 +1073,24 @@ impl WorkerState {
             let token = Token::new(Op::DownstreamWrite, slot, generation, 0);
             let _ = self.engine.write(token, fd, ws, len as usize, off as usize);
         } else {
+            // A parked body splice arms here: the queue the splice
+            // would have jumped is now empty, so the kernel-side copy
+            // starts at the right socket position. Without this the
+            // parked splice is never converted and the client starves.
+            let pending = self.slab.get(slot).and_then(|s| s.body_splice_pending);
+            if let Some(max) = pending {
+                self.slab
+                    .get_mut(slot)
+                    .map(|s| s.body_splice_pending.take());
+                if !self.arm_body_splice(slot, generation, max) {
+                    // Arm failure here cannot fall back (the handler
+                    // already returned "splicing"): the only safe state
+                    // is a closed session.
+                    self.teardown_body_splice(slot);
+                    self.close_session(slot, generation, "body-splice-arm");
+                    return;
+                }
+            }
             // Queue fully flushed: complete a deferred FIN.
             let fin = {
                 let Some(s) = self.slab.get_mut(slot) else {
@@ -951,9 +1242,6 @@ impl WorkerState {
             return; // stale token for a closed/reused session
         }
         match cqe.token.op() {
-            // Body-splice watch events: the fast path is dark (the
-            // handler never arms these today); a stray event is a no-op.
-            Op::BodySpliceIn | Op::BodySpliceOut | Op::BodySpliceCancel => {}
             Op::Accept => {}
             Op::Connect => match cqe.result {
                 Ok(_) => {
@@ -1056,6 +1344,15 @@ impl WorkerState {
                     _ => self.dispatch_upstream_write(cqe, slot, generation, h),
                 }
             }
+            Op::BodySpliceIn => {
+                #[cfg(feature = "vane_dbg")]
+                eprintln!("[bsplice] CQE in");
+                self.pump_body_splice(slot, generation, h);
+            }
+            Op::BodySpliceOut => {
+                self.pump_body_splice(slot, generation, h);
+            }
+            Op::BodySpliceCancel => {}
             Op::Splice => match cqe.result {
                 Ok(0) => {
                     let aux = cqe.token.aux();
@@ -1322,6 +1619,8 @@ impl WorkerState {
         }
         let guard = FdGuard(fd);
         let session = Session {
+            body_splice: None,
+            body_splice_pending: None,
             downstream: StreamFd(-1),
             peer,
             upstream: None,
