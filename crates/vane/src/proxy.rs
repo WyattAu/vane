@@ -3684,6 +3684,14 @@ mod pool_tests {
         SocketAddr::from(([127, 0, 0, 1], 9_001))
     }
 
+    /// Serializes the pool tests: parallel tests that close descriptors
+    /// free fd NUMBERS that a concurrent pair() can re-adopt, which
+    /// makes cross-end liveness probes race with unrelated teardowns.
+    fn fd_serial() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// A connected socket pair as raw descriptors — a parked upstream
     /// connection stand-in whose fate we can observe via `peer`.
     fn pair() -> (RawFd, RawFd) {
@@ -3747,6 +3755,7 @@ mod pool_tests {
     /// afterwards and the connection is untouched.
     #[test]
     fn checkout_within_deadline_reuses_the_connection() {
+        let _serial = fd_serial();
         let registry = Arc::new(Registry::new());
         let mut proxy = HttpProxy::new(config(&registry, 4, 60_000), 0);
         let (mine, peer) = pair();
@@ -3763,6 +3772,7 @@ mod pool_tests {
     /// request may pay for a connection the backend already retired.
     #[test]
     fn checkout_past_deadline_closes_instead_of_handing_out() {
+        let _serial = fd_serial();
         let registry = Arc::new(Registry::new());
         let mut proxy = HttpProxy::new(config(&registry, 4, 0), 0);
         let (mine, peer) = pair();
@@ -3783,6 +3793,7 @@ mod pool_tests {
     /// connection that is past its deadline.
     #[test]
     fn checkout_takes_the_freshest_and_the_stale_below_it_is_reaped() {
+        let _serial = fd_serial();
         let registry = Arc::new(Registry::new());
         let mut proxy = HttpProxy::new(config(&registry, 4, 60_000), 0);
         let (aged, aged_peer) = pair();
@@ -3807,6 +3818,7 @@ mod pool_tests {
     /// next burst would reuse: park reaps expired entries first.
     #[test]
     fn park_reaps_expired_entries_before_refusing_room() {
+        let _serial = fd_serial();
         let registry = Arc::new(Registry::new());
         let mut proxy = HttpProxy::new(config(&registry, 2, 0), 0);
         let (a, a_peer) = pair();
@@ -3837,6 +3849,7 @@ mod pool_tests {
     /// A full pool closes the arriving connection rather than growing.
     #[test]
     fn park_closes_the_arriving_connection_when_full() {
+        let _serial = fd_serial();
         let registry = Arc::new(Registry::new());
         let mut proxy = HttpProxy::new(config(&registry, 1, 60_000), 0);
         let (a, a_peer) = pair();
@@ -3854,6 +3867,7 @@ mod pool_tests {
     /// A dropped worker must not leak its detached descriptors.
     #[test]
     fn dropping_the_proxy_closes_pooled_descriptors() {
+        let _serial = fd_serial();
         let registry = Arc::new(Registry::new());
         let (mine, peer) = pair();
         {
@@ -3872,6 +3886,7 @@ mod pool_tests {
     /// healthy pool from a churning one.
     #[test]
     fn pool_metrics_are_published() {
+        let _serial = fd_serial();
         let registry = Arc::new(Registry::new());
         let mut proxy = HttpProxy::new(config(&registry, 4, 60_000), 0);
         let (mine, peer) = pair();
