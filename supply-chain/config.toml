@@ -1380,6 +1380,10 @@ criteria = "safe-to-deploy"
 version = "0.103.15"
 criteria = "safe-to-deploy"
 
+[[exemptions.rustls-webpki]]
+version = "0.103.16"
+criteria = "safe-to-deploy"
+
 [[exemptions.rustversion]]
 version = "1.0.23"
 criteria = "safe-to-deploy"
@@ -2100,8 +2104,16 @@ criteria = "safe-to-deploy"
 version = "1.0.9"
 criteria = "safe-to-deploy"
 
+[[exemptions.webpki-root-certs]]
+version = "1.0.10"
+criteria = "safe-to-deploy"
+
 [[exemptions.webpki-roots]]
 version = "1.0.9"
+criteria = "safe-to-deploy"
+
+[[exemptions.webpki-roots]]
+version = "1.0.10"
 criteria = "safe-to-deploy"
 
 [[exemptions.winapi]]
