@@ -21,7 +21,12 @@ concurrency:
 
 jobs:
   quality:
-    uses: WyattAu/engineering-standards/.github/workflows/rust-kit.yml@main
+    # Pinned to the last-known-good kit while engineering-standards#6
+    # is open: today's kit coverage series (31b3842..45d6c98) lands
+    # --ignore-filename-regex in the libtest passthrough, failing
+    # every repo that passes coverage-ignore-regex. Unpin once the
+    # kit fix lands.
+    uses: WyattAu/engineering-standards/.github/workflows/rust-kit.yml@4446eb4537c8e84a12039ca63b53067045645a66
     with:
       tier: a
       # The CLI process surface (main.rs): subcommand dispatch exits the
