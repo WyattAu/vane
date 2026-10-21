@@ -204,23 +204,17 @@ fn pool_disabled_dials_every_request() {
     assert_eq!(got, payload);
 }
 
-/// KNOWN-BROKEN (worker integration, 2026-10-19): the worker's pump
-/// reports ingress+egress success into the verified client fd
-/// (SIOCOUTQ drains), yet the client's receive queue stays empty —
-/// the splice's page-moved data is not delivered through the
-/// io_uring+TCP worker context, unlike the raw-libc context the
-/// mechanism test proves. Runtime-gated per the known-broken
-/// discipline: VANE_KNOWN_BROKEN_SPLICE=1 asserts the fix.
+/// The splice moves the body byte-exactly and the keep-alive
+/// connection survives for follow-up requests. ROOT-CAUSED and
+/// fixed (2026-10-21): the pump decremented `moved` but never
+/// `remaining`, so the completion condition (remaining == 0)
+/// could never fire - `finish_body_splice` never ran, the handler
+/// never got `on_body_spliced`, and the session never resumed.
+/// The kernel-level mystery (SIOCOUTQ drained, FIONREAD=0) was
+/// this accounting bug wearing a network costume.
 #[cfg(feature = "response_splice")]
 #[test]
 fn spliced_body_is_exact_and_keepalive_survives() {
-    if std::env::var("VANE_KNOWN_BROKEN_SPLICE").as_deref() != Ok("1") {
-        eprintln!(
-            "skipping: known-broken (worker-integration byte loss); \
-             set VANE_KNOWN_BROKEN_SPLICE=1 to assert the fix"
-        );
-        return;
-    }
     let payload = body(65536);
     let head = format!(
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",

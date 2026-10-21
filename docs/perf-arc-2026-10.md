@@ -431,21 +431,26 @@ door re-opens for the body-splice fast path (its e2e hang was this
 same close-semantics bug amplified by the splice's direct socket
 writes).
 
-**KNOWN-BROKEN status formalized (2026-10-20):** the spliced-body
-e2e is runtime-gated (`VANE_KNOWN_BROKEN_SPLICE=1`) alongside the
-truncated repro (`VANE_KNOWN_BROKEN_TRUNCATED=1`). The final
-instrumented evidence: with the ordering barrier and gates in
-place, the worker trace is CORRECT end to end — parked pending,
-drain-converted, armed on the verified client fd (peer port
-matches the client's local port), ingress 61506, egress 61506,
-SIOCOUTQ drains to 0 — and the client still starves with
-FIONREAD=0. The splice's page-moved data is accepted by the
-kernel into the target socket and is not surfacing in the peer's
-receive queue in this io_uring worker context, while the identical
-raw-libc sequence delivers perfectly (mechanism test). Next
-session: drive UringEngine directly with two TCP sockets + pipe
-(no full proxy) to isolate whether io_uring-held socket state is
-the difference, before any further worker changes.
+**ROOT-CAUSED and FIXED (2026-10-21):** a byte-accounting bug in
+the worker pump, not a kernel mystery. `pump_body_splice`'s egress
+loop incremented `moved` but never decremented `remaining`, so the
+completion condition (`remaining == 0 && pipe_len == 0`) could
+never fire: `finish_body_splice` never ran, the handler never got
+`on_body_spliced`, the body-splice-active read gates never
+cleared, and the session leaked — the "client starves after the
+first chunk" symptom. The SIOCOUTQ-drains / FIONREAD=0 evidence
+was this bug wearing a network costume: bytes moved to the wire,
+but the session machinery never resumed, so the keep-alive flow
+wedged. Found by writing the worker-level unit tests the coverage
+gate demanded (`body_splice_worker_tests` in vane-kernel/worker.rs,
+cfg-gated on `body-splice`): the first test failed with
+`remaining=512, moved=512` — the accounting visible immediately at
+this level, invisible at the e2e level. The spliced-body e2e is
+UN-gated and passes 5/5 byte-exact (65536 x 3 keep-alive
+requests). The fast path remains feature-gated
+(`response_splice` -> `body-splice`) pending the quiet-window
+get64k benchmark for the default-on decision per the iteration-3
+criteria; the code is now proven and pinned by unit + e2e tests.
 
 **Repro hardening (2026-10-19, later):** the gated test now
 deterministically characterizes the bug: the client receives the
