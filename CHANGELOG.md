@@ -4,6 +4,73 @@ All notable changes to vane are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 semver.
 
+## [0.15.0] — 2026-10-21
+
+Crate versions: `vane-kernel` 0.8.0 → **0.9.0**, `vane-control`
+0.11.0 → **0.12.0**, `vane-proxy` 0.14.0 → **0.15.0**. The
+body-splice release: the HTTP fast path is root-caused, proven, and
+default-on — get64k at 2.52× median with the profile flat where the
+memmove pair used to own 29.3% of on-CPU time.
+
+### Added
+
+- **HTTP body splice, default-on** (`vane-proxy` 0.15.0 +
+  `vane-kernel` 0.9.0). Eligible responses (identity Content-Length
+  over plain TCP on both legs, no gzip, not h2, keep-alive) relay
+  through a kernel pipe with splice(2): the worker arms readiness
+  watches, pumps ingress→pipe→egress under a byte cap, and hands the
+  completed transaction back to the handler. get64k A/B (same
+  binary, interleaved median-of-3): 34.2k → 86.3k rps median, p50
+  178 → 77 µs, p99 834 → 267 µs, zero errors; perf shows the
+  copies eliminated. `response_splice` cargo feature + config flag
+  default on; TLS, h2, chunked, upgrade/tunnel, keep-alive-close
+  and mio-engine responses stay on the copied relay by the
+  eligibility gates.
+- **`SessionIo::splice_response_body` + `Handler::on_body_spliced`**
+  (`vane-kernel` 0.9.0, feature `body-splice`): the handler-side
+  seam for the fast path — request the splice, get the completion
+  with the moved byte count.
+- **`Engine::watch`-based readiness plumbing** reused by the splice
+  pump (the 0.8.0 primitives get their first production user).
+- **Worker-level body-splice unit tests** (`body_splice_worker_tests`):
+  exact byte movement + completion handoff, truncation
+  kills-the-session, re-entry/parking rejections — compiled only
+  under the `body-splice` feature.
+
+### Fixed
+
+- **The splice pump never completed** (`vane-kernel` 0.9.0): the
+  egress loop incremented `moved` but never decremented `remaining`,
+  so the completion condition could never fire and the session
+  leaked — the "client starves after the first chunk" symptom that
+  looked like a kernel byte-loss mystery for two sessions. Found by
+  the worker-level unit tests the coverage gate demanded.
+- **Truncated-upstream client hang** (`vane-kernel` 0.9.0): an
+  io_uring op still submitted on a socket holds a kernel reference
+  to the struct file, so `close(2)` alone freed the fd NUMBER
+  without closing the socket — no FIN, client hangs forever.
+  `close_session` now shutdowns both sockets before close, and the
+  truncation path half-closes after flushing queued bytes
+  (nginx-style partial relay). Gated repro
+  (`truncated_clean_main.rs`) passes.
+- **Pool tests serialized** (`vane-proxy`): parallel pool tests
+  closing descriptors freed fd numbers that concurrent socketpairs
+  re-adopted, racing the liveness probes (~1 CI run in 6).
+
+### Changed
+
+- **`ProxyConfig` is `#[non_exhaustive]`** (`vane-proxy` 0.15.0)
+  per the config-struct family rule (feature-compat R2: fields can
+  be feature-gated), with a public `ProxyConfig::new` constructor
+  for the four required wiring handles.
+- **`response_splice` config field** (`vane-control` 0.12.0):
+  default ON via an explicit serde default fn — `#[serde(default)]`
+  alone would call `bool::default()` (false) and silently keep the
+  fast path off.
+- Supply-chain: wasmtime 48.0.7 (RUSTSEC-2026-0378/0379),
+  rustls-webpki 0.103.16 + webpki-roots 1.0.10
+  (RUSTSEC-2026-0381/0382/0383).
+
 ## [0.14.0] — 2026-10-18
 
 Crate versions: `vane-kernel` 0.8.0, `vane-proxy` 0.14.0. A

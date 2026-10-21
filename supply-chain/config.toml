@@ -1329,12 +1329,20 @@ criteria = "safe-to-deploy"
 version = "0.11.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.vane-control]]
+version = "0.12.0"
+criteria = "safe-to-deploy"
+
 [[exemptions.vane-filters]]
 version = "0.6.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.vane-kernel]]
 version = "0.8.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.vane-kernel]]
+version = "0.9.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.vane-observe]]

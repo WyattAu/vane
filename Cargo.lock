@@ -3996,7 +3996,7 @@ dependencies = [
 
 [[package]]
 name = "vane-control"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "base64",
  "envstack",
@@ -4041,7 +4041,7 @@ dependencies = [
 
 [[package]]
 name = "vane-kernel"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "bytes",
  "core_affinity",
