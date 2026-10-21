@@ -486,6 +486,19 @@ needed. TLS, h2, chunked, upgrade/tunnel, keep-alive-close and
 mio-engine responses all stay on the copied path by the existing
 gates.
 
+Two deployment footguns found and fixed while landing the default:
+(1) `#[serde(default)]` on a bool calls `bool::default()` (false),
+not the Default impl — the config-level default-on needs an
+explicit `#[serde(default = "response_splice_default")]`; caught
+live because the first post-flip benchmark window measured the
+copied path. (2) the cross-proxy comparison rerun (vane vs
+Caddy/Traefik with the splice) was started twice and discarded
+twice — load 4-7 with WARNs on every leg after a 90-load storm,
+exactly the contamination the methodology exists to filter. The
+A/B verdict stands on its own methodology; the cross-proxy table
+refresh (docs/benchmarks.md get64k row) is queued on the next
+truly-quiet window.
+
 **Repro hardening (2026-10-19, later):** the gated test now
 deterministically characterizes the bug: the client receives the
 head (61 B) and ZERO body bytes — the queued body write is dropped
