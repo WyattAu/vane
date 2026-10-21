@@ -14,6 +14,23 @@
 > and two missing-END_STREAM paths). Container images publish
 > automatically on `vX.Y.Z` tags (release.yml). Order below unchanged.
 >
+> **v0.15.0 published 2026-10-21** (`vane-kernel` 0.8.0 → 0.9.0,
+> `vane-control` 0.11.0 → 0.12.0, `vane-proxy` 0.14.0 → 0.15.0),
+> install-verified: `cargo install vane-proxy --version 0.15.0
+> --locked` → `vane 0.15.0`. The body-splice release: the HTTP fast
+> path is root-caused (the pump never decremented `remaining`, so
+> completion could never fire — an accounting bug that masqueraded
+> as kernel byte-loss for two sessions), proven at two test levels,
+> and **default-on**: get64k at 2.52× median (34.2k → 86.3k rps,
+> p50 178 → 77 µs) with the profile flat where the memmove pair
+> owned 29.3%. The truncated-upstream client hang fix
+> (shutdown-before-close) ships here too, plus the serde-default
+> footgun fix (`#[serde(default)]` on a bool is false, not your
+> Default impl). Feature forward note: `response_splice` implies
+> `vane-kernel/body-splice`, which is why the kernel's minor bump
+> and the same-commit workspace requirement bump were load-bearing
+> — publishing the proxy against kernel 0.8.0 would not resolve.
+>
 > **v0.14.0 published 2026-10-18** (`vane-kernel` 0.8.0 →
 > `vane-proxy` 0.14.0). Kernel internals: `Op` is
 > `#[non_exhaustive]` with the exhaustive `Token::op` decode fix,

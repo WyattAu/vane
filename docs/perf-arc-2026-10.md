@@ -499,6 +499,14 @@ A/B verdict stands on its own methodology; the cross-proxy table
 refresh (docs/benchmarks.md get64k row) is queued on the next
 truly-quiet window.
 
+**v0.15.0 PUBLISHED (2026-10-21):** vane-kernel 0.9.0, vane-control
+0.12.0, vane-proxy 0.15.0 — install-verified
+(`cargo install vane-proxy --version 0.15.0 --locked` →
+`vane 0.15.0`), ghcr image building on the tag. The arc's headline:
+a two-session "kernel byte-loss mystery" was one missing
+decrement, and fixing it bought 2.52× on the exact leg the whole
+arc started for.
+
 **Repro hardening (2026-10-19, later):** the gated test now
 deterministically characterizes the bug: the client receives the
 head (61 B) and ZERO body bytes — the queued body write is dropped
