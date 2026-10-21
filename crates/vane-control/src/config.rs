@@ -766,8 +766,11 @@ pub struct RuntimeConfig {
     pub pool_per_backend: usize,
     /// Relay eligible response bodies with splice(2) (kernel pipe,
     /// zero user-space copies): identity Content-Length over plain
-    /// TCP on both legs. Opt-in while the fast path is being proven
-    /// (docs/perf-arc-2026-10.md, iteration 3).
+    /// TCP on both legs, gzip excluded. Default ON since the get64k
+    /// A/B verdict (docs/perf-arc-2026-10.md, iteration 3: 2.5x
+    /// median throughput, p50 178 -> 77 us): the splice engages only
+    /// when the binary is built with the `response_splice` cargo
+    /// feature; without it this flag parses but is inert.
     #[serde(default)]
     pub response_splice: bool,
     /// How long a pooled (idle) upstream connection stays reusable
@@ -804,7 +807,7 @@ impl Default for RuntimeConfig {
             // and the honest cap is time, not count: see docs/perf-arc-
             // 2026-10.md, iteration 1.
             pool_per_backend: 4,
-            response_splice: false,
+            response_splice: true,
             pool_idle_ms: 30_000,
         }
     }

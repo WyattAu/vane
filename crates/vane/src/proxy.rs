@@ -161,7 +161,7 @@ impl Default for ProxyConfig {
             pool_per_backend: 4,
             pool_idle_ms: 30_000,
             #[cfg(feature = "body-splice")]
-            response_splice: false,
+            response_splice: true,
             adaptive: Arc::new(HashMap::new()),
             tls: None,
             plugins: Vec::new(),
@@ -1232,6 +1232,7 @@ impl HttpProxy {
                         && !close_after
                         && self.conn(slot).tls.is_none()
                         && self.conn(slot).tls_up.is_none()
+                        && self.conn(slot).gzip.is_none()
                         && io.splice_response_body(remaining)
                     {
                         #[cfg(feature = "vane_dbg")]

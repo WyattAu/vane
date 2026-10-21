@@ -458,6 +458,34 @@ coverage includes the new worker-level unit tests). The splice
 fast path is proven, tested at two levels, and one config flag +
 one benchmark away from default-on.
 
+**BENCHMARK VERDICT (2026-10-21 03:50Z, load 5-6, no builds in
+ps):** get64k c=8, 10 s x 3 interleaved windows, SAME release
+binary (`--features h3,response_splice`), config flag the only
+difference (scripts/bench_splice_ab.sh):
+
+| arm | median rps | p50 | p99 | non200(max) |
+|---|---|---|---|---|
+| splice-off | 34 172 | 178 us | 834 us | 0 |
+| splice-on | 86 268 | 77 us | 267 us | 0 |
+
+**2.52x median throughput, p50 2.3x lower, p99 3.1x lower, zero
+errors in both arms.** Engagement verified by profile (perf record
+999 Hz during an on-window): the memmove pair that was 29.3% of
+on-CPU time is GONE — nothing above 1.4%; the profile is flat
+(worker-loop dispatch noise). 99.4k rps under the profiler.
+
+DECISION: default-on. The config flag defaults to true (vane-control
+RuntimeConfig + ProxyConfig), and the `response_splice` cargo
+feature joins the vane-proxy default set — every plain-TCP
+identity-CL response now splices. The eligibility gate gained the
+gzip exclusion the documented contract always promised (relay_body
+compresses while CL framing survives, so without the guard the
+splice would bypass compression). wasm plugins inspect request
+paths/headers only, body filters do not exist — no further guards
+needed. TLS, h2, chunked, upgrade/tunnel, keep-alive-close and
+mio-engine responses all stay on the copied path by the existing
+gates.
+
 **Repro hardening (2026-10-19, later):** the gated test now
 deterministically characterizes the bug: the client receives the
 head (61 B) and ZERO body bytes — the queued body write is dropped

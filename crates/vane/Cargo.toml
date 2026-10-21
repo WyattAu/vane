@@ -20,7 +20,11 @@ name = "vane"
 path = "src/main.rs"
 
 [features]
-default = ["vane-kernel/io-uring", "h2", "h3"]
+# response_splice default-on since the get64k A/B verdict (2.5x
+# median, docs/perf-arc-2026-10.md iteration 3): the splice engages
+# for identity-CL plain-TCP responses (gzip/TLS/h2/keep-alive-close
+# excluded by the eligibility gate).
+default = ["vane-kernel/io-uring", "h2", "h3", "response_splice"]
 vane_dbg = ["vane-kernel/vane_dbg"]
 post-quantum = ["vane-tls/post-quantum"]
 file-provider = ["vane-control/file-provider"]
