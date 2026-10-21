@@ -729,6 +729,14 @@ pub struct PluginConfig {
     pub path: String,
 }
 
+/// Config-level default for `response_splice`: the get64k A/B
+/// verdict (2.52x median, docs/perf-arc-2026-10.md iteration 3)
+/// flipped it on. `#[serde(default)]` alone would call
+/// `bool::default()` (false) and silently keep the fast path off.
+fn response_splice_default() -> bool {
+    true
+}
+
 /// Runtime tuning knobs.
 ///
 /// `#[non_exhaustive]` per the config-struct family rule: new knobs
@@ -771,7 +779,7 @@ pub struct RuntimeConfig {
     /// median throughput, p50 178 -> 77 us): the splice engages only
     /// when the binary is built with the `response_splice` cargo
     /// feature; without it this flag parses but is inert.
-    #[serde(default)]
+    #[serde(default = "response_splice_default")]
     pub response_splice: bool,
     /// How long a pooled (idle) upstream connection stays reusable
     /// after it was parked (ms).
