@@ -452,6 +452,12 @@ requests). The fast path remains feature-gated
 get64k benchmark for the default-on decision per the iteration-3
 criteria; the code is now proven and pinned by unit + e2e tests.
 
+**Status (2026-10-21, 5ef7d119):** main is fully green — ci +
+interop both pass with the machinery compiled in (--all-features
+coverage includes the new worker-level unit tests). The splice
+fast path is proven, tested at two levels, and one config flag +
+one benchmark away from default-on.
+
 **Repro hardening (2026-10-19, later):** the gated test now
 deterministically characterizes the bug: the client receives the
 head (61 B) and ZERO body bytes — the queued body write is dropped
