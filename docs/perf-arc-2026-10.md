@@ -544,6 +544,12 @@ remove is ~zero. What remains is architectural tidiness (mixed
 Http/L4 listener configs still take the legacy per-listener-pool
 path), not performance.
 
+**Truncated repro UNGATED (2026-10-22):** the fix has been in
+since 2e94fe03 and the gated assertion passes every run — the
+known-broken gate came off truncated_clean_main.rs; the
+assertions are unconditional. Zero runtime-gated known-broken
+tests remain in the tree.
+
 **Cross-proxy refresh LANDED (2026-10-22, 270127e9):** the first
 clean-window full run of the fixed build — vane 0.15.0 wins every
 leg vs Caddy 2.10.2 and Traefik 3.5.4, median of 3, non-2xx = 0

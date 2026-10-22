@@ -167,22 +167,19 @@ cluster = "up"
     println!("clean main: partial body + EOF delivered correctly");
 }
 
-/// KNOWN-BROKEN on main (found 2026-10-19, io_uring engine): a
-/// truncated upstream (Content-Length > delivered, then FIN) leaves
-/// the CLIENT hanging — it receives the response head and then
-/// nothing, forever. The mio engine handles the same shape correctly.
+/// Truncated-upstream contract: upstream sends head + a SHORT body
+/// with Connection: close, then FIN. The client must receive the
+/// partial body and then see EOF — not a hang.
 ///
-/// Runtime-gated per the known-broken discipline: the assertions run
-/// only with VANE_KNOWN_BROKEN_TRUNCATED=1; without it the test
-/// documents the bug and exits green so CI stays actionable.
+/// History: KNOWN-BROKEN on main 2026-10-19 (the io_uring engine
+/// hung the client: head delivered, body never came), runtime-gated
+/// per the known-broken discipline while the fix was pending. Fixed
+/// in vane-kernel 0.9.0 (2e94fe03: shutdown sockets before close —
+/// an in-flight op holds a kernel reference to the struct file, so
+/// close(2) alone freed the fd number without a FIN — plus the
+/// half-close relay that flushes queued bytes first). The gate is
+/// gone; the assertions run unconditionally.
 #[test]
 fn truncated_upstream_on_clean_main() {
-    if std::env::var("VANE_KNOWN_BROKEN_TRUNCATED").as_deref() != Ok("1") {
-        eprintln!(
-            "skipping: known-broken on main (io_uring truncated-upstream hang); \
-             set VANE_KNOWN_BROKEN_TRUNCATED=1 to assert the fix"
-        );
-        return;
-    }
     main_test();
 }
