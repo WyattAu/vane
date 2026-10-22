@@ -45,6 +45,30 @@ Non-2xx max across all 54 legs: **0**.
 | h1 POST 4KB | **44,134** (p50 172µs) | 21,257 | 25,778 | **1.7×** |
 | h1 GET 64KB | 15,326 (p50 478µs) | 16,864 | **19,528** | **0.78× — vane loses** |
 
+**Post-0.15.0 splice addendum (2026-10-22).** The get64k row above
+was measured with `h3 = true` in the bench config; the splice A/B
+(same binary, flag-only difference, controlled load) and a config
+matrix show two independent effects the table conflates:
+
+| configuration (get64k c=8) | median rps | p50 |
+|---|---|---|
+| copied relay (0.14.0 behavior) | 34,172 | 178µs |
+| **body splice (0.15.0 default)** | **86,268** | **77µs** |
+| splice + idle TLS listener, `h3 = false` | 76,895 | 80µs |
+| splice + idle TLS listener, `h3 = true` | 15,590 | 152µs |
+
+- The splice buys **2.52×** on this leg in identical contexts
+  (engagement verified by profile: the memmove pair that was 29.3%
+  of on-CPU time is gone).
+- An **idle `h3 = true` listener costs the plain h1 path ~5×**
+  (quinn runtime tax — see docs/perf-arc-2026-10.md). Until that is
+  fixed, `h3 = false` recovers the throughput when h3 is not being
+  served; the historical 15.3k row above is this tax plus the
+  copies.
+- Sustained back-to-back load decays any of these numbers
+  (86k → 61-73k over 60 s on this host; boost/thermal), so
+  cross-run comparisons need equal-freshness windows.
+
 RSS at rest: vane 502 MB, caddy 41 MB, traefik 69 MB. vane pre-allocates
 `pool_slots × buffer_size` per worker (16 cores × 1024 × 4096 ≈ 64 MB)
 plus per-session slabs — fixed up front by design; the others grow at

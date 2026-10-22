@@ -507,6 +507,35 @@ a two-session "kernel byte-loss mystery" was one missing
 decrement, and fixing it bought 2.52× on the exact leg the whole
 arc started for.
 
+**NEW FINDING — the h3/quinn idle tax (2026-10-22):** the
+cross-proxy refresh exposed a second, bigger deficit that has been
+hiding INSIDE the historical get64k numbers all along. Controlled
+matrix (same binary, same upstream, 10 s get64k c=8, load ~5):
+
+| vane config | median rps | p50 |
+|---|---|---|
+| plain listener only | 85 486 | 81 us |
+| + TLS listener, `h3 = false` | 76 895 | 80 us |
+| + TLS listener, `h3 = true` | **15 590** | 152 us |
+
+An IDLE `h3 = true` listener costs the plain h1 path **5.5x** —
+and the historical bench config (and likely the fleet's) always had
+`h3 = true`. The 15.3k historical get64k and the original
+"Traefik beats vane on get64k" finding are this tax wearing the
+copies' clothes: the memmove profile was real (29.3%) but measured
+inside the quinn-taxed context. The splice fix stands (2.52x
+within identical contexts; the taxed context went 15.3k -> 35.4k
+with the splice — 2.3x). Sustained-run decay is also real but
+smaller: pure get64k back-to-back decays 86k -> 61-73k over 60 s
+(boost/thermal), which is why bench-context numbers (leg position
+6 of 6) read lower than fresh-window numbers.
+
+**Next iteration (queued, headline item): profile the h3-on idle
+path — quinn's runtime integration into the worker loop (poll
+timeout, timer fd, wakeup cadence) is the suspect; the fix should
+make an unused h3 listener free. Interim user guidance: `h3 =
+false` unless h3 is actually served.
+
 **Repro hardening (2026-10-19, later):** the gated test now
 deterministically characterizes the bug: the client receives the
 head (61 B) and ZERO body bytes — the queued body write is dropped
