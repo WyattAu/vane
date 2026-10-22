@@ -507,34 +507,43 @@ a two-session "kernel byte-loss mystery" was one missing
 decrement, and fixing it bought 2.52× on the exact leg the whole
 arc started for.
 
-**NEW FINDING — the h3/quinn idle tax (2026-10-22):** the
-cross-proxy refresh exposed a second, bigger deficit that has been
-hiding INSIDE the historical get64k numbers all along. Controlled
-matrix (same binary, same upstream, 10 s get64k c=8, load ~5):
+**NEW FINDING — ROOT-CAUSED and FIXED: `workers = 0` duplicated
+the core budget PER LISTENER (2026-10-22).** The cross-proxy
+refresh exposed a second deficit hiding inside the historical
+get64k numbers. Controlled matrix (same binary, same upstream,
+10 s get64k c=8, load ~5):
 
-| vane config | median rps | p50 |
+| config (get64k on the plain listener) | before | after the fix |
 |---|---|---|
-| plain listener only | 85 486 | 81 us |
-| + TLS listener, `h3 = false` | 76 895 | 80 us |
-| + TLS listener, `h3 = true` | **15 590** | 152 us |
+| 1 listener, `workers = 0` (16 workers) | 85 486 | 85 486 |
+| 2 plain listeners, `workers = 0` (32 workers!) | 16 436 | **87 598** |
+| plain + TLS + `h3 = true`, `workers = 0` (bench/fleet shape) | 15 590 | **83 475** |
 
-An IDLE `h3 = true` listener costs the plain h1 path **5.5x** —
-and the historical bench config (and likely the fleet's) always had
-`h3 = true`. The 15.3k historical get64k and the original
-"Traefik beats vane on get64k" finding are this tax wearing the
-copies' clothes: the memmove profile was real (29.3%) but measured
-inside the quinn-taxed context. The splice fix stands (2.52x
-within identical contexts; the taxed context went 15.3k -> 35.4k
-with the splice — 2.3x). Sustained-run decay is also real but
-smaller: pure get64k back-to-back decays 86k -> 61-73k over 60 s
-(boost/thermal), which is why bench-context numbers (leg position
-6 of 6) read lower than fresh-window numbers.
+Root cause: `workers = 0` meant "cores PER LISTENER" — the bench
+and fleet shape (plain + TLS listeners) spawned 32 io_uring
+pollers on 16 cpus, and the oversubscription cost 5x. Attribution
+note: the first hypothesis (an h3/quinn idle tax) was DISPROVEN by
+the control experiment — two PLAIN listeners reproduce the drop
+exactly (16.4k), and h3 = false recovers nothing once the worker
+count is fixed. The h3 listener was innocent; it just made the
+config multi-listener. The historical 15.3k get64k, the
+"Traefik beats vane on get64k" finding, AND the 29.3% memmove
+profile were all measured inside this oversubscribed context —
+the copies were real but half the story.
 
-**Next iteration (queued, headline item): profile the h3-on idle
-path — quinn's runtime integration into the worker loop (poll
-timeout, timer fd, wakeup cadence) is the suspect; the fix should
-make an unused h3 listener free. Interim user guidance: `h3 =
-false` unless h3 is actually served.
+The fix (`resolve_workers_per_listener`): `workers = 0` now shares
+the core budget across listeners (cores / count, min 1); explicit
+per-listener `workers` keeps the legacy all-equal semantics.
+Verified end to end: 2 plain listeners auto -> 87.6k (was 16.4k),
+bench shape -> 83.5k (was 15.6k). The proper long-term shape (one
+worker pool owning ALL listeners — the kernel loop already
+multiplexes by listener index) remains queued; it removes the
+idle-pool overhead entirely and fixes mixed-mode listeners.
+
+Sustained-run decay is also real but smaller: pure get64k
+back-to-back decays 86k -> 61-73k over 60 s (boost/thermal), which
+is why bench-context numbers (leg position 6 of 6) read lower than
+fresh-window numbers.
 
 **Repro hardening (2026-10-19, later):** the gated test now
 deterministically characterizes the bug: the client receives the

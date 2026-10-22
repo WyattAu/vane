@@ -303,6 +303,30 @@ fn resolve_admin_token(
     }
 }
 
+/// Resolves the per-listener worker count. `workers = 0` means AUTO:
+/// the core budget is SHARED across listeners, not duplicated per
+/// listener — the old behavior (cores per listener) put
+/// cores × listeners io_uring pollers on `cores` cpus, and two
+/// idle-ish 16-worker pools measured 16.4k get64k where one
+/// 16-worker pool measures 85.5k (a 5× tax on every multi-listener
+/// config; bench + fleet shaped). An explicit per-listener `workers`
+/// keeps the legacy all-equal semantics: the first explicit value
+/// wins for every listener.
+#[must_use]
+fn resolve_workers_per_listener(
+    listeners: &[vane_control::config::ListenerConfig],
+    cores: usize,
+) -> usize {
+    if listeners.iter().all(|l| l.workers == 0) {
+        let count = listeners.len().max(1);
+        (cores / count).max(1)
+    } else {
+        listeners
+            .first()
+            .map_or(1, |l| if l.workers == 0 { cores } else { l.workers })
+    }
+}
+
 /// Runs the proxy until shutdown. Returns the process exit code.
 pub async fn run(opts: RunOptions) -> i32 {
     let mut config = match load_config(opts.config_path.as_deref()) {
@@ -749,10 +773,7 @@ pub async fn run(opts: RunOptions) -> i32 {
         .collect();
     let inherited = opts.handover_from.is_some();
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let workers_per_listener = config
-        .listeners
-        .first()
-        .map_or(1, |l| if l.workers == 0 { cores } else { l.workers });
+    let workers_per_listener = resolve_workers_per_listener(&config.listeners, cores);
     let mut handles = Vec::new();
     let mut tls_cfg_slots: Vec<Option<crate::tls_reload::TlsSlot>> = Vec::new();
     let mut event_rings: Vec<
@@ -1425,6 +1446,51 @@ cluster = "up"
             std::env::remove_var("VANE_WORKERS");
         }
         assert!(cfg.listeners.iter().all(|l| l.workers == 3));
+    }
+
+    /// `workers = 0` on TWO listeners shares the core budget (8 + 8
+    /// on a 16-core host), it does not duplicate it (16 + 16 = 32
+    /// io_uring pollers on 16 cpus cost 5x — see the fn docs).
+    #[test]
+    fn auto_workers_share_the_core_budget_across_listeners() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let dir = tempfile::tempdir().expect("dir");
+        let one_auto = r#"
+[[listeners]]
+address = "127.0.0.1:1"
+
+[clusters.up]
+backends = ["127.0.0.1:2"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+"#;
+        let two_auto = format!("{one_auto}[[listeners]]\naddress = \"127.0.0.1:3\"\n");
+        let path = write_cfg(dir.path(), "one_auto.toml", one_auto);
+        let cfg = load_config(Some(&path)).expect("load");
+        assert_eq!(
+            resolve_workers_per_listener(&cfg.listeners, 16),
+            16,
+            "one auto listener: the full budget"
+        );
+        let path = write_cfg(dir.path(), "two_auto.toml", &two_auto);
+        let cfg = load_config(Some(&path)).expect("load");
+        assert_eq!(
+            resolve_workers_per_listener(&cfg.listeners, 16),
+            8,
+            "two auto listeners: the budget splits"
+        );
+        // Mixed explicit + auto: the legacy all-equal branch reads the
+        // first listener's 0 and hands out the full budget.
+        let two_mixed = format!("{two_auto}workers = 3\n");
+        let path = write_cfg(dir.path(), "two_mixed.toml", &two_mixed);
+        let cfg = load_config(Some(&path)).expect("load");
+        assert_eq!(
+            resolve_workers_per_listener(&cfg.listeners, 16),
+            16,
+            "explicit wins: legacy cores-per-listener semantics"
+        );
     }
 
     /// OTEL_* and RUST_LOG env overrides merge over the file config
