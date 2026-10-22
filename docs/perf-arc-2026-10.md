@@ -537,8 +537,24 @@ per-listener `workers` keeps the legacy all-equal semantics.
 Verified end to end: 2 plain listeners auto -> 87.6k (was 16.4k),
 bench shape -> 83.5k (was 15.6k). The proper long-term shape (one
 worker pool owning ALL listeners — the kernel loop already
-multiplexes by listener index) remains queued; it removes the
-idle-pool overhead entirely and fixes mixed-mode listeners.
+multiplexes by listener index) is DEMOTED from the queue: the
+8+8 split measured FULL throughput (88.7k two-listener vs 85.5k
+single-listener), so the idle-pool overhead the refactor would
+remove is ~zero. What remains is architectural tidiness (mixed
+Http/L4 listener configs still take the legacy per-listener-pool
+path), not performance.
+
+**Cross-proxy refresh LANDED (2026-10-22, 270127e9):** the first
+clean-window full run of the fixed build — vane 0.15.0 wins every
+leg vs Caddy 2.10.2 and Traefik 3.5.4, median of 3, non-2xx = 0
+across 54 legs. get64k: 101.2k vs Traefik 56.8k (1.78x) — the leg
+the 0.8.0 table showed vane LOSING (0.78x). Every leg improved
+1.9-3.1x over the 0.8.0 table (h1-8 63k -> 179k, h3-8 28k ->
+86k, get64k 15.3k -> 101.2k = 6.6x). Published in
+docs/benchmarks.md with the two-defect explanation (copies +
+oversubscription). The arc is closed: every queued performance
+item is either landed, measured into mootness, or refiled as
+architecture rather than performance.
 
 Sustained-run decay is also real but smaller: pure get64k
 back-to-back decays 86k -> 61-73k over 60 s (boost/thermal), which
