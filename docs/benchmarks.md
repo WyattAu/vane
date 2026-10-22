@@ -1,9 +1,12 @@
 # Benchmarks
 
 Methodology-first: every number here is reproducible with the commands
-shown. All runs share one host, one upstream, and the same client
-(`ab`, which caps the observable ceiling near ~70k rps on this class of
-machine — treat absolute numbers as indicative, ratios as meaningful).
+shown. All runs share one host, one upstream, and one client. Modern
+sections use the in-repo `tools/loadgen` (no artificial ceiling —
+it measures 208k+ rps through vane on this host); historical sections
+used `ab`, which capped the observable ceiling near ~70k rps on this
+class of machine — treat absolute numbers as indicative, ratios as
+meaningful.
 
 ## Setup
 
@@ -21,7 +24,33 @@ machine — treat absolute numbers as indicative, ratios as meaningful).
   two full comparative runs died that way and are recorded as such
   further down.
 
-## vane vs Caddy vs Traefik — 2026-10-07 (v0.8.0, the first valid full run)
+## vane vs Caddy vs Traefik — 2026-10-22 (v0.15.0, body splice + worker-budget fix)
+
+`scripts/bench_compare.sh 10`, median of 3 windows, all three proxies
+native and simultaneous, one shared upstream per body size, non-2xx = 0
+across all 54 legs. One window carried a load-4 WARN (the external
+storm cadence on this host); the median filters single-window dips.
+
+| leg (8 conns unless noted) | **vane 0.15.0** | Caddy 2.10.2 | Traefik 3.5.4 | vane vs best other |
+|---|---|---|---|---|
+| h1-8 | **178,698** (p50 41µs) | 75,831 | 93,279 | **1.9×** |
+| h1-64 | **208,043** (p50 168µs) | 106,826 | 141,899 | **1.5×** |
+| h2-8 | **122,557** (p50 53µs) | 50,200 | 55,254 | **2.2×** |
+| h3-8 | **86,127** (p50 83µs) | 39,000 | 45,415 | **1.9×** |
+| h1 POST 4KB | **123,281** (p50 59µs) | 64,584 | 78,258 | **1.6×** |
+| h1 GET 64KB | **101,194** (p50 72µs) | 50,729 | 56,832 | **1.8×** |
+
+vane wins every leg. The get64k row is the release headline: the
+historical 15.3k (vane losing 0.78× to Traefik) was two stacked
+defects — the copied relay (fixed by the body splice, 2.52× in the
+A/B below) and `workers = 0` duplicating the core budget per
+listener (fixed to share it; 5× on this exact shape). vane h3-8
+more than tripled (28.1k → 86.1k) on the same h3-serving config.
+
+RSS at rest: vane 405 MB, caddy 36 MB, traefik 64 MB — the fixed
+pre-allocation trade, stated rather than hidden.
+
+## vane vs Caddy vs Traefik — 2026-10-07 (v0.8.0, historical)
 
 `scripts/bench_compare.sh 10` — all three proxies run SIMULTANEOUSLY as
 native processes (this host's docker measures the plumbing, not the
@@ -45,8 +74,8 @@ Non-2xx max across all 54 legs: **0**.
 | h1 POST 4KB | **44,134** (p50 172µs) | 21,257 | 25,778 | **1.7×** |
 | h1 GET 64KB | 15,326 (p50 478µs) | 16,864 | **19,528** | **0.78× — vane loses** |
 
-**Post-0.15.0 splice addendum (2026-10-22).** The get64k row above
-was measured with `workers = 0` on two listeners — which then meant
+**Post-0.15.0 splice addendum (2026-10-22).** The get64k row in the
+historical table below was measured with `workers = 0` on two listeners — which then meant
 "cores per listener" (32 io_uring pollers on 16 cpus). Two
 independent effects the table conflates, both now fixed or
 measured:
