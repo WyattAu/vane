@@ -550,6 +550,32 @@ known-broken gate came off truncated_clean_main.rs; the
 assertions are unconditional. Zero runtime-gated known-broken
 tests remain in the tree.
 
+**NEXT ARC OPENED — TLS-h2 large-body relay desync (found
+2026-10-22 while building the TLS-h1 measurement leg):** vane's
+TLS-h2 relay of a 64 KiB plain-upstream body fails ~80% of
+transactions (h2load: 1183 ok / 4737 read_err in 3 s; p99 1 ms),
+logging "upstream truncated h2 response; closing" on some
+attempts. Small bodies (the bench h2 legs, 10 B) are clean — the
+path was never load-tested past one read. Evidence so far:
+- The h2 server shim's byte accounting is CORRECT: the QBFDBG
+  frame trace (vane_dbg, kept in tree) shows sid-local emission
+  4004 + 4096×15 + 92 = 65536 with END_STREAM, fresh sid per
+  request, held always drained (the client grants credit fast).
+- The client (h2load/rustls) sees read errors ~4x per success —
+  its parser rejects something the trace does not show: frame
+  bytes, HPACK state, or interleaving. Needs a keylog capture
+  (SSLKEYLOGFILE + wireshark) or a frame-decode harness.
+- Repro (3 commands, this host): certgen DIR; vane with a TLS
+  listener + a plain 64 KiB cluster; `h2load ADDR 1 3 /bench64
+  localhost DIR/cert.pem`.
+- Interim: the h1s measurement leg (loadgen --tls) is BUILT and
+  works for plain-TLS-h1 — the relay defect is h2-specific.
+Suspect list for the arc: the response-translator's head+first-
+read fusion (head and body in ONE feed), the held/credit
+resumption path vs HEADERS emission ordering, and the
+mark_stream_closed/active_stream reset racing a pipelined
+second request.
+
 **Cross-proxy refresh LANDED (2026-10-22, 270127e9):** the first
 clean-window full run of the fixed build — vane 0.15.0 wins every
 leg vs Caddy 2.10.2 and Traefik 3.5.4, median of 3, non-2xx = 0

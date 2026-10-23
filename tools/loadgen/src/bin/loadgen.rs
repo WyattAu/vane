@@ -1,11 +1,15 @@
-//! `loadgen ADDR CONNS DURATION PATH [HOST] [--method M] [--body N]` —
-//! HTTP/1.1 keep-alive flood client.
+//! `loadgen ADDR CONNS DURATION PATH [HOST] [--method M] [--body N]
+//! [--tls CERT]` — HTTP/1.1 keep-alive flood client.
 //!
 //! Pure std threads + blocking I/O, closed-loop per connection (send →
 //! full response → next): `CONNS` OS threads, wall-clock deadline,
 //! latency recorded per complete response. There is no async runtime to
 //! become the measurement, and no lock on the hot path — every thread
 //! keeps its own latency pool, merged once at the end.
+//!
+//! `--tls CERT` wraps every connection in rustls (ALPN http/1.1,
+//! trusting exactly the given self-signed cert — the certgen output),
+//! still synchronous: `rustls::StreamOwned` over the blocking socket.
 
 use std::io::{Read, Write};
 use std::sync::atomic::Ordering;
@@ -13,6 +17,38 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use vane_loadgen::{result_line, split_args, Counters};
+
+/// The connection the transaction loop speaks over: plain TCP, or
+/// TLS 1.3 with the handshake done at connect time. Same Read/Write
+/// surface either way — the loop is identical above this point.
+enum Conn {
+    Plain(std::net::TcpStream),
+    Tls(rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>),
+}
+
+impl Read for Conn {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Conn::Plain(s) => s.read(buf),
+            Conn::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Conn {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Conn::Plain(s) => s.write(buf),
+            Conn::Tls(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Conn::Plain(s) => s.flush(),
+            Conn::Tls(s) => s.flush(),
+        }
+    }
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -32,6 +68,14 @@ fn main() {
         .unwrap_or_else(|| "GET".into())
         .to_uppercase();
     let body_bytes: usize = flags.get("body").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let tls_cert = flags.get("tls").cloned();
+    let tls_cfg: Option<Arc<rustls::ClientConfig>> = match &tls_cert {
+        Some(cert) => Some(
+            vane_loadgen::client_config(cert, &[b"http/1.1"]).expect("tls client config"),
+        ),
+        None => None,
+    };
+    let proto = if tls_cert.is_some() { "h1s" } else { "h1" };
 
     let req = Arc::new(build_request(&method, &path, &host, body_bytes));
     let counters = Arc::new(Counters::new());
@@ -45,10 +89,12 @@ fn main() {
         let req = Arc::clone(&req);
         let counters = Arc::clone(&counters);
         let tx = tx.clone();
+        let tls = tls_cfg.clone();
+        let host = host.clone();
         handles.push(
             std::thread::Builder::new()
                 .stack_size(256 * 1024)
-                .spawn(move || run_conn(addr, &req, &counters, end, tx))
+                .spawn(move || run_conn(&addr, &req, &counters, end, tx, tls, &host))
                 .expect("spawn"),
         );
     }
@@ -64,7 +110,7 @@ fn main() {
     }
     println!(
         "{}",
-        result_line("h1", conns, duration, &counters, pool)
+        result_line(proto, conns, duration, &counters, pool)
     );
 }
 
@@ -73,25 +119,20 @@ fn main() {
 /// connection and reconnects — a keep-alive desync must not silently
 /// poison the next response's status.
 fn run_conn(
-    addr: String,
+    addr: &str,
     req: &Arc<Vec<u8>>,
     counters: &Arc<Counters>,
     end: Instant,
     tx: mpsc::Sender<Vec<u64>>,
+    tls: Option<Arc<rustls::ClientConfig>>,
+    sni: &str,
 ) {
     let mut samples: Vec<u64> = Vec::with_capacity(1 << 16);
-    let mut conn: Option<std::net::TcpStream> = None;
+    let mut conn: Option<Conn> = None;
     while Instant::now() < end {
         if conn.is_none() {
-            match std::net::TcpStream::connect(&addr) {
+            match connect(addr, tls.as_ref(), sni) {
                 Ok(s) => {
-                    s.set_nodelay(true).ok();
-                    // A load generator must terminate: a server that
-                    // stops mid-response (or a desynced keep-alive)
-                    // blocks in read() forever otherwise, and the
-                    // deadline only gets checked between transactions.
-                    s.set_read_timeout(Some(Duration::from_secs(5))).ok();
-                    s.set_write_timeout(Some(Duration::from_secs(5))).ok();
                     conn = Some(s);
                 }
                 Err(_) => {
@@ -122,8 +163,37 @@ fn run_conn(
     let _ = tx.send(samples);
 }
 
+/// Connect + (optionally) complete the TLS handshake. The socket gets
+/// the same terminate-forever guards as the plain path: a load
+/// generator must never block past its 5 s per-op timeouts.
+fn connect(
+    addr: &str,
+    tls: Option<&Arc<rustls::ClientConfig>>,
+    sni: &str,
+) -> std::io::Result<Conn> {
+    let s = std::net::TcpStream::connect(addr)?;
+    s.set_nodelay(true).ok();
+    // A load generator must terminate: a server that stops
+    // mid-response (or a desynced keep-alive) blocks in read()
+    // forever otherwise, and the deadline only gets checked between
+    // transactions.
+    s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    s.set_write_timeout(Some(Duration::from_secs(5))).ok();
+    match tls {
+        None => Ok(Conn::Plain(s)),
+        Some(cfg) => {
+            let server_name =
+                rustls::pki_types::ServerName::try_from(sni.to_string())
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "sni"))?;
+            let conn = rustls::ClientConnection::new(Arc::clone(cfg), server_name)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            Ok(Conn::Tls(rustls::StreamOwned::new(conn, s)))
+        }
+    }
+}
+
 /// One full request/response transaction. Returns `true` for a 2xx.
-fn transaction(s: &mut std::net::TcpStream, req: &[u8]) -> Result<bool, ()> {
+fn transaction(s: &mut Conn, req: &[u8]) -> Result<bool, ()> {
     s.write_all(req).map_err(|_| ())?;
     let mut head = Vec::with_capacity(512);
     let mut buf = [0u8; 16 * 1024];

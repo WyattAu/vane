@@ -528,6 +528,11 @@ impl H2Server {
             if last {
                 t.done = true;
             }
+            vane_core::dbg_trace!(
+                "QBFDBG sid={stream_id} take={take} sent={} last={last} held={}",
+                t.sent,
+                self.held.len()
+            );
             out.push(data_frame(stream_id, &data[offset..offset + take], last));
             offset += take;
             if last {
