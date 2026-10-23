@@ -279,20 +279,12 @@ impl H2Server {
                         );
                         return;
                     }
-                    eprintln!(
-                        "[qdbg] sid={stream_id} queueing (active={:?})",
-                        self.active_stream
-                    );
                     let head = match Self::translate_head(
                         &headers,
                         !end_stream && Self::request_content_length(&headers).is_none(),
                     ) {
-                        Some(h) => {
-                            eprintln!("[qdbg] translated ok len={}", h.len());
-                            h
-                        }
+                        Some(h) => h,
                         None => {
-                            eprintln!("[qdbg] translate FAILED");
                             self.conn.send_rst_stream(
                                 stream_id,
                                 vane_core::h2::connection::error_code::PROTOCOL_ERROR,

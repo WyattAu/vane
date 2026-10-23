@@ -296,12 +296,13 @@ fn protocol_violation_surfaces_the_connection_error() {
     );
 }
 
-/// A second stream while one is active is REFUSED_STREAM: the shim
-/// serializes (one relayed stream at a time) and resets the overlapping
-/// stream — the client retries it on a fresh connection per the h2
-/// spec. The active stream and its relay are untouched.
+/// A second stream while one is active QUEUES (the shim serializes
+/// upstream relays — one at a time per client connection) and replays
+/// through the normal RequestHead path when the active response
+/// completes. The old contract (RST REFUSED_STREAM per overlap) made
+/// clients churn connections: curl --parallel lost 39/40 requests.
 #[test]
-fn overlapping_stream_is_reset_with_refused_stream() {
+fn overlapping_stream_queues_and_replays() {
     let mut shim = H2Server::new(0, false);
     start_with_request(&mut shim, "/first", &[]);
 
@@ -324,24 +325,34 @@ fn overlapping_stream_is_reset_with_refused_stream() {
     let mut events = Vec::new();
     shim.handle_read(input.drain(..).as_slice(), &mut events);
 
-    // The reset is queued for the peer: RST_STREAM(REFUSED_STREAM = 7).
+    // Queued, not refused: no RST, and nothing surfaces while stream
+    // 1 is active.
     let out = shim.pending_writes();
     let parsed = parse_frames(&out);
-    let rst = parsed
-        .iter()
-        .find(|(t, _, s, _)| *t == 0x03 && *s == 3)
-        .expect("RST_STREAM for the overlapping stream");
-    assert_eq!(rst.3.len(), 4, "RST_STREAM carries a 4-byte code");
-    assert_eq!(
-        u32::from_be_bytes([rst.3[0], rst.3[1], rst.3[2], rst.3[3]]),
-        7,
-        "REFUSED_STREAM error code"
+    assert!(
+        !parsed.iter().any(|(t, _, s, _)| *t == 0x03 && *s == 3),
+        "the overlapping stream must not be reset"
     );
     assert!(
         !events
             .iter()
             .any(|e| matches!(e, H2Event::RequestHead { .. })),
-        "the overlapping head must not surface"
+        "the overlapping head must not surface while stream 1 is active"
+    );
+
+    // Completing stream 1's response replays the queued head through
+    // the normal RequestHead path (serialized upstream relay).
+    let head = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    let (_, done) = shim.response_bytes(head);
+    assert!(done, "a one-feed CL response completes");
+    assert!(shim.start_pending(&mut events));
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            H2Event::RequestHead { head, .. }
+            if head.windows(7).any(|w| w == *b"/second")
+        )),
+        "the queued /second head replays on completion"
     );
 }
 
