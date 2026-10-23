@@ -125,19 +125,27 @@ async fn run_conn(
             // without emitting END_STREAM, and the server then waits for
             // a request body that never comes (found in the smoke test —
             // every response future hung forever).
-            let Ok((response, mut body_sender)) =
-                send_request.send_request(request, body_bytes == 0)
-            else {
-                counters.read_err.fetch_add(1, Ordering::Relaxed);
-                continue 'outer;
+            let (response, mut body_sender) = match send_request
+                .send_request(request, body_bytes == 0)
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[h2dbg] send_request: {e}");
+                    counters.read_err.fetch_add(1, Ordering::Relaxed);
+                    continue 'outer;
+                }
             };
             if body_bytes > 0 {
                 let chunk = bytes::Bytes::from(vec![b'x'; body_bytes]);
                 let _ = body_sender.send_data(chunk, true);
             }
-            let Ok(response) = response.await else {
-                counters.read_err.fetch_add(1, Ordering::Relaxed);
-                continue 'outer;
+            let response = match response.await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[h2dbg] response.await: {e}");
+                    counters.read_err.fetch_add(1, Ordering::Relaxed);
+                    continue 'outer;
+                }
             };
             let status = response.status();
             // Drain to END_STREAM, releasing flow-control credit as we
@@ -148,7 +156,8 @@ async fn run_conn(
                     Ok(b) => {
                         let _ = body.flow_control().release_capacity(b.len());
                     }
-                    Err(_) => {
+                    Err(e) => {
+                        eprintln!("[h2dbg] body chunk: {e}");
                         counters.read_err.fetch_add(1, Ordering::Relaxed);
                         continue 'outer;
                     }

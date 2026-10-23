@@ -20,6 +20,8 @@
 //! Wire violations surface as engine connection errors: the driver
 //! flushes the queued GOAWAY and closes (pool discards, no reuse).
 
+use std::collections::VecDeque;
+
 use vane_core::h2::connection::{Connection, ConnectionConfig, Event, Role};
 
 /// What the driver should do when the upstream EOFs mid-response.
@@ -81,7 +83,33 @@ pub struct H2Server {
     /// The response completed (END_STREAM emitted). Further upstream
     /// bytes exceed the declared framing and must never be re-fed.
     resp_done: bool,
+    /// Requests that arrived while another transaction was in flight.
+    /// The shim serializes upstream relays (one active transaction per
+    /// client connection — the h1 upstream pool is per-connection), but
+    /// REFUSED_STREAM on every overlap makes clients churn connections
+    /// (curl --parallel: 39/40 failures). Queued heads start on
+    /// completion; bodies buffer up to [`PENDING_BODY_CAP`].
+    pending: VecDeque<PendingRequest>,
 }
+
+/// A queued request awaiting the active transaction's completion.
+struct PendingRequest {
+    stream_id: u32,
+    head: Vec<u8>,
+    end_stream: bool,
+    chunked: bool,
+    body: Vec<u8>,
+    body_done: bool,
+}
+
+/// Cap for a queued request's buffered body. GET/HEAD (the benchmark
+/// and browser-revalidation shape) carry none; a streamed body beyond
+/// this gets REFUSED_STREAM — the client retries on a new connection,
+/// which is the honest signal at that point.
+const PENDING_BODY_CAP: usize = 1 << 20;
+
+/// Cap for the pending-queue depth (per client connection).
+const PENDING_QUEUE_CAP: usize = 256;
 
 /// Translates one upstream HTTP/1.1 response into h2 HEADERS + DATA.
 struct ResponseTranslator {
@@ -104,9 +132,13 @@ impl H2Server {
     /// mode; lenient by default).
     pub fn new(slot: u32, strict_idle_window_update: bool) -> Self {
         let cfg = ConnectionConfig {
-            // v0.2 serializes transactions per h2 connection; extra
-            // concurrent streams are refused with REFUSED_STREAM.
-            max_concurrent_streams: 1,
+            // 256 (the RFC default): concurrent client streams are
+            // ACCEPTED here and serialized by the shim's pending queue
+            // (see start_pending). The old hard 1 refused every
+            // overlapping stream with RST(REFUSED_STREAM) — curl
+            // --parallel lost 39/40 requests, h2load churned
+            // connections at ~4 read_errs per success.
+            max_concurrent_streams: 256,
             strict_idle_window_update,
             ..ConnectionConfig::default()
         };
@@ -121,6 +153,7 @@ impl H2Server {
             held: Vec::new(),
             probe_inflight: false,
             resp_done: false,
+            pending: VecDeque::new(),
         }
     }
 
@@ -145,6 +178,36 @@ impl H2Server {
     /// Connection is in an error state: flush GOAWAY and close.
     pub fn failed(&self) -> bool {
         self.conn.connection_error().is_some()
+    }
+
+    /// Activates the next queued request, if any. Called by the driver
+    /// when the active transaction completes (the response is fully
+    /// emitted): the queued head replays as RequestHead, buffered body
+    /// as RequestBody/RequestComplete — the same event sequence a
+    /// fresh connection would have produced, so the handler cannot
+    /// tell the difference.
+    pub fn start_pending(&mut self, events: &mut Vec<H2Event>) -> bool {
+        if self.active_stream.is_some() {
+            return false;
+        }
+        let Some(p) = self.pending.pop_front() else {
+            return false;
+        };
+        self.resp_done = false;
+        self.active_stream = Some(p.stream_id);
+        self.req_chunked = p.chunked;
+        self.body_remaining = None;
+        events.push(H2Event::RequestHead {
+            head: p.head,
+            end_stream: p.end_stream,
+        });
+        if !p.body.is_empty() {
+            events.push(H2Event::RequestBody { data: p.body });
+        }
+        if p.end_stream || p.body_done {
+            events.push(H2Event::RequestComplete);
+        }
+        true
     }
 
     /// Debug: engine send windows (conn, active stream).
@@ -173,6 +236,13 @@ impl H2Server {
         loop {
             let mut engine_events = Vec::new();
             let consumed = self.conn.handle_read(&self.backlog, &mut engine_events);
+            vane_core::dbg_trace!(
+                "HRDBG in={} consumed={} ev={} backlog={}",
+                data.len(),
+                consumed,
+                engine_events.len(),
+                self.backlog.len()
+            );
             if consumed == 0 {
                 break;
             }
@@ -198,15 +268,46 @@ impl H2Server {
                 headers,
             } => {
                 if self.active_stream.is_some() {
+                    // Serialized mode: queue the overlap instead of
+                    // refusing. REFUSED_STREAM on every pipelined head
+                    // made clients churn connections (curl --parallel:
+                    // 39/40 failures); queued heads start on completion.
+                    if self.pending.len() >= PENDING_QUEUE_CAP {
+                        self.conn.send_rst_stream(
+                            stream_id,
+                            vane_core::h2::connection::error_code::REFUSED_STREAM,
+                        );
+                        return;
+                    }
                     eprintln!(
-                        "SHIM-REFUSE: incoming stream {} while active {:?}",
-                        stream_id, self.active_stream
+                        "[qdbg] sid={stream_id} queueing (active={:?})",
+                        self.active_stream
                     );
-                    // Serialized mode: refuse overlap.
-                    self.conn.send_rst_stream(
+                    let head = match Self::translate_head(
+                        &headers,
+                        !end_stream && Self::request_content_length(&headers).is_none(),
+                    ) {
+                        Some(h) => {
+                            eprintln!("[qdbg] translated ok len={}", h.len());
+                            h
+                        }
+                        None => {
+                            eprintln!("[qdbg] translate FAILED");
+                            self.conn.send_rst_stream(
+                                stream_id,
+                                vane_core::h2::connection::error_code::PROTOCOL_ERROR,
+                            );
+                            return;
+                        }
+                    };
+                    self.pending.push_back(PendingRequest {
                         stream_id,
-                        vane_core::h2::connection::error_code::REFUSED_STREAM,
-                    );
+                        head,
+                        end_stream,
+                        chunked: !end_stream && Self::request_content_length(&headers).is_none(),
+                        body: Vec::new(),
+                        body_done: end_stream,
+                    });
                     return;
                 }
                 // Bodies with Content-Length relay verbatim; bodies
@@ -254,9 +355,26 @@ impl H2Server {
                 data,
             } => {
                 if self.active_stream != Some(stream_id) {
+                    // Body bytes for a queued request: buffer up to the
+                    // cap. Beyond it, refuse — the client retries on a
+                    // fresh connection.
+                    if let Some(p) = self.pending.iter_mut().find(|p| p.stream_id == stream_id) {
+                        self.conn.release_capacity(stream_id, data.len());
+                        if p.body.len() + data.len() > PENDING_BODY_CAP {
+                            self.pending.retain(|p| p.stream_id != stream_id);
+                            self.conn.send_rst_stream(
+                                stream_id,
+                                vane_core::h2::connection::error_code::REFUSED_STREAM,
+                            );
+                            return;
+                        }
+                        p.body.extend_from_slice(&data);
+                        if end_stream {
+                            p.body_done = true;
+                        }
+                    }
                     return; // unsolicited data on unknown stream
                 }
-                self.conn.release_capacity(stream_id, data.len());
                 if self.req_chunked {
                     // CL-less body: re-frame as h1 chunks; the terminal
                     // chunk closes the upstream's chunked framing.
@@ -760,6 +878,73 @@ mod flow_tests {
     /// exceed the client's total granted window (initial 65535 + all
     /// simulated WINDOW_UPDATE grants), for a 1 MiB response fed in
     /// 4096-byte upstream chunks with a 65535-initial-window client.
+    /// Overlapping request heads QUEUE (no REFUSED_STREAM) and replay
+    /// in order when the active transaction completes. Curl --parallel
+    /// lost 39/40 requests to the old refuse-on-overlap behavior.
+    #[test]
+    fn overlapping_heads_queue_and_replay_in_order() {
+        let mut h2s = H2Server::new(0, false);
+        h2s.conn
+            .handle_read(vane_core::h2::connection::CLIENT_PREFACE, &mut Vec::new());
+
+        // GET with END_STREAM: :method GET indexed (0x82), :scheme
+        // https indexed (0x87), :authority + :path literal.
+        let get_frames = |sid: u32, path: &[u8]| {
+            let mut head = Vec::new();
+            head.extend_from_slice(&[0x82]); // :method GET (indexed, static)
+            head.extend_from_slice(&[0x87]); // :scheme https (indexed, static)
+            // :authority and :path as literals WITHOUT indexing: the
+            // dynamic table is shared across streams, and with-
+            // indexing entries would shift every later decode.
+            head.extend_from_slice(&[0x01, 0x01, b't']);
+            head.extend_from_slice(&[0x04, path.len() as u8]);
+            head.extend_from_slice(path);
+            let mut f = Vec::new();
+            vane_core::h2::frame::write_header(
+                &mut f,
+                head.len() as u32,
+                vane_core::h2::frame::FrameKind::Headers,
+                vane_core::h2::frame::FrameFlags::from_u8(0x04 | 0x01),
+                sid,
+            );
+            f.extend_from_slice(&head);
+            f
+        };
+
+        let mut events = Vec::new();
+        h2s.handle_read(&get_frames(1, b"/one"), &mut events);
+        assert!(
+            matches!(events[0], H2Event::RequestHead { .. }),
+            "stream 1 activates immediately"
+        );
+        h2s.handle_read(&get_frames(3, b"/two"), &mut events);
+        assert_eq!(
+            events.len(),
+            2,
+            "stream 3 queues silently: no new events while stream 1 is active"
+        );
+        assert_eq!(h2s.pending.len(), 1, "the overlap is queued, not refused");
+
+        // Complete stream 1's response: head + CL'd body in one feed.
+        let upstream_head = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nOK!!";
+        let (frames, done) = h2s.response_bytes(upstream_head);
+        assert!(done, "a one-feed CL response completes");
+        assert!(!frames.is_empty());
+
+        // Completion hands the queue's head back.
+        assert!(h2s.start_pending(&mut events));
+        let mut saw_two = false;
+        for ev in &events {
+            if let H2Event::RequestHead { head, .. } = ev {
+                if head.windows(4).any(|w| w == b"/two") {
+                    saw_two = true;
+                }
+            }
+        }
+        assert!(saw_two, "RequestHead for the queued stream fired");
+        assert!(h2s.pending.is_empty());
+    }
+
     #[test]
     // The window variables below feed `dbg_trace!`, which is a no-op
     // without `vane_dbg` — without the allow, a default-features clippy

@@ -913,6 +913,32 @@ impl HttpProxy {
     }
 
     /// Plaintext request bytes (post-TLS or plain listener).
+    /// Starts the next queued h2 request after a completed response:
+    /// replays its events through the normal path and flushes any
+    /// frames. Skipped when the session is closing (close_after) —
+    /// queued requests die with the connection.
+    #[cfg(feature = "h2")]
+    fn h2_start_pending(&mut self, io: &mut SessionIo<'_>) {
+        if self
+            .conns
+            .get(&io.slot_index())
+            .is_some_and(|c| c.close_after)
+        {
+            return;
+        }
+        let mut evs = Vec::new();
+        if let Some(h2s) = self.conn(io.slot_index()).h2.as_mut() {
+            h2s.start_pending(&mut evs);
+        }
+        if evs.is_empty() {
+            return;
+        }
+        for ev in evs {
+            self.h2_event(io, ev);
+        }
+        self.h2_flush(io);
+    }
+
     /// Raw TLS-wrapped write to the client (shared h1/h2 writer).
     #[cfg(feature = "h2")]
     fn h2_intake(&mut self, io: &mut SessionIo<'_>, data: &[u8]) {
@@ -965,6 +991,7 @@ impl HttpProxy {
                     self.conn(slot).body = BodyFraming::Done;
                     self.h2_flush(io);
                     self.check_done(io);
+                    self.h2_start_pending(io);
                 } else {
                     self.h2_flush(io);
                 }
@@ -1398,6 +1425,7 @@ impl HttpProxy {
         if done {
             self.conn(slot).body = BodyFraming::Done;
             self.check_done(io);
+            self.h2_start_pending(io);
         }
     }
 
@@ -1421,6 +1449,7 @@ impl HttpProxy {
                 self.conn(slot).body = BodyFraming::Done;
                 self.h2_flush(io);
                 self.check_done(io);
+                self.h2_start_pending(io);
             }
             crate::h2_server::EofOutcome::Truncated => {
                 // Upstream died before its declared Content-Length:
@@ -3302,6 +3331,9 @@ impl HttpProxy {
             self.conn(slot).body = BodyFraming::Done;
         }
         self.h2_flush(io);
+        if outcome == crate::h2_server::EofOutcome::Completed {
+            self.h2_start_pending(io);
+        }
     }
 
     /// Flushes the gzip trailer when compressing. h1 adds the terminal

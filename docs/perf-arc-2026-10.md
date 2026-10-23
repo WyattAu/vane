@@ -550,31 +550,40 @@ known-broken gate came off truncated_clean_main.rs; the
 assertions are unconditional. Zero runtime-gated known-broken
 tests remain in the tree.
 
-**NEXT ARC OPENED — TLS-h2 large-body relay desync (found
-2026-10-22 while building the TLS-h1 measurement leg):** vane's
-TLS-h2 relay of a 64 KiB plain-upstream body fails ~80% of
-transactions (h2load: 1183 ok / 4737 read_err in 3 s; p99 1 ms),
-logging "upstream truncated h2 response; closing" on some
-attempts. Small bodies (the bench h2 legs, 10 B) are clean — the
-path was never load-tested past one read. Evidence so far:
-- The h2 server shim's byte accounting is CORRECT: the QBFDBG
-  frame trace (vane_dbg, kept in tree) shows sid-local emission
-  4004 + 4096×15 + 92 = 65536 with END_STREAM, fresh sid per
-  request, held always drained (the client grants credit fast).
-- The client (h2load/rustls) sees read errors ~4x per success —
-  its parser rejects something the trace does not show: frame
-  bytes, HPACK state, or interleaving. Needs a keylog capture
-  (SSLKEYLOGFILE + wireshark) or a frame-decode harness.
-- Repro (3 commands, this host): certgen DIR; vane with a TLS
-  listener + a plain 64 KiB cluster; `h2load ADDR 1 3 /bench64
-  localhost DIR/cert.pem`.
-- Interim: the h1s measurement leg (loadgen --tls) is BUILT and
-  works for plain-TLS-h1 — the relay defect is h2-specific.
-Suspect list for the arc: the response-translator's head+first-
-read fusion (head and body in ONE feed), the held/credit
-resumption path vs HEADERS emission ordering, and the
-mark_stream_closed/active_stream reset racing a pipelined
-second request.
+**TLS-h2 concurrency — ROOT-CAUSED and FIXED (2026-10-22/23):
+two stacked causes, one line each.**
+
+1. **`max_concurrent_streams: 1` hardcoded in H2Server::new** —
+   the connection layer refused every overlapping client stream
+   with RST(REFUSED_STREAM) BEFORE the shim ever saw it. Found by
+   frame-tracing a shim-level unit test (the connection consumed
+   the second HEADERS and emitted ZERO events; the concurrency
+   gate in vane-core's connection.rs writes the RST itself). Fix:
+   256 (the RFC default) — the shim's new pending queue serializes
+   the actual relays.
+
+2. **The shim refused overlaps at its own layer too** — replaced
+   with the pending-request queue (`start_pending` + wired at all
+   four completion sites): queued heads replay through the normal
+   RequestHead/RequestBody/RequestComplete path, so the handler
+   cannot tell them from fresh connections. Overlapping bodies
+   buffer up to 1 MiB (REFUSED_STREAM beyond — clients retry).
+
+Verified: h2c parallel 6/40 -> 40/40; TLS-h2 curl serial 30/30
+and 8-way concurrent 80/80 (65536 B, HTTP 200 every time). A
+shim-level regression test pins queue-and-replay-in-order.
+
+**REMAINING (tool-side, next session):** h2load (tokio + h2
+crate) still churns ~4 read_errs per success on the TLS-h2 shape
+while curl on the SAME endpoint is clean — the failures are
+"peer closed without close_notify" with vane closing
+reason=handler AFTER client-side errors (EPIPE on vane's write =
+the client aborted first). The instrument needs a fix (retry
+REFUSED_STREAM instead of reconnect-churning; the TLS handshake
+storm then saturates workers and cascades) before TLS-h2
+numbers are publishable. The stalled upstream reads seen in the
+churn phase (Recv-Q 300-400 KB per connection) are a churn
+symptom to re-check after the tool fix.
 
 **Cross-proxy refresh LANDED (2026-10-22, 270127e9):** the first
 clean-window full run of the fixed build — vane 0.15.0 wins every
