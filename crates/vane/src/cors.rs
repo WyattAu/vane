@@ -252,7 +252,7 @@ fn merge_vary(existing: &str, ours: &str) -> String {
 /// This does not strip upstream `Access-Control-*` headers: a backend
 /// that sets its own CORS policy keeps it, and vane's header goes after
 /// it. When both name an origin the browser reads the first.
-pub fn inject_into_head(head: &mut Vec<u8>, headers: &[(&'static str, String)]) {
+pub fn inject_into_head<S: AsRef<str>>(head: &mut Vec<u8>, headers: &[(S, String)]) {
     if headers.is_empty() {
         return;
     }
@@ -266,11 +266,11 @@ pub fn inject_into_head(head: &mut Vec<u8>, headers: &[(&'static str, String)]) 
     let mut vary: Option<&str> = None;
     let mut insert: Vec<u8> = Vec::with_capacity(headers.len() * 48);
     for (name, value) in headers {
-        if *name == "Vary" {
+        if name.as_ref() == "Vary" {
             vary = Some(value.as_str());
             continue;
         }
-        insert.extend_from_slice(name.as_bytes());
+        insert.extend_from_slice(name.as_ref().as_bytes());
         insert.extend_from_slice(b": ");
         insert.extend_from_slice(value.as_bytes());
         insert.extend_from_slice(b"\r\n");
@@ -303,6 +303,50 @@ pub fn inject_into_head(head: &mut Vec<u8>, headers: &[(&'static str, String)]) 
             head.splice(s..e, line);
         }
     }
+}
+
+/// Deletes every header line whose name matches an entry in `names`
+/// (case-insensitive). Status line and body separator are preserved.
+pub fn remove_from_head(head: &mut Vec<u8>, names: &[String]) {
+    if names.is_empty() {
+        return;
+    }
+    let Some(end) = head.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return;
+    };
+    let head_str = String::from_utf8_lossy(&head[..end]).to_string();
+    let mut lines = head_str.split("\r\n").peekable();
+    let mut out = Vec::with_capacity(head.len());
+    while let Some(line) = lines.next() {
+        let is_header = lines.peek().is_some();
+        if is_header {
+            let name = line.split(':').next().unwrap_or("").trim();
+            if names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+                continue;
+            }
+        }
+        out.extend_from_slice(line.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    // The split consumed the head terminator (we cut at its start);
+    // restore it so later injections can find the insertion point.
+    out.extend_from_slice(b"\r\n\r\n");
+    *head = out;
+}
+
+/// Applies a route's response-header policy to a relayed head:
+/// upstream header removals first, then the CORS injection, then the
+/// route's static adds (round 7 iter 65,
+/// docs/response-headers-design.md).
+pub fn apply_response_policy<S: AsRef<str>>(
+    head: &mut Vec<u8>,
+    cors: &[(S, String)],
+    adds: &[(String, String)],
+    removes: &[String],
+) {
+    remove_from_head(head, removes);
+    inject_into_head(head, cors);
+    inject_into_head(head, adds);
 }
 
 #[cfg(test)]
@@ -525,7 +569,7 @@ mod tests {
     fn inject_is_a_noop_without_headers() {
         let mut head = head_of("HTTP/1.1 200 OK\r\n\r\n");
         let before = head.clone();
-        inject_into_head(&mut head, &[]);
+        inject_into_head::<&str>(&mut head, &[]);
         assert_eq!(head, before);
     }
 }

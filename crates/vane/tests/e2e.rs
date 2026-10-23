@@ -46,6 +46,19 @@ fn spawn_upstream(body: &'static str) -> (SocketAddr, std::thread::JoinHandle<()
 /// Writes a config pointing `/*rest` at the upstream, runs vane::server on
 /// a random port, and returns the proxy address.
 fn spawn_proxy(upstream: SocketAddr, force_mio: bool) -> SocketAddr {
+    spawn_proxy_with_config(
+        upstream,
+        force_mio,
+        r#"
+[[routes]]
+pattern = "/*rest"
+cluster = "e2e"
+"#,
+    )
+}
+
+/// Spawns the proxy with an explicit extra route/config fragment.
+fn spawn_proxy_with_config(upstream: SocketAddr, force_mio: bool, routes: &str) -> SocketAddr {
     let config = format!(
         r#"
 [[listeners]]
@@ -55,9 +68,7 @@ workers = 1
 [clusters.e2e]
 backends = ["{upstream}"]
 
-[[routes]]
-pattern = "/*rest"
-cluster = "e2e"
+{routes}
 
 [admin]
 enabled = false
@@ -82,9 +93,7 @@ address = "{proxy_addr}"
 [clusters.e2e]
 backends = ["{upstream}"]
 
-[[routes]]
-pattern = "/*rest"
-cluster = "e2e"
+{routes}
 
 [admin]
 enabled = false
@@ -126,6 +135,71 @@ fn http_get(proxy: SocketAddr, target: &str, host: &str) -> String {
     let mut out = String::new();
     s.read_to_string(&mut out).expect("read");
     out
+}
+
+/// Upstream emitting an upstream `Server` header and a droppable one.
+fn spawn_upstream_with_headers() -> (SocketAddr, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind upstream");
+    let addr = listener.local_addr().expect("addr");
+    let _handle = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { break };
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let body = "policy response";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nServer: upstream-1.0\r\nX-Powered-By: secret-stack\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+                let _ = s.flush();
+            });
+        }
+    });
+    (addr, _handle)
+}
+
+#[test]
+fn response_headers_policy_adds_and_removes() {
+    let _lock = lock_serial();
+
+    let (upstream, _up_handle) = spawn_upstream_with_headers();
+    let proxy = spawn_proxy_with_config(
+        upstream,
+        true,
+        r#"
+[[routes]]
+pattern = "/*rest"
+cluster = "e2e"
+
+[routes.response_headers]
+add = { Strict-Transport-Security = "max-age=31536000", X-Content-Type-Options = "nosniff" }
+remove = ["Server", "X-Powered-By"]
+"#,
+    );
+
+    let resp = http_get(proxy, "/policy", "test.local");
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    assert!(
+        resp.contains("strict-transport-security: max-age=31536000")
+            || resp.contains("Strict-Transport-Security: max-age=31536000"),
+        "HSTS must be added: {resp}"
+    );
+    assert!(
+        resp.to_ascii_lowercase()
+            .contains("x-content-type-options: nosniff"),
+        "nosniff must be added: {resp}"
+    );
+    assert!(
+        !resp.to_ascii_lowercase().contains("server:"),
+        "upstream Server must be removed: {resp}"
+    );
+    assert!(
+        !resp.to_ascii_lowercase().contains("x-powered-by:"),
+        "X-Powered-By must be removed: {resp}"
+    );
+    assert!(resp.contains("policy response"), "{resp}");
 }
 
 #[test]

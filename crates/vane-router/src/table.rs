@@ -49,6 +49,8 @@ pub struct RouteEntry {
     /// SPIFFE ID prefixes an inbound mTLS caller's URI SAN must match
     /// (empty = no caller-identity authorization).
     pub allowed_spiffe_prefixes: Vec<String>,
+    /// Static response-header policy (empty = relay unchanged).
+    pub response_headers: ResponseHeaderPolicy,
 }
 
 impl RouteEntry {
@@ -175,6 +177,19 @@ pub struct CorsPolicy {
     pub max_age_secs: u64,
 }
 
+/// Per-route response-header policy (resolved from the config plane):
+/// headers appended to every relayed response, and upstream header
+/// names removed from it.
+#[derive(Debug, Clone, Default)]
+pub struct ResponseHeaderPolicy {
+    /// Headers appended after the upstream head is rewritten (CORS
+    /// first, then these — later lines win for duplicate names).
+    pub add: Vec<(String, String)>,
+    /// Upstream header names removed from the relayed response
+    /// (case-insensitive, all occurrences).
+    pub remove: Vec<String>,
+}
+
 /// A zero policy allows no origin — the safe reading of "unset". The
 /// one non-zero default is the preflight cache duration: `0` would tell
 /// browsers never to cache a preflight, turning every cross-origin
@@ -242,6 +257,8 @@ pub struct RouteBuilder {
     /// SPIFFE ID prefixes an inbound mTLS caller must match (empty =
     /// unrestricted).
     pub allowed_spiffe_prefixes: Vec<String>,
+    /// Static response-header policy (empty = relay unchanged).
+    pub response_headers: ResponseHeaderPolicy,
     /// Retry policy (failover cap + 5xx predicate).
     pub retry: RetryPolicy,
     /// Mirror (shadow) cluster: a fire-and-forget request copy goes
@@ -290,6 +307,7 @@ impl RouteBuilder {
             gauges,
             priority: self.priority,
             allowed_spiffe_prefixes: self.allowed_spiffe_prefixes,
+            response_headers: self.response_headers,
         })
     }
 }
@@ -446,6 +464,7 @@ mod tests {
             mirror_backends: Vec::new(),
             cors: None,
             mirror: None,
+            response_headers: ResponseHeaderPolicy::default(),
         }
     }
 

@@ -87,6 +87,7 @@ pub fn build_route(spec: ProviderRouteSpec, health: &crate::health::HealthMap) -
         policy: vane_router::Policy::P2C,
         priority: spec.priority,
         allowed_spiffe_prefixes: Vec::new(),
+        response_headers: vane_router::ResponseHeaderPolicy::default(),
         retry: Default::default(),
         mirror_backends: Vec::new(),
         cors: None,

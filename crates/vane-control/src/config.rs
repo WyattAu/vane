@@ -410,6 +410,23 @@ fn default_cors_max_age() -> u64 {
     86400
 }
 
+/// Per-route static response-header policy
+/// (`[[routes]] response_headers`). Proposed in SIS round 7 iter 61;
+/// see docs/response-headers-design.md.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseHeadersConfig {
+    /// Headers appended to every relayed response (overwrites upstream
+    /// occurrences of the same name). Insertion order follows the map's
+    /// lexical key order.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub add: std::collections::BTreeMap<String, String>,
+    /// Upstream header names deleted from the relayed response
+    /// (case-insensitive, all occurrences).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remove: Vec<String>,
+}
+
 /// A statically configured route.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -448,6 +465,9 @@ pub struct RouteConfig {
     /// CORS policy (preflight + response headers).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cors: Option<CorsConfig>,
+    /// Static response-header policy (add/remove on relayed responses).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_headers: Option<ResponseHeadersConfig>,
 }
 
 /// Admin server configuration.
@@ -890,6 +910,58 @@ impl VaneConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_headers_table_parses_and_applies_to_routes() {
+        let cfg: VaneConfig = toml::from_str(
+            r#"
+[[listeners]]
+address = "127.0.0.1:8080"
+
+[clusters.api]
+backends = ["127.0.0.1:9001"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "api"
+
+[routes.response_headers]
+add = { Strict-Transport-Security = "max-age=31536000", X-Content-Type-Options = "nosniff" }
+remove = ["Server", "X-Powered-By"]
+"#,
+        )
+        .expect("valid config");
+        let rh = cfg.routes[0]
+            .response_headers
+            .as_ref()
+            .expect("policy present");
+        assert_eq!(rh.remove, vec!["Server", "X-Powered-By"]);
+        assert_eq!(
+            rh.add.get("Strict-Transport-Security").map(String::as_str),
+            Some("max-age=31536000")
+        );
+    }
+
+    #[test]
+    fn response_headers_unknown_keys_rejected() {
+        let result = toml::from_str::<VaneConfig>(
+            r#"
+[[listeners]]
+address = "127.0.0.1:8080"
+
+[clusters.api]
+backends = ["127.0.0.1:9001"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "api"
+
+[routes.response_headers]
+bogus = 1
+"#,
+        );
+        assert!(result.is_err(), "unknown keys are startup errors");
+    }
 
     const SAMPLE: &str = r#"
 [[listeners]]

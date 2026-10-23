@@ -41,6 +41,7 @@ fn make_router(routes: &[(&str, &str)]) -> Arc<Router> {
         for (pattern, cluster) in routes {
             editor.insert(
                 RouteBuilder {
+                    response_headers: Default::default(),
                     host: None,
                     pattern: (*pattern).to_owned(),
                     methods: Vec::new(),

@@ -33,6 +33,7 @@ fn config_with_cluster(cluster: &str, backends: &[&str]) -> VaneConfig {
             retry: Default::default(),
             mirror: None,
             cors: None,
+            response_headers: None,
         }],
         ..VaneConfig::default()
     }
@@ -72,6 +73,7 @@ fn resolve_bridge_prefers_route_cluster() {
         retry: Default::default(),
         mirror: None,
         cors: None,
+        response_headers: None,
     }];
     let bridge = resolve_bridge(&cfg).expect("bridge");
     assert_eq!(

@@ -59,6 +59,13 @@ pub fn static_routes(cfg: &VaneConfig, health: &HealthMap) -> Vec<RouteBuilder> 
                 allow_credentials: c.allow_credentials,
                 max_age_secs: c.max_age_secs,
             }),
+            response_headers: r.response_headers.as_ref().map_or(
+                vane_router::ResponseHeaderPolicy::default(),
+                |rh| vane_router::ResponseHeaderPolicy {
+                    add: rh.add.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                    remove: rh.remove.clone(),
+                },
+            ),
             mirror_backends: r
                 .mirror
                 .as_ref()

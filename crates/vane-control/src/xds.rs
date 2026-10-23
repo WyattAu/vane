@@ -213,6 +213,7 @@ pub fn apply_snapshot(
             retry: Default::default(),
             mirror_backends: Vec::new(),
             cors: None,
+            response_headers: vane_router::ResponseHeaderPolicy::default(),
             mirror: None,
         });
     }

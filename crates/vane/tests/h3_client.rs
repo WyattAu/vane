@@ -14,6 +14,7 @@ fn test_router(upstream: std::net::SocketAddr) -> Arc<Router> {
     router.update(|editor| {
         editor.replace_all(vec![]);
         let builder = vane_router::RouteBuilder {
+            response_headers: Default::default(),
             host: None,
             pattern: "/*rest".into(),
             methods: Vec::new(),

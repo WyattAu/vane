@@ -313,6 +313,12 @@ struct Conn {
     /// into the upstream response head). Empty for non-CORS requests and
     /// for origins outside the route's policy.
     cors_headers: Vec<(&'static str, String)>,
+    /// Route response-header policy adds (round 7 iter 61/65): appended
+    /// after the CORS injection, per docs/response-headers-design.md.
+    resp_add: Vec<(String, String)>,
+    /// Route response-header policy removes: upstream header names
+    /// deleted from the relayed head (case-insensitive).
+    resp_remove: Vec<String>,
     /// Accumulated upstream response head while it is still incomplete.
     /// TCP carries no message boundaries, so a head can straddle
     /// segments (or TLS records); empty in the common case where the
@@ -1148,6 +1154,19 @@ impl HttpProxy {
                     Some(c) => std::mem::take(&mut c.cors_headers),
                     None => Vec::new(),
                 };
+                let (resp_add, resp_remove): (Vec<(String, String)>, Vec<String>) =
+                    match self.conns.get_mut(&slot) {
+                        Some(c) => (
+                            std::mem::take(&mut c.resp_add),
+                            std::mem::take(&mut c.resp_remove),
+                        ),
+                        None => (Vec::new(), Vec::new()),
+                    };
+                eprintln!(
+                    "[rhdr] drain adds={} removes={}",
+                    resp_add.len(),
+                    resp_remove.len()
+                );
                 #[cfg(feature = "h2")]
                 if is_h2 {
                     // The shim re-parses the head from `data` and
@@ -1164,7 +1183,12 @@ impl HttpProxy {
                         let (head, rest) = buf.split_at(head_len);
                         let rewritten = vane_proto::compression::rewrite_head_for_gzip_h2(head);
                         if let Some(mut rewritten) = rewritten {
-                            crate::cors::inject_into_head(&mut rewritten, &cors);
+                            crate::cors::apply_response_policy(
+                                &mut rewritten,
+                                &cors,
+                                &resp_add,
+                                &resp_remove,
+                            );
                             self.h2_write(io, &rewritten);
                             if !rest.is_empty() {
                                 let compressed = self.gzip_feed(slot, rest);
@@ -1194,7 +1218,12 @@ impl HttpProxy {
                         // The head must be rewritten in place, so the
                         // body portion goes out as a second write.
                         let mut head = buf[..head_len].to_vec();
-                        crate::cors::inject_into_head(&mut head, &cors);
+                        crate::cors::apply_response_policy(
+                            &mut head,
+                            &cors,
+                            &resp_add,
+                            &resp_remove,
+                        );
                         self.h2_write(io, &head);
                         let rest = &buf[head_len..];
                         if !rest.is_empty() {
@@ -1226,11 +1255,21 @@ impl HttpProxy {
                     if let Some(mut rewritten) =
                         vane_proto::compression::rewrite_head_for_gzip(&head)
                     {
-                        crate::cors::inject_into_head(&mut rewritten, &cors);
+                        crate::cors::apply_response_policy(
+                            &mut rewritten,
+                            &cors,
+                            &resp_add,
+                            &resp_remove,
+                        );
                         self.write_downstream(io, &rewritten);
                     } else {
                         let mut head = head;
-                        crate::cors::inject_into_head(&mut head, &cors);
+                        crate::cors::apply_response_policy(
+                            &mut head,
+                            &cors,
+                            &resp_add,
+                            &resp_remove,
+                        );
                         self.write_downstream(io, &head);
                     }
                 } else {
@@ -1243,12 +1282,21 @@ impl HttpProxy {
                     // portion after the head is relayed below as usual.
                     let alt = self.config.alt_svc.clone();
                     let alt = alt.filter(|a| !a.is_empty());
-                    if alt.is_some() || !cors.is_empty() {
+                    if alt.is_some()
+                        || !cors.is_empty()
+                        || !resp_add.is_empty()
+                        || !resp_remove.is_empty()
+                    {
                         let mut head = buf[..head_len].to_vec();
                         if let Some(alt) = alt.as_deref() {
                             insert_header_once(&mut head, b"alt-svc", alt.as_bytes());
                         }
-                        crate::cors::inject_into_head(&mut head, &cors);
+                        crate::cors::apply_response_policy(
+                            &mut head,
+                            &cors,
+                            &resp_add,
+                            &resp_remove,
+                        );
                         self.write_downstream(io, &head);
                     } else {
                         self.write_downstream(io, &buf[..head_len]);
@@ -2794,6 +2842,8 @@ impl HttpProxy {
             conn.bytes_out = 0;
             conn.access_logged = false;
             conn.cors_headers.clear();
+            conn.resp_add.clear();
+            conn.resp_remove.clear();
         }
 
         // Process-wide rate limiting (cross-worker aggregate).
@@ -2949,6 +2999,19 @@ impl HttpProxy {
                     self.conn(slot).cors_headers = headers;
                 }
             }
+        }
+        // Static response-header policy (round 7 iter 65): staged on the
+        // connection beside the CORS headers, applied on the way out.
+        let rh = &route.response_headers;
+        eprintln!(
+            "[rhdr] staged adds={} removes={}",
+            rh.add.len(),
+            rh.remove.len()
+        );
+        if !rh.add.is_empty() || !rh.remove.is_empty() {
+            let conn = self.conn(slot);
+            conn.resp_add = rh.add.clone();
+            conn.resp_remove = rh.remove.clone();
         }
 
         // Request span (after the error exits so 404/405 stay spanless
