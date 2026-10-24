@@ -1,13 +1,13 @@
 [package]
 name = "vane-kernel"
-description = "io_uring/mio dual-backend, thread-per-core transport engine for Vane"
+description = "L4/L7 reverse proxy,edge gateway, micro sidecar monorepo"
 # 0.7.0 (explicit: overrides the workspace version). History: 0.6.0 —
 # WorkerConfig gained `buf_size`, BufferPool slots became size-flexible;
 # 0.7.0 — the first SETTINGS frame declares
 # SETTINGS_NO_RFC7540_PRIORITIES (RFC 9218 §2.1), values > 1 of that
 # setting are a PROTOCOL_ERROR, and the h2 connection exposes the
 # setting through additive `Setting` helpers.
-version = "0.9.0"
+version = "0.9.2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
