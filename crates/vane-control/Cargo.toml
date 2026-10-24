@@ -5,8 +5,8 @@ name = "vane-control"
 # (deny_unknown_fields on every table but the top-level document), and
 # ACME challenge names accept the RFC 8555 spellings with legacy
 # aliases.
-version = "0.12.0"
-description = "Configuration, discovery providers, ACME, and health checks for Vane"
+version = "0.12.1"
+description = "L4/L7 reverse proxy,edge gateway, micro sidecar monorepo"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
