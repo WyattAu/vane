@@ -1349,6 +1349,10 @@ criteria = "safe-to-deploy"
 version = "0.6.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.vane-filters]]
+version = "0.6.1"
+criteria = "safe-to-deploy"
+
 [[exemptions.vane-kernel]]
 version = "0.8.0"
 criteria = "safe-to-deploy"
@@ -1399,6 +1403,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.vane-tls]]
 version = "0.6.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.vane-tls]]
+version = "0.6.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.venial]]
