@@ -1209,6 +1209,10 @@ criteria = "safe-to-deploy"
 version = "1.53.1"
 criteria = "safe-to-deploy"
 
+[[exemptions.tokio]]
+version = "1.54.1"
+criteria = "safe-to-deploy"
+
 [[exemptions.tokio-macros]]
 version = "2.7.2"
 criteria = "safe-to-deploy"
