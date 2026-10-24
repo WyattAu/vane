@@ -346,12 +346,15 @@ impl H2Server {
                 end_stream,
                 data,
             } => {
+                // Credit release FIRST, for every stream: without the
+                // WINDOW_UPDATE the client's send window depletes and
+                // large request bodies hang forever.
+                self.conn.release_capacity(stream_id, data.len());
                 if self.active_stream != Some(stream_id) {
                     // Body bytes for a queued request: buffer up to the
                     // cap. Beyond it, refuse — the client retries on a
                     // fresh connection.
                     if let Some(p) = self.pending.iter_mut().find(|p| p.stream_id == stream_id) {
-                        self.conn.release_capacity(stream_id, data.len());
                         if p.body.len() + data.len() > PENDING_BODY_CAP {
                             self.pending.retain(|p| p.stream_id != stream_id);
                             self.conn.send_rst_stream(
