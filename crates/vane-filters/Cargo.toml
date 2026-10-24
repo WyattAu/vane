@@ -1,11 +1,11 @@
 [package]
 name = "vane-filters"
-description = "Monomorphized filter pipeline and built-in filters for Vane"
+description = "L4/L7 reverse proxy,edge gateway, micro sidecar monorepo"
 # 0.6.0 (first version off the workspace train: the breaker dependency
 # moved 1.0 -> 2.0 and the trip policy is explicit — rate-based over a
 # volume-gated window with a 5 s open period — see
 # `vane_breaker_config`).
-version = "0.6.0"
+version = "0.6.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
