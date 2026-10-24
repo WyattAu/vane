@@ -204,9 +204,14 @@ impl<'a> SessionIo<'a> {
     }
 
     /// Closes the whole session.
+    #[track_caller]
     pub fn close(&mut self) {
         #[cfg(feature = "vane_dbg")]
-        eprintln!("[trunc] SessionIo::close slot={}", self.slot);
+        eprintln!(
+            "[close-at] slot={} caller={}",
+            self.slot,
+            std::panic::Location::caller()
+        );
         self.worker
             .close_session(self.slot, self.generation, "handler");
     }

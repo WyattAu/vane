@@ -573,17 +573,24 @@ Verified: h2c parallel 6/40 -> 40/40; TLS-h2 curl serial 30/30
 and 8-way concurrent 80/80 (65536 B, HTTP 200 every time). A
 shim-level regression test pins queue-and-replay-in-order.
 
-**REMAINING (tool-side, next session):** h2load (tokio + h2
-crate) still churns ~4 read_errs per success on the TLS-h2 shape
-while curl on the SAME endpoint is clean — the failures are
-"peer closed without close_notify" with vane closing
-reason=handler AFTER client-side errors (EPIPE on vane's write =
-the client aborted first). The instrument needs a fix (retry
-REFUSED_STREAM instead of reconnect-churning; the TLS handshake
-storm then saturates workers and cascades) before TLS-h2
-numbers are publishable. The stalled upstream reads seen in the
-churn phase (Recv-Q 300-400 KB per connection) are a churn
-symptom to re-check after the tool fix.
+**NEXT SESSION OPENING STATE (2026-10-23):** the TLS-h2load
+churn is NOT the tool — with #[track_caller] on SessionIo::close,
+every close is `reason=handler` from ONE site: the upstream-head
+parser's **Malformed** arm, fed **4096 bytes of pure body ('x')**
+as a head. The session's framing resets to AwaitingHead while the
+upstream is mid-body on the TLS-h2 path (h1 clients and h2c
+sustained 400/400 are clean — TLS-h2-specific). Instrumentation
+left in the tree (vane_dbg): [close-at] track_caller on
+SessionIo::close, [malformed]/[headcap] on the parse arms,
+[h2err] on the flush close. Repro: certgen; vane with a TLS
+listener (alpn_h2) + plain 64 KiB cluster; h2load ADDR 1 4
+/bench64 localhost DIR/cert.pem. Suspects: the upstream
+request/response pairing across start_pending activations (the
+h2-driven dial + the parked-connection interleave), and whether
+the request-head write and the response read can cross on the
+new upstream socket. NOTE: with-indexing HPACK literals in tests
+shift the shared dynamic table — use without-indexing in multi-
+request harnesses.
 
 **Cross-proxy refresh LANDED (2026-10-22, 270127e9):** the first
 clean-window full run of the fixed build — vane 0.15.0 wins every

@@ -106,9 +106,12 @@ async fn run_conn(
             continue;
         };
         // Driver for the h2 connection.
+        let (conn_err_tx, conn_err_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            let _ = connection.await;
+            let outcome = connection.await;
+            let _ = conn_err_tx.send(outcome.map(|_| ()));
         });
+        let mut conn_err_rx = Some(conn_err_rx);
         let mut send_request = send_request;
         while Instant::now() < end {
             let request = match http::Request::builder()
@@ -142,6 +145,17 @@ async fn run_conn(
             let response = match response.await {
                 Ok(r) => r,
                 Err(e) => {
+                    if let Some(rx) = conn_err_rx.as_mut() {
+                        match rx.try_recv() {
+                            Ok(Err(driver_err)) => {
+                                eprintln!("[h2dbg] DRIVER died: {driver_err}");
+                            }
+                            Ok(Ok(())) => {
+                                eprintln!("[h2dbg] driver exited cleanly");
+                            }
+                            _ => {}
+                        }
+                    }
                     eprintln!("[h2dbg] response.await: {e}");
                     counters.read_err.fetch_add(1, Ordering::Relaxed);
                     continue 'outer;

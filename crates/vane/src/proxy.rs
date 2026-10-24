@@ -1054,6 +1054,12 @@ impl HttpProxy {
                     HeadParse::Complete { head_len, status } => (head_len, status),
                     HeadParse::Partial => {
                         if buf.len() > RESP_HEAD_CAP {
+                            #[cfg(feature = "vane_dbg")]
+                            eprintln!(
+                                "[headcap] len={} prefix={:?}",
+                                buf.len(),
+                                String::from_utf8_lossy(&buf[..120.min(buf.len())])
+                            );
                             self.respond_full(io, Status::BadGateway, "upstream head too large\n");
                             io.close();
                             return;
@@ -1076,6 +1082,12 @@ impl HttpProxy {
                         return;
                     }
                     HeadParse::Malformed => {
+                        #[cfg(feature = "vane_dbg")]
+                        eprintln!(
+                            "[malformed] len={} prefix={:?}",
+                            buf.len(),
+                            String::from_utf8_lossy(&buf[..160.min(buf.len())])
+                        );
                         self.respond_full(io, Status::BadGateway, "bad upstream response\n");
                         io.close();
                         return;
@@ -1500,6 +1512,15 @@ impl HttpProxy {
         }
         if failed {
             // Abort any in-flight transaction; never reuse the session.
+            #[cfg(feature = "vane_dbg")]
+            {
+                let code = self
+                    .conns
+                    .get(&slot)
+                    .and_then(|c| c.h2.as_ref())
+                    .and_then(|h| h.conn_error_code());
+                eprintln!("[h2err] slot={slot} code={code:?}");
+            }
             io.close();
         }
     }
