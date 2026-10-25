@@ -7,7 +7,7 @@ description = "L4/L7 reverse proxy,edge gateway, micro sidecar monorepo"
 # SETTINGS_NO_RFC7540_PRIORITIES (RFC 9218 §2.1), values > 1 of that
 # setting are a PROTOCOL_ERROR, and the h2 connection exposes the
 # setting through additive `Setting` helpers.
-version = "0.9.2"
+version = "0.9.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

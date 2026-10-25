@@ -4,7 +4,7 @@ description = "L4/L7 reverse proxy,edge gateway, micro sidecar monorepo"
 # 0.2.3: h2 is a DEFAULT feature — the 0.2.2 binary silently hung on
 # h2c = true listeners (the promotion code was feature-gated out).
 # 0.2.2 carried the EDS endpoint-merge support.
-version = "0.15.1"
+version = "0.15.2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -80,7 +80,7 @@ thiserror = { workspace = true }
 # Experimental protocol features
 h2 = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
 
 pem-rfc7468 = { workspace = true }
 quinn = { workspace = true, optional = true }

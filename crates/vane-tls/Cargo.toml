@@ -1,7 +1,7 @@
 [package]
 name = "vane-tls"
 description = "L4/L7 reverse proxy,edge gateway, micro sidecar monorepo"
-version = "0.6.1"
+version = "0.6.2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

@@ -261,6 +261,8 @@ pub fn init_telemetry(cfg: &vane_control::TelemetryConfig) -> Option<otelkit::Te
         otlp_endpoint: merged.otlp_endpoint,
         sentry_dsn: None,
         sample_rate: merged.sample_rate.clamp(0.0, 1.0),
+        exporter: otelkit::Exporter::Otlp,
+        metrics_prometheus: false,
     };
     // Per-request tracing spans are only worth their fmt-layer cost
     // when there is a trace exporter to receive them.
