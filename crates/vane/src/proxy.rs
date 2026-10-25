@@ -1083,11 +1083,20 @@ impl HttpProxy {
                     }
                     HeadParse::Malformed => {
                         #[cfg(feature = "vane_dbg")]
-                        eprintln!(
-                            "[malformed] len={} prefix={:?}",
-                            buf.len(),
-                            String::from_utf8_lossy(&buf[..160.min(buf.len())])
-                        );
+                        {
+                            let mut unread: i32 = 0;
+                            if let Some(fd) = io.upstream_fd() {
+                                // SAFETY: FIONREAD on an owned socket.
+                                unsafe {
+                                    libc::ioctl(fd, libc::FIONREAD, &mut unread);
+                                }
+                            }
+                            eprintln!(
+                                "[malformed] len={} unread_on_upstream={unread} prefix={:?}",
+                                buf.len(),
+                                String::from_utf8_lossy(&buf[..120.min(buf.len())])
+                            );
+                        }
                         self.respond_full(io, Status::BadGateway, "bad upstream response\n");
                         io.close();
                         return;
@@ -3601,6 +3610,17 @@ impl HttpProxy {
         let Some(fd) = io.detach_upstream() else {
             return;
         };
+        #[cfg(feature = "vane_dbg")]
+        {
+            let mut unread: i32 = 0;
+            // SAFETY: FIONREAD on an owned socket.
+            unsafe {
+                libc::ioctl(fd, libc::FIONREAD, &mut unread);
+            }
+            if unread > 0 {
+                eprintln!("[park] fd={fd} parked with UNREAD={unread}");
+            }
+        }
         self.park_fd(addr, fd);
     }
 
@@ -3613,6 +3633,26 @@ impl HttpProxy {
         let now = Instant::now();
         let mut reaped: Vec<RawFd> = Vec::new();
         let mut parked = false;
+        // A parked connection with UNREAD response data is a poisoned
+        // pool entry: the next checkout reads the stale bytes as a
+        // response head (the TLS-h2 churn cascade). Happens when a
+        // session aborts mid-response — close instead of park.
+        {
+            let mut unread: i32 = 0;
+            // SAFETY: FIONREAD on an owned socket.
+            unsafe {
+                libc::ioctl(fd, libc::FIONREAD, &mut unread);
+            }
+            if unread > 0 {
+                // Unread response data on a parked connection poisons
+                // the pool: the next checkout reads the stale bytes as
+                // a response head. Close instead of reusing.
+                #[cfg(feature = "vane_dbg")]
+                eprintln!("[park] fd={fd} UNREAD={unread}: closing instead of parking");
+                self.close_fd(fd);
+                return;
+            }
+        }
         {
             // `entry`, not `get_mut`: the first connection to a backend
             // has to create its list, or pooling silently does nothing.

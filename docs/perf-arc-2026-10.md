@@ -573,6 +573,18 @@ Verified: h2c parallel 6/40 -> 40/40; TLS-h2 curl serial 30/30
 and 8-way concurrent 80/80 (65536 B, HTTP 200 every time). A
 shim-level regression test pins queue-and-replay-in-order.
 
+**SEPARATE REGRESSION (not ours — the otelkit-2 migration, found
+2026-10-24):** `otlp_export_emits_spans` fails: the exported span
+carries a RANDOM trace id — the incoming `traceparent` (4bf92f35-
+77b3-4da6-a3ce-929d0e0e4736) is not honored. vane's extraction is
+CORRECT (tracing_util unit tests 6/6; serve_span parses and calls
+set_remote_parent with the right TraceId). The loss is in the
+tracing→OTEL conversion introduced by the coordinated-release
+commit (094a5261, otelkit 2.2.3 TelemetryConfig migration): the
+span reaches the exporter as a root. Owner: the otelkit migration
+author. Full-payload dump wired into the test's failure output
+(full_hex) for their debugging.
+
 **NEXT SESSION OPENING STATE (2026-10-23, refined 2026-10-24):
 the TLS-h2 body-as-head desync, REPRODUCED ON THE CURRENT BINARY
 after every fix in this arc** — h2load TLS-h2 64 KiB still churns

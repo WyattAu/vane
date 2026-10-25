@@ -1403,14 +1403,8 @@ force_mio = true
     if !saw_trace {
         let guard = bodies.lock().unwrap_or_else(|e| e.into_inner());
         for (i, body) in guard.iter().enumerate() {
-            let hex: String = body
-                .iter()
-                .rev()
-                .take(120)
-                .rev()
-                .map(|b| format!("{b:02x}"))
-                .collect();
-            eprintln!("body[{i}] len={} tail_hex={hex}", body.len());
+            let hex: String = body.iter().map(|b| format!("{b:02x}")).collect();
+            eprintln!("body[{i}] len={} full_hex={hex}", body.len());
         }
         if let Ok(text) = std::fs::read_to_string(&child_log) {
             eprintln!(

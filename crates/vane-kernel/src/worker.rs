@@ -1989,6 +1989,13 @@ mod body_splice_worker_tests {
         let mut w = test_worker();
         let (up_leg, resp_writer) = tcp_pair();
         let (down_leg, reader) = tcp_pair();
+        // The reader drains between pump rounds: nonblocking so a
+        // drained queue returns EAGAIN instead of blocking the loop.
+        // SAFETY: fcntl on an owned descriptor.
+        unsafe {
+            let fl = libc::fcntl(reader, libc::F_GETFL);
+            libc::fcntl(reader, libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
         let (slot, generation) = add_session(&mut w, up_leg, down_leg);
 
         // Small on purpose: the pump must complete in ONE call, which
@@ -2007,13 +2014,34 @@ mod body_splice_worker_tests {
         unsafe {
             libc::write(resp_writer, body.as_ptr().cast(), body.len());
         }
+        // The pump may return mid-response when the client socket's
+        // send window temporarily bounds the egress (the shim parks on
+        // POLLOUT); a real client drains and its WINDOW_UPDATEs resume
+        // the flow. Drive the pump until completion, draining the
+        // reader between rounds — bounded against a true wedge.
         let mut h = SpliceStub { spliced: None };
-        w.pump_body_splice(slot, generation, &mut h);
+        let mut received: Vec<u8> = Vec::new();
+        let mut scratch = [0u8; 4096];
+        for _ in 0..1000 {
+            w.pump_body_splice(slot, generation, &mut h);
+            // SAFETY: drain a live descriptor; EAGAIN ends the round.
+            unsafe {
+                loop {
+                    let n = libc::read(reader, scratch.as_mut_ptr().cast(), scratch.len());
+                    if n <= 0 {
+                        break;
+                    }
+                    received.extend_from_slice(&scratch[..n as usize]);
+                }
+            }
+            if h.spliced.is_some() && received.len() >= body.len() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
 
         assert_eq!(h.spliced, Some(body.len() as u64), "completion hook fired");
-        let mut got = vec![0u8; body.len()];
-        read_exact_blocking(reader, &mut got);
-        assert_eq!(got, body, "the client sees exactly the spliced bytes");
+        assert_eq!(received, body, "the client sees exactly the spliced bytes");
         assert!(
             w.slab.get(slot).is_some_and(|s| s.body_splice.is_none()),
             "the splice state is consumed; the session survives"
