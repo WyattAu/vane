@@ -573,24 +573,33 @@ Verified: h2c parallel 6/40 -> 40/40; TLS-h2 curl serial 30/30
 and 8-way concurrent 80/80 (65536 B, HTTP 200 every time). A
 shim-level regression test pins queue-and-replay-in-order.
 
-**NEXT SESSION OPENING STATE (2026-10-23):** the TLS-h2load
-churn is NOT the tool — with #[track_caller] on SessionIo::close,
-every close is `reason=handler` from ONE site: the upstream-head
-parser's **Malformed** arm, fed **4096 bytes of pure body ('x')**
-as a head. The session's framing resets to AwaitingHead while the
-upstream is mid-body on the TLS-h2 path (h1 clients and h2c
-sustained 400/400 are clean — TLS-h2-specific). Instrumentation
-left in the tree (vane_dbg): [close-at] track_caller on
-SessionIo::close, [malformed]/[headcap] on the parse arms,
-[h2err] on the flush close. Repro: certgen; vane with a TLS
-listener (alpn_h2) + plain 64 KiB cluster; h2load ADDR 1 4
-/bench64 localhost DIR/cert.pem. Suspects: the upstream
-request/response pairing across start_pending activations (the
-h2-driven dial + the parked-connection interleave), and whether
-the request-head write and the response read can cross on the
-new upstream socket. NOTE: with-indexing HPACK literals in tests
-shift the shared dynamic table — use without-indexing in multi-
-request harnesses.
+**NEXT SESSION OPENING STATE (2026-10-23, refined 2026-10-24):
+the TLS-h2 body-as-head desync, REPRODUCED ON THE CURRENT BINARY
+after every fix in this arc** — h2load TLS-h2 64 KiB still churns
+(1317 ok / 5608 read_err in 5 s) and the [malformed] probe fires
+5608 times: **4096-byte reads of pure body ('x') hitting
+parse_upstream_head in the AwaitingHead state** (buf_size-sized
+upstream reads), each closing the connection (proxy.rs:1092,
+reason=handler). While curl on the SAME endpoint is clean:
+serial 30/30, 8-way concurrent 80/80, reconnect-storm 30/30 —
+so the relay serves real clients correctly and the failure
+correlates with h2load's request CADENCE (350/s serial on one
+connection). The state resets to AwaitingHead while 4096 body
+bytes arrive — the framing was clobbered between transactions.
+Suspects, in order: (1) the h2 shim's response completion vs the
+upstream read racing — the shim holds bytes on client credit and
+the session resets when the translator reports done, but the
+upstream read loop may deliver one more body-buffering read
+after the reset; (2) start_pending's dial racing the parked
+upstream's last read. Instrumentation (vane_dbg, in tree):
+[close-at] track_caller on SessionIo::close, [malformed]/
+[headcap] on the parse arms, [h2err] on the flush close,
+[hrdbg]/[qdbg]-class probes removed. Repro (all in /tmp/opencode,
+recreate after tmp wipes): certgen DIR; vane TLS listener
+(alpn_h2) + plain 64 KiB cluster; `h2load ADDR 1 5 /bench64
+localhost DIR/cert.pem`. HPACK harness trap: with-indexing
+literals shift the shared dynamic table — use without-indexing
+in multi-request tests.
 
 **Cross-proxy refresh LANDED (2026-10-22, 270127e9):** the first
 clean-window full run of the fixed build — vane 0.15.0 wins every
