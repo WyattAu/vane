@@ -17,6 +17,7 @@ fn build_router() -> Router {
     router.update(|editor| {
         for (pattern, cluster) in routes {
             let builder = RouteBuilder {
+                response_headers: vane_router::ResponseHeaderPolicy::default(),
                 host: None,
                 pattern: pattern.to_string(),
                 methods: Vec::new(),
