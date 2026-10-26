@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.4"
+version = "0.5.5"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -51,12 +51,12 @@ vane-tls = { version = "0.6.0", path = "crates/vane-tls" }
 vane-plugins = { version = "0.5.3", path = "crates/vane-plugins" }
 
 # WyattAu kit ecosystem (reuse, do not reinvent)
-shm-rings = "0.2"
+shm-rings = "1"
 slab-pool = "0.1"
 throttle-kit = "2"
 breaker = "2.0"
 healthkit = "1.0"
-axum-stack = "0.2"
+axum-stack = "1"
 graceful = "0.1"
 otelkit = { version = "2", features = ["otlp"] }
 envstack = "0.2"
