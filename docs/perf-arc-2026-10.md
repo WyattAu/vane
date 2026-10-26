@@ -600,6 +600,24 @@ SO_REUSEPORT load-balances connections across old and new
 binaries — kill by ss -tlnp port owner and verify the port is
 free before every measurement run.
 
+**THE COORDINATED-RELEASE GATE DEBT (2026-10-26, for the release
+owner):** the estate 1.x dep promotions + response-headers feature
+(8e036da0/9e672f6e) landed with gate debt that blocks main:
+1. semver: vane-control 0.12.2 needs 0.13.0 (RouteConfig gained
+   `response_headers` — constructible_struct_adds_field), plus a
+   `function_requires_different_generic_type_params` failure from
+   the same feature (function TBD, in the kit's newer semver run).
+2. deny: opentelemetry DUPLICATES (0.28 tree + otelkit-2's 0.30
+   via otlp 0.32) — vane's direct opentelemetry/tracing-otel deps
+   need alignment with otelkit-2's stack (a real migration: 0.28
+   -> 0.30 API changes in tracing_util/server).
+3. vet: resync after each publish (vane-shm 0.5.5, vane-tls 0.6.3,
+   vane-proxy 0.15.3 exemptions landed in 8b1061bb).
+The fuzz target (RouteBuilder initializer) was fixed in 8b1061bb.
+My h2 concurrency + park-guard + credit fixes are IN this tree and
+verified (h2c parallel 40/40, TLS curl clean, zero malformed with
+the park guard live).
+
 **NEXT SESSION OPENING STATE (2026-10-23, refined 2026-10-24):
 the TLS-h2 body-as-head desync, REPRODUCED ON THE CURRENT BINARY
 after every fix in this arc** — h2load TLS-h2 64 KiB still churns
