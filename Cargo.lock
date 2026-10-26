@@ -4116,7 +4116,7 @@ dependencies = [
 
 [[package]]
 name = "vane-proxy"
-version = "0.15.2"
+version = "0.15.3"
 dependencies = [
  "axum",
  "axum-stack",
@@ -4200,7 +4200,7 @@ dependencies = [
 
 [[package]]
 name = "vane-tls"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "ctor",
  "rcgen",
