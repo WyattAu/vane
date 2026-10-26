@@ -585,6 +585,21 @@ span reaches the exporter as a root. Owner: the otelkit migration
 author. Full-payload dump wired into the test's failure output
 (full_hex) for their debugging.
 
+**PARK GUARD VERIFIED (2026-10-26):** with the FIONREAD park
+guard live, a 5 s TLS-h2 h2load run produced ZERO malformed parses
+and ZERO handler closes — the poisoned-pool cascade is dead. The
+residual h2load read_errs (~7-15% of transactions) happen WITHOUT
+any vane-side session error (no close_session, no downstream
+error, no truncation) while curl on the same endpoint is clean in
+every shape — scoped to the h2load client (its reconnect churn
+plus whatever first error triggers it). Until h2load's client is
+fixed, TLS-h2 numbers come from curl, not h2load. TEST-ENV TRAP
+that produced days of mixed results: a stale setsid-detached vane
+survives kills (its listener persists via an inherited fd) and
+SO_REUSEPORT load-balances connections across old and new
+binaries — kill by ss -tlnp port owner and verify the port is
+free before every measurement run.
+
 **NEXT SESSION OPENING STATE (2026-10-23, refined 2026-10-24):
 the TLS-h2 body-as-head desync, REPRODUCED ON THE CURRENT BINARY
 after every fix in this arc** — h2load TLS-h2 64 KiB still churns
