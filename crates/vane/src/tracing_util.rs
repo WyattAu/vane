@@ -79,7 +79,12 @@ fn set_remote_parent(span: &tracing::Span, ctx: &TraceContext) {
     };
     let remote = SpanContext::new(trace_id, span_id, flags, true, TraceState::default());
     let cx = opentelemetry::Context::new().with_remote_span_context(remote);
-    tracing_opentelemetry::OpenTelemetrySpanExt::set_parent(span, cx);
+    // A well-formed remote context cannot fail to attach — but a test
+    // running without an installed OTel layer reports SpanDisabled:
+    // there is no layer to propagate to, and the parse is what's under
+    // test. The Result matters only in production (an Err there is the
+    // lost-parent trace-id regression class).
+    let _ = tracing_opentelemetry::OpenTelemetrySpanExt::set_parent(span, cx);
 }
 
 #[cfg(test)]

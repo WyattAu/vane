@@ -34,7 +34,21 @@ yanked = "deny"
 # RS256 verification path has real coverage. It is not in any shipped
 # build graph. Tracked in SECURITY.md's advisory register — remove this
 # entry if `rsa` ever becomes a normal dependency.
-ignore = ["RUSTSEC-2023-0071"]
+#
+# RUSTSEC-2026-0391/0395/0398/0403 (zstd streaming-decompression soundness
+# and data-leak edges): the fixes are zstd-safe >=8.2.0 / zstd >=0.14.3 —
+# a MAJOR bump that wasmtime 48 pins away (wasmtime-internal-cache =
+# zstd 0.13.3 / zstd-safe 7.3.0 exactly). The affected paths are module-
+# cache streaming decompression inside the wasm host; vane's exposure is
+# limited to its own trusted module cache, not adversarial network input.
+# Remove these entries when wasmtime ships the zstd bump (>=49).
+ignore = [
+    "RUSTSEC-2023-0071",
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0395",
+    "RUSTSEC-2026-0398",
+    "RUSTSEC-2026-0403",
+]
 
 [sources]
 unknown-registry = "deny"
