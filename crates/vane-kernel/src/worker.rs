@@ -1974,16 +1974,6 @@ mod body_splice_worker_tests {
         }
     }
 
-    fn read_exact_blocking(fd: RawFd, buf: &mut [u8]) {
-        let mut done = 0;
-        while done < buf.len() {
-            // SAFETY: read into a live buffer on an owned descriptor.
-            let n = unsafe { libc::read(fd, buf[done..].as_mut_ptr().cast(), buf.len() - done) };
-            assert!(n > 0, "peer closed early at {done}");
-            done += n as usize;
-        }
-    }
-
     #[test]
     fn pump_moves_the_capped_bytes_and_hands_off_to_the_handler() {
         let mut w = test_worker();
