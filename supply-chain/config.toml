@@ -325,6 +325,10 @@ criteria = "safe-to-deploy"
 version = "0.2.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.envstack]]
+version = "1.0.0"
+criteria = "safe-to-deploy"
+
 [[exemptions.equivalent]]
 version = "1.0.2"
 criteria = "safe-to-deploy"
@@ -1401,6 +1405,10 @@ criteria = "safe-to-deploy"
 version = "0.5.5"
 criteria = "safe-to-deploy"
 
+[[exemptions.vane-client-sdk]]
+version = "0.5.6"
+criteria = "safe-to-deploy"
+
 [[exemptions.vane-control]]
 version = "0.11.0"
 criteria = "safe-to-deploy"
@@ -1419,6 +1427,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.vane-control]]
 version = "0.13.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.vane-control]]
+version = "0.13.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.vane-filters]]
@@ -1457,12 +1469,20 @@ criteria = "safe-to-deploy"
 version = "0.5.5"
 criteria = "safe-to-deploy"
 
+[[exemptions.vane-observe]]
+version = "0.5.6"
+criteria = "safe-to-deploy"
+
 [[exemptions.vane-plugins]]
 version = "0.5.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.vane-plugins]]
 version = "0.5.5"
+criteria = "safe-to-deploy"
+
+[[exemptions.vane-plugins]]
+version = "0.5.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.vane-proto]]
@@ -1493,6 +1513,10 @@ criteria = "safe-to-deploy"
 version = "0.16.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.vane-proxy]]
+version = "0.16.1"
+criteria = "safe-to-deploy"
+
 [[exemptions.vane-router]]
 version = "0.7.0"
 criteria = "safe-to-deploy"
@@ -1515,6 +1539,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.vane-shm]]
 version = "0.5.5"
+criteria = "safe-to-deploy"
+
+[[exemptions.vane-shm]]
+version = "0.5.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.vane-tls]]
