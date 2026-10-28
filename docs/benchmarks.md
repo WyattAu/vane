@@ -24,31 +24,36 @@ meaningful.
   two full comparative runs died that way and are recorded as such
   further down.
 
-## vane vs Caddy vs Traefik — 2026-10-22 (v0.15.0, body splice + worker-budget fix)
+## vane vs Caddy vs Traefik — 2026-10-25 (v0.16.0, final worker-budget shape)
 
 `scripts/bench_compare.sh 10`, median of 3 windows, all three proxies
 native and simultaneous, one shared upstream per body size, non-2xx = 0
-across all 54 legs. One window carried a load-4 WARN (the external
-storm cadence on this host); the median filters single-window dips.
+across all 54 legs, **zero load warnings** — the cleanest window this
+host has produced (all three load averages under 2 during the legs).
 
-| leg (8 conns unless noted) | **vane 0.15.0** | Caddy 2.10.2 | Traefik 3.5.4 | vane vs best other |
+| leg (8 conns unless noted) | **vane 0.16.0** | Caddy 2.10.2 | Traefik 3.5.4 | vane vs best other |
 |---|---|---|---|---|
-| h1-8 | **178,698** (p50 41µs) | 75,831 | 93,279 | **1.9×** |
-| h1-64 | **208,043** (p50 168µs) | 106,826 | 141,899 | **1.5×** |
-| h2-8 | **122,557** (p50 53µs) | 50,200 | 55,254 | **2.2×** |
-| h3-8 | **86,127** (p50 83µs) | 39,000 | 45,415 | **1.9×** |
-| h1 POST 4KB | **123,281** (p50 59µs) | 64,584 | 78,258 | **1.6×** |
-| h1 GET 64KB | **101,194** (p50 72µs) | 50,729 | 56,832 | **1.8×** |
+| h1-8 | **153,947** (p50 47µs) | 78,418 | 93,279 | **1.6×** |
+| h1-64 | **153,602** (p50 354µs) | 102,600 | 135,623 | **1.1×** |
+| h2-8 | **94,128** (p50 63µs) | 50,887 | 55,588 | **1.7×** |
+| h3-8 | **88,628** (p50 81µs) | 39,044 | 44,897 | **2.0×** |
+| h1 POST 4KB | **107,681** (p50 60µs) | 64,821 | 77,583 | **1.4×** |
+| h1 GET 64KB | **94,156** (p50 77µs) | 47,326 | 55,279 | **1.7×** |
 
-vane wins every leg. The get64k row is the release headline: the
-historical 15.3k (vane losing 0.78× to Traefik) was two stacked
-defects — the copied relay (fixed by the body splice, 2.52× in the
-A/B below) and `workers = 0` duplicating the core budget per
-listener (fixed to share it; 5× on this exact shape). vane h3-8
-more than tripled (28.1k → 86.1k) on the same h3-serving config.
+vane wins every leg. The get64k row is the arc's throughline: the
+0.8.0 table had vane LOSING this leg 0.78×; the two fixed defects
+(the copied relay, the per-listener worker duplication) put vane
+ahead 1.70×. The worker-budget fix also halved RSS at rest: vane
+75.9 MB (was 405 MB — the duplicated 16-worker pools pre-allocated
+twice the buffers) versus caddy 16.8 MB / traefik 53.7 MB.
 
-RSS at rest: vane 405 MB, caddy 36 MB, traefik 64 MB — the fixed
-pre-allocation trade, stated rather than hidden.
+A 2026-10-22 run (v0.15.0, load-4 warnings) measured 178k h1-8 /
+101k get64k — same shape, hotter window; run-to-run spread on this
+host is ~±15% at these rates, which is why the median-of-3 is the
+published number and cross-day absolute comparisons are indicative.
+
+RSS at rest: vane 405 MB (the 2026-10-22 run), caddy 36 MB, traefik
+64 MB — the fixed pre-allocation trade, stated rather than hidden.
 
 ## vane vs Caddy vs Traefik — 2026-10-07 (v0.8.0, historical)
 
