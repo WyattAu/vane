@@ -968,9 +968,9 @@ dependencies = [
 
 [[package]]
 name = "envstack"
-version = "0.2.0"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a2849ff91a24428792f7e030c164265485db921245f474a89895ea67fa015a6"
+checksum = "c835b25d99324f98c601c795f5bb2b74efbe952273cc96f3b8b42b8c48e33fc3"
 dependencies = [
  "serde",
  "serde_json",
@@ -3452,7 +3452,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -3952,7 +3952,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vane-client-sdk"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "tempfile",
  "vane-shm",
@@ -3961,7 +3961,7 @@ dependencies = [
 
 [[package]]
 name = "vane-control"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "base64 0.22.1",
  "envstack",
@@ -4024,7 +4024,7 @@ dependencies = [
 
 [[package]]
 name = "vane-observe"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "loom",
  "rand 0.9.5",
@@ -4034,7 +4034,7 @@ dependencies = [
 
 [[package]]
 name = "vane-plugins"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "tempfile",
  "thiserror 2.0.20",
@@ -4059,7 +4059,7 @@ dependencies = [
 
 [[package]]
 name = "vane-proxy"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "axum",
  "axum-stack",
@@ -4125,7 +4125,7 @@ dependencies = [
 
 [[package]]
 name = "vane-shm"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "criterion",
  "libc",
