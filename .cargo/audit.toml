@@ -9,4 +9,15 @@
 # it at runtime — jsonwebtoken does, and that path is not reachable from
 # vane's configuration. Tracked in SECURITY.md's advisory register; drop
 # this line if rsa ever moves to a normal dependency.
-ignore = ["RUSTSEC-2023-0071"]
+# RUSTSEC-2026-0391/0395/0398/0403 (zstd streaming soundness/leaks):
+# the fixes are zstd-safe >=8.2.0 / zstd >=0.14.3 — major bumps that
+# wasmtime 48 pins away (wasmtime-internal-cache = zstd 0.13.3/7.3.0
+# exactly). Exposure is limited to vane's own trusted module cache.
+# Drop these when wasmtime ships the zstd bump (>=49).
+ignore = [
+    "RUSTSEC-2023-0071",
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0395",
+    "RUSTSEC-2026-0398",
+    "RUSTSEC-2026-0403",
+]

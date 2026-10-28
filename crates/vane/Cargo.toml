@@ -4,7 +4,7 @@ description = "L4/L7 reverse proxy,edge gateway, micro sidecar monorepo"
 # 0.2.3: h2 is a DEFAULT feature — the 0.2.2 binary silently hung on
 # h2c = true listeners (the promotion code was feature-gated out).
 # 0.2.2 carried the EDS endpoint-merge support.
-version = "0.15.3"
+version = "0.16.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
