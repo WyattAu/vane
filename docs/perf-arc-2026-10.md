@@ -635,6 +635,20 @@ continuously). NEXT: re-check after an h2load client fix, or
 verify with a second independent h2 client (python httpx/h2) that
 vane's held-drain resumes on real WINDOW_UPDATEs — if it does,
 the tool is the last blocker for TLS-h2 numbers.
+
+**VERDICT (2026-10-27, the independent-client control):** curl-h2
+multiplexed on ONE connection: 500/500 = 200 (the full 32.7 MB
+through one h2 connection); 200-request parallel batches: p50
+25 ms, p99 42 ms, zero failures — the TLS-h2 relay is CORRECT and
+sustains multiplexed load. The stall requires h2load's specific
+client: its h2-crate driver stalls its capacity release mid-
+response (vane holds 57 KB awaiting credit that never comes;
+FIONREAD on the upstream confirms vane stopped reading at ~8 KB).
+CONCLUSION: vane's relay is correct; h2load's client is the
+defective instrument. The tool fix (retry semantics, driver-error
+surfacing) is the gate for TLS-h2 numbers — tracked as the next
+tool arc. The park guard + checkout gate stay as defense in
+depth.
 the TLS-h2 body-as-head desync, REPRODUCED ON THE CURRENT BINARY
 after every fix in this arc** — h2load TLS-h2 64 KiB still churns
 (1317 ok / 5608 read_err in 5 s) and the [malformed] probe fires

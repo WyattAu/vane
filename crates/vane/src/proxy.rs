@@ -1090,17 +1090,28 @@ impl HttpProxy {
                     HeadParse::Malformed => {
                         #[cfg(feature = "vane_dbg")]
                         {
+                            let ufd = io.upstream_fd();
                             let mut unread: i32 = 0;
-                            if let Some(fd) = io.upstream_fd() {
+                            if let Some(fd) = ufd {
                                 // SAFETY: FIONREAD on an owned socket.
                                 unsafe {
                                     libc::ioctl(fd, libc::FIONREAD, &mut unread);
                                 }
                             }
+                            let h2_active = self.conns.get(&slot).is_some_and(|c| c.h2.is_some());
+                            let resp_head_len = self
+                                .conns
+                                .get(&slot)
+                                .map(|c| c.resp_head.len())
+                                .unwrap_or(0);
                             eprintln!(
-                                "[malformed] len={} unread_on_upstream={unread} prefix={:?}",
-                                buf.len(),
-                                String::from_utf8_lossy(&buf[..120.min(buf.len())])
+                                "[malformed] len={len} ufd={ufd:?} unread={unread} h2={h2_active} resp_head_len={resp_head_len} prefix={prefix:?}",
+                                len = buf.len(),
+                                ufd = ufd,
+                                unread = unread,
+                                h2_active = h2_active,
+                                resp_head_len = resp_head_len,
+                                prefix = String::from_utf8_lossy(&buf[..80.min(buf.len())]),
                             );
                         }
                         self.respond_full(io, Status::BadGateway, "bad upstream response\n");
@@ -3758,6 +3769,25 @@ impl HttpProxy {
             // Parked in order, so walking back yields the freshest
             // first; stop at the first live one and leave the rest.
             while let Some(conn) = idle.pop() {
+                // A parked connection can still grow unread data: the
+                // upstream may have been mid-send when the session
+                // parked it (the TLS-h2 desync). FIONREAD at checkout
+                // is the last gate — unread > 0 means the connection
+                // is NOT idle-clean; close it and try the next.
+                let mut unread: i32 = 0;
+                // SAFETY: FIONREAD on an owned socket.
+                unsafe {
+                    libc::ioctl(conn.fd, libc::FIONREAD, &mut unread);
+                }
+                if unread > 0 {
+                    #[cfg(feature = "vane_dbg")]
+                    eprintln!(
+                        "[checkout] fd={} UNREAD={unread}: closing stale pooled conn",
+                        conn.fd
+                    );
+                    reaped.push(conn.fd);
+                    continue;
+                }
                 if conn.parked_at.elapsed() < ttl {
                     taken = Some(conn.fd);
                     break;
