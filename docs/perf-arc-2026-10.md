@@ -618,7 +618,23 @@ My h2 concurrency + park-guard + credit fixes are IN this tree and
 verified (h2c parallel 40/40, TLS curl clean, zero malformed with
 the park guard live).
 
-**NEXT SESSION OPENING STATE (2026-10-23, refined 2026-10-24):
+**FLOW-CONTROL TRACED (2026-10-26, QBFDBG full-run):** with the
+park guard live, a 5 s TLS-h2 h2load run (23,722 ok / 1088
+read_err) shows: (a) every shim response COMPLETES — each sid's
+final take is sent=65536 last=true, held=0 throughout; (b) 676
+park attempts ALL carried unread data (39-57 KB) and ALL were
+closed by the guard — zero pool poisoning; (c) 338 malformed reads
+remain: a stalled session's upstream sits with 57 KB unread while
+the shim holds bytes awaiting client credit that h2load never
+grants (the h2-crate client's capacity release stalls), until
+h2load's wall deadline mass-drops everything (the reason=handler
+x5933 end-of-run close). The residual read_errs are vane AWAITING
+client credit on stalled sessions — correct backpressure against
+a client that stops granting. curl never stalls (nghttp2 grants
+continuously). NEXT: re-check after an h2load client fix, or
+verify with a second independent h2 client (python httpx/h2) that
+vane's held-drain resumes on real WINDOW_UPDATEs — if it does,
+the tool is the last blocker for TLS-h2 numbers.
 the TLS-h2 body-as-head desync, REPRODUCED ON THE CURRENT BINARY
 after every fix in this arc** — h2load TLS-h2 64 KiB still churns
 (1317 ok / 5608 read_err in 5 s) and the [malformed] probe fires
