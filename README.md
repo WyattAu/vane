@@ -1,20 +1,242 @@
+# vane
+
 **A deterministic, zero-copy L4/L7 reverse proxy, edge gateway, and micro sidecar; in Rust.**
+
+```text
+            ┌──────────────────────────────────────────────────┐
+            │  control plane (Tokio)                           │
+            │  file/docker/K8s providers · ACME · health       │
+            │  ── publishes route generations (EBR swap) ──▶   │
+            └──────────────────────────────────────────────────┘
+   ┌──────────────────────────┬──────────────────────────┐
+   ▼                          ▼                          ▼
+┌──────────────┐      ┌──────────────┐          ┌──────────────┐
+│ worker 0     │      │ worker 1     │   ...    │ worker N     │
+│ pinned core  │      │ pinned core  │          │ pinned core  │
+│ io_uring /   │      │ io_uring /   │          │ io_uring /   │
+│ mio fallback │      │ mio fallback │          │ mio fallback │
+│ slab · fixed │      │ slab · fixed │          │ slab · fixed │
+│ buffers      │      │ buffers      │          │ buffers      │
+└──────────────┘      └──────────────┘          └──────────────┘
+```
+
 - **Thread-per-core, share-nothing**; pinned workers, zero locks on the data
+  plane, cacheline-padded lock-free SPSC command paths.
+- **io_uring with fixed registered buffers** (zero per-op kernel mapping),
+  automatic **mio/epoll fallback** on older kernels.
 - **Lock-free dynamic routing**; immutable radix trie, EBR generation swap
+  across cores in well under 1 ms, ~220 ns lookups at 10k routes.
 - **Monomorphized filter pipelines**; no vtable dispatch; rate limiting
+  (GCRA) and circuit breaking reuse the [`throttle-kit`] and [`breaker`] kits.
 - **POSIX SHM sidecar transport**; co-located services call the proxy over
+  shared-memory rings: **~2.8 µs round-trip** (10× under the 30 µs target).
 - **Zero-loss hot upgrade**; listeners hand over via `SCM_RIGHTS`; route
+  state archives to disk; connections never reset.
 - **Kernel splice passthrough** for L4; request bytes never enter user space.
+
+[`throttle-kit`]: https://crates.io/crates/throttle-kit
+[`breaker`]: https://crates.io/crates/breaker
+
+## Workspace
+
+| Crate | Role |
+|---|---|
+| `vane-kernel` (crate `vane_core`) | io_uring/mio engines, pinned workers, session slab, SPSC, splice |
+| `vane-proto` | zero-copy HTTP/1.1 (httparse), date cache, response writer |
+| `vane-router` | EBR-published radix trie, P2C/RR/least-conn balancers |
+| `vane-filters` | compile-time pipelines + GCRA/breaker/forwarded built-ins |
+| `vane-control` | config, file/docker/K8s providers, ACME, health checks |
+| `vane-shm` | sidecar ring transport, hot-upgrade handover, C ABI |
+| `vane-tls` | rustls termination, ALPN, ChaCha20 session-ticket cache |
+| `vane-plugins` | wasmtime sandbox (feature `wasm`) |
+| `vane-client-sdk` | Rust SDK + `include/vane_sidecar.h` for C/C++ |
+| `vane-proxy` (installs `vane`) | the binary: CLI, proxy handler, admin plane |
+
+## Quick start
+
+```bash
+# 1. upstream
+python3 -m http.server 9001 &
+
+# 2. config
+cat > vane.toml <<'EOF'
+[[listeners]]
+address = "0.0.0.0:8080"
+
+[clusters.demo]
+backends = ["127.0.0.1:9001"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "demo"
+
+[admin]
+enabled = true
+address = "127.0.0.1:9100"
+EOF
+
+# 3. run
+cargo run -p vane-proxy -- run -c vane.toml
+# (or install from crates.io: cargo install vane-proxy → `vane` on PATH)
+
+# 4. verify
+curl -v localhost:8080/anything
+curl localhost:9100/metrics
+```
+
+### Sidecar mode
+
+```bash
+# in the proxy process (or `vane sidecar`)
+curl localhost:9100/config            # route table
+
+# from a co-located service (Rust):
+Sidecar::connect("/dev/shm/vane-sidecar")?.send(b"GET /health", 1s)?;
+# from C/C++: see crates/vane-client-sdk/include/vane_sidecar.h
+```
+
+### TLS termination
+
+```toml
+[[listeners]]
+address = "0.0.0.0:8443"
+[listeners.tls]
+cert = "/etc/vane/cert.pem"
+key  = "/etc/vane/key.pem"
+```
+
+rustls with ALPN (`h2`, `http/1.1`) and a shared ChaCha20 session-ticket
+cache; pair with the ACME manager for automated certificates.
+
+### Production features
+
+- **TLS termination** (rustls, ALPN, ticket cache) with per-listener
+  cert/key or `VANE_TLS_CERT`/`VANE_TLS_KEY`
+- **Failover**: a dead backend is skipped (up to 2 attempts) while the
+  request is still unsent; breaker-recorded
 - **Enforced timeouts**: connect / first-byte / idle; 504 on expiry
+- **Opt-in rate limiting** (GCRA per client IP via `rate_limit_rps`)
+- **Env overrides** (container-friendly layering over TOML):
+  `VANE_LISTEN`, `VANE_ADMIN_ADDR`, `VANE_CLUSTER_<NAME>`
+  (comma-separated backends), `VANE_WORKERS`
+- **In-process SHM sidecar** (`[sidecar] enabled = true`) and **wasm
+  plugins** (`[[plugins]] path = "..."`, feature `wasm`)
+
+### Known issues / current limits
+
+- **Sustained concurrent load** (`crates/vane/tests/load.rs`, always
+  green): fixed in this cycle. The decisive defects were an io_uring
+  `Connect` sockaddr use-after-free (bytes copied at submit, not at SQE
   build; surfaced as EAFNOSUPPORT storms) and an IPv4 byte-order slip
+  (`1.0.0.127` SYN blackhole). Both carry regression coverage
+  (`vane-core/tests/connect.rs`, `vane-core/tests/echo.rs` on both
+  engines).
+- **Upstream keep-alive pooling** on by default (4 idle conns per
+  backend per worker); `pool_per_backend = 0` for dial-fresh.
+- HTTP/2 is served by a **separate REUSEPORT acceptor** (see
+  `h2_edge.rs`) whose bodies are buffered (32 MiB); no upstream h2 yet.
 - Upstream HTTP/2 and HTTP/3 (frontend h2/h3 terminate to HTTP/1.1) -
+  tracked on the roadmap.
+
+### Hot upgrade
+
+```bash
+# new binary takes over listening sockets + routes with zero dropped packets:
+./vane-new run -c vane.toml --handover-from /tmp/vane-handover.sock
+# old binary: sends fds (SCM_RIGHTS) + route archive, then drains and exits
+```
+
+## Performance
+
 Measured on the repository's criterion benches (dev profile; release builds
-| Keep-alive pool (opt-in) | 1 upstream conn across 5 sequential requests |; |
+are faster):
+
+| Bench | Result | Requirement |
+|---|---|---|
+| HTTP/1.1 head parse (5 headers) | ~266 ns incl. storage reset | `PR-01` |
+| Route lookup @ 10k routes | ~223 ns | `CP-01` |
+| SHM sidecar RTT (512 B) | ~2.8 µs | `IP-01` < 30 µs |
+| Keep-alive pool (opt-in) | 1 upstream conn across 5 sequential requests | - |
+| Config generation swap | one `Release` store + epoch retire | `CP-02` < 1 ms |
+
+### Throughput (measured on the dev host, loadgen, keep-alive c=64)
+
+Full matrix, methodology, nginx/Caddy/Traefik history, and
+reproduction commands: [docs/benchmarks.md](docs/benchmarks.md).
+Current snapshot (2026-10-17, v0.13.0, 2 workers, 10 s x 3 windows,
+medians, quiet host):
+
+| Scenario | vane 0.13.0 | pool reuse under load |
+|---|---|---|
+| h1 keep-alive c=64 | **86.7–91.1k rps** (p50 ~129 us) | 92.9% hits (1.24M hits / 94k dials) |
+
+Historical: stock nginx (no upstream keepalive) measured 9–10k rps
+and tuned nginx (upstream keepalive 64) 50–51k on this host
+(2026-10-07); nginx is no longer installable here, so that row stands
+as measured and cross-day comparisons carry a host-drift caveat
+(~3% day-of, larger across days). The honest reading stands: upstream
 connection reuse is the dominant lever; the same upstream serves
+9–10k rps without keep-alive and 50k+ with it.
+
+## Admin plane & metrics
+
+The admin listener (`[admin]`, default `127.0.0.1:9100`) serves:
+
+| Endpoint | Content |
+|---|---|
+| `/healthz`, `/readyz` | Kubernetes probes (`ok` / `ready`) |
+| `/health` | per-backend health states (JSON) |
+| `/metrics` | Prometheus exposition |
+| `/config` | live route-table records (JSON) |
+
+Core metric families (`vane_*`): `http_requests_total`,
+`http_responses_total`, `bytes_in_total`, `bytes_out_total`,
+`upstream_errors_total`, `breaker_rejected_total`,
+`ratelimit_rejected_total`, `config_generation`,
+`request_duration_us` (histogram).
+
+Access logging (`[access_log]`, default off) emits one JSON object per
 completed request; see [docs/config.md](docs/config.md).
+
+## Engineering gates (Tier A)
+
+`cargo clippy -D warnings` (pedantic) · `llvm-cov ≥ 90%` · **loom**
+model-checking of the SPSC/event rings · **miri** on pure-logic modules ·
+**cargo-fuzz** smoke runs on the parser/router/descriptor · criterion
+baseline regressions. CI mirrors [`WyattAu/engineering-standards`].
+
+[`WyattAu/engineering-standards`]: https://github.com/WyattAu/engineering-standards
+
+## Feature flags
+
+| Flag | Effect |
+|---|---|
+| `io-uring` (default) | io_uring engine; off ⇒ mio fallback |
+| `h2` / `h3` | experimental HTTP/2 & HTTP/3 bridges |
+| `wasm` | wasmtime plugin sandbox |
+| `k8s` | Gateway API provider |
+| `rkyv` | zero-copy route snapshots for handover |
 | `post-quantum` | aws-lc-rs provider with X25519MLKEM768 leading the key-exchange list; [docs/post-quantum.md](docs/post-quantum.md) |
 | adaptive concurrency | opt-in per cluster: latency-gradient load shedding (503 before queueing collapse); [docs/perf-arc-2026-10.md](docs/perf-arc-2026-10.md) |
+
+## Documentation
+
+| Doc | What it covers |
+|---|---|
+| [docs/config.md](docs/config.md) | configuration reference (validated by `vane validate`) |
+| [docs/post-quantum.md](docs/post-quantum.md) | the `post-quantum` feature, verification recipe, measured negotiation table |
+| [docs/security.md](docs/security.md) | threat model, hardening, disclosure |
+| [docs/benchmarks.md](docs/benchmarks.md) | measured comparison vs nginx, methodology |
+| [docs/research-loop-2026-10.md](docs/research-loop-2026-10.md) | the ten-iteration research arc: sources, prior art, verdicts |
+| [docs/publishing.md](docs/publishing.md) | crates.io publish order, install verification |
+
+## Deploy
+
 - `Dockerfile`; distroless image
 - `deploy/docker-compose.yml`; local two-service demo
 - `deploy/helm/vane/`; chart with probes, SHM mount, scrape annotations
 - `deploy/vane.example.toml`; full configuration reference
+
+## License
+
+Apache-2.0

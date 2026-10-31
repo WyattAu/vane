@@ -1,71 +1,515 @@
+# Benchmarks
+
+Methodology-first: every number here is reproducible with the commands
+shown. All runs share one host, one upstream, and one client. Modern
 sections use the in-repo `tools/loadgen` (no artificial ceiling -
+it measures 208k+ rps through vane on this host); historical sections
+used `ab`, which capped the observable ceiling near ~70k rps on this
 class of machine; treat absolute numbers as indicative, ratios as
+meaningful.
+
+## Setup
+
+- Upstream: threaded Rust echo server (10-byte body, keep-alive),
   direct ceiling measured first: **65–72k rps**; the shared client
+  bottleneck; proxies are compared against this ceiling, not each
+  other's absolute numbers.
+- Client: historical sections used `ab -k -c <conc> -n <reqs>`; the
+  2026-10-07 comparison uses the in-repo `tools/loadgen` (duration-based
   windows, h1/h2/h3, latency percentiles; see the 13-field output
+  contract in tools/loadgen/README.md).
+- Host: shared multi-tenant Linux box (results vary run-to-run ~±5%).
+  Every number below states its window discipline; runs taken during
   external build storms (load ≥ 15) were discarded, not adjusted -
+  two full comparative runs died that way and are recorded as such
+  further down.
+
 ## vane vs Caddy vs Traefik: 2026-10-25 (v0.16.0, final worker-budget shape)
+
+`scripts/bench_compare.sh 10`, median of 3 windows, all three proxies
+native and simultaneous, one shared upstream per body size, non-2xx = 0
 across all 54 legs, **zero load warnings**; the cleanest window this
+host has produced (all three load averages under 2 during the legs).
+
+| leg (8 conns unless noted) | **vane 0.16.0** | Caddy 2.10.2 | Traefik 3.5.4 | vane vs best other |
+|---|---|---|---|---|
+| h1-8 | **153,947** (p50 47µs) | 78,418 | 93,279 | **1.6×** |
+| h1-64 | **153,602** (p50 354µs) | 102,600 | 135,623 | **1.1×** |
+| h2-8 | **94,128** (p50 63µs) | 50,887 | 55,588 | **1.7×** |
+| h3-8 | **88,628** (p50 81µs) | 39,044 | 44,897 | **2.0×** |
+| h1 POST 4KB | **107,681** (p50 60µs) | 64,821 | 77,583 | **1.4×** |
+| h1 GET 64KB | **94,156** (p50 77µs) | 47,326 | 55,279 | **1.7×** |
+
+vane wins every leg. The get64k row is the arc's throughline: the
+0.8.0 table had vane LOSING this leg 0.78×; the two fixed defects
+(the copied relay, the per-listener worker duplication) put vane
+ahead 1.70×. The worker-budget fix also halved RSS at rest: vane
 75.9 MB (was 405 MB; the duplicated 16-worker pools pre-allocated
+twice the buffers) versus caddy 16.8 MB / traefik 53.7 MB.
+
+A 2026-10-22 run (v0.15.0, load-4 warnings) measured 178k h1-8 /
 101k get64k; same shape, hotter window; run-to-run spread on this
+host is ~±15% at these rates, which is why the median-of-3 is the
+published number and cross-day absolute comparisons are indicative.
+
+RSS at rest: vane 405 MB (the 2026-10-22 run), caddy 36 MB, traefik
 64 MB; the fixed pre-allocation trade, stated rather than hidden.
+
 ## vane vs Caddy vs Traefik: 2026-10-07 (v0.8.0, historical)
+
 `scripts/bench_compare.sh 10`; all three proxies run SIMULTANEOUSLY as
+native processes (this host's docker measures the plumbing, not the
+proxy), each with a plain and a TLS listener, one shared upstream. The
+client is `tools/loadgen` (h1/h2/h3). Load legs cycle proxy × leg three
+times; the published number is the **median of the three windows**, so a
+single-window external spike cannot become the claim. Per-leg spread
 across windows is published below; that is the error bar.
+
+Config: stock defaults for every proxy (vane `buffer_size` default 4096;
+the tuning note below shows what the knob buys). Upstream: 10-byte body
+for the tiny/POST legs, a second 64 KiB upstream for the get64k leg.
+Non-2xx max across all 54 legs: **0**.
+
+| leg (8 conns unless noted) | **vane 0.8.0** | Caddy 2.10.2 | Traefik 3.5.4 | vane vs best other |
+|---|---|---|---|---|
+| h1-8 | **63,223** (p50 121µs) | 21,110 | 30,019 | **2.1×** |
+| h1-64 | **109,131** (p50 493µs) | 37,796 | 51,807 | **2.1×** |
+| h2-8 | **46,038** (p50 158µs) | 16,267 | 18,249 | **2.5×** |
+| h3-8 | **28,100** (p50 265µs) | 12,533 | 14,681 | **1.9×** |
+| h1 POST 4KB | **44,134** (p50 172µs) | 21,257 | 25,778 | **1.7×** |
 | h1 GET 64KB | 15,326 (p50 478µs) | 16,864 | **19,528** | **0.78×; vane loses** |
+
+**Post-0.15.0 splice addendum (2026-10-22).** The get64k row in the
 historical table below was measured with `workers = 0` on two listeners; which then meant
+"cores per listener" (32 io_uring pollers on 16 cpus). Two
+independent effects the table conflates, both now fixed or
+measured:
+
+| configuration (get64k c=8) | median rps | p50 |
+|---|---|---|
+| copied relay (0.14.0 behavior) | 34,172 | 178µs |
+| **body splice (0.15.0 default)** | **86,268** | **77µs** |
+| two listeners, `workers = 0` (pre-fix, 32 workers) | 16,436 | 159µs |
+| two listeners, `workers = 0` (**fixed**, 16 workers) | **87,598** | **78µs** |
+
+- The splice buys **2.52×** on this leg in identical contexts
+  (engagement verified by profile: the memmove pair that was 29.3%
+  of on-CPU time is gone).
+- The multi-listener **worker-oversubscription bug** (`workers = 0`
+  duplicated the core budget per listener) cost **5×** on every
   plain+TLS config; the historical 15.3k row above was this plus
+  the copies. Fixed: auto now shares the budget
+  (`resolve_workers_per_listener`); explicit per-listener `workers`
+  keeps the legacy semantics.
+- Sustained back-to-back load decays any of these numbers
+  (86k → 61-73k over 60 s on this host; boost/thermal), so
+  cross-run comparisons need equal-freshness windows.
+
+RSS at rest: vane 502 MB, caddy 41 MB, traefik 69 MB. vane pre-allocates
+`pool_slots × buffer_size` per worker (16 cores × 1024 × 4096 ≈ 64 MB)
 plus per-session slabs; fixed up front by design; the others grow at
+runtime. This is the honest trade vane makes, stated rather than hidden.
+
+Per-window spread (max−min over max, rps): every leg ≤ 5.9% except vane
 h1-8 at 10.7%; its third window dipped and the median comes from the
+two agreeing windows, which is what the median-of-3 methodology is for.
+Raw: `/tmp/opencode/compare_raw.txt` (54 rows, one per proxy×leg×window).
+
+**The breadth leg vane loses is the finding.** A 64 KiB body through a
+4096-byte slot means 16 read+write round trips per response; Traefik and
+Caddy use larger buffers. `[runtime] buffer_size` exists for exactly
 this (added in 0.8.0); measured vane-only on this same leg, same host,
+same client, interleaved windows (cross-run absolutes are not comparable
+to the table above; the ratios within this experiment are):
+
+| `buffer_size` | 4096 (default) | 8192 | 16384 |
+|---|---|---|---|
+| h1 GET 64KB, median rps | 28,024 | 30,189 | **36,332 (+30%)** |
+
+Envoy remains unmeasured in this environment (see below); nginx
+containerized is invalid for the same docker reason.
+
 ## vane 0.13.0: pool telemetry under load (2026-10-17)
+
+Single-proxy legs, `tools/loadgen`, 10 s x 3 windows, medians,
+upstream = the threaded 10-byte keep-alive server, load 4-7 (quiet):
+
+| leg | rps (median) | p50 | p99 | non-200 |
+|---|---|---|---|---|
+| h1 c=64, 2 workers | **86,715** | 129 us | ~9 ms | 0 / 2.6M |
+| h1 c=64, 2 workers (re-run) | **91,051** | 121 us | 8.7 ms | 0 |
+
+Run-to-run spread across the day's blocks was ~3% (86.7k .. 91.1k),
+which is the error bar for any cross-block comparison on this host.
+
+The new pool telemetry, scraped after the c=64 block:
+`vane_upstream_dials_total` 94,394, `vane_upstream_pool_hits_total`
 1,236,283, `vane_upstream_pool_misses_total` 94,394; a **92.9%
+reuse ratio** (13.6 reuses per dial) under concurrent load, the
+first time this has been measurable. Little's law checks out:
+85k rps x 129 us = ~11 requests in flight, so the 4-per-worker idle
+cap covers the steady state. Metric-driven trigger recorded in
+docs/perf-arc-2026-10.md: revisit the default cap only if the reuse
+ratio sags at higher concurrency.
+
+The published v0.12.0 binary on the identical workload: 89.0k
 (median of 3); the pool changes are throughput-neutral within the
-| keep-alive c=256 |; |; | 47k rps |; |
-| short connections c=64 | 6.1k rps |; | 10.5k rps |; |
-| direct upstream (no proxy) | 65–72k rps |; |; |; |
+~3% variance, stated rather than tuned around.
+
+## vane vs nginx (reverse-proxy mode)
+
+nginx configuration matters enormously and is often the hidden variable
+in proxy benchmarks. Both configurations are reported:
+
+| Scenario | vane (1 worker) | vane (4 workers) | nginx 2 workers, upstream keepalive 64 | nginx stock (no upstream keepalive) |
+|---|---|---|---|---|
+| keep-alive c=64 | **56–60k rps** | **125k rps** | 50–51k rps | 9–10k rps |
+| keep-alive c=256 | - |; | 47k rps | - |
+| short connections c=64 | 6.1k rps | - | 10.5k rps | - |
+| direct upstream (no proxy) | 65–72k rps | - |; | - |
+
 (56–60k / 125k measured on v0.2.0 after the hyper-optimization pass -
+ab, 10 s, keep-alive. Earlier checkpoints on the same code base and
+host: 46–48k / 103k before the pass, and 25k single-worker when
+forensic stderr prints still fired per event.)
+
+### What the optimization pass changed (profiling-led)
+
+1. **Forensic `eprintln!`s gated behind the `vane_dbg` feature**
+   (`dbg_trace!`): `RDNOW`/`ARMDbg`/`DIAL`/`ACCEPT`/shim prints fired
    per engine event; each a stderr `write(2)`. 25k → 49k rps.
+2. **Per-request tracing spans skipped unless trace export is
+   configured** (`[telemetry] otlp_endpoint`): the fmt subscriber
+   formats every span's fields (ANSI writes) then discards them.
+   ~49k → ~53k rps.
+3. **`conns: HashMap<u32, Conn>` → dense `Vec<Option<Conn>>`**
+   (`ConnMap`): dozens of per-request lookups, each a SipHash of a
    small integer; the #1 profile symbol (6.6%). ~53k → ~56k rps.
+4. **Allocation-free hot-path scans**: `head_header` lowercased every
+   header line into a fresh `Vec` (in-place ASCII-case compare now);
+   the gzip head scan only runs when the route actually compresses;
+   the rate-limit key formats into a stack buffer; the breaker gate
+   double-checks its map before allocating a key String. ~56k → ~59k.
+
 Remaining profile (round 2, post-optimization): flat; httparse
+parsing, core relay logic, the allocator spread, and timer reads
+each sit at 2–5% with no dominant hot spot; head-building
+allocations were pooled (recycled per-connection scratch) and
+throughput held at ~59.5k. Next candidates: response-head
+construction pooling on the response side, `io_uring` multishot
+accept tuning, and short-connection accept cost.
+
+Honest reading:
+
 - **vane (1 worker) now beats tuned nginx ~15%**; 56–60k vs 50–51k,
+  and 4-worker vane reaches **125k (~2.4× tuned nginx)**.
+- Single-worker throughput is ~83% of the shared `ab` client ceiling
+  (65–72k); ratios across hosts remain more meaningful than absolute
+  numbers.
+- Short connections are accept-bound; nginx's mature accept path still
+  wins there.
+
+## Reproduce
+
+```bash
+# upstream
+./stub 16082 &                     # scripts/bench stub or any keep-alive server
+# vane
+./target/release/vane run -c bench.toml &   # listeners :16080, workers 2
 # nginx (tuned): keepalive 64 upstream block
+docker run --network host -v nginx.conf:/etc/nginx/nginx.conf nginx:alpine
+ab -n 20000 -c 64 -k http://127.0.0.1:16080/
+```
+
+See `scripts/bench.sh` for the full harness.
+
+## Other measurements
+
+| Bench | Result | Requirement |
+|---|---|---|
+| HTTP/1.1 head parse | ~266 ns | `PR-01` |
+| Route lookup @ 10k routes | ~223 ns | `CP-01` |
+| SHM sidecar RTT (512 B) | ~2.8 µs | `IP-01` |
+| Config generation swap | ~1 µs | `CP-02` |
+
+(Criterion benches, dev profile.)
+
+## h3 bridge path (2026-10-02, release, 8 keep-alive connections, 8 s)
+
 `scripts/bench_bridge.sh`; same route served two ways on one near
+instance; the only difference is the cluster the route selects:
+
+| path | req/s | p50 | p99 |
+|---|---|---|---|
+| h1 cluster (baseline) | 40,276 | 177 µs | 653 µs |
+| http3 cluster (bridge → QUIC → vane h3 edge → h1) | 4,404 | 1,662 µs | 3,519 µs |
+
+The mesh-QUIC path crosses: the loopback bridge (h1 parse + channel +
+h1 write), a QUIC stream hop, the far instance's h3 edge (reqwest h1
 dial to its upstream), and one more h1 relay; ~9× the direct-h1
+cost, ~1.5 ms added per request at this concurrency.
+
+**Decision (SPSC-ring transport)**: the loopback hop is only one of
 several costs; the ring would recover a fraction of the gap, not all
+of it. Profile the QUIC-stream and edge-reqwest segments before
+building the ring transport; at 4.4k req/s per cluster the current
+shape is comfortably sufficient for mesh east-west control traffic
+and moderate data-plane loads.
+
+### After the edge fast path (2026-10-03)
+
+Profiling showed the edge's reqwest hop, not the loopback, was the
+largest segment: the h3 edge now dials plain-h1 upstreams through
+`h1pool` (prebuilt head bytes over pooled keep-alive sockets; h2
+upstreams keep reqwest).
+
+| path | req/s | p50 | p99 | vs baseline |
+|---|---|---|---|---|
+| h1 cluster (baseline) | 43,734 | 159 µs | 712 µs | 1× |
+| h3 edge direct (QUIC → edge → h1) | 22,144 | 320 µs | 1,112 µs | 2.0× |
+| http3 cluster (bridge → QUIC → edge → h1) | 7,592 | 954 µs | 2,081 µs | 5.8× |
+
+The edge-reqwest elimination recovered +45% on the edge leg and +85%
+end-to-end (the full mesh path nearly doubled). The remaining gap is
+dominated by the bridge's per-request channel hop and the QUIC stream
+segment; the ring transport decision stays deferred until the bridge
+segment is profiled in isolation.
+
+Tooling: the load generator is a purpose-built keep-alive client
 (`/tmp/opencode/loadgen`, tokio; req/s + latency percentiles); this
+environment has no `ab`/`wrk`. Same client both legs, so the delta
+isolates the bridge + QUIC cost.
+
 ## Comparative harness (2026-10-03): superseded by the 2026-10-07 run above
+
+`scripts/bench_compare.sh` runs vane vs nginx (1.27, docker) vs Caddy
+(2-alpine) vs Traefik (v3.3) on identical configs (plain + TLS
+listeners, same upstream, docker host networking) with the shared
+loadgen (h1 8/64 conns, h2, h3) and RSS sampling. Envoy v1.31 is
+documented as not measurable in this environment (its data plane
 accepts + reads requests but never responds; host and bridge
+networking, minimal direct_response config, zero log errors).
+
+Two full runs landed during load-average 28–64 windows (concurrent
+rustc builds on this host) and are DISCARDED as invalid: all proxies
+depressed 10–100×, several legs failed on client timeouts. The
+harness is committed; **numbers will be published from a quiet
 machine**; rerun is one command.
+
+One REAL finding fell out regardless: the h2 crate client stalls
+against the h3/h2 edge's h2 listener (REFUSED_STREAM on the second
 sequential stream); tracked in docs/h2-streaming-flake.md with a
+deterministic repro test. nginx/Caddy/Traefik h2 legs answered
+correctly under the same client, so this is a vane bug, not client
+noise.
+
 ## Comparative run (2026-10-03, native, load 15–24): superseded by the 2026-10-07 run above
+
 `scripts/bench_compare.sh`; vane vs Caddy 2.10.2 vs Traefik 3.3.6,
+all native processes, identical plain+TLS listeners, same upstream,
+same client, 8s legs, tiny body. nginx and Envoy are NOT included:
+this machine's docker is rootless-style and containerized proxies
+measured the network plumbing, not the proxy (nginx in docker:
 ~1k req/s at 8.5 ms p50 against a ~0.2 ms upstream; invalid); both
+ship as "requires container install" for a rerun elsewhere. Traefik's
 h2/h3 legs are "not measured" (client/config mismatch to debug; its
+h1 legs answered, so the process itself was healthy).
+
+| proxy | h1 (8) | h1 (64) | h2 (8) | h3 (8) | RSS |
+|---|---|---|---|---|---|
 | **vane 0.5.2** | **37,173** | 26,612 | **1 (bug; tracked)** | **14,151** | 467 MB |
+| Caddy 2.10.2 | 17,965 | 18,820 | **12,163** | 6,516 | 48 MB |
+| Traefik 3.3.6 | 9,534 | **27,251** | not measured | not measured | 81 MB |
+
+(All numbers from one run at load 15–24; treat small deltas as noise.
 Configs are in the script; the client is vane's loadgen; deltas are
+the claim, not absolutes.)
+
+### What the data says
+
 - **vane leads h1 at 8 connections: 2.1× Caddy, 3.9× Traefik**; the
+  epoll/io_uring relay is genuinely fast where it works.
 - **vane leads h3: 2.2× Caddy**; and vane is the only one of the
+  three with an h3 *upstream* story at all.
+- **vane's h2 is broken with standard clients** (the tracked
+  REFUSED_STREAM bug): Caddy serves 12.2k where vane serves 1. This
+  is the highest-priority fix in the project.
+- **vane scales WORSE to 64 connections** (37k → 26k, while Traefik
   climbs 9.5k → 27k); many-connection handling needs attention.
 - **vane's RSS is 6–10× the Go proxies** (467 MB vs 48/81 MB); the
+  zero-copy buffer pool preallocates per worker; a pool-size knob or
+  smaller defaults would matter for small deployments.
+
+### Positioning (data-driven)
+
+On this evidence vane is the **fastest h1/h3 per-connection proxy of
+the three on this rig**, with two clear liabilities: the h2 shim bug
+(fix in flight) and memory footprint. That supports a
 "conformance-leading, h1/h3-fast Rust edge+mesh data plane" niche -
+NOT overall market leadership, which requires the h2 fix, the
+64-connection scaling answer, the memory story, and production
+hardening none of which are done.
+
+### Corrected comparative run (2026-10-03, post h2-shim fix, quiet window)
+
+After v0.5.3 fixed the h2 edge (the REFUSED_STREAM stack), the same
+harness reruns with vane's h2 leg live:
+
+| proxy | h1 (8) | h1 (64) | h2 (8) | h3 (8) | RSS |
+|---|---|---|---|---|---|
+| **vane 0.5.3** | 43,649 | 37,164 | **32,832** | **22,559** | 636 MB |
+| Caddy 2.10.2 | 21,068 | 24,344 | 14,096 | 10,842 | 47 MB |
+| Traefik 3.3.6 | **67,210** | **132,250** | not measured | not measured | 84 MB |
+
+Data-driven position:
+
 - **vane leads h2 (2.3× Caddy) and h3 (2.1× Caddy)**; Traefik's
+  h2/h3 legs remain unmeasured (config debugging pending).
+- **Traefik leads h1, decisively at 64 connections** (132k vs vane's
+  37k): Go's scheduler handles many-connection fan-in better than
+  vane's current per-worker model. This is vane's clearest engine
+  gap.
 - **Memory: 383 MB at 32 workers ≈ 10 MB/worker; reasonable for the
+  class** (nginx workers run ~10–20 MB; Envoy workers 50 MB+). The
+  profile: ~4 MB/worker buffer pool (tunable via
+  `[runtime] pool_slots`), ~2 MB/worker event ring, ~2 MB runtime.
+  The single-process Go proxies (Caddy 42 MB, Traefik 83 MB) trade
   per-core parallelism for a smaller flat footprint; different
+  designs, both defensible; vane's number scales linearly with cores
+  by design.
+
+The pre-fix "vane h2 is broken" liability is resolved and the
+memory liability dissolved on measurement. The one remaining
+evidence-backed engine gap: **absolute h1 throughput vs Traefik**
 (1.4× at 8 conns, 2.4× at 64); targeted at the accept path
+(io_uring multishot accept) in a future round. Traefik's h2/h3 legs
+are pending client-interop debugging (curl confirms its h2/h3 work;
 the loadgen legs return 0; under investigation).
+
+### Completed comparison (2026-10-03, all legs, quiet windows)
+
+Every leg measured; Traefik's h2/h3 landed after fixing a harness
+defect (the Traefik dynamic config was not loading the benchmark
 certificate; it served its default cert, and the loadgen correctly
+rejected it; curl's `-k` had masked this during setup).
+
+| proxy | h1 (8) | h1 (64) | h2 (8) | h3 (8) | RSS |
+|---|---|---|---|---|---|
+| **vane 0.5.3 (fair)** | 43,805 | 43,076 | **33,106** | **20,697** | 383 MB |
+| Caddy 2.10.2 | 16,907 | 19,458 | 12,150 | 9,224 | 42 MB |
+| Traefik 3.3.6 | **59,586** | **103,754** | 15,707 | 12,477 | 83 MB |
+
+**vane leads h2 (2.1× Traefik, 2.7× Caddy) and h3 (1.7× Traefik,
+2.2× Caddy).** Traefik leads h1 (1.4× at 8 conns, 2.4× at 64).
+vane's RSS is highest (by-design per-core pools; tunable).
+
+### Fair-config correction (2026-10-03, quiet window)
+
+The prior comparative run handicapped vane (`workers = 1`,
 `force_mio = true`; a single mio thread vs Traefik's all-core
+defaults), violating this document's own methodology rule. Corrected
 config (workers = cores, io_uring backend); the 64-connection "gap"
+was a bench artifact:
+
+| proxy | h1 (8) | h1 (64) | h2 (8) | h3 (8) | RSS |
+|---|---|---|---|---|---|
+| **vane 0.5.3 (fair)** | 43,805 | 43,076 | **33,106** | **20,697** | 383 MB |
+| Caddy 2.10.2 | 16,907 | 19,458 | 12,150 | 9,224 | 42 MB |
+| Traefik 3.3.6 | **59,586** | **103,754** | not measured | not measured | 83 MB |
+
+- vane's h1 now sustains flat 8→64 connections (43.8k → 43.1k, no
   drop); the worker model scales as designed.
 - Traefik still leads absolute h1 (1.4× at 8 conns, 2.4× at 64) -
+  the remaining real engine gap, targeted at the accept path.
+- vane leads h2 (2.7×) and h3 (2.2×).
+- RSS improved to 383 MB under the fair config (the 1-worker config
   was memory-INEFFICIENT as well); still ~4.6× Caddy; profiling
+  next.
+
+### Interleaved comparison (2026-10-04, window 1 of 3)
+
+`scripts/bench_compare.sh` now runs all three proxies simultaneously
+and cycles proxy x leg across three windows, publishing per-leg
+MEDIANS (single-window spikes from this host's external build storms
+are filtered by construction; the per-window raw file is kept).
+Load 182 storms prevented windows 2–3 from completing today; window
+1 is complete with all 12 legs at non200 = 0:
+
+| proxy | h1 (8) | h1 (64) | h2 (8) | h3 (8) |
+|---|---|---|---|---|
+| **vane 0.5.5** | **42,132** | **81,294** | 18,013 | **23,342** |
+| Caddy 2.10.2 | 17,264 | 31,675 | 14,472 | 10,644 |
+| Traefik 3.3.6 | 27,260 | 48,145 | **16,942** | 13,235 |
+
+- **vane leads every leg in the complete window**: h1-8 (1.5×
+  Traefik, 2.4× Caddy), h1-64 (1.7× / 2.6×), h3 (1.8× / 2.2×).
 - The h2 leg vs Traefik is the CLOSEST (18.0k vs 16.9k = 1.07×) -
+  Traefik's Go h2 stack is competitive; vane's edge is thinner here
+  than elsewhere.
 - vane scales +93% from 8 to 64 connections (h1); the fair-config
+  worker model sustains fan-in.
+- Medians across 3 clean windows are the eventual bar; window 1 is
+  the first complete dataset. The per-window raw file + harness make
+  every number reproducible.
+
+(The 2026-10-03 runs below used sequential per-proxy sections and a
 GIL-capped Python upstream; superseded by this interleaved harness,
+though their vane numbers were confirmed in-window here.)
+
+Two rig defects invalidated the earlier runs and are now fixed:
+(1) the threaded-Python upstream's GIL capped the whole rig at
+~56k req/s (any proxy number near or above that was upstream-bound
 or error-noise; Traefik's earlier "132k" was error responses
+counted as throughput); (2) the loadgen counted every parsed
+response as throughput, including proxy errors. Both fixed: the
+upstream is now tokio (ceiling 111k@8 / 215k@128 conns), and every
+client leg reports its non-200 count.
+
+| proxy | h1 (8) | h1 (64) | h2 (8) | h3 (8) | RSS |
+|---|---|---|---|---|---|
+| **vane 0.5.3** | **49,918** | **82,522** | **34,012** | **22,125** | 378 MB |
+| Caddy 2.10.2 | 22,191 | 33,288 | 14,330 | 11,494 | 33 MB |
+| Traefik 3.3.6 | 29,103 | 55,087 | 18,238 | 14,028 | 69 MB |
+
+Every leg: non200 = 0 (all responses were genuine proxy→upstream
+200s). Run window load 4–12.
+
+**On this rig, with this workload, with all responses verified:
 vane is the fastest of the three on every protocol**; h1 1.5–2.3×,
 h2 1.9–2.4×, h3 1.6–1.9×; with the lowest p50 on every leg, and
+h1 that SCALES with connections (49.9k@8 → 82.5k@64). Memory is the
 standing tradeoff (378 MB vs 33/69 MB; per-core pools, tunable,
+documented above). Traefik's h2/h3 legs were only measurable after
+fixing a harness defect (its dynamic config was not loading the
+benchmark certificate).
+
+### Hot-path profile (2026-10-04, perf, 64 conns)
+
+`perf record` on the h1 relay (41k samples, line tables in release):
+
+| cost | share | note |
+|---|---|---|
+| worker loop (inlined relay) | ~8% | the relay itself |
+| io_uring submit/complete | ~7% | the engine |
+| request handling + upstream intake | ~10% | h1 dispatch |
+| **malloc/free** | ~9% | per-request allocations (head clones, inject vecs, ctx) |
+| **clock reads (vdso)** | ~4.7% | deadline + metrics timestamping |
+| rate limit + breaker | 2% → ~0.3% | rate limit now opt-in (fixed) |
+| httparse | ~3% | |
+
 **Landed**: rate limiting is opt-in; `None` short-circuits the
+per-request GCRA check entirely (it previously ran with placeholder
+1M-rps limits, costing ~2% for a disabled feature). Profile delta
+confirmed (RateLimit out of the top symbols).
+
 **Landed (2026-10-04)**: the dial-path head clones are gone; the
+h1/h2c upstream dial now takes the connection buffer (capacity
+preserved across the transaction) instead of cloning head+inline-body
+per request. Measured on the fair-config shape: h1 45.5k/43.9k
+(+2-4%), RSS -4% on the TLS shape / -41% on the plain shape.
+**Landed (2026-10-04, tranche 2)**: req_host/req_path/upstream_path
 are reusable buffers (clear+push_str / take+restore; capacity
+amortized across transactions). RSS on the plain shape: 225 → 205 MB;
+throughput unchanged within noise (allocation savings are latency/CPU,
+not throughput, at this concurrency). Remaining: inject-vec strings,
+access-record churn; clock-read coalescing (~4.7%).
