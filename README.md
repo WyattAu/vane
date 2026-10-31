@@ -9,7 +9,7 @@
   build; surfaced as EAFNOSUPPORT storms) and an IPv4 byte-order slip
 - Upstream HTTP/2 and HTTP/3 (frontend h2/h3 terminate to HTTP/1.1) -
 Measured on the repository's criterion benches (dev profile; release builds
-| Keep-alive pool (opt-in) | 1 upstream conn across 5 sequential requests |; |
+| Keep-alive pool (opt-in) | 1 upstream conn across 5 sequential requests | - |
 connection reuse is the dominant lever; the same upstream serves
 completed request; see [docs/config.md](docs/config.md).
 | `post-quantum` | aws-lc-rs provider with X25519MLKEM768 leading the key-exchange list; [docs/post-quantum.md](docs/post-quantum.md) |

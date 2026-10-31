@@ -20,7 +20,7 @@ within hours to leave real margin; at the 2/3 point the hourly loop
 | `max_limit` | int | `200` | ceiling; the gradient never grows past this |
 ## `[access_log]`: request logging
 ## `[rate_limit]`: process-wide rate limiting
-| `rps` | int |; | sustained requests/second (aggregate) |
+| `rps` | int | - | sustained requests/second (aggregate) |
 ## `[jwt]`: bearer authentication
 changes; rotate keys without restart.
 ## cluster `compression`: response gzip
