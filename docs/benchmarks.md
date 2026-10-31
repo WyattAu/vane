@@ -20,9 +20,9 @@ this (added in 0.8.0); measured vane-only on this same leg, same host,
 ## vane 0.13.0: pool telemetry under load (2026-10-17)
 1,236,283, `vane_upstream_pool_misses_total` 94,394; a **92.9%
 (median of 3); the pool changes are throughput-neutral within the
-| keep-alive c=256 | - | - | 47k rps | - |
-| short connections c=64 | 6.1k rps | - | 10.5k rps | - |
-| direct upstream (no proxy) | 65–72k rps | - | - | - |
+| keep-alive c=256 |; |; | 47k rps |; |
+| short connections c=64 | 6.1k rps |; | 10.5k rps |; |
+| direct upstream (no proxy) | 65–72k rps |; |; |; |
 (56–60k / 125k measured on v0.2.0 after the hyper-optimization pass -
    per engine event; each a stderr `write(2)`. 25k → 49k rps.
    small integer; the #1 profile symbol (6.6%). ~53k → ~56k rps.
