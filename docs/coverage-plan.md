@@ -1,99 +1,15 @@
-# Tier A coverage closure — work plan
-
-**STATUS (2026-10-11): the bar is met.** quality/coverage reads
-**90.19%** on commit `dafed7fb` and every CI job is green — the first
-fully-green run since the gate started measuring honestly. This
-document stays as the arc: what was dark, what closed it, and the rules
-that got it there.
-
-What actually closed the last ~780 lines was not coverage-chasing but
-the defects the dark lines were hiding:
-
-- **Tunnel bytes coalesced with the 101 head were dropped**
-  (`relay_body` had no Tunnel arm — the catch-all relayed nothing).
-  Invisible on loopback with separate writes; CI's slower runners
-  coalesced the segments and the byte-exact tunnel test failed there.
-  `relay_body` now relays tunnels like chunked, and
-  `upgrade_with_coalesced_tunnel_bytes_loses_nothing` pins the case
-  deterministically (head + first data bytes in ONE write).
-- **The h1 circuit breaker could not see its own failures**: clean EOF
-  before a response head counted as nothing; the gate was per-worker so
-  a dead backend cost `threshold × workers` failures to trip; and
-  breaker 1.0's 5-streak/30 s policy turned a sub-second backend blip
-  into half a minute of hard 503s once the gate was shared. Fixed in
-  all three places; the chaos SLO was rewritten to what a breaker
-  legitimately promises.
-- **RFC 9218**: `SETTINGS_NO_RFC7540_PRIORITIES` values > 1 were
-  silently ignored (must be PROTOCOL_ERROR); the setting is now
-  validated and declared once in our first SETTINGS frame — without a
-  public-enum variant, which cargo-semver-checks correctly flagged as
-  breaking.
-- Real test coverage landed where the dark lines pointed: the h3→h2
-  relay (the only QUIC-meets-HTTP/2 path), the ACME issuance flow
-  against an in-process mock CA that verifies our JWS like a server,
-  `strip_prefix` rewriting observed on the upstream wire, SPIFFE chain
-  extension, the kernel h2 credit oracles, xDS LDS/EDS/SDS decode plus
-  the NACK branch, and startup failure contracts.
-
-The historical gap table below is kept for the record but is stale —
-the live number is the CI job.
-
----
-
-The coverage gate finally measures honestly (see the history below) and
-reports **87.84% vs the 90% Tier A bar** — a gap of ~780 lines. This
-document is the arc: where the misses are, and the test each needs.
-
-Measured 2026-10-08, quality/coverage (unfiltered, the honest run).
-
-## Where the misses are
-
-| File | Missed | Cover | What's dark |
-|---|---|---|---|
-| vane/src/proxy.rs | 738 | 81.5% | relay edge paths (audit with line data next) |
-| vane-kernel/src/h2/connection.rs | 324 | 83.4% | engine h2 error/flow paths |
-| vane/src/h2_server.rs | 318 → 180* | 68% | protocol edges — see the targeted list below |
-| vane/src/main.rs | ~220 | — | xds-client loop, sidecar bridge, watch-mode operator |
-| vane/src/h3_edge.rs | 246 | 64.4% | h3 edge paths (h3 tests now run in coverage) |
-| vane-control/src/acme.rs | 211 | 85.1% | renewal loop, HTTP-01 serving |
-| vane/src/server.rs | 193 | 89.3% | startup/hot-reload edges |
-| vane-control/src/providers/k8s.rs | ~150 | — | watch/spawn loop (list_routes now covered) |
-| vane/src/xds_client.rs | 186 | 67% | ADS client loop (xds-interop covers it; separate workflow) |
-
-\* after the targeted h2 run below; local llvm-cov on the h2 suites.
-
-## h2_server.rs — the precise dark list (from lcov, 2026-10-08)
-
-All unit-testable against the `H2Server` state machine directly
-(`handle_read` → events; `response_bytes` → frames), the same way
-`h2_upstream_boundary_sweep` drives it:
-
-1. `maybe_probe_stall` (132–143): stall detection — never driven.
-2. `conn_debug_windows`/`conn_error_code` (152–160): accessors — cover
-   via a connection-error scenario.
-3. RST_STREAM send path (206–210): protocol violation → reset.
-4. `request_content_length` partial-head cases (230–260).
-5. Multi-frame body emission (268–296): `body_remaining` partial takes —
-   responses larger than `max_frame` split across DATA frames.
-6. `Event::Trailers` (299–313): upstream trailers → h2 trailers frame.
-7. `H2Event::SendCredit` (319): window credit returned to the client.
-
-## Ground rules for this arc
-
-- Every test asserts protocol bytes, not just "no panic".
-- No skipping: `--skip` filters in the coverage invocation are gone (the
-  last one silently measured two suites — cargo-llvm-cov eats libtest
-  `--skip` flags and keeps the values as run-only filters).
-- The bar stays at 90. If the gap closes slower than the code grows,
-  the honest signal is a red gate, not a lower bar.
-
-## History (why this arc exists)
-
-- The coverage numbers were untrustworthy twice over: `shutdown_after`
-  dead code (Sep 26) hung the quality jobs so they never reported; and
-  rust-cache served stale instrumented binaries to the coverage job so
-  even a completed run measured last week's code.
-- The shared quality/coverage job (unfiltered) is the source of truth:
-  87.84% is the honest baseline. The `ci.yml` coverage job now runs
-  unfiltered too (its `--skip` args were being mangled into run-only
-  filters — it measured two suites).
+# Tier A coverage closure: work plan
+**90.19%** on commit `dafed7fb` and every CI job is green; the first
+  (`relay_body` had no Tunnel arm; the catch-all relayed nothing).
+  validated and declared once in our first SETTINGS frame; without a
+The historical gap table below is kept for the record but is stale -
+reports **87.84% vs the 90% Tier A bar**; a gap of ~780 lines. This
+| vane/src/h2_server.rs | 318 → 180* | 68% | protocol edges; see the targeted list below |
+| vane/src/main.rs | ~220 |; | xds-client loop, sidecar bridge, watch-mode operator |
+| vane-control/src/providers/k8s.rs | ~150 |; | watch/spawn loop (list_routes now covered) |
+## h2_server.rs: the precise dark list (from lcov, 2026-10-08)
+1. `maybe_probe_stall` (132–143): stall detection; never driven.
+2. `conn_debug_windows`/`conn_error_code` (152–160): accessors; cover
+5. Multi-frame body emission (268–296): `body_remaining` partial takes -
+  last one silently measured two suites; cargo-llvm-cov eats libtest
+  filters; it measured two suites).
