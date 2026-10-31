@@ -45,7 +45,7 @@ benchmarked against:
    exact latency spike pools exist to prevent. Worse, the dead fd
    stayed parked forever on quiet backends.
 3. **Cap-based eviction without reaping.** A burst that filled the
-   pool pushed out connections arbitrarily (Vec::pop of the freshest : but expired entries below were never reclaimed until a checkout
+   pool pushed out connections arbitrarily (Vec::pop of the freshest: but expired entries below were never reclaimed until a checkout
    walked them), so quiet periods left full pools of dead fds, and
    the next burst found nothing alive to reuse.
 
@@ -304,7 +304,7 @@ deficit; this is the profile evidence the verdict needed.
 
 And a measurement-hygiene data point from the same hour: the
 identical binary measured 12.4-15.3k rps at "load 7 with finishing
-builds in the ps output" and 17.3-18.9k rps at true quiet (load 5-6) : a ~25% swing that load average alone did not predict. Cross-window
+builds in the ps output" and 17.3-18.9k rps at true quiet (load 5-6): a ~25% swing that load average alone did not predict. Cross-window
 comparisons on this host need equal-quiet windows, and the earlier
 12.4k median was NOT the binary's number.
 
@@ -391,7 +391,7 @@ slot never armed, and every request on the connection failed. The
 flag now resets at all three dial/attach sites. The guard is
 per-DIAL because the double-delivery it prevents is per-dial too
 (inline Done + CQE + deferred queue). Caught by
-`config_hot_reload_under_concurrent_load` failing under storm load : a test that also got hardened: its `total > 100` throughput floor
+`config_hot_reload_under_concurrent_load` failing under storm load: a test that also got hardened: its `total > 100` throughput floor
 became a ran-at-all sanity check (the reload contract; ZERO
 failures across the live swap; is unchanged), because a storm-
 loaded host completes fewer hammer iterations and that says nothing
