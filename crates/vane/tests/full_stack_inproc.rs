@@ -193,7 +193,6 @@ enabled = true
 
 [runtime]
 force_mio = true
-workers = 1
 "#
     ));
 
@@ -277,7 +276,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#
     ));
 
@@ -331,7 +329,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#,
         cert_path.display(),
         key_path.display()
@@ -448,7 +445,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#,
         cert_path.display(),
         key_path.display()
@@ -544,7 +540,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 pool_per_backend = 0
 "#
     ));
@@ -622,7 +617,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#
     ));
     let _server_guard_6 = spawn_proxy(cfg);
@@ -662,7 +656,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#
     ));
     let _server_guard_7 = spawn_proxy(cfg);
@@ -719,7 +712,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#
     ));
     let _server_guard_8 = spawn_proxy(cfg);
@@ -775,7 +767,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 first_byte_timeout_ms = 400
 "#
     ));
@@ -821,7 +812,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 idle_timeout_ms = 300
 "#
     ));
@@ -885,7 +875,6 @@ domain = "probe.test"
 
 [runtime]
 force_mio = true
-workers = 1
 "#,
         storage.display()
     ));
@@ -952,7 +941,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#
     ));
     let _server_guard_12 = spawn_proxy(cfg);
@@ -990,7 +978,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 connect_timeout_ms = 400
 "#
     ));
@@ -1042,7 +1029,6 @@ path = "/nonexistent-dir-vane/access.jsonl"
 
 [runtime]
 force_mio = true
-workers = 1
 "#
     ));
     let _server_guard_14 = spawn_proxy(cfg);
@@ -1132,7 +1118,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#
     ));
     let _server_guard_15 = spawn_proxy(cfg);
@@ -1247,7 +1232,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#
     ));
     let _server_guard_16 = spawn_proxy(cfg);
@@ -1361,7 +1345,6 @@ otlp_endpoint = "http://{otlp_addr}/v1/traces"
 
 [runtime]
 force_mio = true
-workers = 1
 "#
     ));
     // NOTE: the proxy runs as a real CHILD PROCESS (not in-process):
@@ -1420,14 +1403,8 @@ workers = 1
     if !saw_trace {
         let guard = bodies.lock().unwrap_or_else(|e| e.into_inner());
         for (i, body) in guard.iter().enumerate() {
-            let hex: String = body
-                .iter()
-                .rev()
-                .take(120)
-                .rev()
-                .map(|b| format!("{b:02x}"))
-                .collect();
-            eprintln!("body[{i}] len={} tail_hex={hex}", body.len());
+            let hex: String = body.iter().map(|b| format!("{b:02x}")).collect();
+            eprintln!("body[{i}] len={} full_hex={hex}", body.len());
         }
         if let Ok(text) = std::fs::read_to_string(&child_log) {
             eprintln!(
@@ -1492,7 +1469,6 @@ path = "{plugin_path}"
 
 [runtime]
 force_mio = true
-workers = 1
 "#
     ));
 
@@ -1565,7 +1541,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#
     ));
     let _server_guard_18 = spawn_proxy(cfg);
@@ -1678,7 +1653,6 @@ secret_path = "{secret_path}"
 
 [runtime]
 force_mio = true
-workers = 1
 "#
     ));
 
@@ -1734,7 +1708,6 @@ burst = 5
 
 [runtime]
 force_mio = true
-workers = 1
 "#
     ));
     let _server_guard_20 = spawn_proxy(cfg);
@@ -1813,7 +1786,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#
     ));
     let _server_guard_21 = spawn_proxy(cfg);
@@ -1856,6 +1828,13 @@ workers = 1
                 }
             }
         }
+        // END_STREAM must terminate the stream, not the connection close:
+        // a gzipped response has no Content-Length for the peer to frame
+        // it with, so without END_STREAM the response is a broken stream.
+        assert!(
+            h2up.response_complete(),
+            "gzip h2 response ended without END_STREAM"
+        );
         let head = String::from_utf8_lossy(&got_head.expect("response head")).into_owned();
         assert!(
             head.to_lowercase().contains("content-encoding: gzip"),
@@ -1928,7 +1907,6 @@ address = "127.0.0.1:{admin}"
 
 [runtime]
 force_mio = true
-workers = 1
 "#,
         cert_a.display(),
         key_a.display()
@@ -2084,7 +2062,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#,
         srv_cert_p.display(),
         srv_key_p.display(),
@@ -2270,7 +2247,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#,
         srv_cert_p.display(),
         srv_key_p.display(),
@@ -2447,7 +2423,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#,
         srv_cert_p.display(),
         srv_key_p.display(),
@@ -2498,7 +2473,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#,
         srv_cert_p.display(),
         srv_key_p.display(),
@@ -2602,7 +2576,6 @@ address = "127.0.0.1:{admin}"
 
 [runtime]
 force_mio = true
-workers = 1
 "#,
         cert_a.display(),
         key_a.display()
@@ -2743,7 +2716,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#,
         cert_path.display(),
         key_path.display()
@@ -2858,7 +2830,6 @@ enabled = false
 
 [runtime]
 force_mio = false
-workers = 1
 "#
         ),
     )
@@ -2902,7 +2873,6 @@ enabled = false
 
 [runtime]
 force_mio = false
-workers = 1
 "#
         ),
     )
@@ -2922,7 +2892,285 @@ workers = 1
     assert!(get(proxy).contains("new"), "post-reload steady state");
 }
 
+/// Hot-reload UNDER LOAD: the existing reload test swaps configs while
+/// the proxy is quiescent, which is not when swaps happen. In
+/// production the table is replaced while relays are mid-flight, and
+/// the invisible-defect question is what those relays see: a route Arc
+/// snapshot per connection should make the swap invisible (old
+/// connections finish on the old route, new ones pick the new route) —
+/// but only a concurrent stream can catch a torn swap. Every request
+/// must complete with a whole body from either backend; nothing may
+/// error, hang, or mix; and the stream must converge to the new
+/// backend.
+#[test]
+fn config_hot_reload_under_concurrent_load() {
+    let _serial = lock_serial();
+    let up_old = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let old_addr = up_old.local_addr().expect("addr");
+    let up_new = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let new_addr = up_new.local_addr().expect("addr");
+    for (l, tag) in [(&up_old, "old"), (&up_new, "new")] {
+        let l = l.try_clone().expect("clone");
+        std::thread::spawn(move || {
+            for stream in l.incoming().flatten() {
+                // Keep-alive loop: the hammers hold one connection each
+                // and stream requests across the reloads.
+                std::thread::spawn(move || {
+                    let mut s = stream;
+                    let mut req = Vec::new();
+                    let mut byte = [0u8; 1];
+                    loop {
+                        // Read one request head.
+                        req.clear();
+                        loop {
+                            match s.read(&mut byte) {
+                                Ok(0) | Err(_) => return,
+                                Ok(_) => req.push(byte[0]),
+                            }
+                            if req.ends_with(b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        // A body large enough that responses straddle
+                        // reads; a torn swap would show up as a partial
+                        // body.
+                        let body = format!("{tag}-{}", "x".repeat(2048));
+                        let r = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: keep-alive\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if s.write_all(r.as_bytes()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    let port = free_port();
+    let dir = tempfile::tempdir().expect("dir");
+    let path = dir.path().join("vane.toml");
+    let cfg = |backend: &str| {
+        format!(
+            r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+workers = 2
+
+[clusters.up]
+backends = ["{backend}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = false
+"#
+        )
+    };
+    std::fs::write(&path, cfg(&old_addr.to_string())).expect("write");
+
+    let _server_guard = spawn_proxy(path.to_str().expect("utf8").to_owned());
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    // 4 hammer threads, keep-alive, continuous.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let failures: std::sync::Arc<std::sync::atomic::AtomicUsize> = Default::default();
+    let requests: std::sync::Arc<std::sync::atomic::AtomicUsize> = Default::default();
+    let mut hammers = Vec::new();
+    // `proxy: SocketAddr` is Copy — each hammer owns its own value; no
+    // clone (a clone() here trips clippy's copy-clone lint under -D
+    // warnings).
+    for _ in 0..4 {
+        let stop = std::sync::Arc::clone(&stop);
+        let failures = std::sync::Arc::clone(&failures);
+        let requests = std::sync::Arc::clone(&requests);
+        hammers.push(std::thread::spawn(move || {
+            let mut s = std::net::TcpStream::connect(proxy).expect("connect");
+            s.set_nodelay(true).ok();
+            s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .ok();
+            let mut buf = [0u8; 16 * 1024];
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if s.write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: keep-alive\r\n\r\n")
+                    .is_err()
+                {
+                    failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+                // Read exactly one response: head, then content-length
+                // body bytes.
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                loop {
+                    match s.read(&mut byte) {
+                        Ok(0) | Err(_) => {
+                            failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+                        Ok(_) => head.push(byte[0]),
+                    }
+                    if head.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                if !head.starts_with(b"HTTP/1.1 200") {
+                    failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+                let clen: usize = String::from_utf8_lossy(&head)
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:").map(str::trim_start))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let mut remaining = clen;
+                while remaining > 0 {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => {
+                            failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+                        Ok(n) => remaining -= n.min(remaining),
+                    }
+                }
+                requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }));
+    }
+
+    // Reload twice while the hammers run: backend swap, then a full
+    // route-table rewrite (new cluster name, same backends).
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    std::fs::write(&path, cfg(&new_addr.to_string())).expect("rewrite 1");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    std::fs::write(
+        &path,
+        cfg(&new_addr.to_string())
+            .replace("[clusters.up]", "[clusters.up2]")
+            .replace("cluster = \"up\"", "cluster = \"up2\""),
+    )
+    .expect("rewrite 2");
+
+    // Let the reloads apply under load, then stop.
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for h in hammers {
+        h.join().expect("hammer");
+    }
+
+    assert_eq!(
+        failures.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "no request may fail across a live table swap"
+    );
+    let total = requests.load(std::sync::atomic::Ordering::Relaxed);
+    // The contract is ZERO failures across the live swap; the request
+    // count is only a sanity check that the stream ran. It is deliberately
+    // not a throughput floor: on a storm-loaded host the hammers complete
+    // fewer iterations, and that says nothing about reload correctness.
+    assert!(
+        total > 0,
+        "the stream did not run at all ({total} requests)"
+    );
+
+    // Convergence: the new backend serves after the swap settles.
+    let get = |proxy: std::net::SocketAddr| -> String {
+        let mut s = std::net::TcpStream::connect(proxy).expect("connect");
+        s.write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+            .expect("write");
+        let mut r = String::new();
+        s.read_to_string(&mut r).expect("read");
+        r
+    };
+    let mut converged = false;
+    for _ in 0..40 {
+        if get(proxy).contains("new-") {
+            converged = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    assert!(converged, "reload applies under load");
+}
+
 /// Per-route retries: one upstream that 500s its first two hits then
+/// Retry-to-a-DIFFERENT-backend: backend 1 refuses connections (dial
+/// failure, not a 5xx); the retry policy must pick_except the dead
+/// backend and succeed on backend 2. Covers the balancer's
+/// except-on-retry path, which the single-backend 5xx test cannot
+/// reach.
+#[test]
+fn retry_dials_a_different_backend_on_connect_failure() {
+    let _serial = lock_serial();
+    // Backend 1: closed port (dial refused). Backend 2: serves "alive".
+    let dead_port = free_port(); // nothing binds it
+    let up2 = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let alive_addr = up2.local_addr().expect("addr");
+    let l = up2.try_clone().expect("clone");
+    std::thread::spawn(move || {
+        for stream in l.incoming().flatten() {
+            let mut s = stream;
+            let mut b = [0u8; 4096];
+            let _ = s.read(&mut b);
+            let _ = s.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nalive",
+            );
+        }
+    });
+
+    let port = free_port();
+    let dir = tempfile::tempdir().expect("dir");
+    let path = dir.path().join("vane.toml");
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.up]
+backends = ["127.0.0.1:{dead_port}", "{alive_addr}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+retry = {{ max_attempts = 3 }}
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = false
+"#
+        ),
+    )
+    .expect("write");
+
+    let _server_guard_r = spawn_proxy(path.to_str().expect("utf8").to_owned());
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    let get = |proxy: std::net::SocketAddr| -> String {
+        let mut s = std::net::TcpStream::connect(proxy).expect("connect");
+        s.write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+            .expect("write");
+        let mut r = String::new();
+        s.read_to_string(&mut r).expect("read");
+        r
+    };
+    let resp = get(proxy);
+    assert!(
+        resp.contains("200") && resp.contains("alive"),
+        "the retry must land on the live backend: {resp}"
+    );
+}
+
 /// 200s forever. With `retry = { max_attempts = 3, retry_5xx = true }`
 /// the third attempt must surface "recovered".
 #[test]
@@ -2979,7 +3227,6 @@ enabled = false
 
 [runtime]
 force_mio = false
-workers = 1
 "#
         ),
     )
@@ -3084,7 +3331,6 @@ enabled = false
 
 [runtime]
 force_mio = false
-workers = 1
 "#
         ),
     )
@@ -3116,5 +3362,293 @@ workers = 1
     assert!(
         captured.contains("GET /m"),
         "the shadow cluster received the mirrored request: {captured:?}"
+    );
+}
+
+/// `strip_prefix` path rewriting, all three branches: a prefix that
+/// strips to a path (`/api/data` -> `/data`), a prefix that strips to
+/// nothing (`/api` -> `/`), and a path that does not carry the prefix
+/// (forwarded unchanged). The upstream echoes the request line so the
+/// rewrite is observed on the wire, not inferred.
+#[test]
+fn strip_prefix_rewrites_the_upstream_path() {
+    let _serial = lock_serial();
+    // Upstream echoes the request target on every request.
+    let upstream = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let upstream_addr = upstream.local_addr().expect("addr");
+    let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in upstream.incoming().flatten() {
+            let mut s = stream;
+            let mut buf = [0u8; 8192];
+            let Ok(n) = s.read(&mut buf) else { continue };
+            let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let target = req
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("")
+                .to_owned();
+            sink.lock().expect("seen").push(target.clone());
+            let body = format!("upstream-saw:{target}");
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = s.write_all(head.as_bytes());
+            let _ = s.write_all(body.as_bytes());
+        }
+    });
+
+    let port = free_port();
+    let (_dir, cfg) = temp_config(format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.up]
+backends = ["{upstream_addr}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+strip_prefix = "/api"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = false
+"#
+    ));
+    let _server_guard = spawn_proxy(cfg);
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    let get = |target: &str| -> String {
+        let mut s = std::net::TcpStream::connect(proxy).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        s.write_all(
+            format!("GET {target} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .expect("write");
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        out
+    };
+
+    // Strips to a path.
+    let resp = get("/api/data");
+    assert!(
+        resp.contains("upstream-saw:/data"),
+        "prefix stripped: {resp}"
+    );
+    // Strips to nothing: the upstream still gets an absolute path.
+    let resp = get("/api");
+    assert!(resp.contains("upstream-saw:/"), "bare prefix -> /: {resp}");
+    // No match: forwarded untouched.
+    let resp = get("/other/thing");
+    assert!(
+        resp.contains("upstream-saw:/other/thing"),
+        "non-matching path passes through: {resp}"
+    );
+    // The health checker's TCP probe also lands here (connect, no
+    // bytes), so filter to the requests that carried a target.
+    let targets: Vec<String> = seen
+        .lock()
+        .expect("seen")
+        .iter()
+        .filter(|t| !t.is_empty())
+        .cloned()
+        .collect();
+    assert_eq!(
+        targets,
+        vec![
+            "/data".to_owned(),
+            "/".to_owned(),
+            "/other/thing".to_owned()
+        ],
+        "the upstream saw exactly the three rewritten targets"
+    );
+}
+
+/// Circuit breaker over the h1 relay: repeated dial failures trip the
+/// cluster breaker, and the next request is answered AT THE EDGE with
+/// 503 "circuit open" instead of dialing a backend that is known bad.
+/// Without this, a dead backend costs every request a failed dial.
+#[test]
+fn h1_breaker_opens_after_repeated_dial_failures() {
+    let _serial = lock_serial();
+    // The upstream ACCEPTS (so the health checker's TCP probe passes and
+    // the backend stays in rotation), READS the request, then closes
+    // without answering: "backend dropped the request". That counts as
+    // an upstream failure, so sustained occurrences trip the cluster
+    // breaker and later requests are answered at the EDGE.
+    let connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let upstream = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let upstream_addr = upstream.local_addr().expect("addr");
+    let counter = Arc::clone(&connects);
+    std::thread::spawn(move || {
+        for mut stream in upstream.incoming().flatten() {
+            let mut buf = [0u8; 1024];
+            // Count only connections that actually carried a request:
+            // the health checker's TCP probe connects without sending
+            // anything and must not count as upstream work.
+            if stream.read(&mut buf).unwrap_or(0) > 0 {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    });
+
+    let port = free_port();
+    let (_dir, cfg) = temp_config(format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+workers = 1
+
+[clusters.up]
+backends = ["{upstream_addr}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = false
+# No upstream keep-alive: every request dials fresh, so the failure is
+# always "request sent, backend closed" rather than "pooled connection
+# died while idle" (a normal pool event, not an upstream failure).
+pool_per_backend = 0
+"#
+    ));
+    let _server_guard = spawn_proxy(cfg);
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    let mut tripped = None;
+    for i in 0..80 {
+        let before = connects.load(std::sync::atomic::Ordering::Relaxed);
+        let resp = request(
+            proxy,
+            b"GET /data HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        );
+        if resp.contains("503") {
+            // Wire proof the 503 was decided at the edge: the rejected
+            // request never opened a connection upstream.
+            let after = connects.load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                after, before,
+                "an open breaker answers without dialing the backend"
+            );
+            tripped = Some((i, resp));
+            break;
+        }
+        assert!(
+            resp.contains("502"),
+            "a dropped request surfaces as 502 until the breaker trips: {resp}"
+        );
+    }
+    let (i, resp) = tripped.expect("breaker opened within 80 requests");
+    assert!(i > 0, "requests reach the upstream before it trips");
+    assert!(
+        resp.contains("503"),
+        "an open breaker answers at the edge with 503: {resp}"
+    );
+}
+
+/// Smuggling defense (Akamai CVE-2025-66373 class): a client whose
+/// chunked request body violates the grammar (an invalid chunk size)
+/// gets the connection CLOSED — the tail bytes are never parsed as a
+/// new request, which is the desync primitive. The upstream receives
+/// exactly what the client sent (verbatim relay) and may reject it on
+/// its own terms; vane's job is to not reuse either connection.
+#[test]
+fn malformed_chunked_request_closes_the_connection() {
+    let _serial = lock_serial();
+    // Upstream that ECHOES each request line it received, so we can
+    // observe exactly what was relayed.
+    let upstream = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let upstream_addr = upstream.local_addr().expect("addr");
+    let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in upstream.incoming().flatten() {
+            let mut s = stream;
+            let sink = Arc::clone(&sink);
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                let Ok(n) = s.read(&mut buf) else { return };
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                sink.lock().expect("seen").push(req);
+                let _ = s.write_all(
+                    b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                );
+            });
+        }
+    });
+
+    let port = free_port();
+    let (_dir, cfg) = temp_config(format!(
+        r#"
+[[listeners]]
+address = "127.0.0.1:{port}"
+
+[clusters.up]
+backends = ["{upstream_addr}"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+
+[admin]
+enabled = false
+
+[runtime]
+force_mio = false
+"#
+    ));
+    let _server_guard = spawn_proxy(cfg);
+    let proxy: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    wait_bound(proxy);
+
+    // POST with an invalid chunk size line ("zz" is not hex) followed
+    // by a smuggled request: vane must close instead of parsing the
+    // smuggled request.
+    let mut c = std::net::TcpStream::connect(proxy).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    c.write_all(
+        b"POST /data HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nzz\r\nGET /smuggled HTTP/1.1\r\nHost: t\r\n\r\n",
+    )
+    .expect("write");
+    let mut out = Vec::new();
+    let _ = c.read_to_end(&mut out);
+    // The connection is closed (EOF) rather than serving the smuggled
+    // request as a second transaction.
+    let _ = c.shutdown(std::net::Shutdown::Both);
+
+    // The invariant: the smuggled request never becomes its own
+    // upstream transaction. Whether the head reached the upstream
+    // before the close depends on read segmentation (head+body in one
+    // read → nothing forwarded; split reads → the head went out and
+    // only the malformed tail was dropped) — BOTH are safe outcomes.
+    let reqs: Vec<String> = seen
+        .lock()
+        .expect("seen")
+        .iter()
+        .filter(|r| !r.is_empty())
+        .cloned()
+        .collect();
+    assert!(
+        reqs.iter().all(|r| !r.contains("GET /smuggled")),
+        "the smuggled request must never be a separate transaction: {reqs:?}"
+    );
+    assert!(
+        reqs.len() <= 1,
+        "at most the head ever reached upstream: {reqs:?}"
     );
 }

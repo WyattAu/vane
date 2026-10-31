@@ -38,14 +38,14 @@ Here are the current repositories for the Gonum project.
 If code you want to contribute doesn't quite fit in any of them, then please start a discussion on the [mailing list](https://groups.google.com/forum/#!forum/gonum-dev).
 Code can be found at [github.com/gonum/](https://github.com/gonum/)\<repo\>, and documentation at gonum.org/v1/\<repo\>.
 
-* [gonum](https://github.com/gonum/gonum) — The gonum repository contains the majority of Gonum packages
-* [plot](https://github.com/gonum/plot) — A repository for plotting and visualizing data
-* [netlib](https://github.com/gonum/netlib) — The netlib repository contains Cgo wrappers for C implementations of BLAS and LAPACKE
-* [hdf5](https://github.com/gonum/hdf5) — The hdf5 repository contains a Cgo wrapper for the HDF5 data storage and access library
-* [exp](https://github.com/gonum/exp) — The exp repository contains experimental and incomplete package implementations
-* [tools](https://github.com/gonum/tools) — Tools for working with Go code
-* [talks](https://github.com/gonum/talks) — Talks given about Go and Gonum delivered by Gonum developers
-* [gonum.github.io](https://github.com/gonum/gonum.github.io) — Gonum website
+* [gonum](https://github.com/gonum/gonum); The gonum repository contains the majority of Gonum packages
+* [plot](https://github.com/gonum/plot); A repository for plotting and visualizing data
+* [netlib](https://github.com/gonum/netlib); The netlib repository contains Cgo wrappers for C implementations of BLAS and LAPACKE
+* [hdf5](https://github.com/gonum/hdf5); The hdf5 repository contains a Cgo wrapper for the HDF5 data storage and access library
+* [exp](https://github.com/gonum/exp); The exp repository contains experimental and incomplete package implementations
+* [tools](https://github.com/gonum/tools); Tools for working with Go code
+* [talks](https://github.com/gonum/talks); Talks given about Go and Gonum delivered by Gonum developers
+* [gonum.github.io](https://github.com/gonum/gonum.github.io); Gonum website
 
 ## Contributing
 
@@ -88,10 +88,10 @@ If you are a contributor, please be welcoming to new contributors.  [Here](https
 
 There are several terms code reviews may use that you should become familiar with.
 
-  * ` LGTM ` — looks good to me
-  * ` SGTM ` — sounds good to me
-  * ` s/foo/bar/ ` — please replace ` foo ` with ` bar `; this is [sed syntax](http://en.wikipedia.org/wiki/Sed#Usage)
-  * ` s/foo/bar/g ` — please replace ` foo ` with ` bar ` throughout your entire change
+  * ` LGTM `; looks good to me
+  * ` SGTM `; sounds good to me
+  * ` s/foo/bar/ `; please replace ` foo ` with ` bar `; this is [sed syntax](http://en.wikipedia.org/wiki/Sed#Usage)
+  * ` s/foo/bar/g `; please replace ` foo ` with ` bar ` throughout your entire change
 
 We follow the convention of requiring at least 1 reviewer to say LGTM before a merge.
 When code is tricky or controversial, submitters and reviewers can request additional review from others and more LGTMs before merge.

@@ -18,6 +18,11 @@ pub struct EnvoyCluster {
 }
 
 /// Decodes an Envoy `Cluster` message.
+///
+/// Returns `None` for a cluster without a name: the Envoy proto
+/// requires field 1, and a nameless cluster with endpoints would be
+/// carried into snapshots where `map_snapshot` keys clusters by name —
+/// un routable dead weight (found by the nightly deep fuzz).
 #[must_use]
 pub fn decode_cluster(buf: &[u8]) -> Option<EnvoyCluster> {
     let mut out = EnvoyCluster::default();
@@ -35,6 +40,9 @@ pub fn decode_cluster(buf: &[u8]) -> Option<EnvoyCluster> {
             33 => decode_load_assignment(f.bytes, &mut out.backends),
             _ => {}
         }
+    }
+    if out.name.is_empty() {
+        return None;
     }
     Some(out)
 }

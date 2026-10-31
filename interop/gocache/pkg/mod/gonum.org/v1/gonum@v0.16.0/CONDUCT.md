@@ -29,7 +29,7 @@ These are the values to which people in the Gonum community (“Numerical Gopher
 	- When we do disagree, try to understand why. 
 - Avoid destructive behavior:
 	- Derailing: stay on topic; if you want to talk about something else, start a new conversation.
-	- Unconstructive criticism: don't merely decry the current state of affairs; offer—or at least solicit—suggestions as to how things may be improved.
+	- Unconstructive criticism: don't merely decry the current state of affairs; offer-or at least solicit-suggestions as to how things may be improved.
 	- Snarking (pithy, unproductive, sniping comments)
 	- Discussing potentially offensive or sensitive issues; this all too often leads to unnecessary conflict.
 	- Microaggressions: brief and commonplace verbal, behavioral and environmental indignities that communicate hostile, derogatory or negative slights and insults to a person or group. 

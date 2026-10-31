@@ -27,9 +27,11 @@ fn entry(host: Option<String>, pattern: String) -> RouteEntry {
         policy: Policy::P2C,
         priority: 0,
         allowed_spiffe_prefixes: Vec::new(),
+        response_headers: vane_router::ResponseHeaderPolicy::default(),
         retry: Default::default(),
-        mirror_backends: Vec::new(),
         mirror: None,
+        mirror_backends: Vec::new(),
+        cors: None,
     }
     .compile()
     .expect("valid route")

@@ -119,6 +119,8 @@ impl StreamFd {
 
 impl Drop for StreamFd {
     fn drop(&mut self) {
+        #[cfg(feature = "vane_dbg")]
+        eprintln!("[streamfd] close fd={}", self.0);
         // SAFETY: single close of an owned descriptor.
         unsafe { libc::close(self.0) };
     }

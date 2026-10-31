@@ -7,13 +7,13 @@ SPIFFE identities over mutual TLS, with rotation and no connection churn.
 
 ## Identity model
 
-- **SVID source (phase 1)**: file-based — the operator/sidecar mounts
+- **SVID source (phase 1)**: file-based; the operator/sidecar mounts
   `cert.pem`/`key.pem`/`bundle.pem` from a SPIRE agent workload
   registration (`/etc/vane/spiffe`). No new protocol code.
 - **SVID source (phase 2)**: SPIFFE Workload API over the Unix socket
   (`/run/spire/agent-sockets/workload_api.spiffe.io`): X.509SVID stream
   (watch), same rotation path as phase 1.
-- Identity string: `spiffe://<trust-domain>/<ns>/<sa>` — encoded in the
+- Identity string: `spiffe://<trust-domain>/<ns>/<sa>`; encoded in the
   cert SAN URI. vane-tls gains `verify_spiffe_id(prefix)` for
   authorization (e.g. sidecars only accept `.../vane/`).
 
@@ -51,14 +51,14 @@ on_connected:
    tested with in-test-generated CA/SVIDs, like the JWT RS256 tests).
 2. ✅ Cluster `upstream_tls` + SPIFFE config surface; e2e: two vanes, mTLS,
    identity asserted in access logs. Verification failure (identity
-   mismatch, TLS error) answers 502 while the response is unsent —
+   mismatch, TLS error) answers 502 while the response is unsent -
    TLS-or-nothing.
 3. ✅ Workload API source (Unix socket watch) + rotation e2e
    (`workload_svid.rs`): `svid_socket` config; vane fetches the SVID
    at startup and a watcher re-materializes the PEM cache on every
    agent push; the per-dial file read picks rotations up with no
    restarts.
-4. ✅ Authorization: per-route `allowed_spiffe_prefixes` — listeners
+4. ✅ Authorization: per-route `allowed_spiffe_prefixes`; listeners
    with `tls.client_ca` require downstream client certs (missing cert
    → `certificate_required` alert, flushed before close); matched
    routes with prefixes answer 403 unless the caller's SPIFFE URI SAN

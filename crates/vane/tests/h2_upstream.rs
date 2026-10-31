@@ -104,9 +104,11 @@ fn router_with(upstream: SocketAddr, h2_upstream: bool) -> Arc<Router> {
             gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
             priority: 0,
             allowed_spiffe_prefixes: Vec::new(),
+            response_headers: vane_router::ResponseHeaderPolicy::default(),
             retry: Default::default(),
             mirror: None,
             mirror_backends: Vec::new(),
+            cors: None,
         });
     });
     Arc::new(r)
@@ -249,9 +251,11 @@ async fn disallowed_method_yields_405() {
             gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
             priority: 0,
             allowed_spiffe_prefixes: Vec::new(),
+            response_headers: vane_router::ResponseHeaderPolicy::default(),
             retry: Default::default(),
             mirror: None,
             mirror_backends: Vec::new(),
+            cors: None,
         });
     });
     // POST on a GET-only route.
@@ -359,9 +363,11 @@ async fn post_body_roundtrip() {
             gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
             priority: 0,
             allowed_spiffe_prefixes: Vec::new(),
+            response_headers: vane_router::ResponseHeaderPolicy::default(),
             retry: Default::default(),
             mirror: None,
             mirror_backends: Vec::new(),
+            cors: None,
         });
     });
     let edge = Arc::new(
@@ -550,7 +556,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#,
             cert_path.display(),
             key_path.display()
@@ -673,9 +678,11 @@ async fn no_healthy_backend_yields_503() {
             gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
             priority: 0,
             allowed_spiffe_prefixes: Vec::new(),
+            response_headers: vane_router::ResponseHeaderPolicy::default(),
             retry: Default::default(),
             mirror: None,
             mirror_backends: Vec::new(),
+            cors: None,
         });
     });
     let (status, _, _) = request_via_edge(Arc::new(r), "/x").await;
@@ -707,9 +714,11 @@ async fn breaker_open_yields_503() {
             gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
             priority: 0,
             allowed_spiffe_prefixes: Vec::new(),
+            response_headers: vane_router::ResponseHeaderPolicy::default(),
             retry: Default::default(),
             mirror: None,
             mirror_backends: Vec::new(),
+            cors: None,
         });
     });
     // Construct the edge with the SAME breaker instance so it is open.
@@ -817,166 +826,6 @@ async fn access_log_records_edge_replies() {
     assert_eq!(rec.method.as_bytes(), b"GET");
     assert_eq!(rec.path.as_bytes(), b"/logged");
     assert_eq!(rec.bytes_out, 11);
-}
-
-/// 1 MiB POST through the edge: streamed chunk-by-chunk (flow control
-/// released per chunk) — no buffering cap on the request path.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "RETIRED ARCHITECTURE: this probe targeted the removed REUSEPORT tokio edge; 1 MiB streaming is covered by `large_body_streams_native_engine` (native engine path), which passes. Kept as documentation of the h2_edge API."]
-async fn large_body_streams_through_edge() {
-    // h2 upstream that echoes the request body back.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    // Yield so the stub task is scheduled before the test proceeds —
-    // mirrors every other working test in this file.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    tokio::spawn(async move {
-        loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                break;
-            };
-            tokio::spawn(async move {
-                let mut conn = match h2::server::handshake(stream).await {
-                    Ok(c) => c,
-                    Err(_) => return,
-                };
-                while let Some(request) = conn.accept().await {
-                    let Ok((request, mut respond)) = request else {
-                        break;
-                    };
-                    let mut body = request.into_body();
-                    let mut collected = Vec::new();
-                    while let Some(chunk) = body.data().await {
-                        match chunk {
-                            Ok(b) => {
-                                let len = b.len();
-                                collected.extend_from_slice(&b);
-                                let _ = body.flow_control().release_capacity(len);
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    let response = http::Response::builder()
-                        .status(200)
-                        .body(())
-                        .expect("static");
-                    let Ok(mut send) = respond.send_response(response, false) else {
-                        break;
-                    };
-                    let _ = send.send_data(bytes::Bytes::from(collected), true);
-                }
-            });
-        }
-    });
-
-    let r = Router::new();
-    r.update(|editor| {
-        editor.insert(RouteEntry {
-            host: None,
-            pattern: "/*rest".into(),
-            methods: Vec::new(),
-            cluster: "up".into(),
-            strip_prefix: None,
-            timeout_ms: None,
-            backends: vec![vane_router::Backend::new(addr, 1)],
-            upstream_h2: true,
-            compression: false,
-            outlier: None,
-            policy: vane_router::Policy::P2C,
-            gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
-            priority: 0,
-            allowed_spiffe_prefixes: Vec::new(),
-            retry: Default::default(),
-            mirror: None,
-            mirror_backends: Vec::new(),
-        });
-    });
-    let edge = Arc::new(
-        tokio::task::spawn_blocking(move || {
-            vane::h2_edge::H2Edge::new(Arc::new(r), Arc::new(Registry::new()), None)
-        })
-        .await
-        .expect("edge build"),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let edge_addr = listener.local_addr().expect("addr");
-    tokio::spawn(async move {
-        loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                break;
-            };
-            let e = Arc::clone(&edge);
-            tokio::spawn(async move {
-                let _ = e.serve_connection(stream).await;
-            });
-        }
-    });
-
-    let io = tokio::net::TcpStream::connect(edge_addr)
-        .await
-        .expect("connect");
-    let (mut send_request, connection) = h2::client::handshake(io).await.expect("h2");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    // 1 MiB streamed across many DATA frames — proves the streaming
-    // relay survives WINDOW_UPDATE pacing with generous server windows
-    // (the old 32 MiB buffered path is gone; this has no size cap).
-    let payload: Vec<u8> = (0..1024 * 1024u32).map(|i| (i % 251) as u8).collect();
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("http://edge/big")
-        .body(())
-        .expect("request");
-    let (response, mut flow) = send_request.send_request(request, false).expect("send");
-    // Stream with h2 flow control: the initial window is immediately
-    // available via send_data; only on insufficient capacity do we wait
-    // for a window increase (poll_capacity resolves on growth).
-    let mut pos = 0;
-    while pos < payload.len() {
-        let n = (payload.len() - pos).min(16384);
-        let chunk = bytes::Bytes::copy_from_slice(&payload[pos..pos + n]);
-        match flow.send_data(chunk, false) {
-            Ok(()) => pos += n,
-            Err(_) => {
-                // Out of window: wait for the peer's window update.
-                match std::future::poll_fn(|cx| flow.poll_capacity(cx)).await {
-                    Some(Ok(_)) => {}
-                    Some(Err(e)) => panic!("capacity error: {e}"),
-                    None => {
-                        // Stream reset: the edge answered (likely an
-                        // error) — surface its response.
-                        let (parts, _body) = response.await.expect("response").into_parts();
-                        panic!(
-                            "edge reset the stream: status={} headers={:?}",
-                            parts.status, parts.headers
-                        );
-                    }
-                }
-            }
-        }
-    }
-    flow.send_data(bytes::Bytes::new(), true).expect("eom");
-
-    let (parts, mut body) = response.await.expect("response").into_parts();
-    assert_eq!(parts.status.as_u16(), 200);
-    let mut got = Vec::new();
-    while let Some(chunk) = body.data().await {
-        match chunk {
-            Ok(b) => {
-                let len = b.len();
-                got.extend_from_slice(&b);
-                let _ = body.flow_control().release_capacity(len);
-            }
-            Err(_) => break,
-        }
-    }
-    assert_eq!(got.len(), payload.len(), "streamed size");
-    assert_eq!(got, payload, "streamed integrity");
 }
 
 /// 1 MiB streamed POST through the NATIVE engine h2 path (TLS ALPN):
@@ -1098,7 +947,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#,
             cert_path.display(),
             key_path.display()
@@ -1268,7 +1116,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#,
             cert_path.display(),
             key_path.display()
@@ -1339,9 +1186,10 @@ workers = 1
 /// TCP (listener `h2c = true`) — removes the h2-crate/tokio client
 /// from the equation entirely. Used to bisect the >window streaming
 /// stall; also the regression gate for h2c support itself.
-// Quarantined: stalls in suite-context coverage runs (all-features,
-// parallel binaries) — the >window streaming stall, same family as
-// `large_body_streams_native_engine`. Passes standalone (verified).
+// Un-quarantined (2026-10-06): the ">window streaming stall" was the
+// one-way upstream read throttle in the worker (see
+// docs/h2-streaming-flake.md) — upstream reads stopped once the
+// client-bound queue passed 8 KiB and nothing resumed them.
 #[tokio::test]
 async fn h2c_native_engine_large_body() {
     let _serial = lock_serial();
@@ -1419,7 +1267,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#
             ),
         )
@@ -1505,9 +1352,10 @@ workers = 1
 /// TLS listener. Isolates the >window stall — same driver, TLS layer
 /// added. If this passes where the h2-crate variant fails, the delta
 /// is client-side; if it fails, the TLS server path is implicated.
-// Quarantined: stalls in suite-context coverage runs (all-features,
-// parallel binaries) — the >window streaming stall, same family as
-// `large_body_streams_native_engine`. Passes standalone (verified).
+// Un-quarantined (2026-10-06): the ">window streaming stall" was the
+// one-way upstream read throttle in the worker (see
+// docs/h2-streaming-flake.md) — upstream reads stopped once the
+// client-bound queue passed 8 KiB and nothing resumed them.
 #[tokio::test]
 async fn tls_h2upstream_large_body() {
     let _serial = lock_serial();
@@ -1591,7 +1439,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#,
             cert_path.display(),
             key_path.display()
@@ -1762,7 +1609,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#,
             cert_path.display(),
             key_path.display()
@@ -1942,7 +1788,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#
         ),
     )
@@ -2143,7 +1988,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 "#
             ),
         )

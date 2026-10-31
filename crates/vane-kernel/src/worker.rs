@@ -50,6 +50,11 @@ pub struct WorkerConfig {
     pub max_sessions: usize,
     /// Buffer pool slots (double as io_uring fixed buffers).
     pub pool_slots: usize,
+    /// Slot size in bytes (`[runtime] buffer_size`). Both engines derive
+    /// their read/write lengths from this, and the relay's backpressure
+    /// thresholds scale with it (2 * buf_size), so raising it trades
+    /// per-connection memory for fewer syscalls per byte.
+    pub buf_size: usize,
     /// io_uring queue depth.
     pub ring_entries: u32,
     /// Use `IORING_SETUP_SQPOLL` (zero-syscall submission).
@@ -66,6 +71,7 @@ impl Default for WorkerConfig {
             core: None,
             max_sessions: 16_384,
             pool_slots: DEFAULT_POOL_SIZE,
+            buf_size: DEFAULT_BUF_SIZE,
             ring_entries: 4096,
             sqpoll: false,
             force_mio: false,
@@ -142,12 +148,52 @@ struct Session {
     upstream_epoch: u8,
     /// Request head already serialized to the upstream (no failover past it).
     request_sent: bool,
+    /// `on_upstream_connected` was already delivered for this dial. A
+    /// connect can complete inline (submission-time Done) AND post its
+    /// CQE, and the inline path ALSO queues a deferred delivery —
+    /// without this guard the callback runs up to three times, and the
+    /// repeated `s.upstream = Some(StreamFd(fd))` closes the dial
+    /// socket out from under the live session.
+    upstream_connected_delivered: bool,
     downstream_eof: bool,
     upstream_eof: bool,
     /// Half-close (FIN) requested while writes are still flushing.
     fin_queued: bool,
     splice: bool,
+    #[cfg(feature = "body-splice")]
+    /// HTTP body splice (see `start_body_splice`): armed, or pending
+    /// until the downstream write queue drains.
+    body_splice: Option<BodySpliceState>,
+    #[cfg(feature = "body-splice")]
+    body_splice_pending: Option<u64>,
+
     deadline: Option<Instant>,
+}
+
+impl Session {
+    /// True while a body splice is armed or parked: the engine reads
+    /// for this session belong to the splice — the handler must not
+    /// be dispatched and reads must not re-arm.
+    #[cfg(feature = "body-splice")]
+    fn body_splice_active(&self) -> bool {
+        self.body_splice.is_some() || self.body_splice_pending.is_some()
+    }
+}
+
+/// State of an in-progress HTTP body splice (see `WorkerState::
+/// start_body_splice`).
+#[cfg(feature = "body-splice")]
+struct BodySpliceState {
+    /// Bytes still owed to the downstream (the Content-Length tail).
+    remaining: u64,
+    /// The kernel pipe the bytes flow through: (read end, write end).
+    pipe: (RawFd, RawFd),
+    /// Bytes currently sitting in the pipe.
+    pipe_len: u64,
+    /// Bytes that have reached the downstream socket.
+    moved: u64,
+    /// A POLLOUT watch is armed on the downstream (backpressure).
+    watching_out: bool,
 }
 
 /// Timer heap entry.
@@ -176,6 +222,15 @@ pub(crate) struct WorkerState {
     ctx: WorkerCtx,
     engine: Box<dyn Engine>,
     pool: BufferPool,
+    /// Reusable data buffers for the relay hot path: every read event
+    /// hands `buf_size` bytes to the handler, and handing out the pool
+    /// slot itself is impossible (the handler needs `&mut self` while
+    /// the data would borrow it). A LIFO freelist gives the same
+    /// steady state as slot reuse — after warmup, zero allocations per
+    /// event; the previous per-event `to_vec()` malloc'd a fresh Vec
+    /// per read, which is what payload-heavy legs pay 16 times per
+    /// 64 KiB response.
+    data_pool: Vec<Vec<u8>>,
     slab: SessionSlab<Session>,
     listeners: Vec<StdTcpListener>,
     timers: BinaryHeap<Timer>,
@@ -187,15 +242,20 @@ pub(crate) struct WorkerState {
     /// their `on_upstream_connected` callback delivered on the next loop
     /// pass — the handler is not reachable from the connect call site.
     inline_connected: Vec<(u32, u16)>,
-    /// Read-dispatch scratch (`MM-01`): bytes are copied here (not into
-    /// a fresh `Vec`) before the handler runs — capacity is retained
-    /// across reads, so steady-state dispatch performs no allocation.
-    /// (The former per-read `to_vec` allocated two to three times per
-    /// proxied request.)
-    read_scratch: Vec<u8>,
 }
 
 impl WorkerState {
+    /// Returns a relay data buffer to the freelist. The list converges to
+    /// the high-water mark of concurrent handler invocations — one per
+    /// worker, since handlers run synchronously — so this is
+    /// allocation-free in steady state; the small bound only guards a
+    /// pathological future where buffers accumulate.
+    fn return_data_buf(&mut self, buf: Vec<u8>) {
+        if self.data_pool.len() < 8 {
+            self.data_pool.push(buf);
+        }
+    }
+
     fn io_for(&mut self, slot: u32, generation: u16) -> SessionIo<'_> {
         SessionIo {
             worker: self,
@@ -233,6 +293,8 @@ impl WorkerState {
                 }
                 s.wq.push_back((ws, n as u32, 0));
                 s.write_inflight = true;
+                #[cfg(feature = "vane_dbg")]
+                eprintln!("[dwrite] direct submit n={n} fd={}", s.downstream.fd());
                 let fd = s.downstream.fd();
                 let token = Token::new(Op::DownstreamWrite, slot, generation, 0);
                 let _ = self.engine.write(token, fd, ws, n, 0);
@@ -313,6 +375,8 @@ impl WorkerState {
                     return false;
                 };
                 crate::dbg_trace!("DIAL fd={fd} slot={slot}");
+                // A NEW dial: the delivered-guard is per-dial.
+                s.upstream_connected_delivered = false;
                 s.upstream = Some(StreamFd(fd));
                 if poll == crate::engine::Poll::Done(0) {
                     self.do_upstream_connected(slot, generation);
@@ -340,6 +404,8 @@ impl WorkerState {
                     return false;
                 };
                 crate::dbg_trace!("DIAL fd={fd} slot={slot}");
+                // A NEW dial: the delivered-guard is per-dial.
+                s.upstream_connected_delivered = false;
                 s.upstream = Some(StreamFd(fd));
                 if poll == crate::engine::Poll::Done(0) {
                     self.do_upstream_connected(slot, generation);
@@ -411,12 +477,276 @@ impl WorkerState {
     /// Closes and drops a session. `reason` documents the call site for
     /// crash triage (compiled out in release... kept as a parameter so the
     /// next debug session can re-enable the trace in one line).
+    /// Starts the capped body splice for one HTTP response: moves up
+    /// to `max` bytes upstream -> pipe -> downstream entirely in the
+    /// kernel, then delivers [`Handler::on_body_spliced`].
+    ///
+    /// Ordering: any bytes still queued toward the downstream (the
+    /// response head, the part of the body that rode the first read)
+    /// must reach the socket FIRST — the splice writes the socket
+    /// directly and would jump the queue. When the queue is not
+    /// drained the request is parked as pending and armed by the
+    /// write-completion drain instead. Returns `false` when the fast
+    /// path is unavailable — the caller relays through slots as usual.
+    #[cfg(feature = "body-splice")]
+    pub(crate) fn start_body_splice(&mut self, slot: u32, generation: u16, max: u64) -> bool {
+        if !self.valid(slot, generation) || max == 0 {
+            return false;
+        }
+        // io_uring-only: the mio backend degrades to the copied relay.
+        if self.engine.kind() != "io_uring" {
+            return false;
+        }
+        let Some(s) = self.slab.get_mut(slot) else {
+            return false;
+        };
+        // An in-flight upstream read would double-deliver bytes the
+        // splice will also move, and a busy splice is not re-entrant.
+        if s.upstream_read_inflight || s.splice || s.body_splice.is_some() {
+            return false;
+        }
+        let queue_busy = !s.wq.is_empty() || !s.pending_down.is_empty() || s.write_inflight;
+        if queue_busy {
+            // Park until the write queue drains; the drain converts it.
+            #[cfg(feature = "vane_dbg")]
+            eprintln!("[bsplice] parked pending={max}");
+            s.body_splice_pending = Some(max);
+            return true;
+        }
+        #[cfg(feature = "vane_dbg")]
+        eprintln!("[bsplice] arm immediate max={max}");
+        self.arm_body_splice(slot, generation, max)
+    }
+
+    /// Converts a pending body splice into an armed one (queue empty).
+    #[cfg(feature = "body-splice")]
+    fn arm_body_splice(&mut self, slot: u32, generation: u16, max: u64) -> bool {
+        let Some(s) = self.slab.get_mut(slot) else {
+            return false;
+        };
+        let Some(up) = &s.upstream else {
+            return false;
+        };
+        let ufd = up.fd();
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: pipe2 with valid out-array; both ends nonblocking +
+        // close-on-exec (closed explicitly at completion/teardown).
+        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        if rc != 0 {
+            return false;
+        }
+        s.body_splice = Some(BodySpliceState {
+            remaining: max,
+            pipe: (fds[0], fds[1]),
+            pipe_len: 0,
+            moved: 0,
+            watching_out: false,
+        });
+        let up_token = Token::new(Op::BodySpliceIn, slot, generation, 0);
+        self.engine
+            .watch(ufd, up_token, libc::POLLIN as u32)
+            .is_ok()
+    }
+
+    /// Tears the body splice down (closes the pipe, drops state).
+    /// Idempotent; called from completion, session close, and reset.
+    #[cfg(feature = "body-splice")]
+    fn teardown_body_splice(&mut self, slot: u32) {
+        if let Some(bs) = self.slab.get_mut(slot).and_then(|s| s.body_splice.take()) {
+            // SAFETY: the pipe ends are owned by this state and no
+            // longer referenced by any engine watch (watches on a
+            // closed fd complete with ECANCELED, filtered by the
+            // engine).
+            unsafe {
+                libc::close(bs.pipe.0);
+                libc::close(bs.pipe.1);
+            }
+        }
+        self.slab
+            .get_mut(slot)
+            .map(|s| s.body_splice_pending.take());
+    }
+
+    /// The body-splice pump: moves upstream bytes into the pipe, then
+    /// drains the pipe into the downstream socket, honouring the byte
+    /// cap and backpressure. Called on either readiness event.
+    #[cfg(feature = "body-splice")]
+    fn pump_body_splice(&mut self, slot: u32, generation: u16, h: &mut dyn Handler) {
+        let (ufd, dfd) = {
+            let Some(s) = self.slab.get(slot) else {
+                return;
+            };
+            let Some(up) = &s.upstream else {
+                return;
+            };
+            (up.fd(), s.downstream.fd())
+        };
+        // Ingress: upstream -> pipe, capped by the remaining budget.
+        loop {
+            let Some(bs) = self.slab.get_mut(slot).and_then(|s| s.body_splice.as_mut()) else {
+                return;
+            };
+            let want = (bs.remaining - bs.pipe_len).min(1 << 16) as usize;
+            if want == 0 {
+                break;
+            }
+            // SAFETY: all fds live and nonblocking; null offsets mean
+            // current file position (sockets/pipes).
+            let n = unsafe {
+                libc::splice(
+                    ufd,
+                    std::ptr::null_mut(),
+                    bs.pipe.1,
+                    std::ptr::null_mut(),
+                    want,
+                    libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK,
+                )
+            };
+            if n < 0 {
+                let err = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
+                    break;
+                }
+                if err == libc::EINTR {
+                    continue;
+                }
+                #[cfg(feature = "body-splice")]
+                self.teardown_body_splice(slot);
+                self.close_session(slot, generation, "body-splice-in");
+                return;
+            }
+            if n == 0 {
+                // Upstream EOF. Bytes still owed means the response is
+                // truncated (the head is already on the wire — no 502
+                // possible): kill the session so the client sees a
+                // short body instead of a silent hang.
+                let bs = self
+                    .slab
+                    .get(slot)
+                    .and_then(|s| s.body_splice.as_ref())
+                    .map(|b| (b.remaining, b.pipe_len));
+                match bs {
+                    Some((0, 0)) => { /* exact fit: the drain completes it */ }
+                    _ => {
+                        self.teardown_body_splice(slot);
+                        self.close_session(slot, generation, "body-splice-truncated");
+                        return;
+                    }
+                }
+                break;
+            }
+            let bs = self
+                .slab
+                .get_mut(slot)
+                .and_then(|s| s.body_splice.as_mut())
+                .expect("checked");
+            bs.pipe_len += u64::try_from(n).unwrap_or(0);
+        }
+
+        // Egress: pipe -> downstream, drain fully or park on EAGAIN.
+        loop {
+            let Some(bs) = self.slab.get_mut(slot).and_then(|s| s.body_splice.as_mut()) else {
+                return;
+            };
+            if bs.pipe_len == 0 {
+                break;
+            }
+            // SAFETY: live nonblocking descriptors; positions null.
+            let n = unsafe {
+                libc::splice(
+                    bs.pipe.0,
+                    std::ptr::null_mut(),
+                    dfd,
+                    std::ptr::null_mut(),
+                    bs.pipe_len as usize,
+                    libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK,
+                )
+            };
+            if n < 0 {
+                let err = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
+                    let need_out = !bs.watching_out;
+                    if need_out {
+                        bs.watching_out = true;
+                        let out_token = Token::new(Op::BodySpliceOut, slot, generation, 0);
+                        let _ = self.engine.watch(dfd, out_token, libc::POLLOUT as u32);
+                    }
+                    return;
+                }
+                if err == libc::EINTR {
+                    continue;
+                }
+                self.teardown_body_splice(slot);
+                self.close_session(slot, generation, "body-splice-out");
+                return;
+            }
+            let bs = self
+                .slab
+                .get_mut(slot)
+                .and_then(|s| s.body_splice.as_mut())
+                .expect("checked");
+            bs.pipe_len -= u64::try_from(n).unwrap_or(0);
+            bs.moved += u64::try_from(n).unwrap_or(0);
+            // The budget shrinks as bytes REACH the client (the cap
+            // bounds delivered bytes; the ingress budget above already
+            // accounts for the pipe in flight via remaining-pipe_len).
+            // Without this the completion condition (remaining == 0)
+            // can never fire: the splice never finishes, the handler
+            // never sees on_body_spliced, and the session leaks.
+            bs.remaining = bs.remaining.saturating_sub(u64::try_from(n).unwrap_or(0));
+        }
+
+        // Completion: the cap is met and the pipe is empty.
+        let done = self
+            .slab
+            .get(slot)
+            .and_then(|s| s.body_splice.as_ref())
+            .is_some_and(|bs| bs.remaining == 0 && bs.pipe_len == 0);
+        if done {
+            self.finish_body_splice(slot, generation, h);
+        }
+    }
+
+    /// Hands the completed splice back to the handler: bytes are on
+    /// the wire, the transaction completes through the normal tail
+    /// (access emit, adaptive release, pool park, keep-alive).
+    #[cfg(feature = "body-splice")]
+    fn finish_body_splice(&mut self, slot: u32, generation: u16, h: &mut dyn Handler) {
+        let Some(s) = self.slab.get_mut(slot) else {
+            return;
+        };
+        let dfd = s.downstream.fd();
+        // Disarm the watches BEFORE the handler runs: completion may
+        // park the upstream (detach it) and the session continues.
+        let up_token = Token::new(Op::BodySpliceIn, slot, generation, 0);
+        let _ = self.engine.unwatch(dfd, up_token);
+        let out_token = Token::new(Op::BodySpliceOut, slot, generation, 0);
+        let _ = self.engine.unwatch(dfd, out_token);
+        let moved = s.body_splice.as_ref().map_or(0, |bs| bs.moved);
+        if let Some(bs) = s.body_splice.take() {
+            // SAFETY: owned pipe ends; watches cancelled above.
+            unsafe {
+                libc::close(bs.pipe.0);
+                libc::close(bs.pipe.1);
+            }
+        }
+        let mut io = self.io_for(slot, generation);
+        h.on_body_spliced(&mut io, moved);
+    }
+
     pub(crate) fn close_session(&mut self, slot: u32, generation: u16, reason: &str) {
         // vane-core stays dependency-light: no tracing here.
+        #[cfg(feature = "vane_dbg")]
+        eprintln!(
+            "[close] slot={slot} gen={generation} valid={} reason={reason}",
+            self.valid(slot, generation)
+        );
         let _ = reason;
         if !self.valid(slot, generation) {
             return;
         }
+        #[cfg(feature = "body-splice")]
+        self.teardown_body_splice(slot);
         let Some(s) = self.slab.remove(slot) else {
             return;
         }; // generation bumps inside
@@ -431,6 +761,24 @@ impl WorkerState {
         }
         for (ws, _, _) in s.uwq {
             self.pool.release(ws);
+        }
+        // Shut both sockets down BEFORE closing: an io_uring op still
+        // submitted on a socket (a keep-alive downstream read, an
+        // upstream read awaiting the peer) holds a kernel reference to
+        // the struct file, so close(2) alone frees the fd NUMBER but
+        // not the socket — no FIN, and the op blocks forever waiting
+        // for data that will never come. shutdown(2) forces every
+        // in-flight op to complete/cancel immediately; queued send-
+        // buffer data still delivers, then the FIN goes out.
+        // SAFETY: shutdown on live, owned, connected descriptors.
+        unsafe {
+            libc::shutdown(s.downstream.fd(), libc::SHUT_RDWR);
+        }
+        if let Some(up) = &s.upstream {
+            // SAFETY: same — live owned connected descriptor.
+            unsafe {
+                libc::shutdown(up.fd(), libc::SHUT_RDWR);
+            }
         }
         // Drain unread downstream bytes before close: closing a socket
         // with pending receive data sends RST, which wipes any frames
@@ -563,6 +911,8 @@ impl WorkerState {
             return false;
         };
         crate::dbg_trace!("DIAL fd={fd} slot={slot}");
+        // Attach is a NEW upstream: reset the per-dial delivered-guard.
+        s.upstream_connected_delivered = false;
         s.upstream = Some(StreamFd(fd));
         if s.urslot.is_none() {
             if let Some(uslot) = self.pool.take() {
@@ -609,6 +959,16 @@ impl WorkerState {
             let Some(s) = self.slab.get_mut(slot) else {
                 return;
             };
+            // Idempotence gate: a connect that completed inline gets
+            // its callback from BOTH the inline path and the CQE (and
+            // the deferred queue). Without this, `s.upstream` is
+            // re-assigned, dropping the first StreamFd — closing the
+            // live dial socket out from under the session.
+            #[cfg(feature = "body-splice")]
+            if s.upstream_connected_delivered {
+                return;
+            }
+            s.upstream_connected_delivered = true;
             if s.urslot.is_none() && !s.splice {
                 if let Some(uslot) = self.pool.take() {
                     let epoch = u16::from(s.upstream_epoch);
@@ -642,7 +1002,11 @@ impl WorkerState {
         let Some(s) = self.slab.get_mut(slot) else {
             return;
         };
-        if s.read_inflight || s.splice {
+        #[cfg(feature = "body-splice")]
+        let splice_busy = s.body_splice_active();
+        #[cfg(not(feature = "body-splice"))]
+        let splice_busy = false;
+        if s.read_inflight || s.splice || splice_busy {
             crate::dbg_trace!(
                 "ARMDbg skip slot={slot} inflight={} splice={}",
                 s.read_inflight,
@@ -680,7 +1044,11 @@ impl WorkerState {
         if s.pending_down.len() > 2 * self.pool.buf_size() {
             return;
         }
-        if s.upstream_read_inflight || s.splice {
+        #[cfg(feature = "body-splice")]
+        let splice_busy = s.body_splice_active();
+        #[cfg(not(feature = "body-splice"))]
+        let splice_busy = false;
+        if s.upstream_read_inflight || s.splice || splice_busy {
             return;
         }
         if s.urslot.is_none() {
@@ -732,6 +1100,29 @@ impl WorkerState {
             let token = Token::new(Op::DownstreamWrite, slot, generation, 0);
             let _ = self.engine.write(token, fd, ws, len as usize, off as usize);
         } else {
+            // A parked body splice arms here: the queue the splice
+            // would have jumped is now empty, so the kernel-side copy
+            // starts at the right socket position. Without this the
+            // parked splice is never converted and the client starves.
+            // (Feature-gated in vane-kernel; see the body-splice
+            // feature docs.)
+            #[cfg(feature = "body-splice")]
+            {
+                let pending = self.slab.get(slot).and_then(|s| s.body_splice_pending);
+                if let Some(max) = pending {
+                    self.slab
+                        .get_mut(slot)
+                        .map(|s| s.body_splice_pending.take());
+                    if !self.arm_body_splice(slot, generation, max) {
+                        // Arm failure here cannot fall back (the handler
+                        // already returned "splicing"): the only safe
+                        // state is a closed session.
+                        self.teardown_body_splice(slot);
+                        self.close_session(slot, generation, "body-splice-arm");
+                        return;
+                    }
+                }
+            }
             // Queue fully flushed: complete a deferred FIN.
             let fin = {
                 let Some(s) = self.slab.get_mut(slot) else {
@@ -757,6 +1148,21 @@ impl WorkerState {
             .is_some_and(|s| s.pending_up.len() <= 2 * self.pool.buf_size());
         if drained {
             self.arm_downstream_read(slot, generation);
+        }
+        // Same for UPSTREAM reads: `arm_upstream_read` throttles itself
+        // while the client-bound queue is backed up, so it has to be
+        // re-armed here once that queue drains. Without this the throttle
+        // is a one-way door — a response larger than the queue (the
+        // throttle threshold is only 2 buffer sizes) pauses upstream
+        // reads permanently and the transaction deadlocks: the client
+        // waits for the rest of the body while vane waits for upstream
+        // bytes it will never read again.
+        let downstream_ready = self
+            .slab
+            .get(slot)
+            .is_some_and(|s| s.pending_down.len() <= 2 * self.pool.buf_size());
+        if downstream_ready {
+            self.arm_upstream_read(slot, generation);
         }
     }
 
@@ -883,7 +1289,7 @@ impl WorkerState {
             Op::DownstreamRead => {
                 {
                     let Some(s) = self.slab.get_mut(slot) else {
-                        eprintln!("WRKDBG slot gone");
+                        crate::dbg_trace!("slot gone mid-completion");
                         return;
                     };
                     s.read_inflight = false;
@@ -906,18 +1312,24 @@ impl WorkerState {
                                 return;
                             };
                             let Some(rs) = s.rslot.take() else { return };
-                            // Copy into the worker's recycled scratch
-                            // instead of a fresh `Vec` (MM-01).
-                            let v = std::mem::take(&mut self.read_scratch);
-                            let mut v = v;
-                            v.clear();
-                            v.extend_from_slice(&self.pool.slot(rs)[..n as usize]);
-                            self.pool.release(rs);
-                            v
+                            // Destructure so `pool` and `data_pool` are
+                            // disjoint field borrows: one copy, straight
+                            // into a freelist buffer — no per-event
+                            // allocation (`s`'s borrow ended above).
+                            let WorkerState {
+                                pool, data_pool, ..
+                            } = self;
+                            let mut buf = data_pool
+                                .pop()
+                                .unwrap_or_else(|| Vec::with_capacity(n as usize));
+                            buf.clear();
+                            buf.extend_from_slice(&pool.slot(rs)[..n as usize]);
+                            pool.release(rs);
+                            buf
                         };
                         let mut io = self.io_for(slot, generation);
                         h.on_downstream_data(&mut io, &data);
-                        self.read_scratch = data;
+                        self.return_data_buf(data);
                         self.arm_downstream_read(slot, generation);
                     }
                     Ok(0) => {
@@ -964,6 +1376,16 @@ impl WorkerState {
                     _ => self.dispatch_upstream_write(cqe, slot, generation, h),
                 }
             }
+            #[cfg(feature = "body-splice")]
+            Op::BodySpliceIn | Op::BodySpliceOut => {
+                #[cfg(feature = "vane_dbg")]
+                eprintln!("[bsplice] CQE");
+                self.pump_body_splice(slot, generation, h);
+            }
+            #[cfg(feature = "body-splice")]
+            Op::BodySpliceCancel => {}
+            #[cfg(not(feature = "body-splice"))]
+            Op::BodySpliceIn | Op::BodySpliceOut | Op::BodySpliceCancel => {}
             Op::Splice => match cqe.result {
                 Ok(0) => {
                     let aux = cqe.token.aux();
@@ -1080,17 +1502,21 @@ impl WorkerState {
                         return;
                     };
                     let Some(rs) = s.urslot.take() else { return };
-                    // Copy into the worker's recycled scratch (MM-01).
-                    let v = std::mem::take(&mut self.read_scratch);
-                    let mut v = v;
-                    v.clear();
-                    v.extend_from_slice(&self.pool.slot(rs)[..n as usize]);
-                    self.pool.release(rs);
-                    v
+                    // Same destructure as the downstream site.
+                    let WorkerState {
+                        pool, data_pool, ..
+                    } = self;
+                    let mut buf = data_pool
+                        .pop()
+                        .unwrap_or_else(|| Vec::with_capacity(n as usize));
+                    buf.clear();
+                    buf.extend_from_slice(&pool.slot(rs)[..n as usize]);
+                    pool.release(rs);
+                    buf
                 };
                 let mut io = self.io_for(slot, generation);
                 h.on_upstream_data(&mut io, &data);
-                self.read_scratch = data;
+                self.return_data_buf(data);
                 self.arm_upstream_read(slot, generation);
             }
             Ok(0) => {
@@ -1226,6 +1652,10 @@ impl WorkerState {
         }
         let guard = FdGuard(fd);
         let session = Session {
+            #[cfg(feature = "body-splice")]
+            body_splice: None,
+            #[cfg(feature = "body-splice")]
+            body_splice_pending: None,
             downstream: StreamFd(-1),
             peer,
             upstream: None,
@@ -1242,6 +1672,7 @@ impl WorkerState {
             connect_inflight: false,
             upstream_epoch: 0,
             request_sent: false,
+            upstream_connected_delivered: false,
             downstream_eof: false,
             upstream_eof: false,
             fin_queued: false,
@@ -1378,6 +1809,7 @@ pub fn spawn(
     let mode = factory.mode();
     let core = config.core;
     let pool_slots = config.pool_slots;
+    let buf_size = config.buf_size;
     let ring_entries = config.ring_entries;
     let sqpoll = config.sqpoll;
     let force_mio = config.force_mio;
@@ -1392,7 +1824,8 @@ pub fn spawn(
                 let _ = core_affinity::set_for_current(*c);
             }
         }
-        let pool = BufferPool::new(pool_slots, DEFAULT_BUF_SIZE).expect("fixed pool allocation");
+        let pool = BufferPool::new(pool_slots, buf_size).expect("fixed pool allocation");
+        let data_pool: Vec<Vec<u8>> = Vec::with_capacity(pool_slots);
         let engine: Box<dyn Engine> = if force_mio {
             Box::new(crate::engine::mio_engine::MioEngine::new(&pool).expect("mio engine init"))
         } else {
@@ -1409,6 +1842,7 @@ pub fn spawn(
                 ctx,
                 engine,
                 pool,
+                data_pool,
                 slab,
                 listeners: vec![listener],
                 timers: BinaryHeap::new(),
@@ -1416,7 +1850,6 @@ pub fn spawn(
                 drain_deadline: None,
                 mode,
                 inline_connected: Vec::new(),
-                read_scratch: Vec::with_capacity(crate::buffer::DEFAULT_BUF_SIZE),
             },
             handler,
         };
@@ -1430,4 +1863,251 @@ pub fn spawn(
         done,
         join: Some(handle),
     })
+}
+
+/// Worker-level tests for the body-splice fast path. Compiled only
+/// under the `body-splice` cargo feature (the machinery is cfg-gated
+/// dark): they pin the pump's byte-accounting, completion handoff, and
+/// truncation contract for the eventual re-entry, and keep the dark
+/// machinery measured by the all-features Tier-A coverage sweep. The
+/// e2e-level starvation (bytes accepted by the client socket but never
+/// surfacing in its receive queue) remains open in
+/// docs/perf-arc-2026-10.md; these tests prove the worker logic itself
+/// moves the right bytes through the right descriptors.
+#[cfg(all(test, feature = "body-splice"))]
+mod body_splice_worker_tests {
+    use super::*;
+    use std::net::{TcpListener, TcpStream};
+    use std::os::fd::IntoRawFd;
+
+    fn test_worker() -> WorkerState {
+        let pool = BufferPool::new(8, 16384).expect("pool");
+        let engine = crate::engine::uring::UringEngine::new(64, Some(&pool), false)
+            .expect("io_uring available");
+        let registry = Arc::new(Registry::new());
+        let connections = registry.register(
+            "vane_test_connections",
+            vane_observe::metrics::MetricKind::Gauge,
+        );
+        WorkerState {
+            ctx: WorkerCtx {
+                id: 0,
+                registry,
+                events: Arc::new(EventRing::new()),
+                config: WorkerConfig::default(),
+                connections,
+            },
+            engine: Box::new(engine),
+            pool,
+            data_pool: Vec::new(),
+            slab: SessionSlab::new(64).expect("slab"),
+            listeners: Vec::new(),
+            timers: BinaryHeap::new(),
+            draining: false,
+            drain_deadline: None,
+            mode: Mode::Http,
+            inline_connected: Vec::new(),
+        }
+    }
+
+    /// Connected TCP pair: the worker leg is nonblocking (the pump
+    /// splices between worker legs), the test leg stays blocking so
+    /// reads/writes on the test side need no polling.
+    fn tcp_pair() -> (RawFd, RawFd) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        let sfd = server.as_raw_fd();
+        // SAFETY: fcntl on an owned live descriptor.
+        unsafe {
+            let fl = libc::fcntl(sfd, libc::F_GETFL);
+            libc::fcntl(sfd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
+        (server.into_raw_fd(), client.into_raw_fd())
+    }
+
+    fn add_session(w: &mut WorkerState, up: RawFd, down: RawFd) -> (u32, u16) {
+        let session = Session {
+            body_splice: None,
+            body_splice_pending: None,
+            downstream: StreamFd(down),
+            peer: "127.0.0.1:9".parse().expect("peer"),
+            upstream: Some(StreamFd(up)),
+            rslot: None,
+            wq: Default::default(),
+            urslot: None,
+            uwq: Default::default(),
+            pending_down: Vec::new(),
+            pending_up: Vec::new(),
+            read_inflight: false,
+            upstream_read_inflight: false,
+            write_inflight: false,
+            upstream_write_inflight: false,
+            connect_inflight: false,
+            upstream_epoch: 0,
+            request_sent: false,
+            upstream_connected_delivered: false,
+            downstream_eof: false,
+            upstream_eof: false,
+            fin_queued: false,
+            splice: false,
+            deadline: None,
+        };
+        w.slab.insert(session).expect("slab room")
+    }
+
+    /// Records the completion handoff.
+    struct SpliceStub {
+        spliced: Option<u64>,
+    }
+
+    impl Handler for SpliceStub {
+        fn on_downstream_data(&mut self, _io: &mut SessionIo<'_>, _data: &[u8]) {}
+        fn on_upstream_connected(&mut self, _io: &mut SessionIo<'_>) {}
+        fn on_upstream_data(&mut self, _io: &mut SessionIo<'_>, _data: &[u8]) {}
+        fn on_downstream_eof(&mut self, _io: &mut SessionIo<'_>) {}
+        fn on_upstream_eof(&mut self, _io: &mut SessionIo<'_>) {}
+        fn on_upstream_error(&mut self, _io: &mut SessionIo<'_>, _err: io::Error) {}
+        fn on_body_spliced(&mut self, _io: &mut SessionIo<'_>, moved: u64) {
+            self.spliced = Some(moved);
+        }
+    }
+
+    #[test]
+    fn pump_moves_the_capped_bytes_and_hands_off_to_the_handler() {
+        let mut w = test_worker();
+        let (up_leg, resp_writer) = tcp_pair();
+        let (down_leg, reader) = tcp_pair();
+        // The reader drains between pump rounds: nonblocking so a
+        // drained queue returns EAGAIN instead of blocking the loop.
+        // SAFETY: fcntl on an owned descriptor.
+        unsafe {
+            let fl = libc::fcntl(reader, libc::F_GETFL);
+            libc::fcntl(reader, libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
+        let (slot, generation) = add_session(&mut w, up_leg, down_leg);
+
+        // Small on purpose: the pump must complete in ONE call, which
+        // needs the body to fit the client socket's INITIAL send
+        // window (the test reader drains only after the pump returns).
+        // 512 bytes fits any minimum; the 64 KiB chunked path is the
+        // e2e's job.
+        let body: Vec<u8> = (0..512).map(|i| b'a' + (i % 26) as u8).collect();
+        assert!(w.start_body_splice(slot, generation, body.len() as u64));
+        assert!(
+            w.slab.get(slot).is_some_and(|s| s.body_splice.is_some()),
+            "armed immediately on an idle queue"
+        );
+
+        // SAFETY: write to an owned connected descriptor.
+        unsafe {
+            libc::write(resp_writer, body.as_ptr().cast(), body.len());
+        }
+        // The pump may return mid-response when the client socket's
+        // send window temporarily bounds the egress (the shim parks on
+        // POLLOUT); a real client drains and its WINDOW_UPDATEs resume
+        // the flow. Drive the pump until completion, draining the
+        // reader between rounds — bounded against a true wedge.
+        let mut h = SpliceStub { spliced: None };
+        let mut received: Vec<u8> = Vec::new();
+        let mut scratch = [0u8; 4096];
+        for _ in 0..1000 {
+            w.pump_body_splice(slot, generation, &mut h);
+            // SAFETY: drain a live descriptor; EAGAIN ends the round.
+            unsafe {
+                loop {
+                    let n = libc::read(reader, scratch.as_mut_ptr().cast(), scratch.len());
+                    if n <= 0 {
+                        break;
+                    }
+                    received.extend_from_slice(&scratch[..n as usize]);
+                }
+            }
+            if h.spliced.is_some() && received.len() >= body.len() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert_eq!(h.spliced, Some(body.len() as u64), "completion hook fired");
+        assert_eq!(received, body, "the client sees exactly the spliced bytes");
+        assert!(
+            w.slab.get(slot).is_some_and(|s| s.body_splice.is_none()),
+            "the splice state is consumed; the session survives"
+        );
+        // SAFETY: owned descriptors.
+        unsafe {
+            libc::close(resp_writer);
+            libc::close(up_leg);
+            libc::close(down_leg);
+            libc::close(reader);
+        }
+    }
+
+    #[test]
+    fn upstream_eof_mid_splice_kills_the_session() {
+        let mut w = test_worker();
+        let (up_leg, resp_writer) = tcp_pair();
+        let (down_leg, reader) = tcp_pair();
+        let (slot, generation) = add_session(&mut w, up_leg, down_leg);
+
+        assert!(w.start_body_splice(slot, generation, 4096));
+        // FIN with no data: the response is truncated mid-splice. The
+        // pump must kill the session (short body beats a silent hang).
+        // SAFETY: owned connected descriptor.
+        unsafe {
+            libc::shutdown(resp_writer, libc::SHUT_WR);
+        }
+        let mut h = SpliceStub { spliced: None };
+        w.pump_body_splice(slot, generation, &mut h);
+
+        assert!(h.spliced.is_none(), "no completion on truncation");
+        assert!(w.slab.get(slot).is_none(), "the session was closed");
+        // SAFETY: owned descriptors.
+        unsafe {
+            libc::close(resp_writer);
+            libc::close(up_leg);
+            libc::close(down_leg);
+            libc::close(reader);
+        }
+    }
+
+    #[test]
+    fn start_rejects_reentry_and_parks_on_a_busy_queue() {
+        let mut w = test_worker();
+        let (up_leg, resp_writer) = tcp_pair();
+        let (down_leg, reader) = tcp_pair();
+        let (slot, generation) = add_session(&mut w, up_leg, down_leg);
+
+        assert!(
+            !w.start_body_splice(slot, generation, 0),
+            "zero cap rejected"
+        );
+
+        // An armed splice is not re-entrant.
+        assert!(w.start_body_splice(slot, generation, 4096));
+        assert!(
+            !w.start_body_splice(slot, generation, 4096),
+            "already armed"
+        );
+        w.teardown_body_splice(slot);
+
+        // A busy downstream queue parks the splice instead of arming.
+        w.downstream_write(slot, generation, b"queued-head");
+        assert!(w.start_body_splice(slot, generation, 4096), "parked=true");
+        assert!(
+            w.slab
+                .get(slot)
+                .is_some_and(|s| s.body_splice.is_none() && s.body_splice_pending.is_some()),
+            "parked, not armed: the drain hook converts it"
+        );
+        // SAFETY: owned descriptors.
+        unsafe {
+            libc::close(resp_writer);
+            libc::close(up_leg);
+            libc::close(down_leg);
+            libc::close(reader);
+        }
+    }
 }

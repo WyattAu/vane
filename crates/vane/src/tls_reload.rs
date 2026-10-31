@@ -116,7 +116,15 @@ pub fn spawn_reloader(
 mod reload_tests {
     use super::*;
 
+    // With the post-quantum feature, rustls compiles two provider
+    // features and refuses to auto-pick: these tests build rustls
+    // configs directly, so install the process default first.
+    fn ensure_provider() {
+        vane_tls::install_crypto_provider();
+    }
+
     fn test_certpair(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+        ensure_provider();
         let certs = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
         let cert = dir.join("cert.pem");
         let key = dir.join("key.pem");

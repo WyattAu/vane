@@ -548,6 +548,13 @@ pub fn spawn(
     tls: Arc<rustls::ServerConfig>,
     edge: Arc<H3Edge>,
 ) -> tokio::task::JoinHandle<()> {
+    // DELIBERATE 0-RTT REJECTION: the accept loop never calls
+    // `Connecting::into_0rtt()`, so quinn discards early data. 0-RTT
+    // has no replay protection (RFC 9000 §2.3, RFC 9308 §3.1) and
+    // RFC 8740 only blesses idempotent HTTP methods for it — a proxy
+    // relaying non-idempotent requests keeps the safe default. Path
+    // validation, retry tokens (anti-amplification) and NAT-rebinding
+    // handling are quinn's, per RFC 9000 §8/§9.
     tokio::spawn(async move {
         let mut tls = tls.as_ref().clone();
         tls.alpn_protocols = alpn_protocols();

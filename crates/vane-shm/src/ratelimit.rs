@@ -97,18 +97,26 @@ mod tests {
 
     #[test]
     fn sustained_rate_matches_config() {
+        // Synthetic clock: `allow_at` takes the timestamp, so the test
+        // drives a deterministic 1 ms-per-step schedule instead of a
+        // wall-clock busy loop. The busy-loop version measured how often
+        // the test THREAD got scheduled — on a loaded runner the loop
+        // starves, admissions drop below the band, and a correct limiter
+        // 'fails' (exactly what happened in CI). Same invariant, zero
+        // scheduler dependence.
         let g = SharedGcra::new(1_000, 1); // 1000/s, burst 1
-        let start = monotonic_ns();
+        let mut t: i64 = 1_000_000_000; // arbitrary anchor
         let mut admitted = 0;
-        // ~50 ms window: expect ~50 admissions (+1 burst).
-        while monotonic_ns() - start < 50_000_000 {
-            if g.allow_at(monotonic_ns()) {
+        for _ in 0..2_000 {
+            // 2000 steps x 1 ms = 2 s at 1000/s.
+            if g.allow_at(t) {
                 admitted += 1;
             }
+            t += 1_000_000;
         }
         assert!(
-            (30..=80).contains(&admitted),
-            "sustained admissions near 1000/s x 50ms, got {admitted}"
+            (1_950..=2_050).contains(&admitted),
+            "sustained admissions near 1000/s over 2 s, got {admitted}"
         );
     }
 
@@ -116,16 +124,23 @@ mod tests {
     fn concurrent_workers_share_the_budget() {
         // Four workers hammering one bucket: the AGGREGATE must stay
         // near the configured rate — the cross-worker point of this
-        // limiter.
+        // limiter. Threads share one synthetic clock (an AtomicU64 the
+        // test advances), so admission decisions depend on the schedule,
+        // not on scheduler slices.
         let g = std::sync::Arc::new(SharedGcra::new(2_000, 4));
+        let clock = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(1_000_000_000));
         let mut handles = Vec::new();
         for _ in 0..4 {
             let g = std::sync::Arc::clone(&g);
+            let clock = std::sync::Arc::clone(&clock);
             handles.push(thread::spawn(move || {
                 let mut admitted = 0u32;
-                let start = monotonic_ns();
-                while monotonic_ns() - start < 100_000_000 {
-                    if g.allow_at(monotonic_ns()) {
+                // 4 threads x 4000 steps x 0.125 ms = 16000 calls spread
+                // over 2 s: demand 8000/s against a 2000/s budget — 4x
+                // oversubscribed.
+                for _ in 0..4_000 {
+                    let t = clock.fetch_add(125_000, std::sync::atomic::Ordering::Relaxed);
+                    if g.allow_at(t) {
                         admitted += 1;
                     }
                 }
@@ -133,10 +148,10 @@ mod tests {
             }));
         }
         let total: u32 = handles.into_iter().map(|h| h.join().expect("join")).sum();
-        // 2000/s x 100ms = 200 + burst 4 slack.
+        // Budget: 2000/s x 2 s = 4000, plus the burst-4 allowance.
         assert!(
-            (150..=260).contains(&total),
-            "aggregate admissions near budget, got {total}"
+            (3_950..=4_010).contains(&total),
+            "aggregate admissions near budget (4000 + burst slack), got {total}"
         );
     }
 }

@@ -1,10 +1,10 @@
 [package]
 name = "vane-proxy"
-description = "Deterministic, zero-copy L4/L7 reverse proxy, edge gateway, and micro sidecar"
+description = "L4/L7 reverse proxy,edge gateway, micro sidecar monorepo"
 # 0.2.3: h2 is a DEFAULT feature — the 0.2.2 binary silently hung on
 # h2c = true listeners (the promotion code was feature-gated out).
 # 0.2.2 carried the EDS endpoint-merge support.
-version = "0.6.0"
+version = "0.16.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -20,8 +20,13 @@ name = "vane"
 path = "src/main.rs"
 
 [features]
-default = ["vane-kernel/io-uring", "h2", "h3"]
+# response_splice default-on since the get64k A/B verdict (2.5x
+# median, docs/perf-arc-2026-10.md iteration 3): the splice engages
+# for identity-CL plain-TCP responses (gzip/TLS/h2/keep-alive-close
+# excluded by the eligibility gate).
+default = ["vane-kernel/io-uring", "h2", "h3", "response_splice"]
 vane_dbg = ["vane-kernel/vane_dbg"]
+post-quantum = ["vane-tls/post-quantum"]
 file-provider = ["vane-control/file-provider"]
 docker-provider = ["vane-control/docker-provider"]
 h2 = ["dep:h2", "dep:tokio-rustls"]
@@ -32,6 +37,11 @@ acme-pebble = []
 # mimalloc as the process global allocator (MM-02). Off by default:
 # tests/embedders keep the system allocator; release builds enable it.
 mimalloc = ["dep:mimalloc"]
+# Kernel-side body-splice fast path support. Default off: the fast
+# path is dark while its e2e byte-loss is being root-caused
+# (docs/perf-arc-2026-10.md, iteration 3).
+body-splice = ["vane-kernel/body-splice"]
+response_splice = ["body-splice"]
 
 [dependencies]
 vane-kernel = { workspace = true }
@@ -73,8 +83,8 @@ thiserror = { workspace = true }
 # Experimental protocol features
 h2 = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
-reqwest = { workspace = true }
-rustls-pemfile = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
+
 pem-rfc7468 = { workspace = true }
 quinn = { workspace = true, optional = true }
 h3 = { workspace = true, optional = true }

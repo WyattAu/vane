@@ -21,9 +21,52 @@ cd /home/wyatt/dev/src/github.com/WyattAu/vane
 
 DURATION="${1:-8}"
 WINDOWS=3
-LG=/tmp/opencode/loadgen/target/release
+# Artifacts live OUTSIDE /tmp: this host wipes /tmp on restart, which
+# silently turns "binary missing" into "no comparison run". Override
+# with VANE_ARTIFACTS=/path.
+ART=${VANE_ARTIFACTS:-/var/tmp/vane-artifacts}
+PROXIES="$ART/proxies"
+mkdir -p "$ART" "$PROXIES"
+
+# Third-party comparison binaries, pinned + checksum-verified (the
+# published numbers in docs/benchmarks.md name these exact versions).
+fetch_verified() { # url sha256 dest
+  local url=$1 want=$2 dest=$3 got
+  got=$(curl -fsSL -o "$dest.tgz" "$url" && sha256sum "$dest.tgz" | cut -d' ' -f1)
+  if [ "$got" != "$want" ]; then
+    echo "checksum mismatch for $url"
+    echo "  expected $want"
+    echo "  got      $got"
+    rm -f "$dest.tgz"
+    return 1
+  fi
+}
+if [ ! -x "$PROXIES/caddy" ]; then
+  echo "== fetching Caddy 2.10.2 =="
+  fetch_verified \
+    https://github.com/caddyserver/caddy/releases/download/v2.10.2/caddy_2.10.2_linux_amd64.tar.gz \
+    5c218bc34c9197369263da7e9317a83acdbd80ef45d94dca5eff76e727c67cdd \
+    "$PROXIES/caddy" || exit 2
+  tar -xzf "$PROXIES/caddy.tgz" -C "$PROXIES" caddy || exit 2
+fi
+if [ ! -x "$PROXIES/traefik" ]; then
+  echo "== fetching Traefik 3.5.4 =="
+  fetch_verified \
+    https://github.com/traefik/traefik/releases/download/v3.5.4/traefik_v3.5.4_linux_amd64.tar.gz \
+    9f1d30b3f3b547da88bf95e49c416cd898968be6f9157571d000e646b2ef8bae \
+    "$PROXIES/traefik" || exit 2
+  tar -xzf "$PROXIES/traefik.tgz" -C "$PROXIES" traefik || exit 2
+fi
+
+# Load generator lives in-repo now (tools/loadgen): it was previously an
+# untracked scratch crate under /tmp/opencode, which a restart wiped.
+LG="$PWD/tools/loadgen/target/release"
 for t in loadgen h2load h3load certgen upstream; do
-  [ -x "$LG/$t" ] || { echo "bench tools missing ($t) — build /tmp/opencode/loadgen"; exit 2; }
+  if [ ! -x "$LG/$t" ]; then
+    echo "== building tools/loadgen =="
+    (cd tools/loadgen && cargo build --release) || exit 2
+    break
+  fi
 done
 
 echo "== building vane (release) =="
@@ -31,13 +74,19 @@ cargo build --release -p vane-proxy --features h3 || exit 2
 
 mkport() { python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1])"; }
 FREE_UP=$(mkport)
+FREE_UP64=$(mkport)
 VANE_P1=$(mkport); VANE_P2=$(mkport)
 CADDY_P1=$(mkport); CADDY_P2=$(mkport)
 TRAEFIK_P1=$(mkport); TRAEFIK_P2=$(mkport)
 
-# ---- shared upstream (identical for every proxy) ----
+# ---- shared upstreams (identical for every proxy) ----
+# `$FREE_UP` serves 10-byte bodies (the tiny-response legs); `$FREE_UP64`
+# serves 64 KiB bodies (the breadth legs). Two processes, so a 64 KiB
+# transfer can never contend with the tiny-response legs on upstream CPU.
 "$LG/upstream" "127.0.0.1:$FREE_UP" &
 UP=$!
+"$LG/upstream" "127.0.0.1:$FREE_UP64" 65536 &
+UP64=$!
 sleep 0.5
 
 DIR=$(mktemp -d)
@@ -62,6 +111,13 @@ alpn_h2 = true
 [clusters.up]
 backends = ["127.0.0.1:$FREE_UP"]
 
+[clusters.up64]
+backends = ["127.0.0.1:$FREE_UP64"]
+
+[[routes]]
+pattern = "/bench64"
+cluster = "up64"
+
 [[routes]]
 pattern = "/*rest"
 cluster = "up"
@@ -82,14 +138,20 @@ cat > "$DIR/Caddyfile" <<EOF
   admin off
 }
 :$CADDY_P1 {
+  handle_path /bench64* {
+    reverse_proxy 127.0.0.1:$FREE_UP64
+  }
   reverse_proxy 127.0.0.1:$FREE_UP
 }
 :$CADDY_P2 {
   tls $DIR/cert.pem $DIR/key.pem
+  handle_path /bench64* {
+    reverse_proxy 127.0.0.1:$FREE_UP64
+  }
   reverse_proxy 127.0.0.1:$FREE_UP
 }
 EOF
-/tmp/opencode/proxies/caddy run --config "$DIR/Caddyfile" > "$DIR/caddy.log" 2>&1 &
+"$PROXIES/caddy" run --config "$DIR/Caddyfile" > "$DIR/caddy.log" 2>&1 &
 CADDY_PID=$!
 
 # ---- traefik ----
@@ -115,10 +177,19 @@ tls:
       keyFile: "CERTDIR/key.pem"
 http:
   routers:
+    plain64:
+      rule: "Path(`/bench64`)"
+      service: up64
+      entryPoints: ["plain"]
     plain:
       rule: "PathPrefix(`/`)"
       service: up
       entryPoints: ["plain"]
+    secure64:
+      rule: "Path(`/bench64`)"
+      service: up64
+      entryPoints: ["tls"]
+      tls: {}
     secure:
       rule: "PathPrefix(`/`)"
       service: up
@@ -129,9 +200,13 @@ http:
       loadBalancer:
         servers:
           - url: "http://127.0.0.1:REPLACE_UP"
+    up64:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:REPLACE_UP64"
 EOF
-sed -i "s|REPLACE_UP|$FREE_UP|; s|CERTDIR|$DIR|g" "$DIR/rules/dynamic.yml"
-/tmp/opencode/proxies/traefik --configfile "$DIR/traefik.yml" > "$DIR/traefik.log" 2>&1 &
+sed -i "s|REPLACE_UP64|$FREE_UP64|; s|REPLACE_UP|$FREE_UP|; s|CERTDIR|$DIR|g" "$DIR/rules/dynamic.yml"
+"$PROXIES/traefik" --configfile "$DIR/traefik.yml" > "$DIR/traefik.log" 2>&1 &
 TRAEFIK_PID=$!
 sleep 3
 
@@ -155,7 +230,7 @@ leg() { # port proto conns
   esac
 }
 
-RAW="/tmp/opencode/compare_raw.txt"
+RAW="$ART/compare_raw.txt"
 : > "$RAW"
 
 run_legs() { # proxy plain_port tls_port window
@@ -168,6 +243,17 @@ run_legs() { # proxy plain_port tls_port window
   out=$(leg "$p2" h2 8);  echo "$proxy h2-8  $w $out" >> "$RAW"
   wait_quiet
   out=$(leg "$p2" h3 8);  echo "$proxy h3-8  $w $out" >> "$RAW"
+  # Breadth legs: same wire path as h1-8, but payload-dominated. A proxy
+  # that wins on tiny responses can lose here (header overhead per byte,
+  # buffer sizing); without these legs the table overstates real edges.
+  # POST 4KB also exercises the upload direction, which GET legs never
+  # touch.
+  wait_quiet
+  out=$("$LG/loadgen" "127.0.0.1:$p1" 8 "$DURATION" /bench bench --method POST --body 4096 2>/dev/null | sed 's/^h1 /h1-post4k /')
+  echo "$proxy h1-post4k $w $out" >> "$RAW"
+  wait_quiet
+  out=$("$LG/loadgen" "127.0.0.1:$p1" 8 "$DURATION" /bench64 bench64 2>/dev/null | sed 's/^h1 /h1-get64k /')
+  echo "$proxy h1-get64k $w $out" >> "$RAW"
 }
 
 for w in $(seq 1 "$WINDOWS"); do
@@ -179,20 +265,25 @@ done
 
 echo "  RSS: vane $(ps -o rss= -p "$VANE_PID" 2>/dev/null | tr -d ' ') KB, caddy $(ps -o rss= -p "$CADDY_PID" 2>/dev/null | tr -d ' ') KB, traefik $(ps -o rss= -p "$TRAEFIK_PID" 2>/dev/null | tr -d ' ') KB"
 
-kill "$VANE_PID" "$CADDY_PID" "$TRAEFIK_PID" "$UP" 2>/dev/null
+kill "$VANE_PID" "$CADDY_PID" "$TRAEFIK_PID" "$UP" "$UP64" 2>/dev/null
 wait 2>/dev/null
 
 echo
 echo "================ MEDIAN OF $WINDOWS WINDOWS ================"
 echo "| proxy | leg | median req/s | median p50 | median p99 | non200(max) |"
 echo "|---|---|---|---|---|---|"
+# Raw row = "proxy leg window" + the loadgen's 13 fields, so loadgen
+# field N sits at awk column N+3: rps=8, non200=12, p50=14, p99=16.
+# (The columns used to line up at 5/9/11/13 when the generator printed
+# 10 fields; the richer line shifted them and the first compare run
+# computed medians over connection counts — caught before publishing.)
 awk '
 {
   k = $1 " " $2
-  req[k] = req[k] " " $5
-  if ($9 + 0 > mx[k] + 0) mx[k] = $9 + 0
-  p50[k] = p50[k] " " $11
-  p99[k] = p99[k] " " $13
+  req[k] = req[k] " " $8
+  if ($12 + 0 > mx[k] + 0) mx[k] = $12 + 0
+  p50[k] = p50[k] " " $14
+  p99[k] = p99[k] " " $16
 }
 function med(str,   n, a, i, j, t) {
   n = split(str, a, " ")

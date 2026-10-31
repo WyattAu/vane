@@ -1,16 +1,24 @@
 [package]
 name = "vane-tls"
-description = "rustls termination, ALPN, and SHM session-ticket cache for Vane"
-version.workspace = true
+description = "L4/L7 reverse proxy,edge gateway, micro sidecar monorepo"
+version = "0.6.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+# Post-quantum hybrid key exchange: X25519MLKEM768 becomes the
+# highest-priority kx group (aws-lc-rs provider). See install_crypto_
+# provider — the ring provider stays the default build.
+post-quantum = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
+
 [dependencies]
+ctor = "1.0"
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
+
 ring = { workspace = true }
 shm-rings = { workspace = true }
 zerocopy = { workspace = true }

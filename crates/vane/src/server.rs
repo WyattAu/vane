@@ -104,9 +104,11 @@ pub fn receive_inherited(
                 policy: vane_router::Policy::P2C,
                 priority: 20,
                 allowed_spiffe_prefixes: Vec::new(),
+                response_headers: vane_router::ResponseHeaderPolicy::default(),
                 retry: Default::default(),
                 mirror: None,
                 mirror_backends: Vec::new(),
+                cors: None,
             };
             match builder.compile() {
                 Ok(entry) => editor.insert(entry),
@@ -173,13 +175,11 @@ pub fn load_config(path: Option<&str>) -> Result<VaneConfig, String> {
         if let Some(l) = cfg.listeners.first_mut() {
             l.address = addr;
         } else {
-            cfg.listeners.push(vane_control::ListenerConfig {
-                address: addr,
-                mode: vane_control::config::ListenerMode::Http,
-                workers: 0,
-                tls: None,
-                h2c: false,
-            });
+            // non_exhaustive config: construct via Default + field
+            // assignment, never a struct expression.
+            let mut l = vane_control::ListenerConfig::default();
+            l.address = addr;
+            cfg.listeners.push(l);
         }
     }
     if let (Ok(cert), Ok(key)) = (
@@ -262,6 +262,8 @@ pub fn init_telemetry(cfg: &vane_control::TelemetryConfig) -> Option<otelkit::Te
         otlp_endpoint: merged.otlp_endpoint,
         sentry_dsn: None,
         sample_rate: merged.sample_rate.clamp(0.0, 1.0),
+        exporter: otelkit::Exporter::Otlp,
+        metrics_prometheus: false,
     };
     // Per-request tracing spans are only worth their fmt-layer cost
     // when there is a trace exporter to receive them.
@@ -304,6 +306,30 @@ fn resolve_admin_token(
     }
 }
 
+/// Resolves the per-listener worker count. `workers = 0` means AUTO:
+/// the core budget is SHARED across listeners, not duplicated per
+/// listener — the old behavior (cores per listener) put
+/// cores × listeners io_uring pollers on `cores` cpus, and two
+/// idle-ish 16-worker pools measured 16.4k get64k where one
+/// 16-worker pool measures 85.5k (a 5× tax on every multi-listener
+/// config; bench + fleet shaped). An explicit per-listener `workers`
+/// keeps the legacy all-equal semantics: the first explicit value
+/// wins for every listener.
+#[must_use]
+fn resolve_workers_per_listener(
+    listeners: &[vane_control::config::ListenerConfig],
+    cores: usize,
+) -> usize {
+    if listeners.iter().all(|l| l.workers == 0) {
+        let count = listeners.len().max(1);
+        (cores / count).max(1)
+    } else {
+        listeners
+            .first()
+            .map_or(1, |l| if l.workers == 0 { cores } else { l.workers })
+    }
+}
+
 /// Runs the proxy until shutdown. Returns the process exit code.
 pub async fn run(opts: RunOptions) -> i32 {
     let mut config = match load_config(opts.config_path.as_deref()) {
@@ -322,6 +348,11 @@ pub async fn run(opts: RunOptions) -> i32 {
     }
 
     let registry = Arc::new(Registry::new());
+    // Process-default rustls provider (ring, or aws-lc-rs + X25519MLKEM768
+    // with the post-quantum feature). MUST run before any ServerConfig
+    // is built: with both provider features compiled in, rustls refuses
+    // to auto-pick.
+    vane_tls::install_crypto_provider();
     let router = Arc::new(Router::new());
     let health = Arc::new(vane_control::HealthMap::new());
 
@@ -434,6 +465,14 @@ pub async fn run(opts: RunOptions) -> i32 {
             return 1;
         }
     }
+    let adaptive_limits: Arc<HashMap<String, vane_control::config::AdaptiveConcurrencyConfig>> =
+        Arc::new(
+            config
+                .clusters
+                .iter()
+                .filter_map(|(name, c)| c.adaptive.as_ref().map(|a| (name.clone(), a.clone())))
+                .collect(),
+        );
     let mesh_identities: Arc<HashMap<String, vane_control::config::MeshUpstreamConfig>> =
         Arc::new(mesh_map);
 
@@ -737,10 +776,7 @@ pub async fn run(opts: RunOptions) -> i32 {
         .collect();
     let inherited = opts.handover_from.is_some();
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let workers_per_listener = config
-        .listeners
-        .first()
-        .map_or(1, |l| if l.workers == 0 { cores } else { l.workers });
+    let workers_per_listener = resolve_workers_per_listener(&config.listeners, cores);
     let mut handles = Vec::new();
     let mut tls_cfg_slots: Vec<Option<crate::tls_reload::TlsSlot>> = Vec::new();
     let mut event_rings: Vec<
@@ -820,6 +856,7 @@ pub async fn run(opts: RunOptions) -> i32 {
             let worker_cfg = WorkerConfig {
                 core: Some(w % cores),
                 pool_slots: config.runtime.pool_slots,
+                buf_size: config.runtime.buffer_size,
                 ring_entries: config.runtime.ring_entries,
                 sqpoll: config.runtime.sqpoll,
                 force_mio: opts.force_mio || config.runtime.force_mio,
@@ -884,8 +921,10 @@ pub async fn run(opts: RunOptions) -> i32 {
                 jwt,
                 shared_rate_limit: shared_rate_limit.clone(),
                 h2c: config.listeners.get(li).is_some_and(|l| l.h2c),
+                proxy_protocol: config.listeners.get(li).is_some_and(|l| l.proxy_protocol),
                 alt_svc: alt_svc.clone(),
                 mesh: Arc::clone(&mesh_identities),
+                adaptive: Arc::clone(&adaptive_limits),
                 h2_strict_idle_window_update: config.http2.strict_idle_window_update,
             };
             match spawn_worker(
@@ -1126,10 +1165,20 @@ pub async fn run(opts: RunOptions) -> i32 {
     let mut opts = opts;
     let ext = opts.shutdown.take();
     let mut ext = ext.map(Box::pin);
+    // `shutdown_after` is the test-hook timer: the shutdown select must
+    // honor it. The Sep 26 refactor that added the channel deleted the
+    // `timeout(d, …)` branch and left the field documented but dead —
+    // every `shutdown_after` caller then hung forever waiting for a
+    // signal that never comes. On CI this was `quality / test` sitting
+    // in_progress for 10+ hours (and, in hindsight, every coverage-job
+    // hang since Sep 26).
+    let shutdown_after = opts.shutdown_after;
     let mut shutdown = Box::pin(wait_for_signal());
     let ext_fut = async {
         if let Some(rx) = ext.as_mut() {
             let _ = rx.as_mut().await;
+        } else if let Some(d) = shutdown_after {
+            tokio::time::sleep(d).await;
         } else {
             std::future::pending::<()>().await;
         }
@@ -1195,8 +1244,12 @@ struct WorkerFactory {
     shared_rate_limit: Option<Arc<vane_shm::ratelimit::SharedGcra>>,
     /// Mesh mTLS identities by cluster name.
     mesh: Arc<HashMap<String, vane_control::config::MeshUpstreamConfig>>,
+    /// Per-cluster adaptive concurrency config (startup-bound).
+    adaptive: Arc<HashMap<String, vane_control::config::AdaptiveConcurrencyConfig>>,
     /// Serve h2c on this plain listener (feature `h2`).
     h2c: bool,
+    /// Require + trust a PROXY protocol header on every connection.
+    proxy_protocol: bool,
     /// RFC 7838 Alt-Svc value injected into responses (h3 listeners).
     alt_svc: Option<String>,
     /// Strict h2 conformance (`[http2] strict_idle_window_update`).
@@ -1217,11 +1270,16 @@ impl vane_core::HandlerFactory for WorkerFactory {
                 rate_limit_rps: None,
                 shared_rate_limit: self.shared_rate_limit.clone(),
                 h2c: self.h2c,
+                proxy_protocol: self.proxy_protocol,
                 alt_svc: self.alt_svc.clone(),
                 connect_timeout_ms: self.runtime.connect_timeout_ms,
                 idle_timeout_ms: self.runtime.idle_timeout_ms,
                 first_byte_timeout_ms: self.runtime.first_byte_timeout_ms,
                 pool_per_backend: self.runtime.pool_per_backend,
+                adaptive: Arc::clone(&self.adaptive),
+                pool_idle_ms: self.runtime.pool_idle_ms,
+                #[cfg(feature = "response_splice")]
+                response_splice: self.runtime.response_splice,
                 tls: self.tls.clone(),
                 plugins: self.plugins.clone(),
                 http01_tokens: self.http01_tokens.clone(),
@@ -1362,9 +1420,11 @@ cluster = "up"
                 gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
                 priority: 0,
                 allowed_spiffe_prefixes: Vec::new(),
+                response_headers: vane_router::ResponseHeaderPolicy::default(),
                 retry: Default::default(),
                 mirror: None,
                 mirror_backends: Vec::new(),
+                cors: None,
             });
         });
         let records = crate::proxy::flatten_routes(&router);
@@ -1390,6 +1450,51 @@ cluster = "up"
             std::env::remove_var("VANE_WORKERS");
         }
         assert!(cfg.listeners.iter().all(|l| l.workers == 3));
+    }
+
+    /// `workers = 0` on TWO listeners shares the core budget (8 + 8
+    /// on a 16-core host), it does not duplicate it (16 + 16 = 32
+    /// io_uring pollers on 16 cpus cost 5x — see the fn docs).
+    #[test]
+    fn auto_workers_share_the_core_budget_across_listeners() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let dir = tempfile::tempdir().expect("dir");
+        let one_auto = r#"
+[[listeners]]
+address = "127.0.0.1:1"
+
+[clusters.up]
+backends = ["127.0.0.1:2"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "up"
+"#;
+        let two_auto = format!("{one_auto}[[listeners]]\naddress = \"127.0.0.1:3\"\n");
+        let path = write_cfg(dir.path(), "one_auto.toml", one_auto);
+        let cfg = load_config(Some(&path)).expect("load");
+        assert_eq!(
+            resolve_workers_per_listener(&cfg.listeners, 16),
+            16,
+            "one auto listener: the full budget"
+        );
+        let path = write_cfg(dir.path(), "two_auto.toml", &two_auto);
+        let cfg = load_config(Some(&path)).expect("load");
+        assert_eq!(
+            resolve_workers_per_listener(&cfg.listeners, 16),
+            8,
+            "two auto listeners: the budget splits"
+        );
+        // Mixed explicit + auto: the legacy all-equal branch reads the
+        // first listener's 0 and hands out the full budget.
+        let two_mixed = format!("{two_auto}workers = 3\n");
+        let path = write_cfg(dir.path(), "two_mixed.toml", &two_mixed);
+        let cfg = load_config(Some(&path)).expect("load");
+        assert_eq!(
+            resolve_workers_per_listener(&cfg.listeners, 16),
+            16,
+            "explicit wins: legacy cores-per-listener semantics"
+        );
     }
 
     /// OTEL_* and RUST_LOG env overrides merge over the file config
@@ -1431,7 +1536,7 @@ cluster = "up"
         }
         let cfg_with_file = vane_control::config::AdminConfig {
             auth_token_file: Some("/nonexistent/token".into()),
-            ..vane_control::config::AdminConfig::default()
+            ..Default::default()
         };
         let tok = resolve_admin_token(&cfg_with_file)
             .expect("env path ok")
@@ -1461,7 +1566,7 @@ cluster = "up"
         std::fs::write(&empty, "  \n\t").expect("write");
         let cfg_empty = vane_control::config::AdminConfig {
             auth_token_file: Some(empty.to_str().expect("utf8").into()),
-            ..vane_control::config::AdminConfig::default()
+            ..Default::default()
         };
         let err = resolve_admin_token(&cfg_empty).unwrap_err();
         assert!(err.contains("is empty"), "{err}");
@@ -1515,9 +1620,11 @@ mod handover_helper_tests {
                 gauges: Arc::new(vane_router::balancer::ConnGauges::new(1)),
                 priority: 0,
                 allowed_spiffe_prefixes: Vec::new(),
+                response_headers: vane_router::ResponseHeaderPolicy::default(),
                 retry: Default::default(),
                 mirror: None,
                 mirror_backends: Vec::new(),
+                cors: None,
             });
         });
         let health = Arc::new(vane_control::HealthMap::new());

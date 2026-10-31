@@ -17,6 +17,7 @@ fn build_router() -> Router {
     router.update(|editor| {
         for (pattern, cluster) in routes {
             let builder = RouteBuilder {
+                response_headers: vane_router::ResponseHeaderPolicy::default(),
                 host: None,
                 pattern: pattern.to_string(),
                 methods: Vec::new(),
@@ -33,6 +34,10 @@ fn build_router() -> Router {
                 outlier: None,
                 allowed_spiffe_prefixes: Vec::new(),
                 priority: 0,
+                retry: Default::default(),
+                mirror: None,
+                mirror_backends: Vec::new(),
+                cors: None,
             };
             if let Ok(entry) = builder.compile() {
                 editor.insert(entry);
@@ -42,10 +47,21 @@ fn build_router() -> Router {
     router
 }
 
+/// Built once per process, not once per input.
+///
+/// The router snapshot is a crossbeam-epoch allocation, and rebuilding it
+/// inside the target churned a fresh table (and leaked the old epoch
+/// snapshot) on every single input: libFuzzer's allocator saw 241k
+/// allocations for a 2-byte path and the job died with an out-of-memory
+/// that had nothing to do with routing. The target is about lookup.
+fn router() -> &'static Router {
+    static R: std::sync::OnceLock<Router> = std::sync::OnceLock::new();
+    R.get_or_init(build_router)
+}
+
 fuzz_target!(|data: &[u8]| {
-    let router = build_router();
     let path = String::from_utf8_lossy(data);
-    let table = router.load();
+    let table = router().load();
     if let Some(m) = table.table().lookup(None, &path) {
         // Invariants on successful matches.
         assert!(!m.terminal.value.cluster.is_empty());

@@ -702,8 +702,76 @@ impl AcmeManager {
         Ok(())
     }
 
-    /// Long-running renewal loop: checks expiry daily, renews at 2/3
-    /// lifetime with `retry-backoff` between failures.
+    /// The stored chain's leaf validity window, `(not_before,
+    /// not_after)` as unix seconds. `None` when there is no certificate
+    /// file or it does not parse — both mean "renew".
+    fn cert_lifetime(pem: &str) -> Option<(i64, i64)> {
+        // First CERTIFICATE block of the chain = the leaf.
+        let begin = pem.find("-----BEGIN CERTIFICATE-----")?;
+        let rest = &pem[begin..];
+        let end = rest.find("-----END CERTIFICATE-----")?;
+        let body = &rest[rest.find('\n')? + 1..end];
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(body.lines().collect::<String>().as_bytes())
+            .ok()?;
+        let (_, cert) = x509_parser::parse_x509_certificate(&der).ok()?;
+        Some((
+            cert.validity.not_before.timestamp(),
+            cert.validity.not_after.timestamp(),
+        ))
+    }
+
+    /// The renewal decision on a parsed validity window: renew once
+    /// `renew_at_fraction` of the lifetime has ELAPSED (the documented
+    /// 2/3 default leaves the last third as failure margin). Degenerate
+    /// windows (zero or inverted) renew immediately.
+    fn should_renew_lifetime(not_before: i64, not_after: i64, now: i64, fraction: f64) -> bool {
+        let total = not_after - not_before;
+        if total <= 0 {
+            return true;
+        }
+        let fraction = fraction.clamp(0.0, 1.0);
+        let elapsed = now - not_before;
+        (elapsed as f64) >= fraction * (total as f64)
+    }
+
+    /// Renewal decision for the stored chain: missing or unparsable
+    /// material always renews (nothing to protect); a parsable leaf
+    /// renews on the configured fraction of its lifetime.
+    fn should_renew(&self, now: i64) -> bool {
+        let Ok(pem) = std::fs::read_to_string(self.config.storage.join("cert.pem")) else {
+            return true;
+        };
+        match Self::cert_lifetime(&pem) {
+            Some((not_before, not_after)) => Self::should_renew_lifetime(
+                not_before,
+                not_after,
+                now,
+                self.config.renew_at_fraction,
+            ),
+            None => true,
+        }
+    }
+
+    fn unix_now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(i64::MAX)
+    }
+
+    /// Long-running renewal loop: HOURLY, reads the stored leaf's
+    /// validity, and re-issues only once `renew_at_fraction` of the
+    /// lifetime has elapsed. Two properties this replaces — and why the
+    /// change matters:
+    ///
+    /// - The loop used to re-issue UNCONDITIONALLY every 24 hours. Let's
+    ///   Encrypt allows 5 duplicate certificates per week for the same
+    ///   names, so a vane deployment broke its own renewals on day 5 of
+    ///   uptime and then failed forever.
+    /// - A daily check cannot safely serve short-lived certificates
+    ///   (Let's Encrypt's ~6-day offering): an hourly check leaves
+    ///   ~48 hourly attempts of margin at the 2/3 point instead of one.
     pub fn spawn_renewal(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let config = loop_retry::RetryConfig {
@@ -714,24 +782,26 @@ impl AcmeManager {
                 jitter: true,
             };
             loop {
-                let mgr = Arc::clone(&self);
-                let result = loop_retry::with_backoff(&config, || {
-                    let mgr = Arc::clone(&mgr);
-                    async move { mgr.obtain_certificate().await }
-                })
-                .await;
-                match result {
-                    Ok(domains) if domains.is_empty() => {
-                        return; // ACME not configured
-                    }
-                    Ok(domains) => {
-                        tracing::info!("acme: certificate ready for {domains:?}");
-                    }
-                    Err(e) => {
-                        tracing::error!("acme: renewal failed: {e}");
+                if self.should_renew(Self::unix_now()) {
+                    let mgr = Arc::clone(&self);
+                    let result = loop_retry::with_backoff(&config, || {
+                        let mgr = Arc::clone(&mgr);
+                        async move { mgr.obtain_certificate().await }
+                    })
+                    .await;
+                    match result {
+                        Ok(domains) if domains.is_empty() => {
+                            return; // ACME not configured
+                        }
+                        Ok(domains) => {
+                            tracing::info!("acme: certificate ready for {domains:?}");
+                        }
+                        Err(e) => {
+                            tracing::error!("acme: renewal failed: {e}");
+                        }
                     }
                 }
-                tokio::time::sleep(Duration::from_secs(60 * 60 * 24)).await;
+                tokio::time::sleep(Duration::from_secs(60 * 60)).await;
             }
         })
     }
@@ -754,6 +824,83 @@ fn reqwest_chain(e: &reqwest::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The renewal math: renew at/after the configured fraction of
+    /// the lifetime, never before, and always for degenerate windows.
+    #[test]
+    fn renewal_fraction_math() {
+        // 90-day window starting now: 2/3 elapsed is day 60.
+        let nb = 1_000_000_000;
+        let na = nb + 90 * 86_400;
+        let f = 2.0 / 3.0;
+        assert!(
+            !AcmeManager::should_renew_lifetime(nb, na, nb, f),
+            "day 0: fresh"
+        );
+        assert!(!AcmeManager::should_renew_lifetime(
+            nb,
+            na,
+            nb + 59 * 86_400,
+            f
+        ));
+        assert!(
+            AcmeManager::should_renew_lifetime(nb, na, nb + 60 * 86_400, f),
+            "day 60 = 2/3 elapsed"
+        );
+        assert!(
+            AcmeManager::should_renew_lifetime(nb, na, na, f),
+            "at expiry"
+        );
+        assert!(
+            AcmeManager::should_renew_lifetime(nb, na, na + 1, f),
+            "past expiry"
+        );
+
+        // Degenerate windows renew immediately.
+        assert!(
+            AcmeManager::should_renew_lifetime(500, 500, 500, f),
+            "zero-length"
+        );
+        assert!(
+            AcmeManager::should_renew_lifetime(na, nb, 500, f),
+            "inverted"
+        );
+
+        // A 6-day certificate (Let's Encrypt's short-lived offering):
+        // renew on day 4 — two full days of margin, not 24 h.
+        let na6 = nb + 6 * 86_400;
+        assert!(!AcmeManager::should_renew_lifetime(
+            nb,
+            na6,
+            nb + 3 * 86_400,
+            f
+        ));
+        assert!(AcmeManager::should_renew_lifetime(
+            nb,
+            na6,
+            nb + 4 * 86_400,
+            f
+        ));
+    }
+
+    /// cert_lifetime reads the leaf of a REAL chain and tolerates the
+    /// mock PEM (which is not a certificate at all) by returning None.
+    #[test]
+    fn cert_lifetime_parses_rcgen_chain() {
+        let certs = rcgen::generate_simple_self_signed(vec!["renew.test".into()]).expect("cert");
+        let chain = format!("{}\n{}", certs.cert.pem(), certs.cert.pem());
+        let (nb, na) = AcmeManager::cert_lifetime(&chain).expect("leaf validity");
+        assert!(na > nb, "validity window is forward: {nb} -> {na}");
+        // The leaf must be valid NOW: rcgen backdates not_before (by
+        // more than the cert's own lifetime, as it happens) to defeat
+        // clock skew, so assert validity rather than the exact window.
+        let now = AcmeManager::unix_now();
+        assert!(nb <= now, "not_before is in the past: {nb} vs {now}");
+        assert!(na > now, "freshly issued certificate is valid now");
+        // Unparsable material: None -> the caller renews.
+        assert_eq!(AcmeManager::cert_lifetime("not a pem"), None);
+        assert_eq!(AcmeManager::cert_lifetime(""), None);
+    }
 
     #[test]
     fn b64_url_nopad() {

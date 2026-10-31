@@ -14,12 +14,12 @@ set -uo pipefail
 cd /home/wyatt/dev/src/github.com/WyattAu/vane
 
 DURATION="${1:-8}"
-LG=/tmp/opencode/loadgen/target/release
+# Load generator lives in-repo (tools/loadgen); the old path under
+# /tmp/opencode was wiped by a machine restart.
+LG="$PWD/tools/loadgen/target/release"
 if [ ! -x "$LG/loadgen" ] || [ ! -x "$LG/certgen" ]; then
   echo "== building bench tools (loadgen + certgen) =="
-  mkdir -p /tmp/opencode/loadgen/src/bin
-  [ -f /tmp/opencode/loadgen/Cargo.toml ] || { echo "loadgen crate missing at /tmp/opencode/loadgen"; exit 2; }
-  (cd /tmp/opencode/loadgen && cargo build --release) || exit 2
+  (cd tools/loadgen && cargo build --release) || exit 2
 fi
 
 echo "== building vane (release) =="
@@ -60,6 +60,7 @@ DIR=$(mktemp -d)
 cat > "$DIR/far.toml" <<TOML
 [[listeners]]
 address = "127.0.0.1:$PORT_FAR"
+workers = 1
 
 [listeners.tls]
 cert = "$DIR/cert.pem"
@@ -78,7 +79,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 TOML
 ./target/release/vane run -c "$DIR/far.toml" &
 FAR=$!
@@ -114,7 +114,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 1
 TOML
 ./target/release/vane run -c "$DIR/near.toml" &
 NEAR=$!

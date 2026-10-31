@@ -1,8 +1,12 @@
 [package]
 name = "vane-control"
 # 0.2.2 adds envoy::decode_cla (EDS resources) required by vane-proxy.
-version = "0.6.0"
-description = "Configuration, discovery providers, ACME, and health checks for Vane"
+# 0.8.0: user-authored config tables reject unknown fields
+# (deny_unknown_fields on every table but the top-level document), and
+# ACME challenge names accept the RFC 8555 spellings with legacy
+# aliases.
+version = "0.13.1"
+description = "L4/L7 reverse proxy,edge gateway, micro sidecar monorepo"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -28,6 +32,9 @@ loop-retry = { workspace = true }
 rustls-pki-types = { workspace = true }
 rustls = { workspace = true }
 rcgen = { workspace = true }
+# Leaf validity parsing for the renewal decision (already in the tree
+# as a transitive dependency of rustls tooling).
+x509-parser = "0.18"
 ring = { workspace = true }
 base64 = "0.22"
 rand = { workspace = true }
@@ -40,6 +47,7 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+base64 = "0.22"
 tokio = { workspace = true, features = ["test-util"] }
 wiremock = "0.6"
 

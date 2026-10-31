@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use vane_router::Router;
+use vane_tls::install_crypto_provider;
 
 fn init_log() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -24,6 +25,7 @@ fn test_router(upstream: std::net::SocketAddr) -> Arc<Router> {
     router.update(|editor| {
         editor.replace_all(vec![]);
         let builder = vane_router::RouteBuilder {
+            response_headers: Default::default(),
             host: None,
             pattern: "/*rest".into(),
             methods: Vec::new(),
@@ -40,6 +42,7 @@ fn test_router(upstream: std::net::SocketAddr) -> Arc<Router> {
             retry: Default::default(),
             mirror: None,
             mirror_backends: Vec::new(),
+            cors: None,
         };
         editor.insert(builder.compile().expect("route"));
     });
@@ -74,6 +77,10 @@ fn spawn_upstream() -> std::net::SocketAddr {
 /// plain OS thread. Returns the QUIC address and the server cert
 /// (DER) for trust material.
 fn spawn_h3_edge_backend(router: Arc<Router>) -> (SocketAddr, String) {
+    // With the post-quantum feature, rustls carries both provider
+    // features and refuses to auto-pick a process default: install ours
+    // before any ServerConfig::builder() call in the tests.
+    vane_tls::install_crypto_provider();
     let edge = Arc::new(vane::h3_edge::H3Edge::new(
         router,
         Arc::new(vane_observe::metrics::Registry::new()),
@@ -82,11 +89,9 @@ fn spawn_h3_edge_backend(router: Arc<Router>) -> (SocketAddr, String) {
     let certs = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
     let cert_pem = certs.cert.pem();
     let cert_der = certs.cert.der().clone();
-    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
-        certs.signing_key.serialize_pem().as_bytes(),
-    ))
-    .expect("key pem")
-    .expect("key");
+    let key = <rustls::pki_types::PrivateKeyDer<'static> as rustls::pki_types::pem::PemObject>::from_pem_slice(certs.signing_key.serialize_pem().as_bytes())
+        .expect("key pem");
+    install_crypto_provider();
     let mut server_tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key)
@@ -226,20 +231,15 @@ fn h3_bridge_mtls_client_cert() {
     // CA, serving a canned h3 response, on its own runtime thread.
     let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp bind");
     let quic_addr: SocketAddr = udp.local_addr().expect("addr");
-    let srv_certs: Vec<_> =
-        rustls_pemfile::certs(&mut std::io::BufReader::new(srv.pem().as_bytes()))
+    let srv_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        <rustls::pki_types::CertificateDer<'static> as rustls::pki_types::pem::PemObject>::pem_slice_iter(srv.pem().as_bytes())
             .map(Result::unwrap)
             .collect();
-    let server_key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
-        srv_key.serialize_pem().as_bytes(),
-    ))
-    .expect("pem")
-    .expect("key");
-    let client_cas: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(
-        std::fs::File::open(&ca_pem).expect("ca pem"),
-    ))
-    .map(Result::unwrap)
-    .collect();
+    let server_key = <rustls::pki_types::PrivateKeyDer<'static> as rustls::pki_types::pem::PemObject>::from_pem_slice(srv_key.serialize_pem().as_bytes()).expect("pem");
+    let client_cas: Vec<rustls::pki_types::CertificateDer<'static>> = <rustls::pki_types::CertificateDer<'static> as rustls::pki_types::pem::PemObject>::pem_file_iter(&ca_pem)
+        .expect("open pem")
+        .map(Result::unwrap)
+        .collect();
     let mut cas_roots = rustls::RootCertStore::empty();
     for c in client_cas {
         cas_roots.add(c).expect("ca root");
@@ -247,6 +247,7 @@ fn h3_bridge_mtls_client_cert() {
     let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(cas_roots))
         .build()
         .expect("verifier");
+    install_crypto_provider();
     let mut server_tls = rustls::ServerConfig::builder()
         .with_client_cert_verifier(verifier)
         .with_single_cert(srv_certs, server_key)
@@ -395,11 +396,9 @@ fn h3_bridge_reuses_one_quic_connection() {
 
     // Raw quinn+h3 backend with an accept counter.
     let certs = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
-    let server_key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
-        certs.signing_key.serialize_pem().as_bytes(),
-    ))
-    .expect("pem")
-    .expect("key");
+    let server_key = <rustls::pki_types::PrivateKeyDer<'static> as rustls::pki_types::pem::PemObject>::from_pem_slice(certs.signing_key.serialize_pem().as_bytes())
+        .expect("pem");
+    install_crypto_provider();
     let mut server_tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![certs.cert.der().clone()], server_key)
@@ -539,14 +538,12 @@ fn h3_bridge_rotates_upstream_material() {
     std::fs::write(&cli_key, &v1_key).expect("write");
 
     // Server: quinn+h3, client-auth required against CA2, canned 200.
-    let srv_certs: Vec<_> = rustls_pemfile::certs(&mut srv.pem().as_bytes())
+    let srv_certs: Vec<rustls::pki_types::CertificateDer<'static>> = <rustls::pki_types::CertificateDer<'static> as rustls::pki_types::pem::PemObject>::pem_slice_iter(srv.pem().as_bytes())
         .map(Result::unwrap)
         .collect();
-    let server_key = rustls_pemfile::private_key(&mut srv_key.serialize_pem().as_bytes())
-        .expect("pem")
-        .expect("key");
+    let server_key = <rustls::pki_types::PrivateKeyDer<'static> as rustls::pki_types::pem::PemObject>::from_pem_slice(srv_key.serialize_pem().as_bytes()).expect("pem");
     let mut cas_roots = rustls::RootCertStore::empty();
-    let ca2_der: Vec<_> = rustls_pemfile::certs(&mut ca2.pem().as_bytes())
+    let ca2_der: Vec<rustls::pki_types::CertificateDer<'static>> = <rustls::pki_types::CertificateDer<'static> as rustls::pki_types::pem::PemObject>::pem_slice_iter(ca2.pem().as_bytes())
         .map(Result::unwrap)
         .collect();
     for c in ca2_der {
@@ -555,6 +552,7 @@ fn h3_bridge_rotates_upstream_material() {
     let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(cas_roots))
         .build()
         .expect("verifier");
+    install_crypto_provider();
     let mut server_tls = rustls::ServerConfig::builder()
         .with_client_cert_verifier(verifier)
         .with_single_cert(srv_certs, server_key)

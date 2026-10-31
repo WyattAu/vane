@@ -6,6 +6,7 @@
 
 [[listeners]]
 address = "0.0.0.0:8080"
+workers = 2
 
 [clusters.up]
 backends = ["upstream:18082"]
@@ -16,6 +17,3 @@ cluster = "up"
 
 [admin]
 enabled = false
-
-[runtime]
-workers = 2

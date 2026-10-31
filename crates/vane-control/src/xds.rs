@@ -176,6 +176,7 @@ pub fn apply_snapshot(
             http2: cluster.http2,
             http3: false,
             h3_tls: None,
+            adaptive: None,
             mesh: None,
         };
         let backends = resolve_backends(&cluster_cfg, health);
@@ -187,8 +188,13 @@ pub fn apply_snapshot(
         }
         let outlier = cluster.outlier.as_ref().map(|o| {
             let addrs: Vec<SocketAddr> = backends.iter().map(|b| b.addr).collect();
-            vane_router::outlier::OutlierSet::new(addrs, o.consecutive_failures, o.ejection_ms)
-                .shared()
+            vane_router::outlier::OutlierSet::with_max_ejected(
+                addrs,
+                o.consecutive_failures,
+                o.ejection_ms,
+                o.max_ejection_percent,
+            )
+            .shared()
         });
         builders.push(RouteBuilder {
             host: route.host.clone(),
@@ -206,6 +212,8 @@ pub fn apply_snapshot(
             allowed_spiffe_prefixes: route.allowed_spiffe_prefixes.clone(),
             retry: Default::default(),
             mirror_backends: Vec::new(),
+            cors: None,
+            response_headers: vane_router::ResponseHeaderPolicy::default(),
             mirror: None,
         });
     }

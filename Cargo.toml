@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.3"
+version = "0.5.6"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -39,27 +39,27 @@ expect_used = "allow"
 
 [workspace.dependencies]
 # Internal
-vane-kernel = { version = "0.5.3", path = "crates/vane-kernel" }
+vane-kernel = { version = "0.9.0", path = "crates/vane-kernel" }
 vane-observe = { version = "0.5.3", path = "crates/vane-observe" }
-vane-proto = { version = "0.5.4", path = "crates/vane-proto" }
-vane-router = { version = "0.7.0", path = "crates/vane-router" }
-vane-filters = { version = "0.5.3", path = "crates/vane-filters" }
-vane-control = { version = "0.6.0", path = "crates/vane-control" }
+vane-proto = { version = "0.7.0", path = "crates/vane-proto" }
+vane-router = { version = "0.9.0", path = "crates/vane-router" }
+vane-filters = { version = "0.6.0", path = "crates/vane-filters" }
+vane-control = { version = "0.13.0", path = "crates/vane-control" }
 vane-shm = { version = "0.5.3", path = "crates/vane-shm" }
 vane-client-sdk = { version = "0.5.3", path = "crates/vane-client-sdk" }
-vane-tls = { version = "0.5.3", path = "crates/vane-tls" }
+vane-tls = { version = "0.6.0", path = "crates/vane-tls" }
 vane-plugins = { version = "0.5.3", path = "crates/vane-plugins" }
 
 # WyattAu kit ecosystem (reuse, do not reinvent)
-shm-rings = "0.1.1"
+shm-rings = "1"
 slab-pool = "0.1"
-throttle-kit = "1.0"
-breaker = "1.0"
+throttle-kit = "2"
+breaker = "2.0"
 healthkit = "1.0"
-axum-stack = "0.1"
+axum-stack = "1"
 graceful = "0.1"
-otelkit = { version = "1.0", features = ["otlp"] }
-envstack = "0.2"
+otelkit = { version = "2", features = ["otlp"] }
+envstack = "1"
 validkit = "1.0"
 errcode = "0.1.0-alpha.2"
 json-envelope = "0.1"
@@ -107,7 +107,6 @@ futures = "0.3"
 jsonwebtoken = "9"
 rsa = { version = "0.9", features = ["sha2"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pemfile = "2"
 pem-rfc7468 = { version = "0.7", features = ["std"] }
 # Pin ring: the tokio-rustls default pulls `rustls/aws_lc_rs`, which —
 # combined with our direct rustls `ring` pin — makes the process-level
@@ -122,12 +121,12 @@ rcgen = "0.14"
 
 # Observability
 tracing = "0.1"
-# Aligned with otelkit's OTLP stack (0.28/0.29): the parent links we
+# Aligned with otelkit 2's OTLP stack (0.32/0.33): the parent links we
 # write must use the same type-IDs the export layer reads, or traces
 # silently fragment.
-opentelemetry = "0.28"
-opentelemetry_sdk = "0.28"
-tracing-opentelemetry = "0.29"
+opentelemetry = "0.32"
+opentelemetry_sdk = "0.32"
+tracing-opentelemetry = "0.33"
 futures-core = "0.3"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std"] }
 
@@ -139,7 +138,7 @@ h3 = { version = "0.0.8" }
 h3-quinn = { version = "0.0.10" }
 
 # Plugins (feature-gated)
-wasmtime = { version = "48" }
+wasmtime = { version = "48.0.4" }
 
 # Misc
 notify = "8"

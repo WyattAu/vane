@@ -5,24 +5,42 @@ name: ci
 on:
   schedule:
     - cron: "0 3 * * *"
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
 
+# Pushes supersede each other; SCHEDULED runs get their own group and
+# must NOT be cancelled by a push. The nightly deep-fuzz job is 13
+# targets x 600 s (~2.5 h) — under a shared group any mid-run push
+# killed it, and the log shows it never completed on an active day.
+# That is the project's slow-bug detector dying silently.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
   quality:
-    uses: WyattAu/engineering-standards/.github/workflows/rust-kit.yml@main
+    # Pinned to the last-known-good kit while engineering-standards#6
+    # is open: today's kit coverage series (31b3842..45d6c98) lands
+    # --ignore-filename-regex in the libtest passthrough, failing
+    # every repo that passes coverage-ignore-regex. Unpin once the
+    # kit fix lands.
+    uses: WyattAu/engineering-standards/.github/workflows/rust-kit.yml@4446eb4537c8e84a12039ca63b53067045645a66
     with:
       tier: a
+      # The CLI process surface (main.rs): subcommand dispatch exits the
+      # process and two subcommands run never-returning service loops.
+      # The bodies (cmd_run/validate/sidecar/gateway-operator tick) are
+      # unit-tested; the process boundary itself cannot be covered
+      # in-process (rust-kit ADR-0005).
+      coverage-ignore-regex: "crates/vane/src/main.rs"
     secrets: inherit
 
   e2e:
     name: end-to-end proxy
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -39,6 +57,7 @@ jobs:
   h2spec:
     name: h2 conformance (h2spec generic)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -62,6 +81,7 @@ jobs:
   loom:
     name: loom model checking
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -74,6 +94,7 @@ jobs:
   miri:
     name: miri (pure-logic modules)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -88,6 +109,7 @@ jobs:
   feature-matrix:
     name: feature matrix
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -106,6 +128,7 @@ jobs:
   h3-quic:
     name: h3 QUIC suites (release)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -146,23 +169,51 @@ jobs:
   coverage:
     name: coverage (llvm-cov)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-llvm-cov --locked
+      # h3 suites RUN here now: they were skipped as debug-mode QUIC
+      # slow/flaky, but that made h3_edge/h3_bridge/h3_client permanently
+      # uncoverable — the workspace bar counts their lines whether or not
+      # the job exercises them. The release-mode h3 job still gates
+      # correctness independently; if the instrumented run proves too
+      # slow, the honest fix is a coverage-specific profile, not a skip.
+      #
+      # `llvm-cov clean` first: rust-cache keeps target/ (including the
+      # llvm-cov-target subtree) across commits, and a stale instrumented
+      # binary silently reports "0 tests, N filtered out" — the coverage
+      # number was computed from last week's code (h3 inclusion moved the
+      # total by ONE line until this).
+      - name: Clean coverage artifacts
+        run: cargo llvm-cov clean --workspace
+      # No --skip filters: cargo-llvm-cov 0.9.1 eats libtest `--skip`
+      # flags and keeps their VALUES as run-only positional filters, so
+      # this job silently measured two suites (hot_upgrade + anything
+      # containing 'h3spec') while reporting a workspace total. The
+      # unfiltered run costs hot_upgrade (~1 s) and nothing else — the
+      # h3spec cargo target was retired long ago (the binary-based run
+      # lives in scripts/h3spec_run.sh). The shared quality/coverage job
+      # already runs unfiltered and is the number that counts.
       - name: Generate coverage (serial proxy suites)
         run: |
           cargo llvm-cov --workspace --features vane-plugins/wasm,acme-pebble --lcov \
             --output-path lcov.info -- \
-            --include-ignored --test-threads=2 -- --skip hot_upgrade --skip h3_ --skip h3spec
+            --include-ignored --test-threads=2
       - name: Chaos suite
         run: cargo test -p vane-proxy --test chaos -- --test-threads=1
       - name: Enforce Tier A threshold
-        run: |
-          cargo llvm-cov --workspace --features vane-plugins/wasm,acme-pebble --lcov \
-            --output-path /dev/null --fail-under-lines 90 -- \
-            --include-ignored --test-threads=2 --skip hot_upgrade --skip large_body_streams_through_edge --skip h3_ --skip h3spec
+        # `report`, not a second full run: the step above already
+        # produced the measurement, and re-running with `--skip`
+        # flags is the trap documented above — cargo-llvm-cov turns
+        # them into run-only positional filters, so the gate would
+        # score a subset of the suite and fail at a number nobody
+        # else reproduces. `report` reads the same profraw data the
+        # generate step wrote, so the enforced number IS the number
+        # the run measured.
+        run: cargo llvm-cov report --fail-under-lines 90 --summary-only
         # The streaming-family tests run as subprocess servers now
         # (2026-09-19) — the suite-sequence wedge is fixed, no skips
         # needed beyond the retired REUSEPORT-edge probe (kept: it is
@@ -173,6 +224,7 @@ jobs:
   helm:
     name: helm lint + template
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: Set up Helm
@@ -181,10 +233,13 @@ jobs:
           version: v3.14.4
       - name: Lint
         run: helm lint charts/vane
+      # `>` does not create parent directories, and a fresh runner has no
+      # /tmp/opencode — the redirect failed and took the step with it.
       - name: Template (default + k8s-provider)
         run: |
-          helm template vane charts/vane --show-only templates/configmap.yaml > /tmp/opencode/cm-default.yaml
-          test -s /tmp/opencode/cm-default.yaml
+          out="$(mktemp -d)"
+          helm template vane charts/vane --show-only templates/configmap.yaml > "$out/cm-default.yaml"
+          test -s "$out/cm-default.yaml"
           helm template vane charts/vane -f charts/vane/values-k8s-provider.yaml | grep -q "kind: ClusterRoleBinding"
       - name: Compose validation
         run: |
@@ -194,56 +249,113 @@ jobs:
   kind-smoke:
     name: kind smoke (chart + provider + data path)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # /usr/local/bin is not writable on the runner ("Operation not
+      # permitted" on chmod); $HOME/.local/bin already precedes it on PATH.
       - name: Install kind + kubectl + helm
         run: |
-          curl -sLo /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
-          chmod +x /usr/local/bin/kind
-          curl -sLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl
-          chmod +x /usr/local/bin/kubectl
-          curl -sL https://get.helm.sh/helm-v3.14.4-linux-amd64.tar.gz | tar -xz --strip-components=1 -C /usr/local/bin linux-amd64/helm
+          set -euo pipefail
+          bin="$HOME/.local/bin"
+          mkdir -p "$bin"
+          curl -sLo "$bin/kind" https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+          chmod +x "$bin/kind"
+          curl -sLo "$bin/kubectl" https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl
+          chmod +x "$bin/kubectl"
+          curl -sL https://get.helm.sh/helm-v3.14.4-linux-amd64.tar.gz | tar -xz --strip-components=1 -C "$bin" linux-amd64/helm
+          kind version && kubectl version --client=true && helm version --short
       - name: Create kind cluster
         run: kind create cluster --name vane-smoke --wait 120s
       - name: Run smoke
         run: scripts/kind-smoke.sh
 
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo install cargo-audit --locked
+      # Known unfixed advisories are tracked in SECURITY.md.
+      - run: cargo audit --file Cargo.lock
+
   fuzz-smoke:
     name: fuzz smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-fuzz --locked
-      # crossbeam-epoch (router) holds allocations until thread exit —
-      # LeakSanitizer false-positives there, so leaks stay undetected.
+      # `fuzz/` is a separate workspace, so `cargo check --workspace` never
+      # compiles a fuzz target. A stale literal in one surfaces only as a
+      # sanitizer build error mid-job, naming the wrong thing — a RouteBuilder
+      # that gained a field broke this job exactly that way. Compile them all
+      # first so the failure is a compile error with a file and a line.
+      - name: fuzz targets compile
+        run: cargo +nightly check --manifest-path fuzz/Cargo.toml --all-targets
+      # tools/loadgen is a separate workspace too — same gap: a broken
+      # bench script surfaces only when someone benches, mid-measurement.
+      - name: bench tools compile
+        run: cargo check --manifest-path tools/loadgen/Cargo.toml --all-targets
+      # crossbeam-epoch (router) holds the snapshot until the process
+      # exits, so LeakSanitizer reports it as a leak; leaks stay
+      # undetected repo-wide. The route_lookup target used to rebuild the
+      # router on every input, which churned (and leaked) an epoch
+      # snapshot per input — that churn is gone, and the target now runs
+      # 10.7M inputs in 120s with leak detection on and clean.
       - name: parser smoke (60s)
-        run: cargo fuzz run parse_request -- -max_total_time=60 -max_len=8192 -detect_leaks=0
+        run: cargo +nightly fuzz run parse_request -- -max_total_time=60 -max_len=8192 -detect_leaks=0
       - name: response smoke (60s)
-        run: cargo fuzz run parse_response -- -max_total_time=60 -max_len=8192 -detect_leaks=0
+        run: cargo +nightly fuzz run parse_response -- -max_total_time=60 -max_len=8192 -detect_leaks=0
       - name: h2 connection smoke (60s)
-        run: cargo fuzz run h2_conn_server -- -max_total_time=60 -max_len=16384 -detect_leaks=0
+        run: cargo +nightly fuzz run h2_conn_server -- -max_total_time=60 -max_len=16384 -detect_leaks=0
       - name: xds decode smoke (60s)
-        run: cargo fuzz run xds_decode -- -max_total_time=60 -max_len=16384 -detect_leaks=0
+        run: cargo +nightly fuzz run xds_decode -- -max_total_time=60 -max_len=16384 -detect_leaks=0
       - name: h1pool response smoke (60s)
-        run: cargo fuzz run h1pool_response -- -max_total_time=60 -max_len=8192 -detect_leaks=0
+        run: cargo +nightly fuzz run h1pool_response -- -max_total_time=60 -max_len=8192 -detect_leaks=0
+      - name: chunked scanner smoke (60s)
+        run: cargo +nightly fuzz run chunked_scanner -- -max_total_time=60 -max_len=4096 -detect_leaks=0
+      # Regression seeds: every fuzz-found bug must stay found.
+      # Corpus paths are resolved against the invocation directory, and
+      # this job runs from the repo root — `corpus/regression` silently
+      # pointed at a directory that does not exist and every target
+      # exited 1 with "The required directory does not exist".
+      - name: regression seeds (all targets)
+        run: |
+          seeds="$(ls fuzz/corpus/regression 2>/dev/null | wc -l)"
+          echo "regression seeds: ${seeds}"
+          test "$seeds" -gt 0
+          for t in parse_request parse_response frame hpack h2_conn_server xds_decode h1pool_response chunked_scanner cert_san proxy_protocol; do
+            cargo +nightly fuzz run "$t" fuzz/corpus/regression -- -detect_leaks=0 -runs=5000
+          done
       - name: h2 frame smoke (60s)
-        run: cargo fuzz run frame -- -max_total_time=60 -detect_leaks=0
+        run: cargo +nightly fuzz run frame -- -max_total_time=60 -detect_leaks=0
       - name: hpack smoke (60s)
-        run: cargo fuzz run hpack -- -max_total_time=60 -detect_leaks=0
+        run: cargo +nightly fuzz run hpack -- -max_total_time=60 -detect_leaks=0
       - name: shm descriptor smoke (60s)
-        run: cargo fuzz run shm_descriptors -- -max_total_time=60 -detect_leaks=0
+        run: cargo +nightly fuzz run shm_descriptors -- -max_total_time=60 -detect_leaks=0
       - name: access record smoke (60s)
-        run: cargo fuzz run access_record -- -max_total_time=60 -detect_leaks=0
+        run: cargo +nightly fuzz run access_record -- -max_total_time=60 -detect_leaks=0
       - name: router smoke (60s)
-        run: cargo fuzz run route_lookup -- -max_total_time=60 -detect_leaks=0
+        run: cargo +nightly fuzz run route_lookup -- -max_total_time=60 -detect_leaks=0
+      - name: cert SAN walk smoke (60s)
+        run: cargo +nightly fuzz run cert_san -- -max_total_time=60 -max_len=8192 -detect_leaks=0
+      - name: PROXY protocol smoke (60s)
+        run: cargo +nightly fuzz run proxy_protocol -- -max_total_time=60 -max_len=4096 -detect_leaks=0
   fuzz-nightly:
     name: fuzz deep (nightly)
     runs-on: ubuntu-latest
-    if: github.event_name == 'schedule'
+    # 13 targets x 600 s of fuzzing plus builds: a 60-minute ceiling
+    # (the push-job default) would kill the job mid-run every night.
+    timeout-minutes: 200
+    # The nightly schedule, or a manual dispatch (`gh workflow run ci`)
+    # to validate the deep budgets without waiting for 03:00 UTC.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -253,7 +365,9 @@ jobs:
       # Any artifact uploaded for triage; crashes fail the run.
       - name: deep fuzz (600s per target)
         run: |
-          for t in parse_request parse_response frame hpack h2_conn_server xds_decode h1pool_response route_lookup shm_descriptors access_record; do
+          for t in parse_request parse_response frame hpack h2_conn_server xds_decode h1pool_response chunked_scanner cert_san proxy_protocol route_lookup shm_descriptors access_record; do
             echo "=== $t ==="
-            cargo fuzz run "$t" -- -max_total_time=600 -max_len=16384 -detect_leaks=0 -artifact_prefix=/tmp/artifacts/
+            # cargo-fuzz already passes its own artifact prefix; an
+            # explicit /tmp path just risks a missing directory.
+            cargo +nightly fuzz run "$t" -- -max_total_time=600 -max_len=16384 -detect_leaks=0
           done

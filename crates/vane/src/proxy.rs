@@ -31,11 +31,18 @@ fn ip16(ip: std::net::IpAddr) -> [u8; 16] {
 }
 use vane_observe::{LogEvent, LogLevel};
 use vane_proto::request::{MAX_HEADERS, Parsed, RequestView};
-use vane_proto::response::{Status, write_full};
+use vane_proto::response::{Status, write_full, write_head};
 use vane_router::{RouteEntry, Router};
 use vane_shm::handover::RouteRecord;
 
 /// Proxy handler configuration shared across workers.
+///
+/// Proxy handler configuration shared across workers.
+///
+/// `#[non_exhaustive]` per the config-struct family rule (feature-
+/// compat R2): fields can be feature-gated, so downstream code must
+/// construct via [`ProxyConfig::new`] plus field assignment.
+#[non_exhaustive]
 pub struct ProxyConfig {
     /// Router (EBR snapshot source).
     pub router: Arc<Router>,
@@ -53,6 +60,19 @@ pub struct ProxyConfig {
     pub first_byte_timeout_ms: u64,
     /// Idle upstream connections kept per backend (per worker).
     pub pool_per_backend: usize,
+    /// Adaptive concurrency limits per cluster name (absent =
+    /// unlimited; startup-bound like the pool — reloads rebuild
+    /// routes, not worker config).
+    pub adaptive: Arc<HashMap<String, vane_control::config::AdaptiveConcurrencyConfig>>,
+    /// How long a parked upstream connection stays reusable.
+    pub pool_idle_ms: u64,
+    /// Relay eligible response bodies with splice(2) (kernel pipe):
+    /// identity Content-Length over plain TCP on both legs. Requires
+    /// the `body-splice` cargo feature (and vane-kernel's kernel-side
+    /// support) to have any effect; without it the config parses but
+    /// the fast path is inert.
+    #[cfg(feature = "body-splice")]
+    pub response_splice: bool,
     /// TLS termination config (`None` = plaintext listener). Shared slot:
     /// hot reload swaps the inner Arc without touching workers.
     pub tls: Option<Arc<std::sync::RwLock<Arc<rustls::ServerConfig>>>>,
@@ -73,6 +93,9 @@ pub struct ProxyConfig {
     pub shared_rate_limit: Option<std::sync::Arc<vane_shm::ratelimit::SharedGcra>>,
     /// Serve h2c (prior-knowledge HTTP/2) on this plain listener.
     pub h2c: bool,
+    /// Require a PROXY protocol header on every connection and trust
+    /// the client address it carries (listener config `proxy_protocol`).
+    pub proxy_protocol: bool,
     /// RFC 7838 `Alt-Svc` header value injected into every response
     /// head (e.g. `h3=":8443"; ma=86400` when the h3 edge shares the
     /// TLS listener's port). `None` = no advertisement.
@@ -84,6 +107,76 @@ pub struct ProxyConfig {
     /// Mesh mTLS identities by cluster name (absent entry = plaintext
     /// upstream).
     pub mesh: Arc<HashMap<String, vane_control::config::MeshUpstreamConfig>>,
+}
+
+/// An upstream connection parked in the idle pool.
+///
+/// The descriptor is DETACHED from the engine while parked, so the fd
+/// is owned outright by this struct (and closed by `Drop` on the
+/// proxy). `parked_at` is what makes the pool honest: a connection
+/// the backend has already closed is worse than no connection, because
+/// the request that checks it out pays a failed attach plus a fresh
+/// dial (see `RuntimeConfig::pool_idle_ms`).
+struct PooledConn {
+    fd: RawFd,
+    parked_at: Instant,
+}
+
+impl ProxyConfig {
+    /// Constructs a config with the four required wiring handles set
+    /// (router, metrics, event ring, plugins) and every other knob at
+    /// its documented default. The embedder-facing constructor: with
+    /// the struct `#[non_exhaustive]`, downstream code cannot use
+    /// struct literals.
+    #[must_use]
+    pub fn new(
+        router: Arc<Router>,
+        registry: Arc<Registry>,
+        events: Arc<EventRing<LogEvent, { vane_observe::EVENT_RING_CAPACITY }>>,
+        plugins: Vec<String>,
+    ) -> Self {
+        Self {
+            router,
+            registry,
+            events,
+            plugins,
+            ..Default::default()
+        }
+    }
+}
+
+impl Default for ProxyConfig {
+    /// A usable-for-tests default: real (empty) router, registry and
+    /// event ring, every optional feature off, documented-default pool
+    /// and timeout knobs.
+    fn default() -> Self {
+        Self {
+            router: Arc::new(Router::new()),
+            registry: Arc::new(Registry::new()),
+            events: Arc::new(EventRing::new()),
+            rate_limit_rps: None,
+            connect_timeout_ms: 5_000,
+            idle_timeout_ms: 75_000,
+            first_byte_timeout_ms: 30_000,
+            pool_per_backend: 4,
+            pool_idle_ms: 30_000,
+            #[cfg(feature = "body-splice")]
+            response_splice: true,
+            adaptive: Arc::new(HashMap::new()),
+            tls: None,
+            plugins: Vec::new(),
+            access: None,
+            jwt: None,
+            shared_rate_limit: None,
+            proxy_protocol: false,
+            alt_svc: None,
+            h2_strict_idle_window_update: false,
+            h2c: false,
+            l4_splice: false,
+            mesh: Arc::new(HashMap::new()),
+            http01_tokens: None,
+        }
+    }
 }
 
 /// Worker-side per-slot connection state. Slots are dense worker
@@ -129,7 +222,6 @@ struct Conn {
     /// Matched route for the in-flight request.
     route: Option<Arc<RouteEntry>>,
     /// Rewritten request path.
-    upstream_path: Option<String>,
     /// Pipeline verdict headers to inject.
     inject: Vec<(String, String)>,
     /// `Connection: close` for this transaction.
@@ -138,6 +230,15 @@ struct Conn {
     body: BodyFraming,
     /// WebSocket tunnel active (101 switched): raw bidirectional pump.
     tunnel: bool,
+    /// Client address claimed by a PROXY protocol header (`proxy_protocol`
+    /// listeners). `None` until the header parses; then it IS the peer
+    /// for forwarding, metrics, and access logs.
+    proxy_peer: Option<SocketAddr>,
+    /// PROXY protocol header bytes buffered until the header completes.
+    pp_buf: Vec<u8>,
+    /// The header was parsed (or the listener does not require one):
+    /// downstream bytes are connection payload from here on.
+    pp_done: bool,
     remaining: u64,
     started: Option<Instant>,
     /// The route cluster's circuit breaker, keyed by cluster name and
@@ -170,10 +271,18 @@ struct Conn {
     attempts: u8,
     /// Request head bytes kept for response-phase retry (5xx failover).
     req_head_copy: Vec<u8>,
+    /// Cluster this connection's request was admitted to by adaptive
+    /// concurrency (`None` = nothing to release; `take()`-based so
+    /// release is idempotent across the terminal paths).
+    inflight: Option<String>,
     /// Access-log fields for the in-flight transaction.
     req_method: String,
-    req_host: Option<String>,
+    req_host: String,
+    /// Empty = the request carried no Host header.
     req_path: String,
+    /// The rewritten upstream path (take/restore scratch — capacity
+    /// amortized across transactions).
+    upstream_path: String,
     resp_status: u16,
     bytes_out: u64,
     /// Set once the transaction's access record was emitted.
@@ -203,6 +312,21 @@ struct Conn {
     tls_backlog: Vec<u8>,
     /// Response compression state (Some = gzip the relay).
     gzip: Option<GzipRelay>,
+    /// CORS response headers resolved for this transaction (injected
+    /// into the upstream response head). Empty for non-CORS requests and
+    /// for origins outside the route's policy.
+    cors_headers: Vec<(&'static str, String)>,
+    /// Route response-header policy adds (round 7 iter 61/65): appended
+    /// after the CORS injection, per docs/response-headers-design.md.
+    resp_add: Vec<(String, String)>,
+    /// Route response-header policy removes: upstream header names
+    /// deleted from the relayed head (case-insensitive).
+    resp_remove: Vec<String>,
+    /// Accumulated upstream response head while it is still incomplete.
+    /// TCP carries no message boundaries, so a head can straddle
+    /// segments (or TLS records); empty in the common case where the
+    /// whole head arrives in one read.
+    resp_head: Vec<u8>,
 }
 
 /// Streaming gzip relay state for one response transaction.
@@ -212,27 +336,36 @@ struct GzipRelay {
 
 /// Request-side body framing (streaming relay — bodies are never
 /// buffered whole; bytes go upstream as read events arrive).
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Debug, Clone)]
 enum ReqFraming {
     /// Head not yet handled for this connection.
     #[default]
     AwaitingHead,
     /// Content-Length body: bytes remaining to relay.
     ContentLength(u64),
-    /// Chunked request body: relay raw until the terminal 0-chunk.
-    Chunked { seen_zero: bool },
+    /// Chunked request body: relay raw until the terminal chunk. The
+    /// grammar is tracked incrementally — see `ChunkedScanner` for why
+    /// a content scan is wrong (and what it enables).
+    Chunked {
+        scan: vane_proto::chunked::ChunkedScanner,
+    },
     /// No body / body complete.
     Done,
 }
 
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Debug, Clone)]
 enum BodyFraming {
     #[default]
     AwaitingHead,
     /// Pass raw bytes until `remaining` bytes forwarded.
     ContentLength,
-    /// Pass chunked bytes until terminal 0-chunk observed (len tracking).
-    Chunked { last_was_lf: bool, seen_zero: bool },
+    /// Pass chunked bytes until the terminal chunk is seen. Framing is
+    /// tracked incrementally (`ChunkedScanner`), not by scanning for
+    /// `0\r\n\r\n`: that sequence is legal inside chunk data and can
+    /// straddle a read.
+    Chunked {
+        scan: vane_proto::chunked::ChunkedScanner,
+    },
     /// WebSocket/protocol tunnel: raw bidirectional pump.
     Tunnel,
     /// Response complete.
@@ -252,7 +385,16 @@ pub struct HttpProxy {
     /// Per-worker date cache (one refresh/second, zero alloc otherwise).
     date: vane_proto::date::DateCache,
     /// Idle upstream connection pool (per backend, worker-local).
-    pool: HashMap<SocketAddr, Vec<RawFd>>,
+    ///
+    /// Worker-local like nginx's and Envoy's pools, and deliberately
+    /// NOT shared across workers: a shared pool needs cross-thread
+    /// handoff of live connections, which trades the connection-churn
+    /// win for contention on the hot path. Pingora shares pools
+    /// (multithreaded, work-stealing) and wins big at Cloudflare's
+    /// scale; the trigger for revisiting that here is a measured low
+    /// reuse ratio with many workers — the metrics above are what
+    /// makes it measurable. See docs/perf-arc-2026-10.md.
+    pool: HashMap<SocketAddr, Vec<PooledConn>>,
     /// Per-cluster request counters (lazily registered, one per cluster).
     cluster_metrics: HashMap<String, ClusterMetric>,
     /// Loaded plugin instances (one set per worker; instances are !Sync).
@@ -264,6 +406,9 @@ pub struct HttpProxy {
     /// filled, and returned per intake — capacity is retained across
     /// requests, so steady-state parsing performs no allocation.
     head_scratch: Vec<u8>,
+    /// Adaptive concurrency controllers, created on first sight of a
+    /// cluster that configures one (see `adaptive_limit`).
+    adaptive: HashMap<String, crate::adaptive::AdaptiveLimit>,
 }
 
 struct ProxyMetrics {
@@ -273,6 +418,17 @@ struct ProxyMetrics {
     bytes_in: MetricHandle,
     bytes_out: MetricHandle,
     latency: MetricHandle,
+    /// Upstream keep-alive pool: a checkout that found a live
+    /// connection, one that had to dial, the dial count itself, and
+    /// the idle population right now.
+    ///
+    /// Without these the reuse ratio is invisible — and reuse is the
+    /// single biggest lever on proxy throughput, so an operator
+    /// cannot tell a healthy pool from a churning one.
+    pool_hits: MetricHandle,
+    pool_misses: MetricHandle,
+    dials: MetricHandle,
+    pool_idle: MetricHandle,
 }
 
 /// Lazily-registered per-cluster counters. Registration takes a brief
@@ -282,6 +438,38 @@ struct ProxyMetrics {
 struct ClusterMetric {
     requests: MetricHandle,
     errors: MetricHandle,
+    /// Requests refused by adaptive concurrency (503, never dialed).
+    shed: MetricHandle,
+    /// The controller's current limit for this cluster (this worker).
+    concurrency_limit: MetricHandle,
+}
+
+/// The process's circuit-breaker gate, keyed by the metrics registry.
+///
+/// A breaker protects the BACKEND, not the worker that happened to
+/// notice. With a gate per worker, a dead upstream costs
+/// `threshold x workers` failures before the whole process stops dialing
+/// it, and every worker keeps hammering a backend the others already
+/// ejected.
+///
+/// Keying by registry gives exactly the right scope: `server::run`
+/// builds one registry for the process and shares it with every worker,
+/// so they share one gate; separate embedders and tests each carry
+/// their own registry and therefore get their own breaker state instead
+/// of tripping each other's.
+fn shared_breaker_gate(registry: &Arc<Registry>) -> Arc<BreakerGate> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock, Weak};
+    static GATES: OnceLock<Mutex<HashMap<usize, Weak<BreakerGate>>>> = OnceLock::new();
+    let map = GATES.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = Arc::as_ptr(registry) as *const () as usize;
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(gate) = guard.get(&key).and_then(Weak::upgrade) {
+        return gate;
+    }
+    let gate = Arc::new(BreakerGate::new(Arc::clone(registry)));
+    guard.insert(key, Arc::downgrade(&gate));
+    gate
 }
 
 impl ClusterMetric {
@@ -299,6 +487,14 @@ impl ClusterMetric {
             errors: registry.register(
                 &format!("vane_cluster_{safe}_upstream_errors_total"),
                 MetricKind::Counter,
+            ),
+            shed: registry.register(
+                &format!("vane_cluster_{safe}_overload_shed_total"),
+                MetricKind::Counter,
+            ),
+            concurrency_limit: registry.register(
+                &format!("vane_cluster_{safe}_concurrency_limit"),
+                MetricKind::Gauge,
             ),
         }
     }
@@ -328,8 +524,12 @@ impl HttpProxy {
             bytes_in: registry.register("vane_bytes_in_total", MetricKind::Counter),
             bytes_out: registry.register("vane_bytes_out_total", MetricKind::Counter),
             latency: registry.register_histogram("vane_request_duration_us"),
+            pool_hits: registry.register("vane_upstream_pool_hits_total", MetricKind::Counter),
+            pool_misses: registry.register("vane_upstream_pool_misses_total", MetricKind::Counter),
+            dials: registry.register("vane_upstream_dials_total", MetricKind::Counter),
+            pool_idle: registry.register("vane_upstream_pool_idle", MetricKind::Gauge),
         };
-        let breaker = Arc::new(BreakerGate::new(Arc::clone(&registry)));
+        let breaker = shared_breaker_gate(&registry);
         // Rate limiting is opt-in: `None` removes the per-request
         // GCRA check entirely (~3% of the relay hot path). The
         // shared-bucket aggregate (cross-worker) is enforced in the
@@ -374,6 +574,7 @@ impl HttpProxy {
             date: vane_proto::date::DateCache::new(),
             pool: HashMap::new(),
             cluster_metrics: HashMap::new(),
+            adaptive: HashMap::new(),
             #[cfg(feature = "wasm")]
             plugins,
             metrics,
@@ -738,6 +939,32 @@ impl HttpProxy {
     }
 
     /// Plaintext request bytes (post-TLS or plain listener).
+    /// Starts the next queued h2 request after a completed response:
+    /// replays its events through the normal path and flushes any
+    /// frames. Skipped when the session is closing (close_after) —
+    /// queued requests die with the connection.
+    #[cfg(feature = "h2")]
+    fn h2_start_pending(&mut self, io: &mut SessionIo<'_>) {
+        if self
+            .conns
+            .get(&io.slot_index())
+            .is_some_and(|c| c.close_after)
+        {
+            return;
+        }
+        let mut evs = Vec::new();
+        if let Some(h2s) = self.conn(io.slot_index()).h2.as_mut() {
+            h2s.start_pending(&mut evs);
+        }
+        if evs.is_empty() {
+            return;
+        }
+        for ev in evs {
+            self.h2_event(io, ev);
+        }
+        self.h2_flush(io);
+    }
+
     /// Raw TLS-wrapped write to the client (shared h1/h2 writer).
     #[cfg(feature = "h2")]
     fn h2_intake(&mut self, io: &mut SessionIo<'_>, data: &[u8]) {
@@ -790,6 +1017,7 @@ impl HttpProxy {
                     self.conn(slot).body = BodyFraming::Done;
                     self.h2_flush(io);
                     self.check_done(io);
+                    self.h2_start_pending(io);
                 } else {
                     self.h2_flush(io);
                 }
@@ -804,7 +1032,7 @@ impl HttpProxy {
         self.metrics
             .bytes_out
             .add(&self.config.registry, data.len() as u64);
-        if self.conn(slot).body == BodyFraming::AwaitingHead {
+        if matches!(self.conn(slot).body, BodyFraming::AwaitingHead) {
             // First upstream byte: clear the FirstByte deadline.
             io.set_deadline(None, vane_core::handler::DeadlineReason::FirstByte);
         }
@@ -825,15 +1053,92 @@ impl HttpProxy {
         let is_h2 = self.conns.get(&slot).is_some_and(|c| c.h2.is_some());
         #[cfg(not(feature = "h2"))]
         let is_h2 = false;
-        let framing = self.conn(slot).body;
+        let framing = self.conn(slot).body.clone();
         match framing {
             BodyFraming::AwaitingHead => {
-                let (head_len, status, _close) = self.parse_upstream_head(slot, data);
-                if head_len == 0 {
-                    self.respond_full(io, Status::BadGateway, "bad upstream response\n");
-                    io.close();
-                    return;
-                }
+                // A response head can straddle TCP segments (or TLS
+                // records): TCP has no message boundaries, so a backend
+                // with Nagle off, a slow socket, or large headers hands
+                // us a prefix first. Accumulate until the parse
+                // succeeds. The common single-read case copies nothing —
+                // `buf` borrows `data` directly.
+                let had_fragment = self
+                    .conns
+                    .get(&slot)
+                    .is_some_and(|c| !c.resp_head.is_empty());
+                let fragment: Vec<u8> = if had_fragment {
+                    if let Some(c) = self.conns.get_mut(&slot) {
+                        c.resp_head.extend_from_slice(data);
+                    }
+                    std::mem::take(&mut self.conn(slot).resp_head)
+                } else {
+                    Vec::new()
+                };
+                let buf: &[u8] = if had_fragment { &fragment } else { data };
+
+                let (head_len, status) = match self.parse_upstream_head(slot, buf) {
+                    HeadParse::Complete { head_len, status } => (head_len, status),
+                    HeadParse::Partial => {
+                        if buf.len() > RESP_HEAD_CAP {
+                            #[cfg(feature = "vane_dbg")]
+                            eprintln!(
+                                "[headcap] len={} prefix={:?}",
+                                buf.len(),
+                                String::from_utf8_lossy(&buf[..120.min(buf.len())])
+                            );
+                            self.respond_full(io, Status::BadGateway, "upstream head too large\n");
+                            io.close();
+                            return;
+                        }
+                        // Hold the prefix and wait for the rest. Re-arm
+                        // the first-byte deadline: an upstream that
+                        // sends a few bytes and stalls is a
+                        // first-byte problem, not an idle one, and must
+                        // not hold the connection for the full idle
+                        // window.
+                        if let Some(c) = self.conns.get_mut(&slot) {
+                            c.resp_head.clear();
+                            c.resp_head.reserve(buf.len() + data.len());
+                            c.resp_head.extend_from_slice(buf);
+                        }
+                        io.set_deadline(
+                            Some(self.deadline(self.config.first_byte_timeout_ms)),
+                            vane_core::handler::DeadlineReason::FirstByte,
+                        );
+                        return;
+                    }
+                    HeadParse::Malformed => {
+                        #[cfg(feature = "vane_dbg")]
+                        {
+                            let ufd = io.upstream_fd();
+                            let mut unread: i32 = 0;
+                            if let Some(fd) = ufd {
+                                // SAFETY: FIONREAD on an owned socket.
+                                unsafe {
+                                    libc::ioctl(fd, libc::FIONREAD, &mut unread);
+                                }
+                            }
+                            let h2_active = self.conns.get(&slot).is_some_and(|c| c.h2.is_some());
+                            let resp_head_len = self
+                                .conns
+                                .get(&slot)
+                                .map(|c| c.resp_head.len())
+                                .unwrap_or(0);
+                            eprintln!(
+                                "[malformed] len={len} ufd={ufd:?} unread={unread} h2={h2_active} resp_head_len={resp_head_len} prefix={prefix:?}",
+                                len = buf.len(),
+                                ufd = ufd,
+                                unread = unread,
+                                h2_active = h2_active,
+                                resp_head_len = resp_head_len,
+                                prefix = String::from_utf8_lossy(&buf[..80.min(buf.len())]),
+                            );
+                        }
+                        self.respond_full(io, Status::BadGateway, "bad upstream response\n");
+                        io.close();
+                        return;
+                    }
+                };
                 // Configured 5xx retry: retry idempotent, bodyless
                 // requests while attempts remain. The response was
                 // never relayed downstream, so the swap is invisible.
@@ -872,6 +1177,27 @@ impl HttpProxy {
                     return;
                 }
                 self.metrics.responses.inc(&self.config.registry);
+                // CORS response headers for this transaction, taken out
+                // of the connection so head injection below can borrow
+                // them without re-entering `self`. Empty (the common
+                // case) leaves the relay byte-for-byte unchanged.
+                let cors: Vec<(&'static str, String)> = match self.conns.get_mut(&slot) {
+                    Some(c) => std::mem::take(&mut c.cors_headers),
+                    None => Vec::new(),
+                };
+                let (resp_add, resp_remove): (Vec<(String, String)>, Vec<String>) =
+                    match self.conns.get_mut(&slot) {
+                        Some(c) => (
+                            std::mem::take(&mut c.resp_add),
+                            std::mem::take(&mut c.resp_remove),
+                        ),
+                        None => (Vec::new(), Vec::new()),
+                    };
+                eprintln!(
+                    "[rhdr] drain adds={} removes={}",
+                    resp_add.len(),
+                    resp_remove.len()
+                );
                 #[cfg(feature = "h2")]
                 if is_h2 {
                     // The shim re-parses the head from `data` and
@@ -881,22 +1207,62 @@ impl HttpProxy {
                     // no chunk wrapper.
                     let compressing = self.conns.get(&slot).is_some_and(|c| c.gzip.is_some());
                     if compressing {
-                        let head_len = data
+                        let head_len = buf
                             .windows(4)
                             .position(|w| w == b"\r\n\r\n")
                             .map_or(0, |p| p + 4);
-                        let (head, rest) = data.split_at(head_len);
+                        let (head, rest) = buf.split_at(head_len);
                         let rewritten = vane_proto::compression::rewrite_head_for_gzip_h2(head);
-                        if let Some(rewritten) = rewritten {
+                        if let Some(mut rewritten) = rewritten {
+                            crate::cors::apply_response_policy(
+                                &mut rewritten,
+                                &cors,
+                                &resp_add,
+                                &resp_remove,
+                            );
                             self.h2_write(io, &rewritten);
                             if !rest.is_empty() {
                                 let compressed = self.gzip_feed(slot, rest);
                                 self.h2_write(io, &compressed);
+                                // Account for the inline body: this arm
+                                // bypasses relay_body, so without this the
+                                // declared length is never satisfied, the
+                                // gzip trailer is never flushed, and the
+                                // upstream EOF reads as a truncated body.
+                                let complete = {
+                                    let conn = self.conn(slot);
+                                    conn.remaining =
+                                        conn.remaining.saturating_sub(rest.len() as u64);
+                                    matches!(conn.body, BodyFraming::ContentLength)
+                                        && conn.remaining == 0
+                                };
+                                if complete {
+                                    self.finish_gzip(io);
+                                    self.h2_end_response(io);
+                                    self.conn(slot).body = BodyFraming::Done;
+                                }
                             }
                             return;
                         }
                     }
-                    self.h2_write(io, data);
+                    if !cors.is_empty() {
+                        // The head must be rewritten in place, so the
+                        // body portion goes out as a second write.
+                        let mut head = buf[..head_len].to_vec();
+                        crate::cors::apply_response_policy(
+                            &mut head,
+                            &cors,
+                            &resp_add,
+                            &resp_remove,
+                        );
+                        self.h2_write(io, &head);
+                        let rest = &buf[head_len..];
+                        if !rest.is_empty() {
+                            self.h2_write(io, rest);
+                        }
+                        return;
+                    }
+                    self.h2_write(io, buf);
                     return;
                 }
                 #[cfg(not(feature = "h2"))]
@@ -907,7 +1273,7 @@ impl HttpProxy {
                 // of throughput under `ab`).
                 let gzip_on = self.conns.get(&slot).is_some_and(|c| c.gzip.is_some());
                 let use_gzip = gzip_on && {
-                    let head = &data[..head_len];
+                    let head = &buf[..head_len];
                     let ct = vane_proto::compression::head_header(head, b"content-type");
                     vane_proto::compression::is_compressible(ct)
                         && !vane_proto::compression::head_already_encoded(head)
@@ -916,10 +1282,25 @@ impl HttpProxy {
                 if use_gzip {
                     // Rewrite the head: CL out, gzip + chunked in. The
                     // body relay then compresses through GzipRelay.
-                    let head = data[..head_len].to_vec();
-                    if let Some(rewritten) = vane_proto::compression::rewrite_head_for_gzip(&head) {
+                    let head = buf[..head_len].to_vec();
+                    if let Some(mut rewritten) =
+                        vane_proto::compression::rewrite_head_for_gzip(&head)
+                    {
+                        crate::cors::apply_response_policy(
+                            &mut rewritten,
+                            &cors,
+                            &resp_add,
+                            &resp_remove,
+                        );
                         self.write_downstream(io, &rewritten);
                     } else {
+                        let mut head = head;
+                        crate::cors::apply_response_policy(
+                            &mut head,
+                            &cors,
+                            &resp_add,
+                            &resp_remove,
+                        );
                         self.write_downstream(io, &head);
                     }
                 } else {
@@ -931,15 +1312,25 @@ impl HttpProxy {
                     // edge shares this listener's port. The body
                     // portion after the head is relayed below as usual.
                     let alt = self.config.alt_svc.clone();
-                    if let Some(alt) = alt.filter(|a| !a.is_empty()) {
-                        let mut head = data[..head_len].to_vec();
-                        if insert_header_once(&mut head, b"alt-svc", alt.as_bytes()) {
-                            self.write_downstream(io, &head);
-                        } else {
-                            self.write_downstream(io, &data[..head_len]);
+                    let alt = alt.filter(|a| !a.is_empty());
+                    if alt.is_some()
+                        || !cors.is_empty()
+                        || !resp_add.is_empty()
+                        || !resp_remove.is_empty()
+                    {
+                        let mut head = buf[..head_len].to_vec();
+                        if let Some(alt) = alt.as_deref() {
+                            insert_header_once(&mut head, b"alt-svc", alt.as_bytes());
                         }
+                        crate::cors::apply_response_policy(
+                            &mut head,
+                            &cors,
+                            &resp_add,
+                            &resp_remove,
+                        );
+                        self.write_downstream(io, &head);
                     } else {
-                        self.write_downstream(io, &data[..head_len]);
+                        self.write_downstream(io, &buf[..head_len]);
                     }
                 }
                 if self.conns.get(&slot).is_some_and(|c| c.tunnel) {
@@ -948,9 +1339,35 @@ impl HttpProxy {
                     let started = self.conns.get(&slot).and_then(|c| c.started);
                     self.access_emit(io, started);
                 }
-                let rest = &data[head_len..];
+                let rest = &buf[head_len..];
                 if !rest.is_empty() {
                     self.relay_body(io, rest);
+                }
+                // Body-splice fast path: everything the head parse left
+                // has been relayed; if a capped kernel splice can take
+                // the rest, the transaction completes via
+                // `on_body_spliced` instead of slot round trips. The
+                // worker parks the splice until the queued head/rest
+                // bytes have drained — it writes the socket directly
+                // and must not jump the queue.
+                #[cfg(feature = "response_splice")]
+                if matches!(self.conn(slot).body, BodyFraming::ContentLength) {
+                    let remaining = self.conn(slot).remaining;
+                    let close_after = self.conn(slot).close_after;
+                    if remaining > 0
+                        && self.config.response_splice
+                        && !close_after
+                        && self.conn(slot).tls.is_none()
+                        && self.conn(slot).tls_up.is_none()
+                        && self.conn(slot).gzip.is_none()
+                        && io.splice_response_body(remaining)
+                    {
+                        #[cfg(feature = "vane_dbg")]
+                        eprintln!("[bsplice] handler: splice accepted ({remaining})");
+                        // The worker owns the body until the cap is
+                        // met; check_done runs on the completion event.
+                        return;
+                    }
                 }
                 self.check_done(io);
             }
@@ -989,6 +1406,7 @@ impl HttpProxy {
             };
             h2up.handle_read(data, &mut events);
         }
+
         if self.conn(slot).h2up.as_ref().is_some_and(|h| h.failed()) {
             self.log(LogLevel::Warn, "h2 upstream protocol error");
             self.respond_full(io, Status::BadGateway, "upstream unreachable\n");
@@ -1017,7 +1435,7 @@ impl HttpProxy {
         // trailers) would read as BodyFraming::Done and drop the body —
         // switch to an unbounded relay; the upstream's trailers frame
         // (END_STREAM) completes the response.
-        if self.conn(slot).body == BodyFraming::Done
+        if matches!(self.conn(slot).body, BodyFraming::Done)
             && (!body.is_empty() || trailers.is_some() || !complete)
         {
             let conn = self.conn(slot);
@@ -1045,7 +1463,32 @@ impl HttpProxy {
                 self.h2_flush(io);
             }
         }
-        if complete && self.conn(slot).body != BodyFraming::Done {
+        // Credit-driven request-body retries (WINDOW_UPDATEs handled
+        // inside handle_read) queue frames; flush them upstream.
+        #[cfg(feature = "h2")]
+        {
+            let out = self
+                .conn(slot)
+                .h2up
+                .as_mut()
+                .map(|h| h.pending_writes())
+                .unwrap_or_default();
+            if !out.is_empty() {
+                self.upstream_send(io, &out);
+            }
+        }
+        if complete && !matches!(self.conn(slot).body, BodyFraming::Done) {
+            // An h2 response is framed by h2 rules and normally carries
+            // no Content-Length (h2 forbids framing on it), so the
+            // downstream shim cannot derive END_STREAM from a byte
+            // count. Without this the response is left unterminated and
+            // only the connection close ends it — a broken stream under
+            // RFC 9113 §6. End the stream from the upstream's own
+            // completion instead.
+            #[cfg(feature = "h2")]
+            if self.conns.get(&slot).is_some_and(|c| c.h2.is_some()) {
+                self.h2_end_response(io);
+            }
             self.conn(slot).body = BodyFraming::Done;
             self.check_done(io);
         }
@@ -1082,6 +1525,7 @@ impl HttpProxy {
         if done {
             self.conn(slot).body = BodyFraming::Done;
             self.check_done(io);
+            self.h2_start_pending(io);
         }
     }
 
@@ -1105,6 +1549,7 @@ impl HttpProxy {
                 self.conn(slot).body = BodyFraming::Done;
                 self.h2_flush(io);
                 self.check_done(io);
+                self.h2_start_pending(io);
             }
             crate::h2_server::EofOutcome::Truncated => {
                 // Upstream died before its declared Content-Length:
@@ -1155,6 +1600,15 @@ impl HttpProxy {
         }
         if failed {
             // Abort any in-flight transaction; never reuse the session.
+            #[cfg(feature = "vane_dbg")]
+            {
+                let code = self
+                    .conns
+                    .get(&slot)
+                    .and_then(|c| c.h2.as_ref())
+                    .and_then(|h| h.conn_error_code());
+                eprintln!("[h2err] slot={slot} code={code:?}");
+            }
             io.close();
         }
     }
@@ -1236,16 +1690,14 @@ impl HttpProxy {
         // never buffered whole. Until the upstream connects they queue
         // handler-side (req_pending) so ordering with the inline bytes
         // forwarded at connect is preserved.
-        let (framing, upstream_ready) = self
-            .conns
-            .get(&slot)
-            .map(|c| (c.req_framing, c.upstream_ready))
-            .unwrap_or((ReqFraming::AwaitingHead, false));
-        let body_active = match framing {
-            ReqFraming::ContentLength(remaining) => remaining > 0,
-            ReqFraming::Chunked { seen_zero } => !seen_zero,
+        let upstream_ready = self.conns.get(&slot).is_some_and(|c| c.upstream_ready);
+        #[cfg(feature = "h2")]
+        let is_h2up = self.conns.get(&slot).is_some_and(|c| c.h2up.is_some());
+        let body_active = self.conns.get(&slot).is_some_and(|c| match &c.req_framing {
+            ReqFraming::ContentLength(remaining) => *remaining > 0,
+            ReqFraming::Chunked { .. } => true,
             _ => false,
-        };
+        });
         if body_active {
             {
                 let conn = self.conn(slot);
@@ -1253,6 +1705,22 @@ impl HttpProxy {
                     ReqFraming::ContentLength(remaining) => {
                         let n = (data.len() as u64).min(*remaining) as usize;
                         *remaining -= n as u64;
+                        // h2 upstream: raw h1 body bytes must become
+                        // DATA frames — sending them raw desyncs the h2
+                        // parser and the upstream waits for a body that
+                        // never completes (POST through an h2up cluster
+                        // 504'd: the head went out as frames, the body
+                        // tail went out as garbage).
+                        #[cfg(feature = "h2")]
+                        if is_h2up {
+                            let frames = conn
+                                .h2up
+                                .as_mut()
+                                .expect("h2up checked")
+                                .request_body(&data[..n]);
+                            self.upstream_send(io, &frames);
+                            return; // held tail retries on WINDOW_UPDATE
+                        }
                         if upstream_ready {
                             self.upstream_send(io, &data[..n]);
                         } else {
@@ -1265,14 +1733,25 @@ impl HttpProxy {
                             return;
                         }
                     }
-                    ReqFraming::Chunked { seen_zero } => {
-                        vane_core::dbg_trace!(
-                            "CHDBG h1-chunked relay {}B seen_zero={}",
-                            data.len(),
-                            seen_zero
-                        );
-                        if !*seen_zero && data.windows(5).any(|w| w == b"0\r\n\r\n") {
-                            *seen_zero = true;
+                    ReqFraming::Chunked { scan } => {
+                        // Completion by chunked grammar, not by scanning
+                        // for `0\r\n\r\n`: that sequence is legal inside
+                        // chunk data, so ending the body there truncates
+                        // the relay and leaves the rest to be parsed as
+                        // the next request head (a desync / smuggling
+                        // vector), and it can straddle two reads, which
+                        // never completes the body at all.
+                        scan.feed(data);
+                        if scan.is_malformed() {
+                            // Akamai CVE-2025-66373 class: the peer's
+                            // framing is broken, so any tail bytes are
+                            // attacker-controlled. Close without
+                            // forwarding — never parse the tail as the
+                            // next request on this connection, and
+                            // never forward a body we know is garbage.
+                            self.log(LogLevel::Warn, "malformed chunked request; closing");
+                            io.close();
+                            return;
                         }
                         if upstream_ready {
                             self.upstream_send(io, data);
@@ -1350,6 +1829,30 @@ impl HttpProxy {
     /// Lazily registers and returns a cluster's metric handles. First sight
     /// of a cluster takes the registry's control-plane lock once; later
     /// requests are lock-free handle lookups.
+    /// Releases one adaptive-concurrency slot, feeding the latency
+    /// sample when the transaction actually completed. Idempotent: the
+    /// slot is `take()`n, so the terminal paths (access emit, session
+    /// reset) can both call this without double-releasing.
+    fn release_inflight(&mut self, slot: u32, sample_us: Option<u64>) {
+        let Some(cluster) = self.conn(slot).inflight.take() else {
+            return;
+        };
+        let (new_limit, sampled) = {
+            let Some(limit) = self.adaptive.get_mut(&cluster) else {
+                return;
+            };
+            match sample_us {
+                Some(us) => limit.exit(us),
+                None => limit.abandon(),
+            }
+            (limit.limit(), sample_us.is_some())
+        };
+        if sampled {
+            let gauge = self.cluster_metric(&cluster).concurrency_limit;
+            gauge.set(&self.config.registry, u64::from(new_limit));
+        }
+    }
+
     fn cluster_metric(&mut self, cluster: &str) -> ClusterMetric {
         if let Some(m) = self.cluster_metrics.get(cluster) {
             return m.clone();
@@ -1380,13 +1883,117 @@ impl HttpProxy {
         );
     }
 
+    /// Answers a CORS preflight at the edge: 204 with the policy's
+    /// headers, no upstream dial. RFC 9110 §8.3.3 forbids a
+    /// `Content-Length` on a 204, so the head is written directly.
+    fn respond_cors_preflight(
+        &mut self,
+        io: &mut SessionIo<'_>,
+        headers: &[(&'static str, String)],
+    ) {
+        let slot = io.slot_index();
+        self.conn(slot).resp_status = Status::NoContent.code();
+        if let Some(span) = self.conns.get_mut(&slot).and_then(|c| c.span.take()) {
+            span.record("http.status_code", Status::NoContent.code());
+            drop(span);
+        }
+        let owned: Vec<(&str, &[u8])> = headers
+            .iter()
+            .map(|(name, value)| (*name, value.as_bytes()))
+            .collect();
+        // Sized for a policy with long allow-lists (origin/header lists
+        // are user config and can each be hundreds of bytes).
+        let mut buf = [0u8; 2048];
+        if let Ok(n) = write_head(&mut buf, Status::NoContent, &owned, &self.date, None) {
+            self.write_downstream(io, &buf[..n]);
+            self.metrics.responses.inc(&self.config.registry);
+        } else {
+            self.log(LogLevel::Warn, "cors preflight head overflow");
+        }
+        let started = self.conns.get(&slot).and_then(|c| c.started);
+        self.access_emit(io, started);
+        io.set_deadline(
+            Some(self.deadline(self.config.idle_timeout_ms)),
+            vane_core::handler::DeadlineReason::Idle,
+        );
+    }
+
+    /// Consumes the parsed request head from the connection's parse
+    /// buffer and resets the request-phase state.
+    ///
+    /// Intake appends every downstream byte to `head_buf` and only the
+    /// upstream path drains it (it re-parses to serialize the head). A
+    /// response generated at the edge returns before that point, so
+    /// without this the head is still at the front of the buffer and the
+    /// next keep-alive transaction re-parses the stale head and replays
+    /// this response to the client.
+    fn consume_request_head(&mut self, slot: u32, head_len: usize) {
+        if let Some(c) = self.conns.get_mut(&slot) {
+            let drop = head_len.min(c.head_buf.len());
+            c.head_buf.drain(..drop);
+            // No upstream will relay a body for an edge-answered
+            // request, so the framing must not survive into the next
+            // transaction.
+            c.req_framing = ReqFraming::AwaitingHead;
+            c.req_pending.clear();
+            c.body = BodyFraming::AwaitingHead;
+            c.remaining = 0;
+        }
+    }
+
+    /// The address to attribute the connection to: the PROXY protocol
+    /// source when the listener trusts one, otherwise the real socket
+    /// peer. Everything that names the client — X-Forwarded-For,
+    /// access records, filter contexts — reads through this.
+    fn client_peer(&self, io: &SessionIo<'_>, slot: u32) -> SocketAddr {
+        self.conns
+            .get(&slot)
+            .and_then(|c| c.proxy_peer)
+            .or_else(|| io.peer())
+            .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)))
+    }
+
+    /// Answers a request at the edge (no upstream dial) and leaves the
+    /// connection ready for the next transaction.
+    ///
+    /// `has_body` closes the connection after the reply: vane never read
+    /// the request body, so the stream cannot be resynchronized and the
+    /// unread bytes would be parsed as the next request head. Bodyless
+    /// requests keep the connection alive.
+    fn respond_edge(
+        &mut self,
+        io: &mut SessionIo<'_>,
+        status: Status,
+        body: &str,
+        head_len: usize,
+        has_body: bool,
+    ) {
+        let slot = io.slot_index();
+        self.consume_request_head(slot, head_len);
+        self.respond_full(io, status, body);
+        if has_body {
+            io.close();
+        }
+    }
+
     /// Emits the transaction's access record (once). No-op when the
     /// access log is disabled or the record was already written.
     fn access_emit(&mut self, io: &SessionIo<'_>, started: Option<Instant>) {
+        // Release the adaptive-concurrency slot FIRST, on every
+        // terminal path, regardless of whether access logging is on:
+        // a leak here would shed everything once inflight stuck at the
+        // limit. The slot must also survive the access-log-disabled
+        // early return below.
+        let slot = io.slot_index();
+        let sample_us = started
+            .map(|s| s.elapsed().as_micros())
+            .unwrap_or(0)
+            .min(u128::from(u64::MAX)) as u64;
+        self.release_inflight(slot, Some(sample_us));
+
         let Some(access) = self.config.access.as_ref() else {
             return;
         };
-        let slot = io.slot_index();
         let Some(conn) = self.conns.get(&slot) else {
             return;
         };
@@ -1397,10 +2004,10 @@ impl HttpProxy {
             .map(|s| s.elapsed().as_micros())
             .unwrap_or(0)
             .min(u128::from(u32::MAX)) as u32;
-        let client = io
-            .peer()
-            .map(|a| (ip16(a.ip()), a.port()))
-            .unwrap_or(([0u8; 16], 0));
+        let client = {
+            let a = self.client_peer(io, io.slot_index());
+            (ip16(a.ip()), a.port())
+        };
         let upstream = conn.upstream_addr.map(|a| (ip16(a.ip()), a.port()));
         let mut trace_hex = [0u8; 32];
         let mut trace_len = 0;
@@ -1419,7 +2026,7 @@ impl HttpProxy {
             client,
             upstream,
             conn.req_method.as_bytes(),
-            conn.req_host.as_deref().unwrap_or_default().as_bytes(),
+            conn.req_host.as_bytes(),
             conn.req_path.as_bytes(),
             &trace_hex[..trace_len],
         );
@@ -1510,7 +2117,7 @@ impl HttpProxy {
     }
 
     /// Parses the upstream response head and decides body framing.
-    fn parse_upstream_head(&mut self, slot: u32, data: &[u8]) -> (usize, Status, bool) {
+    fn parse_upstream_head(&mut self, slot: u32, data: &[u8]) -> HeadParse {
         let mut storage = [httparse::EMPTY_HEADER; vane_proto::response::MAX_RESPONSE_HEADERS];
         match vane_proto::response::parse_upstream_head(data, &mut storage) {
             Ok(Some(head)) => {
@@ -1529,8 +2136,7 @@ impl HttpProxy {
                     BodyFraming::Tunnel
                 } else if chunked {
                     BodyFraming::Chunked {
-                        last_was_lf: false,
-                        seen_zero: false,
+                        scan: vane_proto::chunked::ChunkedScanner::new(),
                     }
                 } else {
                     match content_length {
@@ -1543,11 +2149,28 @@ impl HttpProxy {
                 conn.body = framing;
                 conn.remaining = remaining;
                 conn.close_after |= upstream_close;
-                (head_len, status, upstream_close)
+                // `upstream_close` is already folded into the
+                // connection's close_after below.
+                let _ = upstream_close;
+                HeadParse::Complete { head_len, status }
             }
-            _ => (0, Status::BadGateway, true),
+            // Incomplete so far: the caller accumulates and re-parses.
+            Ok(None) => HeadParse::Partial,
+            _ => HeadParse::Malformed,
         }
     }
+}
+
+/// Outcome of parsing an upstream response head.
+enum HeadParse {
+    /// The whole head is present (the head's own `Connection: close` is
+    /// applied to the connection when it parses).
+    Complete { head_len: usize, status: Status },
+    /// A valid prefix: more bytes are needed before anything can be
+    /// decided.
+    Partial,
+    /// Not a response head, or more headers than the parser allows.
+    Malformed,
 }
 
 /// Round-robin cursor for mirror (shadow) backend picks.
@@ -1562,6 +2185,10 @@ const REQ_PENDING_CAP: usize = 1024 * 1024;
 /// first body bytes typically coalesced into the same read, so the
 /// steady-state `extend_from_slice` never reallocates.
 const HEAD_SCRATCH_CAP: usize = 16 * 1024;
+
+/// Cap on an accumulated upstream response head. A head larger than this
+/// is a protocol error, not a slow sender.
+const RESP_HEAD_CAP: usize = 64 * 1024;
 
 /// Hop-by-hop headers the proxy manages itself (ASCII-case-insensitive).
 fn is_hop_by_hop(name: &str) -> bool {
@@ -1601,7 +2228,9 @@ fn insert_header_once(head: &mut Vec<u8>, name: &[u8], value: &[u8]) -> bool {
 fn conn_set_framing(conns: &mut ConnMap, slot: u32, view: &RequestView<'_>) {
     if let Some(c) = conns.get_mut(&slot) {
         c.req_framing = if view.is_chunked() {
-            ReqFraming::Chunked { seen_zero: false }
+            ReqFraming::Chunked {
+                scan: vane_proto::chunked::ChunkedScanner::new(),
+            }
         } else if let Some(Some(n)) = view.content_length() {
             if n > 0 {
                 ReqFraming::ContentLength(n)
@@ -1615,8 +2244,17 @@ fn conn_set_framing(conns: &mut ConnMap, slot: u32, view: &RequestView<'_>) {
 }
 
 impl Handler for HttpProxy {
+    #[cfg(feature = "body-splice")]
+    fn on_body_spliced(&mut self, io: &mut SessionIo<'_>, moved: u64) {
+        self.on_body_spliced(io, moved);
+    }
+
     fn on_connected(&mut self, io: &mut SessionIo<'_>) {
         let slot = io.slot_index();
+        // A transaction can die with its session (client vanished
+        // mid-flight): release its adaptive slot or the count sticks
+        // at the limit and the cluster sheds forever.
+        self.release_inflight(slot, None);
         // Fresh per-session state: worker slots are reused across
         // connections and must not inherit the previous session's
         // buffered bytes, route, or timers (stale head_buf replays the
@@ -1661,13 +2299,15 @@ impl Handler for HttpProxy {
         // h2c: plain listeners speak prior-knowledge HTTP/2 directly.
         #[cfg(feature = "h2")]
         if self.config.h2c && self.config.tls.is_none() {
-            eprintln!("H2CDBG promoting slot={slot}");
             let mut h2s = Box::new(crate::h2_server::H2Server::new(
                 slot,
                 self.config.h2_strict_idle_window_update,
             ));
             let out = h2s.pending_writes();
-            eprintln!("H2CDBG initial settings bytes={}", out.len());
+            vane_core::dbg_trace!(
+                "h2c promoting slot={slot}; initial settings bytes={}",
+                out.len()
+            );
             self.conn(slot).h2 = Some(h2s);
             if !out.is_empty() {
                 self.raw_downstream(io, &out);
@@ -1714,6 +2354,51 @@ impl Handler for HttpProxy {
         if self.conns.get(&slot).is_some_and(|c| c.l4) {
             self.upstream_send(io, data);
             return;
+        }
+        // PROXY protocol: the header precedes EVERYTHING on the
+        // connection — including the TLS handshake — and is parsed
+        // exactly once. Enabled listeners require it ("do not mix
+        // modes"): a connection whose first bytes are not a valid
+        // header is closed, never guessed at.
+        if self.config.proxy_protocol && self.conns.get(&slot).is_some_and(|c| !c.pp_done) {
+            {
+                let conn = self.conn(slot);
+                conn.pp_buf.extend_from_slice(data);
+            }
+            // Bound a slowloris-style dribble: the largest header vane
+            // accepts is a v2 with a full 4 KiB payload.
+            const PP_CAP: usize = 16 + 4096 + 16;
+            if self.conn(slot).pp_buf.len() > PP_CAP {
+                self.log(LogLevel::Warn, "proxy protocol header too large");
+                io.close();
+                return;
+            }
+            let buf = std::mem::take(&mut self.conn(slot).pp_buf);
+            match vane_proto::proxy_protocol::parse(&buf) {
+                Err(e) => {
+                    self.log(
+                        LogLevel::Warn,
+                        &format!("proxy protocol: closing connection: {e:?}"),
+                    );
+                    io.close();
+                    return;
+                }
+                Ok(None) => {
+                    self.conn(slot).pp_buf = buf; // wait for the rest
+                    return;
+                }
+                Ok(Some(outcome)) => {
+                    let mut rest = buf;
+                    rest.drain(..outcome.header_len);
+                    let conn = self.conn(slot);
+                    conn.proxy_peer = outcome.source;
+                    conn.pp_done = true;
+                    if rest.is_empty() {
+                        return; // header was the whole read
+                    }
+                    return self.on_downstream_data(io, &rest);
+                }
+            }
         }
         // WebSocket tunnel: raw bidirectional relay, no parsing.
         if self.conns.get(&slot).is_some_and(|c| c.tunnel) {
@@ -1893,7 +2578,7 @@ impl Handler for HttpProxy {
         // Path + inject storage also move by take (`MM-01`): the build
         // below borrows them, then both return to the connection —
         // the former `upstream_path.clone()` allocated per request.
-        let path_taken = self.conn(slot).upstream_path.take();
+        let path_taken = std::mem::take(&mut self.conn(slot).upstream_path);
         let inject = std::mem::take(&mut self.conn(slot).inject);
         let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
         if let Parsed::Complete(view, head_len) = RequestView::parse_in(&buf, &mut storage) {
@@ -1909,7 +2594,7 @@ impl Handler for HttpProxy {
             // Recycled scratch: one allocation for the connection's
             // lifetime instead of one per request.
             let mut head = std::mem::take(&mut self.conn(slot).head_out);
-            let path: &str = path_taken.as_deref().expect("path");
+            let path: &str = path_taken.as_str();
             self.build_upstream_head(&mut head, &view, &route, path, &inject, false, 0);
             // Storage returns to the connection before any fallible
             // step (retry/failover re-dials reuse it).
@@ -1918,8 +2603,8 @@ impl Handler for HttpProxy {
             // Mirror (fire-and-forget): a detached thread copies the
             // request to the shadow cluster. Every error is ignored —
             // mirroring never delays or fails the real response.
-            eprintln!(
-                "MIRRORDBG: mirror_backends={} head_len={}",
+            vane_core::dbg_trace!(
+                "mirror dispatch: mirror_backends={} head_len={}",
                 route.mirror_backends.len(),
                 head.len()
             );
@@ -1934,17 +2619,13 @@ impl Handler for HttpProxy {
                     .spawn(move || {
                         use std::io::{Read as _, Write as _};
                         let conn_res = std::net::TcpStream::connect(maddr);
-                        eprintln!("MIRRORTHREAD: connect={:?}", conn_res.is_ok());
+                        vane_core::dbg_trace!("mirror connect ok={}", conn_res.is_ok());
                         let Ok(mut s) = conn_res else {
                             return;
                         };
                         let _ = s.set_nodelay(true);
                         let w = s.write_all(&mhead);
-                        eprintln!(
-                            "MIRRORTHREAD: head write {:?} len {}",
-                            w.is_ok(),
-                            mhead.len()
-                        );
+                        vane_core::dbg_trace!("mirror head write ok={}", w.is_ok());
                         if w.is_err() {
                             return;
                         }
@@ -1970,10 +2651,17 @@ impl Handler for HttpProxy {
                 if let ReqFraming::ContentLength(remaining) = &mut conn.req_framing {
                     *remaining = remaining.saturating_sub(body.len() as u64);
                 }
-                if let ReqFraming::Chunked { seen_zero } = &mut conn.req_framing {
-                    if !*seen_zero && body.windows(5).any(|w| w == b"0\r\n\r\n") {
-                        *seen_zero = true;
-                    }
+                let malformed = if let ReqFraming::Chunked { scan } = &mut conn.req_framing {
+                    scan.feed(body);
+                    scan.is_malformed()
+                } else {
+                    false
+                };
+                if malformed {
+                    // Akamai CVE-2025-66373 class: broken framing, close
+                    // instead of parsing the tail as the next request.
+                    self.log(LogLevel::Warn, "malformed chunked request; closing");
+                    io.close();
                 }
             }
             if !body.is_empty() {
@@ -2083,7 +2771,7 @@ impl Handler for HttpProxy {
         let (framing, remaining, request_sent, ready) = {
             let conn = self.conns.get(&slot).expect("conn exists");
             (
-                conn.body,
+                conn.body.clone(),
                 conn.remaining,
                 io.request_sent_upstream(),
                 conn.upstream_ready,
@@ -2098,12 +2786,31 @@ impl Handler for HttpProxy {
         }
         match framing {
             BodyFraming::AwaitingHead => {
-                // Died before producing a response head, request already sent.
+                // Died before producing a response head, request already
+                // sent. A backend that accepts and then closes is exactly
+                // the signature a circuit breaker exists for: count it,
+                // or every request pays a dial + read for the same 502.
+                self.note_upstream_failure(slot);
                 self.upstream_failed(io);
             }
             BodyFraming::ContentLength if remaining > 0 => {
-                self.log(LogLevel::Warn, "upstream truncated body; closing");
-                io.close();
+                self.log(
+                    LogLevel::Warn,
+                    "upstream truncated body; relaying what arrived, then FIN",
+                );
+                #[cfg(feature = "vane_dbg")]
+                eprintln!("[trunc] eof-truncation remaining={remaining}");
+                #[cfg(feature = "vane_dbg")]
+                eprintln!("[trunc-diag] eof truncation, remaining={remaining}");
+                // Half-close the downstream AFTER the queued bytes
+                // flush: whatever body bytes arrived before the
+                // truncation are already relayed/queued and must reach
+                // the client (nginx-style partial relay), then FIN.
+                // A hard close here would drop queued bytes AND — on
+                // the io_uring engine — leave the client hanging,
+                // because in-flight ops hold the socket alive past
+                // close(2) without ever producing a FIN.
+                io.downstream_eof_write();
             }
             _ => {
                 #[cfg(not(feature = "h2"))]
@@ -2124,28 +2831,8 @@ impl Handler for HttpProxy {
     }
 
     fn on_upstream_error(&mut self, io: &mut SessionIo<'_>, err: io::Error) {
-        self.metrics.upstream_errors.inc(&self.config.registry);
         let slot = io.slot_index();
-        if let Some(cluster) = self
-            .conns
-            .get(&slot)
-            .and_then(|c| c.route.as_ref())
-            .map(|r| r.cluster.clone())
-        {
-            self.breaker.record_failure(&cluster);
-            self.cluster_metric(&cluster)
-                .errors
-                .inc(&self.config.registry);
-        }
-        if let (Some(outlier), Some(addr)) = (
-            self.conns
-                .get(&slot)
-                .and_then(|c| c.route.as_ref())
-                .and_then(|r| r.outlier.clone()),
-            self.conns.get(&slot).and_then(|c| c.upstream_addr),
-        ) {
-            outlier.record_failure(addr);
-        }
+        self.note_upstream_failure(slot);
         self.log(LogLevel::Warn, &format!("upstream error: {err}"));
         self.upstream_failed(io);
     }
@@ -2193,33 +2880,35 @@ impl Handler for HttpProxy {
 
 impl HttpProxy {
     #[allow(clippy::too_many_lines)]
-    fn handle_request(&mut self, io: &mut SessionIo<'_>, view: &RequestView<'_>, _head_len: usize) {
+    fn handle_request(&mut self, io: &mut SessionIo<'_>, view: &RequestView<'_>, head_len: usize) {
         let started = Instant::now();
         let slot = io.slot_index();
+        // A request that declares a body: an edge-generated response
+        // cannot relay it, and its unread bytes would desynchronize a
+        // keep-alive connection, so those responses close the socket.
+        let req_has_body =
+            view.content_length().flatten().is_some_and(|n| n > 0) || view.is_chunked();
         {
             let conn = self.conn(slot);
             conn.req_method.clear();
             conn.req_method.push_str(view.method);
-            // In-place reuse (`MM-01`): clear + refill keeps the
-            // String capacity; the former `to_owned` allocated per
-            // request.
-            match view
+            // Reusable buffers: clear+push_str keeps capacity across
+            // requests (zero per-request allocation after warmup).
+            conn.req_host.clear();
+            if let Some(h) = view
                 .header("host")
                 .and_then(|h| std::str::from_utf8(h).ok())
-                .map(|h| h.split(':').next().unwrap_or(h))
             {
-                Some(h) => {
-                    let slot_str = conn.req_host.get_or_insert_with(String::new);
-                    slot_str.clear();
-                    slot_str.push_str(h);
-                }
-                None => conn.req_host = None,
+                conn.req_host.push_str(h.split(':').next().unwrap_or(h));
             }
             conn.req_path.clear();
             conn.req_path.push_str(view.path);
             conn.resp_status = 0;
             conn.bytes_out = 0;
             conn.access_logged = false;
+            conn.cors_headers.clear();
+            conn.resp_add.clear();
+            conn.resp_remove.clear();
         }
 
         // Process-wide rate limiting (cross-worker aggregate).
@@ -2292,8 +2981,15 @@ impl HttpProxy {
             return;
         };
 
-        // Method check.
-        if !route.methods.is_empty()
+        // Method check. A CORS preflight is exempt: it carries no
+        // credentials, the browser will not send the actual request
+        // unless the preflight succeeds, and a method allowlist that
+        // omitted OPTIONS would otherwise fail every cross-origin call.
+        let cors_preflight = route.cors.is_some()
+            && view.method == "OPTIONS"
+            && view.header("access-control-request-method").is_some();
+        if !cors_preflight
+            && !route.methods.is_empty()
             && !route
                 .methods
                 .iter()
@@ -2338,6 +3034,51 @@ impl HttpProxy {
             }
         }
 
+        // CORS: a preflight is answered here, at the edge — the upstream is
+        // never dialed. An actual request gets response headers injected
+        // on the way out. Evaluated after the identity check so a
+        // mesh caller's authorization still applies, and before any
+        // filter/dial work so neither pays for a preflight.
+        if let Some(policy) = route.cors.as_ref() {
+            let origin = view
+                .header("origin")
+                .and_then(|h| std::str::from_utf8(h).ok());
+            let acrm = view
+                .header("access-control-request-method")
+                .and_then(|h| std::str::from_utf8(h).ok());
+            let acrh = view
+                .header("access-control-request-headers")
+                .and_then(|h| std::str::from_utf8(h).ok());
+            match crate::cors::evaluate(policy, &route.methods, view.method, origin, acrm, acrh) {
+                crate::cors::CorsAction::Pass => {}
+                crate::cors::CorsAction::Preflight(headers) => {
+                    let slot = io.slot_index();
+                    self.consume_request_head(slot, head_len);
+                    self.respond_cors_preflight(io, &headers);
+                    if req_has_body {
+                        io.close();
+                    }
+                    return;
+                }
+                crate::cors::CorsAction::Actual(headers) => {
+                    self.conn(slot).cors_headers = headers;
+                }
+            }
+        }
+        // Static response-header policy (round 7 iter 65): staged on the
+        // connection beside the CORS headers, applied on the way out.
+        let rh = &route.response_headers;
+        eprintln!(
+            "[rhdr] staged adds={} removes={}",
+            rh.add.len(),
+            rh.remove.len()
+        );
+        if !rh.add.is_empty() || !rh.remove.is_empty() {
+            let conn = self.conn(slot);
+            conn.resp_add = rh.add.clone();
+            conn.resp_remove = rh.remove.clone();
+        }
+
         // Request span (after the error exits so 404/405 stay spanless
         // and cheap). Closed with status at response completion.
         // Skipped entirely when trace export is not configured — the
@@ -2361,44 +3102,40 @@ impl HttpProxy {
         // take the streaming relay path instead of re-entering here).
         conn_set_framing(&mut self.conns, slot, view);
 
-        // Path rewrite into the connection's recycled buffer (`MM-01`):
-        // one String per connection, cleared and refilled per request —
-        // no per-request allocation (the former `to_owned` + pipeline
-        // clone allocated twice per request).
-        let mut path_buf = self.conn(slot).upstream_path.take().unwrap_or_default();
-        path_buf.clear();
-        match route
-            .strip_prefix
-            .as_ref()
-            .and_then(|p| view.path.strip_prefix(p.as_str()))
-        {
-            Some(rest) if rest.starts_with('/') => path_buf.push_str(rest),
-            Some(rest) => {
-                path_buf.push('/');
-                path_buf.push_str(rest);
+        // Path rewrite (into the connection's reusable scratch).
+        let mut upstream_path = std::mem::take(&mut self.conn(slot).upstream_path);
+        upstream_path.clear();
+        if let Some(p) = &route.strip_prefix {
+            if let Some(rest) = view.path.strip_prefix(p.as_str()) {
+                if rest.starts_with('/') {
+                    upstream_path.push_str(rest);
+                } else {
+                    upstream_path.push('/');
+                    upstream_path.push_str(rest);
+                }
+            } else {
+                upstream_path.push_str(view.path);
             }
-            None => path_buf.push_str(view.path),
+        } else {
+            upstream_path.push_str(view.path);
         }
 
-        // Filter pipeline (scoped: ctx borrows `path_buf`).
-        let peer = io
-            .peer()
-            .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
-        // Seed the pipeline with the connection's recycled inject
-        // storage: after warmup the header set is stable, so injection
-        // updates slots in place (see `RequestCtx::inject`) — no
-        // per-request Vec/String allocation.
-        let recycled_inject = std::mem::take(&mut self.conn(slot).inject);
+        // Filter pipeline (scoped: ctx borrows the path buffer).
+        let peer = self.client_peer(io, slot);
         let (inject, short_circuit, trace) = {
-            let mut ctx = RequestCtx::new(view.method, &mut path_buf, peer, host_only);
-            ctx.inject_headers = recycled_inject;
+            let mut ctx = RequestCtx::new(view.method, &mut upstream_path, peer, host_only);
             ctx.cluster = Some(&route.cluster);
-            // Stack-format the client IP (`MM-01`): the former
-            // `ip().to_string()` malloc'd per request.
-            let mut ipbuf = [0u8; 46]; // max IPv6 text length
-            let mut ipw = vane_filters::StackStr::new(&mut ipbuf);
-            core::fmt::write(&mut ipw, format_args!("{}", peer.ip())).ok();
-            ctx.inject("X-Forwarded-For", ipw.as_str());
+            // Trace-log correlation: the pipeline's trace must be the
+            // INBOUND trace when the client supplied a valid
+            // `traceparent` — otherwise the access record carries a
+            // random id while the request span continues the client's
+            // trace, and every log/trace join breaks at this hop.
+            if let Some(h) = view.header("traceparent") {
+                if let Some(tc) = vane_observe::trace::TraceContext::parse(h) {
+                    ctx.trace = tc;
+                }
+            }
+            ctx.inject("X-Forwarded-For", &peer.ip().to_string());
             // Scheme as this edge saw it: TLS-terminating listeners report
             // https (the h2 edge path does the same). Never trust an
             // inbound X-Forwarded-Proto — build_upstream_head strips it.
@@ -2444,7 +3181,7 @@ impl HttpProxy {
             (ctx.inject_headers, sc, ctx.trace)
         };
         if let Some((code, reason)) = short_circuit {
-            self.respond_full(io, Status::from_code(code), reason);
+            self.respond_edge(io, Status::from_code(code), reason, head_len, req_has_body);
             return;
         }
 
@@ -2463,7 +3200,7 @@ impl HttpProxy {
                 .collect();
             let mut rejected = None;
             for plugin in &mut self.plugins {
-                match plugin.on_request_with_headers(&path_buf, &headers) {
+                match plugin.on_request_with_headers(&upstream_path, &headers) {
                     Ok(vane_plugins::GuestVerdict::Continue) => {}
                     Ok(vane_plugins::GuestVerdict::Reject(code)) => {
                         rejected = Some(code);
@@ -2475,7 +3212,13 @@ impl HttpProxy {
                 }
             }
             if let Some(code) = rejected {
-                self.respond_full(io, Status::from_code(code), "rejected by plugin\n");
+                self.respond_edge(
+                    io,
+                    Status::from_code(code),
+                    "rejected by plugin\n",
+                    head_len,
+                    req_has_body,
+                );
                 return;
             }
         }
@@ -2494,7 +3237,13 @@ impl HttpProxy {
             }
         }
         let Some(addr) = addr else {
-            self.respond_full(io, Status::ServiceUnavailable, "no healthy upstream\n");
+            self.respond_edge(
+                io,
+                Status::ServiceUnavailable,
+                "no healthy upstream\n",
+                head_len,
+                req_has_body,
+            );
             return;
         };
         // Per-cluster request counter.
@@ -2520,19 +3269,8 @@ impl HttpProxy {
         {
             let conn = self.conn(slot);
             conn.route = Some(Arc::clone(&route));
-            // Re-resolve the breaker Arc only when the routed cluster
-            // changed (a per-request tuple rebuild cloned the cluster
-            // name every request).
-            if conn
-                .breaker
-                .as_ref()
-                .is_none_or(|(c, _)| c != &route.cluster)
-            {
-                conn.breaker = Some((route.cluster.clone(), Arc::clone(&cached_breaker)));
-            }
-            // The recycled path buffer parks here until dial; the
-            // dial restores it after building the upstream head.
-            conn.upstream_path = Some(path_buf);
+            conn.breaker = Some((route.cluster.clone(), Arc::clone(&cached_breaker)));
+            conn.upstream_path = upstream_path;
             conn.inject = inject;
             conn.started = Some(started);
             conn.close_after = view.wants_close();
@@ -2543,8 +3281,46 @@ impl HttpProxy {
             });
         }
 
+        // Adaptive concurrency (opt-in per cluster): shed BEFORE
+        // dialing when the latency gradient says the cluster is past
+        // its healthy concurrency. A shed request never reaches a
+        // backend, so rejections cannot poison the latency baseline.
+        if self.config.adaptive.contains_key(&route.cluster) {
+            let admitted = {
+                let limit = self
+                    .adaptive
+                    .entry(route.cluster.clone())
+                    .or_insert_with(|| {
+                        crate::adaptive::AdaptiveLimit::new(
+                            self.config.adaptive[&route.cluster].clone(),
+                        )
+                    });
+                limit.enter()
+            };
+            if !admitted {
+                self.cluster_metric(&route.cluster)
+                    .shed
+                    .inc(&self.config.registry);
+                self.respond_edge(
+                    io,
+                    Status::ServiceUnavailable,
+                    "overloaded\n",
+                    head_len,
+                    req_has_body,
+                );
+                return;
+            }
+            self.conn(slot).inflight = Some(route.cluster.clone());
+        }
+
         if cached_breaker.is_open() {
-            self.respond_full(io, Status::ServiceUnavailable, "circuit open\n");
+            self.respond_edge(
+                io,
+                Status::ServiceUnavailable,
+                "circuit open\n",
+                head_len,
+                req_has_body,
+            );
             return;
         }
 
@@ -2556,17 +3332,22 @@ impl HttpProxy {
         }
         // Checkout a pooled keep-alive connection, else dial fresh.
         if self.config.pool_per_backend > 0 {
-            let pooled = self.pool.get_mut(&addr).and_then(Vec::pop);
-            if let Some(fd) = pooled {
-                if io.attach_upstream(fd) {
-                    // Pooled conn is already connected: drive the head now.
-                    self.on_upstream_connected(io);
-                    return;
+            match self.take_pooled(addr) {
+                Some(fd) => {
+                    self.metrics.pool_hits.inc(&self.config.registry);
+                    if io.attach_upstream(fd) {
+                        // Pooled conn is already connected: drive the head now.
+                        self.on_upstream_connected(io);
+                        return;
+                    }
+                    // Stale pooled fd (the peer went away between park
+                    // and checkout): discard, fall through to a fresh dial.
+                    self.close_fd(fd);
                 }
-                // Stale pooled fd: discard, fall through to a fresh dial.
-                self.close_fd(fd);
+                None => self.metrics.pool_misses.inc(&self.config.registry),
             }
         }
+        self.metrics.dials.inc(&self.config.registry);
         if !io.connect_upstream(addr) {
             self.metrics.upstream_errors.inc(&self.config.registry);
             self.breaker.record_failure(&route.cluster);
@@ -2584,7 +3365,37 @@ impl HttpProxy {
 
     fn relay_body(&mut self, io: &mut SessionIo<'_>, data: &[u8]) {
         let slot = io.slot_index();
-        // Compute the relay decision first (avoids overlapping borrows).
+        // Chunked framing first (the scanner needs a mutable borrow).
+        // Completion is decided by the chunked grammar, not by looking
+        // for `0\r\n\r\n` in the buffer: that sequence is legal inside
+        // chunk data (base64, compressed payloads) and can straddle two
+        // reads, so a content scan both truncates and hangs.
+        let (chunked_done, chunked_malformed) = {
+            let Some(c) = self.conns.get_mut(&slot) else {
+                return;
+            };
+            if let BodyFraming::Chunked { scan } = &mut c.body {
+                let done = scan.feed(data);
+                (done, scan.is_malformed())
+            } else {
+                (false, false)
+            }
+        };
+        if chunked_malformed {
+            // The upstream sent framing it never closed correctly: the
+            // client and vane now disagree about where the response
+            // ends. Stop relaying, and close instead of reusing either
+            // connection.
+            self.log(LogLevel::Warn, "malformed chunked response; closing");
+            {
+                let conn = self.conn(slot);
+                conn.close_after = true;
+                conn.body = BodyFraming::Done;
+            }
+            io.close();
+            return;
+        }
+        // Compute the relay decision (avoids overlapping borrows).
         let (take, framing_done) = {
             let conn = self.conn(slot);
             match conn.body {
@@ -2594,15 +3405,16 @@ impl HttpProxy {
                     let done = conn.remaining == 0;
                     (Some(take), done)
                 }
-                BodyFraming::Chunked { seen_zero, .. } => {
-                    let done = !seen_zero && data.windows(5).any(|w| w == b"0\r\n\r\n");
-                    if done {
-                        if let BodyFraming::Chunked { seen_zero, .. } = &mut conn.body {
-                            *seen_zero = true;
-                        }
-                    }
-                    (Some(data.len()), done)
-                }
+                BodyFraming::Chunked { .. } => (Some(data.len()), chunked_done),
+                // Tunnel: every byte is the stream. This arm matters
+                // when tunnel bytes arrive in the SAME read as the 101
+                // head — `on_upstream_data_h1` relays subsequent reads
+                // directly, but the head-carrying read funnels its tail
+                // through here, and `(None, false)` silently dropped
+                // it. On loopback the head and the first data usually
+                // land in separate segments, so the drop was invisible
+                // until a peer (or CI runner) coalesced them.
+                BodyFraming::Tunnel => (Some(data.len()), false),
                 _ => (None, false),
             }
         };
@@ -2617,7 +3429,7 @@ impl HttpProxy {
             #[cfg(not(feature = "h2"))]
             let is_h2 = false;
             let compressing = self.conns.get(&slot).is_some_and(|c| c.gzip.is_some());
-            if compressing {
+            let out = if compressing {
                 let mut gz = self.conn(slot).gzip.take();
                 let compressed = gz
                     .as_mut()
@@ -2627,17 +3439,59 @@ impl HttpProxy {
                 let mut out = Vec::with_capacity(compressed.len() + 18);
                 if is_h2 {
                     out.extend_from_slice(&compressed);
-                } else {
+                } else if !compressed.is_empty() {
                     out.extend_from_slice(&vane_proto::compression::chunk(&compressed));
                 }
-                self.write_downstream(io, &out);
+                out
             } else {
-                self.write_downstream(io, bytes);
+                bytes.to_vec()
+            };
+            // A feed can produce nothing (deflate buffering the window),
+            // and `chunk(&[])` is literally the terminal sequence
+            // `0\r\n\r\n` — writing it would truncate the client's
+            // chunked stream mid-body.
+            if !out.is_empty() {
+                self.write_downstream(io, &out);
             }
         }
         if framing_done {
             self.finish_gzip(io);
+            // A gzipped h2 response has no Content-Length (the head
+            // rewrite strips it), so the shim cannot derive END_STREAM
+            // from byte counts — the upstream CL is what says the body
+            // ended. Close the stream here instead of waiting for an
+            // upstream EOF that may never come, or arriving after the
+            // response is logically over.
+            #[cfg(feature = "h2")]
+            if self.conns.get(&slot).is_some_and(|c| c.h2.is_some()) {
+                self.h2_end_response(io);
+            }
             self.conn(slot).body = BodyFraming::Done;
+        }
+    }
+
+    /// Ends the h2 response stream (END_STREAM) for a body whose length
+    /// the shim cannot derive — the gzip relay, where the head rewrite
+    /// removes Content-Length and the compressed size is not known up
+    /// front.
+    #[cfg(feature = "h2")]
+    fn h2_end_response(&mut self, io: &mut SessionIo<'_>) {
+        let slot = io.slot_index();
+        let (frames, outcome) = {
+            let Some(h2s) = self.conn(slot).h2.as_mut() else {
+                return;
+            };
+            h2s.response_eof()
+        };
+        for f in frames {
+            self.conn(slot).h2_out.extend_from_slice(&f);
+        }
+        if outcome == crate::h2_server::EofOutcome::Completed {
+            self.conn(slot).body = BodyFraming::Done;
+        }
+        self.h2_flush(io);
+        if outcome == crate::h2_server::EofOutcome::Completed {
+            self.h2_start_pending(io);
         }
     }
 
@@ -2658,7 +3512,11 @@ impl HttpProxy {
         if is_h2 {
             out.extend_from_slice(&tail);
         } else {
-            out.extend_from_slice(&vane_proto::compression::chunk(&tail));
+            // Same rule as the body relay: an empty trailer is the
+            // terminal sequence, not a chunk.
+            if !tail.is_empty() {
+                out.extend_from_slice(&vane_proto::compression::chunk(&tail));
+            }
             out.extend_from_slice(&vane_proto::compression::final_chunk());
         }
         self.write_downstream(io, &out);
@@ -2676,12 +3534,28 @@ impl HttpProxy {
         compressed
     }
 
+    /// The body splice finished: `moved` bytes reached the client.
+    /// Account them, mark the body complete, and let the normal tail
+    /// run (access emit, adaptive release, breaker success, pool
+    /// park, keep-alive reset).
+    #[cfg(feature = "body-splice")]
+    fn on_body_spliced(&mut self, io: &mut SessionIo<'_>, moved: u64) {
+        let slot = io.slot_index();
+        {
+            let conn = self.conn(slot);
+            conn.bytes_out += moved;
+            conn.body = BodyFraming::Done;
+        }
+        self.metrics.bytes_out.add(&self.config.registry, moved);
+        self.check_done(io);
+    }
+
     fn check_done(&mut self, io: &mut SessionIo<'_>) {
         let slot = io.slot_index();
         let (done, close_after, started) = {
             let conn = self.conns.get(&slot).expect("conn");
             (
-                conn.body == BodyFraming::Done,
+                matches!(conn.body, BodyFraming::Done),
                 conn.close_after,
                 conn.started,
             )
@@ -2729,19 +3603,14 @@ impl HttpProxy {
                 let conn = self.conn(slot);
                 conn.head_buf.clear();
                 conn.route = None;
-                // upstream_path stays parked (capacity reused next
-                // request; refilled from scratch via take+clear).
+                conn.upstream_path.clear();
                 conn.body = BodyFraming::AwaitingHead;
                 conn.remaining = 0;
                 conn.close_after = false;
                 conn.attempts = 0;
                 conn.upstream_ready = false;
                 conn.req_method.clear();
-                // Park the recycled host String (capacity preserved):
-                // dropping it here re-allocated it every request.
-                if let Some(h) = &mut conn.req_host {
-                    h.clear();
-                }
+                conn.req_host.clear();
                 conn.req_path.clear();
                 conn.resp_status = 0;
                 conn.bytes_out = 0;
@@ -2765,12 +3634,33 @@ impl HttpProxy {
     }
     /// Upstream unusable: fail over to another backend while the request
     /// is still unsent, otherwise answer 502/504.
+    /// Records one upstream failure against the cluster breaker, the
+    /// cluster error counter, and the outlier detector. Shared by every
+    /// signature that means "this backend did not answer": connection
+    /// errors, timeouts, and a clean EOF before the response head.
+    fn note_upstream_failure(&mut self, slot: u32) {
+        self.metrics.upstream_errors.inc(&self.config.registry);
+        let Some(route) = self.conns.get(&slot).and_then(|c| c.route.clone()) else {
+            return;
+        };
+        self.breaker.record_failure(&route.cluster);
+        self.cluster_metric(&route.cluster)
+            .errors
+            .inc(&self.config.registry);
+        if let (Some(outlier), Some(addr)) = (
+            &route.outlier,
+            self.conns.get(&slot).and_then(|c| c.upstream_addr),
+        ) {
+            outlier.record_failure(addr);
+        }
+    }
+
     fn upstream_failed(&mut self, io: &mut SessionIo<'_>) {
         if io.request_sent_upstream() {
             if self
                 .conns
                 .get(&io.slot_index())
-                .is_some_and(|c| c.body == BodyFraming::AwaitingHead)
+                .is_some_and(|c| matches!(c.body, BodyFraming::AwaitingHead))
             {
                 self.respond_full(io, Status::BadGateway, "upstream unreachable\n");
             }
@@ -2849,18 +3739,150 @@ impl HttpProxy {
         let Some(fd) = io.detach_upstream() else {
             return;
         };
+        #[cfg(feature = "vane_dbg")]
+        {
+            let mut unread: i32 = 0;
+            // SAFETY: FIONREAD on an owned socket.
+            unsafe {
+                libc::ioctl(fd, libc::FIONREAD, &mut unread);
+            }
+            if unread > 0 {
+                eprintln!("[park] fd={fd} parked with UNREAD={unread}");
+            }
+        }
+        self.park_fd(addr, fd);
+    }
+
+    /// Parks a DETACHED upstream descriptor in the idle pool, or
+    /// closes it: the single place a pooled connection is created or
+    /// discarded.
+    fn park_fd(&mut self, addr: SocketAddr, fd: RawFd) {
         let cap = self.config.pool_per_backend;
-        let idle = self.pool.entry(addr).or_default();
-        if idle.len() < cap {
-            idle.push(fd);
-        } else {
+        let ttl = Duration::from_millis(self.config.pool_idle_ms);
+        let now = Instant::now();
+        let mut reaped: Vec<RawFd> = Vec::new();
+        let mut parked = false;
+        // A parked connection with UNREAD response data is a poisoned
+        // pool entry: the next checkout reads the stale bytes as a
+        // response head (the TLS-h2 churn cascade). Happens when a
+        // session aborts mid-response — close instead of park.
+        {
+            let mut unread: i32 = 0;
+            // SAFETY: FIONREAD on an owned socket.
+            unsafe {
+                libc::ioctl(fd, libc::FIONREAD, &mut unread);
+            }
+            if unread > 0 {
+                // Unread response data on a parked connection poisons
+                // the pool: the next checkout reads the stale bytes as
+                // a response head. Close instead of reusing.
+                #[cfg(feature = "vane_dbg")]
+                eprintln!("[park] fd={fd} UNREAD={unread}: closing instead of parking");
+                self.close_fd(fd);
+                return;
+            }
+        }
+        {
+            // `entry`, not `get_mut`: the first connection to a backend
+            // has to create its list, or pooling silently does nothing.
+            let idle = self.pool.entry(addr).or_default();
+            // Reap expired entries BEFORE deciding the connection has
+            // nowhere to go: a burst that filled the pool must not push
+            // out a connection the next burst would have reused.
+            if idle.len() >= cap {
+                let mut keep: Vec<PooledConn> = Vec::with_capacity(idle.len());
+                for c in idle.drain(..) {
+                    if now.duration_since(c.parked_at) < ttl {
+                        keep.push(c);
+                    } else {
+                        reaped.push(c.fd);
+                    }
+                }
+                *idle = keep;
+            }
+            if idle.len() < cap {
+                idle.push(PooledConn { fd, parked_at: now });
+                parked = true;
+            }
+        }
+        if !parked {
             self.close_fd(fd);
         }
+        for stale in reaped {
+            self.close_fd(stale);
+        }
+        self.refresh_pool_gauge();
+    }
+
+    /// Takes the freshest still-reusable idle connection for `addr`,
+    /// closing anything past its idle deadline on the way.
+    fn take_pooled(&mut self, addr: SocketAddr) -> Option<RawFd> {
+        let ttl = Duration::from_millis(self.config.pool_idle_ms);
+        let mut reaped: Vec<RawFd> = Vec::new();
+        let mut taken = None;
+        if let Some(idle) = self.pool.get_mut(&addr) {
+            // Parked in order, so walking back yields the freshest
+            // first; stop at the first live one and leave the rest.
+            while let Some(conn) = idle.pop() {
+                // A parked connection can still grow unread data: the
+                // upstream may have been mid-send when the session
+                // parked it (the TLS-h2 desync). FIONREAD at checkout
+                // is the last gate — unread > 0 means the connection
+                // is NOT idle-clean; close it and try the next.
+                let mut unread: i32 = 0;
+                // SAFETY: FIONREAD on an owned socket.
+                unsafe {
+                    libc::ioctl(conn.fd, libc::FIONREAD, &mut unread);
+                }
+                if unread > 0 {
+                    #[cfg(feature = "vane_dbg")]
+                    eprintln!(
+                        "[checkout] fd={} UNREAD={unread}: closing stale pooled conn",
+                        conn.fd
+                    );
+                    reaped.push(conn.fd);
+                    continue;
+                }
+                if conn.parked_at.elapsed() < ttl {
+                    taken = Some(conn.fd);
+                    break;
+                }
+                reaped.push(conn.fd);
+            }
+        }
+        for stale in reaped {
+            self.close_fd(stale);
+        }
+        self.refresh_pool_gauge();
+        taken
+    }
+
+    /// Republishes the idle population (a gauge summed across this
+    /// worker's backend pools).
+    fn refresh_pool_gauge(&self) {
+        let idle: usize = self.pool.values().map(Vec::len).sum();
+        self.metrics
+            .pool_idle
+            .set(&self.config.registry, idle as u64);
     }
 
     fn close_fd(&mut self, fd: RawFd) {
         // SAFETY: single ownership of a detached descriptor.
         unsafe { libc::close(fd) };
+    }
+}
+
+impl Drop for HttpProxy {
+    fn drop(&mut self) {
+        // Parked descriptors are detached from the engine, so nothing
+        // else closes them: a dropped worker (embedder teardown, a
+        // failed restart) would otherwise leak every idle connection
+        // it was holding.
+        for (_, idle) in std::mem::take(&mut self.pool) {
+            for conn in idle {
+                self.close_fd(conn.fd);
+            }
+        }
     }
 }
 
@@ -2880,4 +3902,250 @@ pub fn flatten_routes(router: &Router) -> Vec<RouteRecord> {
             strip_prefix: r.strip_prefix,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod pool_tests {
+    //! The idle-pool contract, proved without a clock: `pool_idle_ms`
+    //! is the only time input, so a deadline of 0 means "everything is
+    //! already expired" and a large deadline means "everything is
+    //! live" — no sleeping, no flakes, and the assertions mean the
+    //! same thing on a loaded CI box.
+    //!
+    //! Liveness is observed THROUGH the peer end of each socketpair
+    //! (a 1-byte write succeeds iff the other end still exists), never
+    //! through the descriptor number: closed fds free their numbers
+    //! and a parallel test can re-adopt one mid-assertion, which would
+    //! make `fcntl(F_GETFD)` lie.
+
+    use super::*;
+    use std::os::fd::RawFd;
+    use std::time::Duration;
+
+    fn addr() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 9_001))
+    }
+
+    /// Serializes the pool tests: parallel tests that close descriptors
+    /// free fd NUMBERS that a concurrent pair() can re-adopt, which
+    /// makes cross-end liveness probes race with unrelated teardowns.
+    fn fd_serial() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A connected socket pair as raw descriptors — a parked upstream
+    /// connection stand-in whose fate we can observe via `peer`.
+    fn pair() -> (RawFd, RawFd) {
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: socketpair fills both descriptors or fails.
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair");
+        (fds[0], fds[1])
+    }
+
+    /// True iff the OTHER end of the pair is still open. The peer's
+    /// descriptor number is held for the whole test, so this cannot be
+    /// fooled by fd-number reuse.
+    fn peer_alive(peer: RawFd) -> bool {
+        // SAFETY: write to an owned, connected descriptor; EPIPE (rc
+        // -1) is the "other end is closed" answer, not a crash.
+        unsafe { libc::write(peer, "x".as_ptr().cast(), 1) == 1 }
+    }
+
+    fn close(fd: RawFd) {
+        // SAFETY: single ownership of a test descriptor.
+        unsafe { libc::close(fd) };
+    }
+
+    fn config(registry: &Arc<Registry>, pool_per_backend: usize, pool_idle_ms: u64) -> ProxyConfig {
+        ProxyConfig {
+            registry: Arc::clone(registry),
+            pool_per_backend,
+            pool_idle_ms,
+            ..Default::default()
+        }
+    }
+
+    /// Metric value as the operator sees it (Prometheus text): the
+    /// value is the LAST whitespace-separated field of the line, with
+    /// or without a label set.
+    fn metric(registry: &Registry, name: &str) -> u64 {
+        registry
+            .render_prometheus()
+            .lines()
+            .filter(|line| line.starts_with(name))
+            .find_map(|line| line.split_whitespace().last())
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|v| v as u64)
+            .unwrap_or_else(|| {
+                panic!(
+                    "metric {name} not published:\n{}",
+                    registry.render_prometheus()
+                )
+            })
+    }
+
+    /// Ages every pooled entry for `addr` past the deadline.
+    fn age_all(proxy: &mut HttpProxy, by: Duration) {
+        for idle in proxy.pool.get_mut(&addr()).expect("pool entry") {
+            idle.parked_at -= by;
+        }
+    }
+
+    /// A live deadline hands the connection back; the pool is empty
+    /// afterwards and the connection is untouched.
+    #[test]
+    fn checkout_within_deadline_reuses_the_connection() {
+        let _serial = fd_serial();
+        let registry = Arc::new(Registry::new());
+        let mut proxy = HttpProxy::new(config(&registry, 4, 60_000), 0);
+        let (mine, peer) = pair();
+        proxy.park_fd(addr(), mine);
+        assert_eq!(metric(&registry, "vane_upstream_pool_idle"), 1);
+        let got = proxy.take_pooled(addr()).expect("live connection");
+        assert!(peer_alive(peer), "the handed-out connection must be alive");
+        assert_eq!(metric(&registry, "vane_upstream_pool_idle"), 0);
+        close(got);
+        close(peer);
+    }
+
+    /// Past the deadline the connection is closed, not handed out: no
+    /// request may pay for a connection the backend already retired.
+    #[test]
+    fn checkout_past_deadline_closes_instead_of_handing_out() {
+        let _serial = fd_serial();
+        let registry = Arc::new(Registry::new());
+        let mut proxy = HttpProxy::new(config(&registry, 4, 0), 0);
+        let (mine, peer) = pair();
+        proxy.park_fd(addr(), mine);
+        assert!(
+            proxy.take_pooled(addr()).is_none(),
+            "an expired connection must not be handed out"
+        );
+        assert!(
+            !peer_alive(peer),
+            "the expired connection must be closed, not parked"
+        );
+        close(peer);
+    }
+
+    /// Freshest first — and once the freshest is taken, the next
+    /// checkout still refuses the aged entry instead of serving a
+    /// connection that is past its deadline.
+    #[test]
+    fn checkout_takes_the_freshest_and_the_stale_below_it_is_reaped() {
+        let _serial = fd_serial();
+        let registry = Arc::new(Registry::new());
+        let mut proxy = HttpProxy::new(config(&registry, 4, 60_000), 0);
+        let (aged, aged_peer) = pair();
+        proxy.park_fd(addr(), aged);
+        age_all(&mut proxy, Duration::from_secs(120));
+        let (fresh, fresh_peer) = pair();
+        proxy.park_fd(addr(), fresh);
+        assert_eq!(metric(&registry, "vane_upstream_pool_idle"), 2);
+
+        let got = proxy.take_pooled(addr()).expect("the fresh connection");
+        assert_eq!(got, fresh, "freshest is handed out");
+        assert!(peer_alive(fresh_peer));
+        assert!(proxy.take_pooled(addr()).is_none(), "the aged one is not");
+        assert!(!peer_alive(aged_peer), "the aged connection is reaped");
+
+        close(got);
+        close(aged_peer);
+        close(fresh_peer);
+    }
+
+    /// A burst that filled the pool must not push out a connection the
+    /// next burst would reuse: park reaps expired entries first.
+    #[test]
+    fn park_reaps_expired_entries_before_refusing_room() {
+        let _serial = fd_serial();
+        let registry = Arc::new(Registry::new());
+        let mut proxy = HttpProxy::new(config(&registry, 2, 0), 0);
+        let (a, a_peer) = pair();
+        let (b, b_peer) = pair();
+        proxy.park_fd(addr(), a);
+        proxy.park_fd(addr(), b);
+        // Reaping is lazy by design — there is no background sweeper,
+        // so a parked connection holds its slot until either a
+        // checkout or a full pool needs the room.
+        assert!(
+            peer_alive(a_peer) && peer_alive(b_peer),
+            "nothing reaped while idle"
+        );
+        let (c, c_peer) = pair();
+        proxy.park_fd(addr(), c);
+        assert!(
+            !peer_alive(a_peer) && !peer_alive(b_peer),
+            "the full pool reaped its expired entries to make room"
+        );
+        assert!(peer_alive(c_peer), "the live arrival is pooled");
+        assert_eq!(metric(&registry, "vane_upstream_pool_idle"), 1);
+        close(c);
+        close(a_peer);
+        close(b_peer);
+        close(c_peer);
+    }
+
+    /// A full pool closes the arriving connection rather than growing.
+    #[test]
+    fn park_closes_the_arriving_connection_when_full() {
+        let _serial = fd_serial();
+        let registry = Arc::new(Registry::new());
+        let mut proxy = HttpProxy::new(config(&registry, 1, 60_000), 0);
+        let (a, a_peer) = pair();
+        proxy.park_fd(addr(), a);
+        let (b, b_peer) = pair();
+        proxy.park_fd(addr(), b);
+        assert!(!peer_alive(b_peer), "the pool is full: close the arrival");
+        assert!(peer_alive(a_peer), "the resident stays");
+        assert_eq!(metric(&registry, "vane_upstream_pool_idle"), 1);
+        close(a);
+        close(a_peer);
+        close(b_peer);
+    }
+
+    /// A dropped worker must not leak its detached descriptors.
+    #[test]
+    fn dropping_the_proxy_closes_pooled_descriptors() {
+        let _serial = fd_serial();
+        let registry = Arc::new(Registry::new());
+        let (mine, peer) = pair();
+        {
+            let mut proxy = HttpProxy::new(config(&registry, 4, 60_000), 0);
+            proxy.park_fd(addr(), mine);
+            assert!(peer_alive(peer));
+        }
+        assert!(
+            !peer_alive(peer),
+            "a dropped proxy leaked a pooled connection"
+        );
+        close(peer);
+    }
+
+    /// Reuse has to be observable, or an operator cannot tell a
+    /// healthy pool from a churning one.
+    #[test]
+    fn pool_metrics_are_published() {
+        let _serial = fd_serial();
+        let registry = Arc::new(Registry::new());
+        let mut proxy = HttpProxy::new(config(&registry, 4, 60_000), 0);
+        let (mine, peer) = pair();
+        proxy.park_fd(addr(), mine);
+        let taken = proxy.take_pooled(addr()).expect("live");
+        close(taken);
+        close(peer);
+        assert_eq!(metric(&registry, "vane_upstream_pool_idle"), 0);
+        for name in [
+            "vane_upstream_pool_hits_total",
+            "vane_upstream_pool_misses_total",
+            "vane_upstream_dials_total",
+        ] {
+            assert!(
+                registry.render_prometheus().contains(name),
+                "missing pool metric {name}"
+            );
+        }
+    }
 }

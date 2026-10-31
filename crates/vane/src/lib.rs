@@ -9,7 +9,9 @@
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+pub mod adaptive;
 pub mod admin;
+pub mod cors;
 pub mod h1pool;
 #[cfg(feature = "h2")]
 pub mod h2_client;
@@ -18,8 +20,11 @@ pub mod h2_edge;
 #[cfg(feature = "h2")]
 pub mod h2_server;
 #[cfg(feature = "h3")]
-#[cfg(feature = "h3")]
 pub mod h3_bridge;
+// Needs `quinn`, which only the `h3` feature pulls in. Declared
+// unconditionally this broke `cargo check --no-default-features` — the
+// documented way to compile h3 out.
+#[cfg(feature = "h3")]
 pub mod h3_client;
 #[cfg(feature = "h3")]
 pub mod h3_edge;

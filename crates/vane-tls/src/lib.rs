@@ -41,7 +41,34 @@ pub enum TlsError {
 /// rustls without a default provider — client stacks (reqwest) would
 /// otherwise panic with "No provider set".
 pub fn install_crypto_provider() {
+    // PROVIDER (research loop iteration 6, docs/research-loop-
+    // 2026-10.md): the ring provider is the default build. The
+    // `post-quantum` feature switches to aws-lc-rs with
+    // X25519MLKEM768 as the highest-priority kx group — the PQ hybrid
+    // Chrome and Cloudflare negotiate by default (harvest-now-
+    // decrypt-later defense). aws-lc-rs needs cmake to build; the
+    // switch is opt-in so the default build matrix is untouched.
+    #[cfg(feature = "post-quantum")]
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    #[cfg(not(feature = "post-quantum"))]
     let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // With the post-quantum feature, rustls carries BOTH provider
+    // features and refuses to auto-pick a process default. This ctor
+    // installs aws-lc-rs BEFORE main in every binary that links this
+    // crate — production (the startup install becomes a no-op) and,
+    // critically, test binaries, which build rustls configs directly
+    // and would otherwise panic on first use. The default (ring-only)
+    // build keeps rustls's own auto-pick.
+    #[cfg(feature = "post-quantum")]
+    #[::ctor::ctor(unsafe)]
+    fn vane_install_provider_before_main() {
+        // SAFETY (ctor 1.x asks for the explicit claim): the ctor takes
+        // no arguments and does nothing but a safe, idempotent
+        // provider install; it runs before main with no other
+        // thread- or state-safety obligations.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
 }
 
 /// Loads PEM cert chain + key from disk.
@@ -58,18 +85,12 @@ pub fn load_cert_key(
     ),
     TlsError,
 > {
-    let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(
-        std::fs::File::open(cert_path)
-            .map_err(|e| TlsError::Material(format!("{}: {e}", cert_path.display())))?,
-    ))
-    .collect::<Result<_, _>>()
-    .map_err(|e| TlsError::Material(e.to_string()))?;
-    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
-        std::fs::File::open(key_path)
-            .map_err(|e| TlsError::Material(format!("{}: {e}", key_path.display())))?,
-    ))
-    .map_err(|e| TlsError::Material(e.to_string()))?
-    .ok_or_else(|| TlsError::Material("no private key found".into()))?;
+    let certs = <rustls::pki_types::CertificateDer<'static> as rustls::pki_types::pem::PemObject>::pem_file_iter(cert_path)
+        .map_err(|e| TlsError::Material(format!("{}: {e}", cert_path.display())))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| TlsError::Material(e.to_string()))?;
+    let key = <rustls::pki_types::PrivateKeyDer<'static> as rustls::pki_types::pem::PemObject>::from_pem_file(key_path)
+        .map_err(|e| TlsError::Material(format!("{}: {e}", key_path.display())))?;
     Ok((certs, key))
 }
 
@@ -116,17 +137,16 @@ pub fn server_config_from_parts(
     key_pem: &str,
     client_ca_pem: Option<&str>,
 ) -> Result<rustls::ServerConfig, TlsError> {
-    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
-        .collect::<Result<_, _>>()
+    let certs = <rustls::pki_types::CertificateDer<'static> as rustls::pki_types::pem::PemObject>::pem_slice_iter(cert_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
         .map_err(|e| TlsError::Material(e.to_string()))?;
-    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
-        .map_err(|e| TlsError::Material(e.to_string()))?
-        .ok_or_else(|| TlsError::Material("no private key found".into()))?;
+    let key = <rustls::pki_types::PrivateKeyDer<'static> as rustls::pki_types::pem::PemObject>::from_pem_slice(key_pem.as_bytes())
+        .map_err(|e| TlsError::Material(e.to_string()))?;
     let builder = rustls::ServerConfig::builder();
     let builder = match client_ca_pem {
         Some(ca) => {
-            let cas: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(ca.as_bytes()))
-                .collect::<Result<_, _>>()
+            let cas = <rustls::pki_types::CertificateDer<'static> as rustls::pki_types::pem::PemObject>::pem_slice_iter(ca.as_bytes())
+                .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| TlsError::Material(e.to_string()))?;
             let mut roots = rustls::RootCertStore::empty();
             for c in cas {
@@ -376,12 +396,10 @@ pub mod mesh {
             Path::new(&identity.cert_path),
             Path::new(&identity.key_path),
         )?;
-        let cas: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(
-            std::fs::File::open(&identity.ca_path)
-                .map_err(|e| TlsError::Material(format!("{}: {e}", identity.ca_path)))?,
-        ))
-        .collect::<Result<_, _>>()
-        .map_err(|e| TlsError::Material(e.to_string()))?;
+        let cas = <rustls::pki_types::CertificateDer<'static> as rustls::pki_types::pem::PemObject>::pem_file_iter(&identity.ca_path)
+            .map_err(|e| TlsError::Material(format!("{}: {e}", identity.ca_path)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| TlsError::Material(e.to_string()))?;
         let mut roots = rustls::RootCertStore::empty();
         for ca in cas {
             roots
@@ -427,14 +445,45 @@ pub mod mesh {
                     break;
                 };
                 if gtag == 0x86 {
-                    return String::from_utf8(names[spos + ghdr..spos + ghdr + gclen].to_vec())
-                        .ok();
+                    // `der_header` now guarantees these bounds, but slice
+                    // with `get` like every other step of this walk: a
+                    // certificate is peer-supplied, so no step here may
+                    // be able to panic.
+                    let start = spos.checked_add(ghdr)?;
+                    let end = start.checked_add(gclen)?;
+                    let uri = names.get(start..end)?;
+                    return String::from_utf8(uri.to_vec()).ok();
                 }
                 spos += gtotal;
             }
             return None;
         }
         None
+    }
+
+    /// A GeneralName whose declared length runs past the end of the SAN
+    /// sequence must yield `None`, not a slice-index panic.
+    ///
+    /// Every other step of the DER walk uses `get`, so a malformed length
+    /// was already handled — this one site indexed directly. Nothing in the
+    /// suite reached it because every test certificate comes from `rcgen`
+    /// and is therefore well formed. A peer presenting a crafted
+    /// certificate hits it.
+    #[test]
+    fn spiffe_id_rejects_a_general_name_that_overruns_the_san_sequence() {
+        // OID 2.5.29.17, then the wrapping OCTET STRING, whose content is
+        // a SEQUENCE holding one context-[6] GeneralName that claims 200
+        // bytes of URI but supplies 2.
+        //   06 03 55 1d 11          SAN extension OID (2.5.29.17)
+        //   04 08                   OCTET STRING, 8 content bytes
+        //     30 06                 SEQUENCE, 6 content bytes
+        //       86 7f 01 02 03 04   context [6] URI, claims 127 bytes
+        let der: Vec<u8> = vec![
+            0x06, 0x03, 0x55, 0x1D, 0x11, 0x04, 0x08, 0x30, 0x06, 0x86, 0x7F, 0x01, 0x02, 0x03,
+            0x04,
+        ];
+        let cert = CertificateDer::from(der);
+        assert_eq!(spiffe_id(&cert), None);
     }
 
     /// Verifies the peer certificate's SPIFFE ID against `prefix`.
@@ -467,7 +516,16 @@ pub mod mesh {
         let constructed = tag & 0x20 != 0;
         let first = buf[1];
         if first & 0x80 == 0 {
-            Some((2, first as usize, 2 + first as usize, constructed, tag))
+            // A TLV must fit inside the buffer it was read from. Enforcing
+            // that here rather than at each call site is what keeps every
+            // returned length in bounds — the walker in `spiffe_id` slices
+            // with these values, and one over-long length used to panic
+            // (a peer-presented certificate reaches this code).
+            let total = 2 + first as usize;
+            if total > buf.len() {
+                return None;
+            }
+            Some((2, first as usize, total, constructed, tag))
         } else {
             let n = (first & 0x7f) as usize;
             if n == 0 || n > 4 || buf.len() < 2 + n {
@@ -477,7 +535,11 @@ pub mod mesh {
             for b in &buf[2..2 + n] {
                 len = (len << 8) | *b as usize;
             }
-            Some((2 + n, len, 2 + n + len, constructed, tag))
+            let total = match 2usize.checked_add(n).and_then(|h| h.checked_add(len)) {
+                Some(total) if total <= buf.len() => total,
+                _ => return None,
+            };
+            Some((2 + n, len, total, constructed, tag))
         }
     }
 
@@ -499,6 +561,9 @@ pub mod mesh {
         /// through the DER walk.
         #[test]
         fn spiffe_id_roundtrips_through_der() {
+            // With the post-quantum feature, rustls carries two provider
+            // features and refuses to auto-pick: install ours first.
+            crate::install_crypto_provider();
             let ca_key = rcgen::KeyPair::generate().expect("ca key");
             let mut ca_params =
                 rcgen::CertificateParams::new(vec!["mesh-ca".into()]).expect("ca params");
@@ -553,5 +618,36 @@ pub mod mesh {
             );
             assert!(verify_spiffe(&[der], "spiffe://other.org/").is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod pq_tests {
+    /// The lean proof for iteration 6: with the `post-quantum` feature,
+    /// the installed provider offers X25519MLKEM768 (the hybrid PQ kx
+    /// Chrome and Cloudflare negotiate); without it, the ring provider
+    /// does not. Feature-gated to match.
+    #[test]
+    #[cfg(feature = "post-quantum")]
+    fn pq_provider_offers_x25519_mlkem768() {
+        crate::install_crypto_provider();
+        let provider = rustls::crypto::CryptoProvider::get_default()
+            .expect("process default provider installed")
+            .clone();
+        let names: Vec<String> = provider
+            .kx_groups
+            .iter()
+            .map(|g| format!("{:?}", g.name()))
+            .collect();
+        assert!(
+            names.iter().any(|n| n.contains("X25519MLKEM768")),
+            "PQ hybrid kx missing from the provider: {names:?}"
+        );
+        // It must be the HIGHEST priority (first in the list) — the
+        // `prefer-post-quantum` feature's contract.
+        assert!(
+            names[0].contains("X25519MLKEM768"),
+            "PQ kx must lead: {names:?}"
+        );
     }
 }

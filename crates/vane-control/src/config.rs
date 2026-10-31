@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 /// HTTP/2 protocol tuning.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Http2Config {
     /// Reject WINDOW_UPDATE on streams the peer has never opened
     /// (RFC 7540 §5.1 idle → PROTOCOL_ERROR connection error).
@@ -76,7 +77,14 @@ pub struct VaneConfig {
 }
 
 /// An ingress listener.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `#[non_exhaustive]` by design: config structs grow (h2c, h3,
+/// proxy_protocol were each added after the first release), and this
+/// keeps adding a field from breaking downstream `match`/construction.
+/// Construct with `..Default::default()`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ListenerConfig {
     /// Bind address (e.g. `0.0.0.0:8080`).
     pub address: String,
@@ -93,10 +101,21 @@ pub struct ListenerConfig {
     /// listener — containers/service meshes speak h2c without TLS.
     #[serde(default)]
     pub h2c: bool,
+    /// Require a PROXY protocol header (v1 text or v2 binary) at the
+    /// start of every connection and attribute it to the client address
+    /// it carries — the client-IP contract for listeners behind an L4
+    /// load balancer (AWS NLB, HAProxy, Cloudflare). Trust is the
+    /// operator's declaration: enable ONLY where every sender is the
+    /// trusted fronting proxy, because anyone who can open a connection
+    /// can send a spoofed header. The header precedes the TLS
+    /// handshake; malformed or missing headers close the connection.
+    #[serde(default)]
+    pub proxy_protocol: bool,
 }
 
 /// TLS material for a listener.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListenerTls {
     /// PEM certificate chain path (or ACME-managed path).
     pub cert: String,
@@ -133,6 +152,8 @@ pub enum ListenerMode {
 
 /// An upstream cluster.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ClusterConfig {
     /// Static backend addresses (`host:port`).
     #[serde(default)]
@@ -169,10 +190,103 @@ pub struct ClusterConfig {
     /// Mesh mTLS upstream (SPIFFE-verified). Absent = plaintext.
     #[serde(default)]
     pub mesh: Option<MeshUpstreamConfig>,
+    /// Gradient-based adaptive concurrency limiting (Netflix
+    /// Gradient2 / Envoy adaptive-concurrency family). Absent =
+    /// disabled: the cluster admits everything and relies on the
+    /// circuit breaker.
+    #[serde(default)]
+    pub adaptive: Option<AdaptiveConcurrencyConfig>,
+}
+
+/// Adaptive concurrency limits for one cluster, tuned by measuring the
+/// gradient of request latency against its own no-load baseline.
+///
+/// The controller (crates/vane/src/adaptive.rs) keeps a per-cluster
+/// in-flight count and an exponentially-smoothed latency baseline; a
+/// request is shed with 503 when the count is at the current limit.
+/// The limit itself is recomputed on every completion: the gradient
+/// clamps to 0.5..1.0 (tolerance x baseline / latest), the new limit
+/// is `limit * gradient + queue_size`, then smoothed toward it by
+/// `smoothing`.
+///
+/// Defaults follow Netflix's Gradient2 defaults (min 20, max 200,
+/// queue 4, smoothing 0.2, tolerance 1.5).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct AdaptiveConcurrencyConfig {
+    /// Floor for the estimated limit — prevents death spirals where a
+    /// burst sheds so much that the cluster never recovers.
+    #[serde(default = "default_adaptive_min_limit")]
+    pub min_limit: u32,
+    /// Ceiling — a failsafe; the gradient never grows past this.
+    #[serde(default = "default_adaptive_max_limit")]
+    pub max_limit: u32,
+    /// How much may queue while latencies stay low (the gradient adds
+    /// this on every update, so it bounds growth per update).
+    #[serde(default = "default_adaptive_queue_size")]
+    pub queue_size: u32,
+    /// 0.0..1.0 — how much of each new estimate is adopted per update.
+    #[serde(default = "default_adaptive_smoothing")]
+    pub smoothing: f64,
+    /// At least 1.0: how much baseline drift is tolerated before the
+    /// gradient starts shedding (2.0 = a 2x latency rise is acceptable).
+    #[serde(default = "default_adaptive_rtt_tolerance")]
+    pub rtt_tolerance: f64,
+}
+
+fn default_adaptive_min_limit() -> u32 {
+    20
+}
+fn default_adaptive_max_limit() -> u32 {
+    200
+}
+fn default_adaptive_queue_size() -> u32 {
+    4
+}
+fn default_adaptive_smoothing() -> f64 {
+    0.2
+}
+fn default_adaptive_rtt_tolerance() -> f64 {
+    1.5
+}
+
+impl Default for AdaptiveConcurrencyConfig {
+    fn default() -> Self {
+        Self {
+            min_limit: default_adaptive_min_limit(),
+            max_limit: default_adaptive_max_limit(),
+            queue_size: default_adaptive_queue_size(),
+            smoothing: default_adaptive_smoothing(),
+            rtt_tolerance: default_adaptive_rtt_tolerance(),
+        }
+    }
+}
+
+impl Default for ClusterConfig {
+    /// An empty, disabled cluster: no backends, no features. Exists
+    /// for `#[non_exhaustive]` downstream construction (tests,
+    /// embedders) — parsed configs fill fields from TOML instead.
+    fn default() -> Self {
+        Self {
+            backends: Vec::new(),
+            unix_socket: None,
+            policy: PolicyConfig::default(),
+            health_path: None,
+            compression: false,
+            outlier: None,
+            http2: false,
+            http3: false,
+            h3_tls: None,
+            mesh: None,
+            adaptive: None,
+        }
+    }
 }
 
 /// TLS material for the h3 upstream bridge (`clusters.*.h3_tls`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct H3UpstreamTls {
     /// CA bundle (PEM) the backend's certificate must chain to.
     pub ca: String,
@@ -200,6 +314,7 @@ fn default_h3_server_name() -> String {
 /// the backend's SVID chains to the mesh CA, and enforces the SPIFFE
 /// ID prefix.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct MeshUpstreamConfig {
     /// Client SVID certificate chain (PEM).
     pub cert: String,
@@ -252,6 +367,7 @@ impl From<PolicyConfig> for vane_router::Policy {
 
 /// Per-route retry policy input (`[[routes]] retry`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct RetryInput {
     /// Total dial attempts including the first (default 3).
     #[serde(default = "default_retry_attempts")]
@@ -266,8 +382,54 @@ fn default_retry_attempts() -> u8 {
     3
 }
 
+/// Per-route CORS policy (`[[routes]] cors`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CorsConfig {
+    /// Allowed origins: exact ("https://app.example.com") or "*" for
+    /// any. Required.
+    pub allow_origins: Vec<String>,
+    /// Allowed methods (default: the route's methods).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_methods: Option<Vec<String>>,
+    /// Allowed request headers (default: Content-Type, Authorization).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_headers: Option<Vec<String>>,
+    /// Exposed response headers (Access-Control-Expose-Headers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expose_headers: Option<Vec<String>>,
+    /// Allow cookies / Authorization credentials (default false).
+    #[serde(default)]
+    pub allow_credentials: bool,
+    /// Preflight cache duration (seconds, default 86400).
+    #[serde(default = "default_cors_max_age")]
+    pub max_age_secs: u64,
+}
+
+fn default_cors_max_age() -> u64 {
+    86400
+}
+
+/// Per-route static response-header policy
+/// (`[[routes]] response_headers`). Proposed in SIS round 7 iter 61;
+/// see docs/response-headers-design.md.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseHeadersConfig {
+    /// Headers appended to every relayed response (overwrites upstream
+    /// occurrences of the same name). Insertion order follows the map's
+    /// lexical key order.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub add: std::collections::BTreeMap<String, String>,
+    /// Upstream header names deleted from the relayed response
+    /// (case-insensitive, all occurrences).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remove: Vec<String>,
+}
+
 /// A statically configured route.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouteConfig {
     /// Host match (empty = any).
     #[serde(default)]
@@ -300,11 +462,17 @@ pub struct RouteConfig {
     /// Per-route retry policy override (failover cap + 5xx predicate).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<RetryInput>,
+    /// CORS policy (preflight + response headers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cors: Option<CorsConfig>,
+    /// Static response-header policy (add/remove on relayed responses).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_headers: Option<ResponseHeadersConfig>,
 }
 
 /// Admin server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AdminConfig {
     /// Bind address (disabled when `enabled = false`).
     pub address: String,
@@ -331,7 +499,7 @@ impl Default for AdminConfig {
 
 /// File provider configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct FileProviderConfig {
     /// Directory of `*.toml` route files.
     pub directory: Option<PathBuf>,
@@ -350,7 +518,7 @@ impl Default for FileProviderConfig {
 
 /// Docker provider configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DockerConfig {
     /// Enabled flag.
     pub enabled: bool,
@@ -369,7 +537,7 @@ impl Default for DockerConfig {
 
 /// Kubernetes provider configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct K8sConfig {
     /// Enabled flag.
     pub enabled: bool,
@@ -391,6 +559,7 @@ impl Default for K8sConfig {
 
 /// ACME section.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AcmeSection {
     /// ACME configuration (disabled when unset).
     pub domains: Vec<AcmeDomain>,
@@ -407,6 +576,7 @@ pub struct AcmeSection {
 
 /// Domains managed by ACME.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AcmeDomain {
     /// DNS identifier.
     pub domain: String,
@@ -417,17 +587,19 @@ pub struct AcmeDomain {
 
 /// Supported ACME challenges.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "kebab-case")]
 pub enum AcmeChallenge {
-    /// HTTP-01 (served by vane's listeners).
+    /// HTTP-01 (RFC 8555 §8.3, served by vane's listeners).
     #[default]
+    #[serde(rename = "http-01", alias = "http01")]
     Http01,
     /// TLS-ALPN-01 (planned; rejected at load time for now).
+    #[serde(rename = "tls-alpn-01", alias = "tls-alpn01")]
     TlsAlpn01,
 }
 
 /// OpenTelemetry export configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {
     /// Service name reported to backends.
     #[serde(default = "default_service_name")]
@@ -469,6 +641,7 @@ impl Default for TelemetryConfig {
 
 /// Access-log configuration (`Default` = disabled, stderr sink).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AccessLogConfig {
     /// Emit one JSON line per completed request.
     #[serde(default)]
@@ -480,7 +653,7 @@ pub struct AccessLogConfig {
 
 /// In-process SHM sidecar transport configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SidecarConfig {
     /// Enabled flag.
     pub enabled: bool,
@@ -512,6 +685,16 @@ pub struct OutlierConfig {
     /// Ejection duration in milliseconds.
     #[serde(default = "default_outlier_ejection_ms")]
     pub ejection_ms: u64,
+    /// Maximum share of the cluster's backends that may be ejected at
+    /// once (percent, 1-100; always allows at least one). A shared-cause
+    /// transient (a network blip) must not eject the whole cluster —
+    /// Envoy caps at 10% with the same at-least-one rule.
+    #[serde(default = "default_outlier_max_ejection_percent")]
+    pub max_ejection_percent: u32,
+}
+
+fn default_outlier_max_ejection_percent() -> u32 {
+    50
 }
 
 fn default_outlier_threshold() -> u32 {
@@ -566,12 +749,31 @@ pub struct PluginConfig {
     pub path: String,
 }
 
+/// Config-level default for `response_splice`: the get64k A/B
+/// verdict (2.52x median, docs/perf-arc-2026-10.md iteration 3)
+/// flipped it on. `#[serde(default)]` alone would call
+/// `bool::default()` (false) and silently keep the fast path off.
+fn response_splice_default() -> bool {
+    true
+}
+
 /// Runtime tuning knobs.
+///
+/// `#[non_exhaustive]` per the config-struct family rule: new knobs
+/// must not break downstream constructors; `Default` carries the
+/// documented defaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct RuntimeConfig {
     /// Buffer pool slots per worker.
     pub pool_slots: usize,
+    /// Slot size in bytes. Both engines derive read/write lengths from
+    /// it and the relay's backpressure thresholds scale with it
+    /// (2 × buffer_size): raising it trades per-connection memory
+    /// (pool_slots × buffer_size) for fewer syscalls per byte. Bounded
+    /// to [512, 65536] (validated).
+    pub buffer_size: usize,
     /// io_uring queue depth.
     pub ring_entries: u32,
     /// Enable SQPOLL (zero-syscall submission; needs privileges).
@@ -590,12 +792,34 @@ pub struct RuntimeConfig {
     pub idle_timeout_ms: u64,
     /// Idle upstream connections retained per backend per worker.
     pub pool_per_backend: usize,
+    /// Relay eligible response bodies with splice(2) (kernel pipe,
+    /// zero user-space copies): identity Content-Length over plain
+    /// TCP on both legs, gzip excluded. Default ON since the get64k
+    /// A/B verdict (docs/perf-arc-2026-10.md, iteration 3: 2.5x
+    /// median throughput, p50 178 -> 77 us): the splice engages only
+    /// when the binary is built with the `response_splice` cargo
+    /// feature; without it this flag parses but is inert.
+    #[serde(default = "response_splice_default")]
+    pub response_splice: bool,
+    /// How long a pooled (idle) upstream connection stays reusable
+    /// after it was parked (ms).
+    ///
+    /// A pooled connection is a promise to the backend that we will
+    /// speak on it again; the backend usually enforces its own idle
+    /// timeout (nginx `keepalive_timeout` 60 s, most LBs 60 s). A
+    /// connection we keep past that point is a promise we cannot
+    /// keep: the first request that checks it out pays a failed
+    /// attach and a fresh dial. This deadline is what makes the pool
+    /// honest — after it, the connection is reaped instead of
+    /// handed to a request that would fail on it.
+    pub pool_idle_ms: u64,
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             pool_slots: 1024,
+            buffer_size: 4096,
             ring_entries: 4096,
             sqpoll: false,
             force_mio: false,
@@ -604,9 +828,15 @@ impl Default for RuntimeConfig {
             connect_timeout_ms: 5_000,
             first_byte_timeout_ms: 30_000,
             idle_timeout_ms: 75_000,
-            // Upstream keep-alive pooling: 4 idle connections per backend
-            // per worker. Validated under sustained load (load_pooled).
+            // Upstream keep-alive pooling: idle connections per backend
+            // per worker, each reusable for `pool_idle_ms`. Reuse is the
+            // single biggest lever on proxy throughput (a fresh upstream
+            // connection costs a TCP (and TLS) handshake per request),
+            // and the honest cap is time, not count: see docs/perf-arc-
+            // 2026-10.md, iteration 1.
             pool_per_backend: 4,
+            response_splice: true,
+            pool_idle_ms: 30_000,
         }
     }
 }
@@ -650,6 +880,18 @@ impl VaneConfig {
                 )));
             }
         }
+        // Slot size bounds: both engines derive their read lengths from
+        // it and backpressure thresholds scale with it — a config typo
+        // must be a startup error, not a silent 1-byte-read or
+        // gigabytes-per-worker allocation. Mirrors
+        // vane_kernel::buffer::{MIN_BUF_SIZE, MAX_BUF_SIZE} (kept as
+        // literals here: vane-control does not depend on vane-kernel).
+        if !(512..=65536).contains(&self.runtime.buffer_size) {
+            return Err(ConfigError::Invalid(format!(
+                "runtime.buffer_size {} out of range [512, 65536]",
+                self.runtime.buffer_size
+            )));
+        }
         for d in &self.acme.domains {
             if d.challenge == AcmeChallenge::TlsAlpn01 {
                 return Err(ConfigError::Invalid(
@@ -668,6 +910,58 @@ impl VaneConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_headers_table_parses_and_applies_to_routes() {
+        let cfg: VaneConfig = toml::from_str(
+            r#"
+[[listeners]]
+address = "127.0.0.1:8080"
+
+[clusters.api]
+backends = ["127.0.0.1:9001"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "api"
+
+[routes.response_headers]
+add = { Strict-Transport-Security = "max-age=31536000", X-Content-Type-Options = "nosniff" }
+remove = ["Server", "X-Powered-By"]
+"#,
+        )
+        .expect("valid config");
+        let rh = cfg.routes[0]
+            .response_headers
+            .as_ref()
+            .expect("policy present");
+        assert_eq!(rh.remove, vec!["Server", "X-Powered-By"]);
+        assert_eq!(
+            rh.add.get("Strict-Transport-Security").map(String::as_str),
+            Some("max-age=31536000")
+        );
+    }
+
+    #[test]
+    fn response_headers_unknown_keys_rejected() {
+        let result = toml::from_str::<VaneConfig>(
+            r#"
+[[listeners]]
+address = "127.0.0.1:8080"
+
+[clusters.api]
+backends = ["127.0.0.1:9001"]
+
+[[routes]]
+pattern = "/*rest"
+cluster = "api"
+
+[routes.response_headers]
+bogus = 1
+"#,
+        );
+        assert!(result.is_err(), "unknown keys are startup errors");
+    }
 
     const SAMPLE: &str = r#"
 [[listeners]]
@@ -692,6 +986,29 @@ cluster = "api"
 [admin]
 address = "127.0.0.1:9100"
 "#;
+
+    #[test]
+    fn unknown_runtime_keys_are_rejected() {
+        // A typo'd key must be a startup error, not a silent no-op:
+        // `[runtime] workers = 0` sat in the dogfood config doing
+        // nothing (workers is a listener field) and validate said OK.
+        let typo = SAMPLE.replace("[admin]", "[runtime]\nworkers = 0\n\n[admin]");
+        let cfg = VaneConfig::parse_toml(&typo);
+        assert!(cfg.is_err(), "unknown [runtime] key must fail: {typo}");
+        let err = format!("{}", cfg.expect_err("err"));
+        assert!(err.contains("workers"), "error names the key: {err}");
+    }
+
+    #[test]
+    fn buffer_size_bounds_are_validated() {
+        let mut cfg = VaneConfig::parse_toml(SAMPLE).expect("parses");
+        cfg.runtime.buffer_size = 16384;
+        cfg.validate().expect("16 KiB is in range");
+        cfg.runtime.buffer_size = 100;
+        assert!(cfg.validate().is_err(), "below the floor");
+        cfg.runtime.buffer_size = 128 * 1024;
+        assert!(cfg.validate().is_err(), "above the ceiling");
+    }
 
     #[test]
     fn parses_and_validates() {

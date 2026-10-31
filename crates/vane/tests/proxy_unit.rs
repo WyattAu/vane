@@ -17,30 +17,7 @@ fn make_proxy(
     events: Arc<EventRing<LogEvent, { vane_observe::EVENT_RING_CAPACITY }>>,
     plugins: Vec<String>,
 ) -> HttpProxy {
-    HttpProxy::new(
-        ProxyConfig {
-            router,
-            registry: Arc::clone(&registry),
-            events,
-            rate_limit_rps: None,
-            connect_timeout_ms: 5_000,
-            idle_timeout_ms: 75_000,
-            first_byte_timeout_ms: 30_000,
-            pool_per_backend: 4,
-            tls: None,
-            h2_strict_idle_window_update: false,
-            plugins,
-            http01_tokens: None,
-            access: None,
-            jwt: None,
-            shared_rate_limit: None,
-            h2c: false,
-            alt_svc: None,
-            l4_splice: false,
-            mesh: Default::default(),
-        },
-        0,
-    )
+    HttpProxy::new(ProxyConfig::new(router, registry, events, plugins), 0)
 }
 
 /// Plugins configured without the `wasm` feature: construction must
@@ -64,6 +41,7 @@ fn make_router(routes: &[(&str, &str)]) -> Arc<Router> {
         for (pattern, cluster) in routes {
             editor.insert(
                 RouteBuilder {
+                    response_headers: Default::default(),
                     host: None,
                     pattern: (*pattern).to_owned(),
                     methods: Vec::new(),
@@ -80,6 +58,7 @@ fn make_router(routes: &[(&str, &str)]) -> Arc<Router> {
                     retry: Default::default(),
                     mirror: None,
                     mirror_backends: Vec::new(),
+                    cors: None,
                 }
                 .compile()
                 .expect("valid route"),

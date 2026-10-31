@@ -36,6 +36,7 @@ TOML=$(mktemp --suffix=.toml)
 cat > "$TOML" <<TOML
 [[listeners]]
 address = "127.0.0.1:18080"
+workers = 1
 
 [clusters.placeholder]
 backends = ["127.0.0.1:1"]
@@ -50,7 +51,6 @@ address = "127.0.0.1:9901"
 
 [runtime]
 force_mio = true
-workers = 1
 TOML
 "$BIN" run -c "$TOML" &
 VANE_PID=$!

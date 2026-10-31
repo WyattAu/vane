@@ -21,8 +21,13 @@ pub fn static_routes(cfg: &VaneConfig, health: &HealthMap) -> Vec<RouteBuilder> 
         }
         let outlier = cluster.outlier.as_ref().map(|o| {
             let addrs: Vec<std::net::SocketAddr> = backends.iter().map(|b| b.addr).collect();
-            vane_router::outlier::OutlierSet::new(addrs, o.consecutive_failures, o.ejection_ms)
-                .shared()
+            vane_router::outlier::OutlierSet::with_max_ejected(
+                addrs,
+                o.consecutive_failures,
+                o.ejection_ms,
+                o.max_ejection_percent,
+            )
+            .shared()
         });
         out.push(RouteBuilder {
             host: r.host.clone(),
@@ -46,6 +51,21 @@ pub fn static_routes(cfg: &VaneConfig, health: &HealthMap) -> Vec<RouteBuilder> 
                     retry_5xx: c.retry_5xx,
                 }),
             mirror: r.mirror.clone(),
+            cors: r.cors.as_ref().map(|c| vane_router::CorsPolicy {
+                allow_origins: c.allow_origins.clone(),
+                allow_methods: c.allow_methods.clone(),
+                allow_headers: c.allow_headers.clone(),
+                expose_headers: c.expose_headers.clone(),
+                allow_credentials: c.allow_credentials,
+                max_age_secs: c.max_age_secs,
+            }),
+            response_headers: r.response_headers.as_ref().map_or(
+                vane_router::ResponseHeaderPolicy::default(),
+                |rh| vane_router::ResponseHeaderPolicy {
+                    add: rh.add.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                    remove: rh.remove.clone(),
+                },
+            ),
             mirror_backends: r
                 .mirror
                 .as_ref()
@@ -103,6 +123,7 @@ mod resolve_tests {
             compression: false,
             outlier: None,
             mesh: None,
+            adaptive: None,
         };
         let backends = resolve_backends(&cluster, &health);
         assert_eq!(backends.len(), 2);
@@ -122,6 +143,7 @@ mod resolve_tests {
             compression: false,
             outlier: None,
             mesh: None,
+            adaptive: None,
         };
         let backends = resolve_backends(&cluster, &health);
         assert_eq!(backends.len(), 1, "localhost must resolve");
@@ -142,6 +164,7 @@ mod resolve_tests {
             compression: false,
             outlier: None,
             mesh: None,
+            adaptive: None,
         };
         let backends = resolve_backends(&cluster, &health);
         assert!(

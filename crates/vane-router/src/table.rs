@@ -25,6 +25,8 @@ pub struct RouteEntry {
     pub mirror: Option<String>,
     /// The mirror cluster's resolved backends.
     pub mirror_backends: Vec<crate::balancer::Backend>,
+    /// CORS policy (preflight + response headers).
+    pub cors: Option<CorsPolicy>,
     /// Prefix to strip from the matched path before forwarding.
     pub strip_prefix: Option<String>,
     /// Request timeout override (ms).
@@ -47,6 +49,8 @@ pub struct RouteEntry {
     /// SPIFFE ID prefixes an inbound mTLS caller's URI SAN must match
     /// (empty = no caller-identity authorization).
     pub allowed_spiffe_prefixes: Vec<String>,
+    /// Static response-header policy (empty = relay unchanged).
+    pub response_headers: ResponseHeaderPolicy,
 }
 
 impl RouteEntry {
@@ -154,6 +158,53 @@ pub enum RouterError {
     Invalid(String),
 }
 
+/// Per-route CORS policy (resolved from the config plane).
+#[derive(Debug, Clone)]
+pub struct CorsPolicy {
+    /// Allowed origins: exact or "*".
+    pub allow_origins: Vec<String>,
+    /// Allowed methods (None = reflect the route's methods).
+    pub allow_methods: Option<Vec<String>>,
+    /// Allowed request headers.
+    pub allow_headers: Option<Vec<String>>,
+    /// Exposed response headers.
+    pub expose_headers: Option<Vec<String>>,
+    /// Allow credentials.
+    pub allow_credentials: bool,
+    /// Preflight cache duration (seconds).
+    pub max_age_secs: u64,
+}
+
+/// Per-route response-header policy (resolved from the config plane):
+/// headers appended to every relayed response, and upstream header
+/// names removed from it.
+#[derive(Debug, Clone, Default)]
+pub struct ResponseHeaderPolicy {
+    /// Headers appended after the upstream head is rewritten (CORS
+    /// first, then these — later lines win for duplicate names).
+    pub add: Vec<(String, String)>,
+    /// Upstream header names removed from the relayed response
+    /// (case-insensitive, all occurrences).
+    pub remove: Vec<String>,
+}
+
+/// A zero policy allows no origin — the safe reading of "unset". The
+/// one non-zero default is the preflight cache duration: `0` would tell
+/// browsers never to cache a preflight, turning every cross-origin
+/// request into two round trips.
+impl Default for CorsPolicy {
+    fn default() -> Self {
+        Self {
+            allow_origins: Vec::new(),
+            allow_methods: None,
+            allow_headers: None,
+            expose_headers: None,
+            allow_credentials: false,
+            max_age_secs: 86_400,
+        }
+    }
+}
+
 /// Per-cluster retry policy (failover behavior on failed attempts).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {
@@ -204,6 +255,8 @@ pub struct RouteBuilder {
     /// SPIFFE ID prefixes an inbound mTLS caller must match (empty =
     /// unrestricted).
     pub allowed_spiffe_prefixes: Vec<String>,
+    /// Static response-header policy (empty = relay unchanged).
+    pub response_headers: ResponseHeaderPolicy,
     /// Retry policy (failover cap + 5xx predicate).
     pub retry: RetryPolicy,
     /// Mirror (shadow) cluster: a fire-and-forget request copy goes
@@ -212,6 +265,8 @@ pub struct RouteBuilder {
     /// The mirror cluster's resolved backends (materialized by the
     /// caller; empty = mirroring disabled).
     pub mirror_backends: Vec<crate::balancer::Backend>,
+    /// CORS policy (preflight + response headers).
+    pub cors: Option<CorsPolicy>,
 }
 
 impl RouteBuilder {
@@ -238,6 +293,7 @@ impl RouteBuilder {
             cluster: self.cluster,
             retry: self.retry,
             mirror: self.mirror,
+            cors: self.cors,
             mirror_backends: self.mirror_backends,
             strip_prefix: self.strip_prefix,
             timeout_ms: self.timeout_ms,
@@ -249,6 +305,7 @@ impl RouteBuilder {
             gauges,
             priority: self.priority,
             allowed_spiffe_prefixes: self.allowed_spiffe_prefixes,
+            response_headers: self.response_headers,
         })
     }
 }
@@ -403,7 +460,9 @@ mod tests {
             allowed_spiffe_prefixes: Vec::new(),
             retry: Default::default(),
             mirror_backends: Vec::new(),
+            cors: None,
             mirror: None,
+            response_headers: ResponseHeaderPolicy::default(),
         }
     }
 
