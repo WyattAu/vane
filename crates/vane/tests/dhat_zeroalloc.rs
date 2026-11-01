@@ -161,6 +161,7 @@ fn h1_relay_hot_path_is_allocation_free() {
         r#"
 [[listeners]]
 address = "127.0.0.1:{port}"
+workers = 1
 
 [clusters.up]
 backends = ["{upstream}"]
@@ -172,7 +173,6 @@ methods = ["GET"]
 
 [runtime]
 force_mio = true
-workers = 1
 connect_timeout_ms = 1000
 first_byte_timeout_ms = 500
 idle_timeout_ms = 2000

@@ -3123,7 +3123,13 @@ impl HttpProxy {
         // Filter pipeline (scoped: ctx borrows the path buffer).
         let peer = self.client_peer(io, slot);
         let (inject, short_circuit, trace) = {
+            // Seed the pipeline with the connection's recycled inject
+            // storage: after warmup the header set is stable, so
+            // injection updates slots in place (see `RequestCtx::inject`)
+            // — no per-request Vec/String allocation (`MM-01`).
+            let recycled_inject = std::mem::take(&mut self.conn(slot).inject);
             let mut ctx = RequestCtx::new(view.method, &mut upstream_path, peer, host_only);
+            ctx.inject_headers = recycled_inject;
             ctx.cluster = Some(&route.cluster);
             // Trace-log correlation: the pipeline's trace must be the
             // INBOUND trace when the client supplied a valid
@@ -3135,7 +3141,12 @@ impl HttpProxy {
                     ctx.trace = tc;
                 }
             }
-            ctx.inject("X-Forwarded-For", &peer.ip().to_string());
+            // Stack-format the client IP (`MM-01`): the former
+            // `ip().to_string()` malloc'd per request.
+            let mut ipbuf = [0u8; 46]; // max IPv6 text length
+            let mut ipw = vane_filters::StackStr::new(&mut ipbuf);
+            core::fmt::write(&mut ipw, format_args!("{}", peer.ip())).ok();
+            ctx.inject("X-Forwarded-For", ipw.as_str());
             // Scheme as this edge saw it: TLS-terminating listeners report
             // https (the h2 edge path does the same). Never trust an
             // inbound X-Forwarded-Proto — build_upstream_head strips it.
@@ -3269,7 +3280,16 @@ impl HttpProxy {
         {
             let conn = self.conn(slot);
             conn.route = Some(Arc::clone(&route));
-            conn.breaker = Some((route.cluster.clone(), Arc::clone(&cached_breaker)));
+            // Re-resolve the breaker tuple only when the routed cluster
+            // changed (`MM-01`): the per-request `route.cluster.clone()`
+            // in the unconditional rebuild malloc'd every request.
+            if conn
+                .breaker
+                .as_ref()
+                .is_none_or(|(c, _)| c != &route.cluster)
+            {
+                conn.breaker = Some((route.cluster.clone(), Arc::clone(&cached_breaker)));
+            }
             conn.upstream_path = upstream_path;
             conn.inject = inject;
             conn.started = Some(started);
@@ -3429,7 +3449,7 @@ impl HttpProxy {
             #[cfg(not(feature = "h2"))]
             let is_h2 = false;
             let compressing = self.conns.get(&slot).is_some_and(|c| c.gzip.is_some());
-            let out = if compressing {
+            if compressing {
                 let mut gz = self.conn(slot).gzip.take();
                 let compressed = gz
                     .as_mut()
@@ -3442,16 +3462,18 @@ impl HttpProxy {
                 } else if !compressed.is_empty() {
                     out.extend_from_slice(&vane_proto::compression::chunk(&compressed));
                 }
-                out
-            } else {
-                bytes.to_vec()
-            };
-            // A feed can produce nothing (deflate buffering the window),
-            // and `chunk(&[])` is literally the terminal sequence
-            // `0\r\n\r\n` — writing it would truncate the client's
-            // chunked stream mid-body.
-            if !out.is_empty() {
-                self.write_downstream(io, &out);
+                // A feed can produce nothing (deflate buffering the
+                // window), and `chunk(&[])` is literally the terminal
+                // sequence `0\r\n\r\n` — writing it would truncate the
+                // client's chunked stream mid-body.
+                if !out.is_empty() {
+                    self.write_downstream(io, &out);
+                }
+            } else if !bytes.is_empty() {
+                // No staging copy (`MM-01`): the un-compressed body is
+                // written straight through — `bytes` is raw body data,
+                // never the chunked terminal.
+                self.write_downstream(io, bytes);
             }
         }
         if framing_done {
