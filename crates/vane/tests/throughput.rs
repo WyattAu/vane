@@ -120,6 +120,7 @@ fn proxy_throughput_percentiles() {
             r#"
 [[listeners]]
 address = "127.0.0.1:{port}"
+workers = 2
 
 [clusters.bench]
 backends = ["{upstream}"]
@@ -133,7 +134,6 @@ enabled = false
 
 [runtime]
 force_mio = true
-workers = 2
 "#
         ),
     )
