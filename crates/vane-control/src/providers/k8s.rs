@@ -29,6 +29,9 @@ pub struct K8sProvider {
     /// default; injectable so the provider is testable off-cluster).
     pub token_path: String,
     client: reqwest::Client,
+    /// Static bearer token override (`with_client`; in-cluster reads
+    /// the service-account file).
+    token: Option<String>,
 }
 
 /// The namespaces to issue HTTPRoute list requests for.
@@ -92,10 +95,33 @@ impl K8sProvider {
             namespaces,
             token_path: SA_TOKEN.to_owned(),
             client,
+            token: None,
         })
     }
 
+    /// Builds a provider from an explicit client and optional static
+    /// bearer token — the test seam (`wiremock` mocks) and the seam for
+    /// exotic service-account setups; the in-cluster path is [`Self::new`].
+    #[must_use]
+    pub fn with_client(
+        api: String,
+        namespaces: Vec<String>,
+        client: reqwest::Client,
+        token: Option<String>,
+    ) -> Self {
+        Self {
+            api,
+            namespaces,
+            client,
+            token,
+            token_path: SA_TOKEN.to_owned(),
+        }
+    }
+
     fn token(&self) -> Result<String, String> {
+        if let Some(t) = &self.token {
+            return Ok(t.clone());
+        }
         std::fs::read_to_string(&self.token_path).map_err(|e| format!("read token: {e}"))
     }
 
@@ -464,6 +490,7 @@ mod tests {
             api: format!("http://{addr}"),
             namespaces: vec!["app".to_string()],
             token_path: "/dev/null".to_owned(),
+            token: None,
             client,
         };
         let routes = provider.list_routes().await.expect("list_routes");
@@ -486,6 +513,7 @@ mod tests {
             api: "http://127.0.0.1:1".to_owned(), // nothing listens
             namespaces: vec!["app".to_string()],
             token_path: "/dev/null".to_owned(),
+            token: None,
             client,
         };
         assert!(provider.list_routes().await.is_err());

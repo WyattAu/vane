@@ -254,6 +254,9 @@ struct Conn {
     /// Upstream-bound bytes deferred behind flow control (flushed on
     /// upstream-write completion).
     up_buf: Vec<u8>,
+    /// Recycled chunk staging for `upstream_flush` (`MM-01`): the
+    /// former `drain(..).collect()` malloc'd per deferred write.
+    up_out: Vec<u8>,
     /// A chunk of upstream-bound bytes is in flight.
     up_write_out: bool,
     /// Unconsumed ciphertext tail (partial TLS records between reads).
@@ -399,6 +402,10 @@ pub struct HttpProxy {
     plugins: Vec<vane_plugins::PluginInstance>,
     metrics: ProxyMetrics,
     worker_id: usize,
+    /// Per-worker scratch pool for head parsing (`MM-01`): taken,
+    /// filled, and returned per intake — capacity is retained across
+    /// requests, so steady-state parsing performs no allocation.
+    head_scratch: Vec<u8>,
     /// Adaptive concurrency controllers, created on first sight of a
     /// cluster that configures one (see `adaptive_limit`).
     adaptive: HashMap<String, crate::adaptive::AdaptiveLimit>,
@@ -572,6 +579,7 @@ impl HttpProxy {
             plugins,
             metrics,
             worker_id,
+            head_scratch: Vec::with_capacity(HEAD_SCRATCH_CAP),
         }
     }
 
@@ -649,31 +657,35 @@ impl HttpProxy {
 
     fn upstream_send(&mut self, io: &mut SessionIo<'_>, plaintext: &[u8]) {
         let slot = io.slot_index();
-        let ready = if let Some(tls) = self.conns.get_mut(&slot).and_then(|c| c.tls_up.as_mut()) {
-            use std::io::Write as _;
-            if tls.writer().write_all(plaintext).is_err() {
-                io.close();
-                return;
-            }
-            let mut ciphertext = Vec::with_capacity(17 * 1024);
-            let mut buf = [0u8; 17 * 1024];
-            loop {
-                match tls.write_tls(&mut buf.as_mut_slice()) {
-                    Ok(0) => break,
-                    Ok(n) => ciphertext.extend_from_slice(&buf[..n]),
-                    Err(_) => {
-                        io.close();
-                        return;
+        // Encrypt through mesh TLS when configured; otherwise relay the
+        // caller's bytes directly (no copy — `MM-01`).
+        let ciphertext =
+            if let Some(tls) = self.conns.get_mut(&slot).and_then(|c| c.tls_up.as_mut()) {
+                use std::io::Write as _;
+                if tls.writer().write_all(plaintext).is_err() {
+                    io.close();
+                    return;
+                }
+                let mut ciphertext = Vec::with_capacity(17 * 1024);
+                let mut buf = [0u8; 17 * 1024];
+                loop {
+                    match tls.write_tls(&mut buf.as_mut_slice()) {
+                        Ok(0) => break,
+                        Ok(n) => ciphertext.extend_from_slice(&buf[..n]),
+                        Err(_) => {
+                            io.close();
+                            return;
+                        }
                     }
                 }
-            }
-            ciphertext
-        } else {
-            plaintext.to_vec()
-        };
+                Some(ciphertext)
+            } else {
+                None
+            };
+        let ready: &[u8] = ciphertext.as_deref().unwrap_or(plaintext);
         {
             let conn = self.conn(slot);
-            conn.up_buf.extend_from_slice(&ready);
+            conn.up_buf.extend_from_slice(ready);
             // Runaway guard: deferral is bounded (the old close-on-
             // overflow only tripped at 1 MiB; this allows deep bursts
             // but still kills truly stuck streams).
@@ -701,10 +713,18 @@ impl HttpProxy {
                 return;
             }
             let n = conn.up_buf.len().min(UP_CHUNK);
-            conn.up_buf.drain(..n).collect::<Vec<u8>>()
+            // Stage the chunk into the connection's recycled buffer
+            // (zero alloc after warmup, `MM-01`).
+            let mut out = std::mem::take(&mut conn.up_out);
+            out.clear();
+            out.extend_from_slice(conn.up_buf.drain(..n).as_slice());
+            out
         };
         self.conn(slot).up_write_out = true;
         io.write_upstream(&chunk);
+        // The write copies into the kernel's pool slot synchronously;
+        // the staging buffer returns for the next chunk.
+        self.conn(slot).up_out = chunk;
     }
 
     /// Feeds upstream ciphertext into the mesh TLS state; returns the
@@ -1753,10 +1773,17 @@ impl HttpProxy {
             let conn = self.conn(slot);
             conn.head_buf.extend_from_slice(data);
         }
-        let buf = self.conn(slot).head_buf.clone();
+        // Parse from the worker's recycled scratch (MM-01): capacity is
+        // retained across requests, so after warmup this is a memcpy —
+        // the former per-request `head_buf.clone()` malloc'd every time
+        // a client streamed head bytes.
+        let mut buf = std::mem::take(&mut self.head_scratch);
+        buf.clear();
+        buf.extend_from_slice(&self.conn(slot).head_buf);
         let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
         match RequestView::parse_in(&buf, &mut storage) {
             Parsed::Partial => {
+                self.head_scratch = buf;
                 // Refresh idle deadline while the client streams the head.
                 io.set_deadline(
                     Some(self.deadline(self.config.idle_timeout_ms)),
@@ -1764,6 +1791,7 @@ impl HttpProxy {
                 );
             }
             Parsed::Error(e) => {
+                self.head_scratch = buf;
                 let status = match e {
                     vane_proto::request::ParseError::TooLarge => Status::PayloadTooLarge,
                     // Ambiguous framing (CL+TE, duplicate CL, non-chunked
@@ -1778,6 +1806,9 @@ impl HttpProxy {
             Parsed::Complete(view, head_len) => {
                 self.metrics.requests.inc(&self.config.registry);
                 self.handle_request(io, &view, head_len);
+                // Scratch capacity returns to the pool (the view's
+                // borrow ends with the dispatch).
+                self.head_scratch = buf;
             }
         }
     }
@@ -2149,6 +2180,12 @@ static MIRROR_RR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 /// connects. The window is one dial; anything beyond this is abusive.
 const REQ_PENDING_CAP: usize = 1024 * 1024;
 
+/// Warmup capacity of the per-worker head-parse scratch (`MM-01`):
+/// covers the request-head cap (`MAX_HEADERS` lines ≈ 16 KiB) plus the
+/// first body bytes typically coalesced into the same read, so the
+/// steady-state `extend_from_slice` never reallocates.
+const HEAD_SCRATCH_CAP: usize = 16 * 1024;
+
 /// Cap on an accumulated upstream response head. A head larger than this
 /// is a protocol error, not a slow sender.
 const RESP_HEAD_CAP: usize = 64 * 1024;
@@ -2462,14 +2499,7 @@ impl Handler for HttpProxy {
             }
         }
         self.conn(slot).upstream_ready = true;
-        let (route, upstream_path, inject) = {
-            let conn = self.conn(slot);
-            (
-                conn.route.clone().expect("route"),
-                conn.upstream_path.clone(),
-                std::mem::take(&mut conn.inject),
-            )
-        };
+        let route = self.conn(slot).route.clone().expect("route");
         // HTTP/2 upstream: speak h2 to the backend (prior knowledge),
         // translating the buffered h1 request head.
         #[cfg(feature = "h2")]
@@ -2544,15 +2574,32 @@ impl Handler for HttpProxy {
         // buffer; the handler call is synchronous so this is safe).
         // Zero-copy: take the buffer (capacity preserved across the
         // transaction) instead of cloning the head per request.
-        let buf = std::mem::take(&mut self.conn(slot).head_buf);
+        let mut buf = std::mem::take(&mut self.conn(slot).head_buf);
+        // Path + inject storage also move by take (`MM-01`): the build
+        // below borrows them, then both return to the connection —
+        // the former `upstream_path.clone()` allocated per request.
+        let path_taken = std::mem::take(&mut self.conn(slot).upstream_path);
+        let inject = std::mem::take(&mut self.conn(slot).inject);
         let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
         if let Parsed::Complete(view, head_len) = RequestView::parse_in(&buf, &mut storage) {
-            // Head-only copy for response-phase retry (5xx failover).
-            self.conn(slot).req_head_copy = buf[..head_len].to_vec();
+            // Head-only copy for response-phase retry (5xx failover),
+            // recycled across requests (`MM-01`).
+            {
+                let conn = self.conn(slot);
+                let mut rhc = std::mem::take(&mut conn.req_head_copy);
+                rhc.clear();
+                rhc.extend_from_slice(&buf[..head_len]);
+                conn.req_head_copy = rhc;
+            }
             // Recycled scratch: one allocation for the connection's
             // lifetime instead of one per request.
             let mut head = std::mem::take(&mut self.conn(slot).head_out);
-            self.build_upstream_head(&mut head, &view, &route, &upstream_path, &inject, false, 0);
+            let path: &str = path_taken.as_str();
+            self.build_upstream_head(&mut head, &view, &route, path, &inject, false, 0);
+            // Storage returns to the connection before any fallible
+            // step (retry/failover re-dials reuse it).
+            self.conn(slot).inject = inject;
+            self.conn(slot).upstream_path = path_taken;
             // Mirror (fire-and-forget): a detached thread copies the
             // request to the shadow cluster. Every error is ignored —
             // mirroring never delays or fails the real response.
@@ -2625,6 +2672,13 @@ impl Handler for HttpProxy {
             if !pending.is_empty() {
                 self.upstream_send(io, &pending);
             }
+            // Restore the head buffer (capacity preserved, `MM-01`):
+            // drop the forwarded head + inline body bytes, keep any
+            // pipelined tail for the next transaction. (The dial
+            // previously took the buffer without restoring it, so
+            // head_buf re-grew from scratch every request.)
+            buf.drain(..head_len + body.len());
+            self.conn(slot).head_buf = buf;
             // The local buffer was drained above and restored to the
             // connection (capacity preserved) — no re-parse of old
             // bytes on the next keep-alive transaction. The first-byte
@@ -3069,7 +3123,13 @@ impl HttpProxy {
         // Filter pipeline (scoped: ctx borrows the path buffer).
         let peer = self.client_peer(io, slot);
         let (inject, short_circuit, trace) = {
+            // Seed the pipeline with the connection's recycled inject
+            // storage: after warmup the header set is stable, so
+            // injection updates slots in place (see `RequestCtx::inject`)
+            // — no per-request Vec/String allocation (`MM-01`).
+            let recycled_inject = std::mem::take(&mut self.conn(slot).inject);
             let mut ctx = RequestCtx::new(view.method, &mut upstream_path, peer, host_only);
+            ctx.inject_headers = recycled_inject;
             ctx.cluster = Some(&route.cluster);
             // Trace-log correlation: the pipeline's trace must be the
             // INBOUND trace when the client supplied a valid
@@ -3081,7 +3141,12 @@ impl HttpProxy {
                     ctx.trace = tc;
                 }
             }
-            ctx.inject("X-Forwarded-For", &peer.ip().to_string());
+            // Stack-format the client IP (`MM-01`): the former
+            // `ip().to_string()` malloc'd per request.
+            let mut ipbuf = [0u8; 46]; // max IPv6 text length
+            let mut ipw = vane_filters::StackStr::new(&mut ipbuf);
+            core::fmt::write(&mut ipw, format_args!("{}", peer.ip())).ok();
+            ctx.inject("X-Forwarded-For", ipw.as_str());
             // Scheme as this edge saw it: TLS-terminating listeners report
             // https (the h2 edge path does the same). Never trust an
             // inbound X-Forwarded-Proto — build_upstream_head strips it.
@@ -3215,7 +3280,16 @@ impl HttpProxy {
         {
             let conn = self.conn(slot);
             conn.route = Some(Arc::clone(&route));
-            conn.breaker = Some((route.cluster.clone(), Arc::clone(&cached_breaker)));
+            // Re-resolve the breaker tuple only when the routed cluster
+            // changed (`MM-01`): the per-request `route.cluster.clone()`
+            // in the unconditional rebuild malloc'd every request.
+            if conn
+                .breaker
+                .as_ref()
+                .is_none_or(|(c, _)| c != &route.cluster)
+            {
+                conn.breaker = Some((route.cluster.clone(), Arc::clone(&cached_breaker)));
+            }
             conn.upstream_path = upstream_path;
             conn.inject = inject;
             conn.started = Some(started);
@@ -3368,13 +3442,14 @@ impl HttpProxy {
             let bytes = &data[..n];
             // Gzip relay: compress the accepted bytes. h1 frames the
             // compressed output as chunks; h2 writes it raw (DATA
-            // framing delimits).
+            // framing delimits). Without compression the bytes go
+            // downstream directly — no staging copy (`MM-01`).
             #[cfg(feature = "h2")]
             let is_h2 = self.conns.get(&slot).is_some_and(|c| c.h2.is_some());
             #[cfg(not(feature = "h2"))]
             let is_h2 = false;
             let compressing = self.conns.get(&slot).is_some_and(|c| c.gzip.is_some());
-            let out = if compressing {
+            if compressing {
                 let mut gz = self.conn(slot).gzip.take();
                 let compressed = gz
                     .as_mut()
@@ -3387,16 +3462,18 @@ impl HttpProxy {
                 } else if !compressed.is_empty() {
                     out.extend_from_slice(&vane_proto::compression::chunk(&compressed));
                 }
-                out
-            } else {
-                bytes.to_vec()
-            };
-            // A feed can produce nothing (deflate buffering the window),
-            // and `chunk(&[])` is literally the terminal sequence
-            // `0\r\n\r\n` — writing it would truncate the client's
-            // chunked stream mid-body.
-            if !out.is_empty() {
-                self.write_downstream(io, &out);
+                // A feed can produce nothing (deflate buffering the
+                // window), and `chunk(&[])` is literally the terminal
+                // sequence `0\r\n\r\n` — writing it would truncate the
+                // client's chunked stream mid-body.
+                if !out.is_empty() {
+                    self.write_downstream(io, &out);
+                }
+            } else if !bytes.is_empty() {
+                // No staging copy (`MM-01`): the un-compressed body is
+                // written straight through — `bytes` is raw body data,
+                // never the chunked terminal.
+                self.write_downstream(io, bytes);
             }
         }
         if framing_done {

@@ -159,6 +159,25 @@ are faster):
 | Keep-alive pool (opt-in) | 1 upstream conn across 5 sequential requests | - |
 | Config generation swap | one `Release` store + epoch retire | `CP-02` < 1 ms |
 
+Latency budgets for the criterion benches are committed in
+[`percentile-budgets.toml`](percentile-budgets.toml) and enforced in CI
+(`bench-budgets` job) via [`percentile-kit`].
+
+### Zero-allocation hot path (`MM-01`)
+
+The HTTP/1.1 relay path performs **zero heap allocations per request after
+warmup**, verified by a [dhat](https://crates.io/crates/dhat) gate
+(`cargo test --release -p vane-proxy --test dhat_zeroalloc -- --ignored`):
+
+- per-worker head-parse scratch and per-connection recycled path, inject,
+  and head-serialization buffers (take → fill → restore);
+- borrowed-backend balancers (no per-request backend `Vec` clone), rank
+  selection without a healthy-index build;
+- allocation-free parser framing checks (case-insensitive scans, no
+  lowered copies), stack-formatted `X-Forwarded-For` / `X-Request-Id`;
+- throttled JWT key-file re-stat (one `stat()` per second, not per request);
+- optional **mimalloc** global allocator (feature `mimalloc`, default off).
+
 ### Throughput (measured on the dev host, loadgen, keep-alive c=64)
 
 Full matrix, methodology, nginx/Caddy/Traefik history, and
