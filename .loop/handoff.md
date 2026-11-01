@@ -139,3 +139,23 @@ commits: green through 735afc0f; the tip's red runs are the other
 actor's otelkit-2 regression (the trace-id loss; documented in
 docs/perf-arc-2026-10.md, their migration) plus the shared-runner
 flake pattern (exit 101 install steps).
+
+## CONCURRENT-WRITER ALERT (2026-10-28, the final state this session)
+
+Two agents share this working directory. The current state:
+- LOCAL commit 04366731 (the zstd advisory register:
+  RUSTSEC-2026-0396/0397/0399/0400 in deny.toml +
+  .cargo/audit.toml) — committed locally, NOT pushed, and the
+  OTHER AGENT's session has unstaged changes that REMOVE those
+  register entries (their cargo test --workspace run is live in
+  this tree right now).
+- origin/main = b559d340: the other agent's doc sweeps + the
+  otelkit-2 migration; THEIR CI is red on the zstd/wasmtime
+  advisories (the register additions would clear the audit gate).
+
+DO NOT resolve this by force. The resolution is a human decision:
+either (a) the register additions re-land on top of their state
+(the audit gate clears), or (b) the register reverts intentionally
+(the advisories get tracked in SECURITY.md instead). Both agents'
+work is otherwise preserved: every commit in the perf-arc ledger
+is pushed or locally recoverable (04366731 in this repo's reflog).
