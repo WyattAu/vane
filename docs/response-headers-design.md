@@ -1,9 +1,9 @@
-# Response-headers stage — design proposal
+# Response-headers stage: design proposal
 
 Proposed in the SIS hosting research loop (round 7, iteration 61) as
 work item 1 for the docker01 edge migration (SIS backlog #19): the
 platform's per-tenant security headers (`Strict-Transport-Security`,
-`X-Content-Type-Options`, `Referrer-Policy`, `Server` suppression —
+`X-Content-Type-Options`, `Referrer-Policy`, `Server` suppression -
 OWASP OSHP universal subset) have no configuration surface in vane
 today. Everything else the platform's Caddyfile does, vane already
 does.
@@ -57,7 +57,7 @@ the policy rides the same path CORS uses.
    `cors_headers`). At each `inject_into_head` call site, apply the
    policy after CORS: removes first (delete header lines), adds second
    (append `Name: value\r\n` before the terminal CRLF). The head is
-   already an owned, mutable `Vec<u8>` on every branch that injects —
+   already an owned, mutable `Vec<u8>` on every branch that injects -
    the zero-copy relay path (no cors, no gzip, no alt-svc) would need
    the same owned-copy treatment CORS forces today; acceptable, and
    only when a route actually declares a policy.
@@ -75,7 +75,7 @@ the policy rides the same path CORS uses.
 
 ## Non-goals
 
-- Per-header conditional logic (only set-if-absent vs overwrite) —
+- Per-header conditional logic (only set-if-absent vs overwrite) -
   add overwrites upstream occurrences of the same name; document it.
 - Response-body filters, per-route compression policy changes.
 

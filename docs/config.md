@@ -1,6 +1,6 @@
 # vane configuration reference (`vane.toml`)
 
-Validate any file with `vane validate -c <path>` — it runs the same
+Validate any file with `vane validate -c <path>`; it runs the same
 parse + semantic checks the binary does at startup. All sections are
 optional except at least one `[[listeners]]` (the binary exits 1 with
 "no listeners configured" otherwise).
@@ -8,7 +8,7 @@ optional except at least one `[[listeners]]` (the binary exits 1 with
 **Unknown keys are startup errors.** Every user-authored table
 (`[runtime]`, `[[listeners]`, `[clusters.*]`, `[[routes]`, `[routes.cors]`,
 `[admin]`, provider sections, …) rejects keys it does not define, with
-the key named in the error — a typo'd key must never silently no-op.
+the key named in the error; a typo'd key must never silently no-op.
 The top level stays permissive so whole new sections can appear across
 versions without breaking old files. ACME challenge values use the
 RFC 8555 spellings (`http-01`, `tls-alpn-01`; the compact `http01`
@@ -28,11 +28,11 @@ pattern = "/*rest"
 cluster = "up"
 ```
 
-## `[[listeners]]` — ingress sockets
+## `[[listeners]]`: ingress sockets
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `address` | string | — (required) | `ip:port`, e.g. `0.0.0.0:8080` |
+| `address` | string |; (required) | `ip:port`, e.g. `0.0.0.0:8080` |
 | `mode` | `"http"` \| `"tcp"` | `"http"` | `tcp` = L4 splice passthrough (kernel zero-copy, no HTTP parsing) |
 | `workers` | int | `0` (one per core) | threads pinned per listener |
 | `tls` | table | absent | plaintext when absent |
@@ -43,21 +43,21 @@ cluster = "up"
 |---|---|---|
 | `cert` | path | PEM chain (leaf + intermediates) |
 | `key` | path | PEM private key |
-| `alpn_h2` | bool | serve h2 on this listener (feature `h2`) — a dedicated acceptor handles h2 while engine workers keep HTTP/1.1 |
+| `alpn_h2` | bool | serve h2 on this listener (feature `h2`); a dedicated acceptor handles h2 while engine workers keep HTTP/1.1 |
 
-## `[clusters.<name>]` — upstreams
+## `[clusters.<name>]`: upstreams
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `backends` | list of string | `[]` | `host:port` — **hostname or IP** (DNS names resolve via the system resolver at control-plane cadence; bare `port` implies `127.0.0.1`) |
+| `backends` | list of string | `[]` | `host:port`; **hostname or IP** (DNS names resolve via the system resolver at control-plane cadence; bare `port` implies `127.0.0.1`) |
 | `unix_socket` | path | unset | single-backend UDS |
 | `policy` | `p2c` \| `round-robin` \| `least-conn` | `p2c` | load balancing |
 | `health_path` | string | unset | active `GET` probe path; empty disables HTTP checks |
-| `http2` | bool | `false` | speak HTTP/2 to backends (prior knowledge) — honored by the h2 edge; the engine's h1 pool ignores it |
+| `http2` | bool | `false` | speak HTTP/2 to backends (prior knowledge); honored by the h2 edge; the engine's h1 pool ignores it |
 
 Clusters with no resolvable backends contribute no routes (no fatal error).
 
-## `[[routes]]` — static routes
+## `[[routes]]`: static routes
 
 ```toml
 [[routes]]
@@ -90,7 +90,7 @@ handshake (`certificate_required`).
 Unmatched request → **404**. Dynamic sources (file/docker/Kubernetes
 providers, ACME) publish additional routes into the same lock-free table.
 
-## `[admin]` — observability plane
+## `[admin]`: observability plane
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
@@ -98,7 +98,7 @@ providers, ACME) publish additional routes into the same lock-free table.
 | `address` | string | `127.0.0.1:9100` | bind address (loopback default; expose deliberately) |
 | `auth_token_file` | string | unset | file containing the admin bearer token; when set, every admin request needs `Authorization: Bearer <token>` (constant-time compare) or gets `401`. `VANE_ADMIN_TOKEN` env var overrides the file |
 
-Endpoints: `/healthz` + `/readyz` (probes — `/readyz` answers `503` until
+Endpoints: `/healthz` + `/readyz` (probes; `/readyz` answers `503` until
 routes are loaded and listeners are bound), `/health` (backend states),
 `/metrics` (Prometheus exposition), `/config` (route records). When a
 token is configured it gates the entire plane, probes included.
@@ -111,7 +111,7 @@ token is configured it gates the entire plane, probes included.
 | `[docker]` | `enabled`, `socket` (default `/var/run/docker.sock`) | label-driven routes |
 | `[kubernetes]` | `enabled`, `api_server` (unset = in-cluster discovery), `namespaces` (default `["default"]`, `"*"` = all) | Gateway API HTTPRoutes + Endpoints |
 
-## `[acme]` — certificate management
+## `[acme]`: certificate management
 
 | Field | Type | Notes |
 |---|---|---|
@@ -128,10 +128,10 @@ material without restart. Hourly (not daily) matters twice: an
 unconditional daily re-issue runs into Let's Encrypt's 5-duplicates-
 per-week limit within five days of uptime, and short-lived
 certificates (Let's Encrypt's ~6-day offering) need failures noticed
-within hours to leave real margin — at the 2/3 point the hourly loop
+within hours to leave real margin; at the 2/3 point the hourly loop
 has ~48 attempts before expiry.
 
-## `[sidecar]` — SHM transport
+## `[sidecar]`: SHM transport
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
@@ -140,13 +140,13 @@ has ~48 attempts before expiry.
 | `slot_size` | int | `262144` | payload ceiling per message |
 | `slots` | int | `16` | slots per direction |
 
-## `[[plugins]]` — Wasm middleware (feature `wasm`)
+## `[[plugins]]`: Wasm middleware (feature `wasm`)
 
 | Field | Type | Notes |
 |---|---|---|
 | `path` | path | `.wasm` module, instantiated per worker; see the guest ABI in `vane-plugins` |
 
-## `[runtime]` — engine tuning
+## `[runtime]`: engine tuning
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
@@ -161,9 +161,9 @@ has ~48 attempts before expiry.
 | `first_byte_timeout_ms` | int | `30000` | upstream first response byte |
 | `idle_timeout_ms` | int | `75000` | keep-alive idle |
 | `pool_per_backend` | int | `4` | retained idle upstream connections per backend per worker |
-| `pool_idle_ms` | int | `30000` | how long a pooled upstream connection stays reusable after it was parked; past this it is reaped instead of handed out (backends enforce their own idle timeouts — nginx `keepalive_timeout` 60 s, most LBs 60 s — so a stale parked connection would cost the next request a failed attach plus a fresh dial) |
+| `pool_idle_ms` | int | `30000` | how long a pooled upstream connection stays reusable after it was parked; past this it is reaped instead of handed out (backends enforce their own idle timeouts; nginx `keepalive_timeout` 60 s, most LBs 60 s; so a stale parked connection would cost the next request a failed attach plus a fresh dial) |
 
-### `clusters.<name>.adaptive` — adaptive concurrency limiting
+### `clusters.<name>.adaptive`: adaptive concurrency limiting
 
 Opt-in gradient-based load shedding (Netflix Gradient2 / Envoy
 adaptive-concurrency family; analysis in
@@ -175,8 +175,8 @@ request count; past the current limit, requests are shed with 503
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `min_limit` | int | `20` | floor — prevents death spirals |
-| `max_limit` | int | `200` | ceiling — the gradient never grows past this |
+| `min_limit` | int | `20` | floor; prevents death spirals |
+| `max_limit` | int | `200` | ceiling; the gradient never grows past this |
 | `queue_size` | int | `4` | growth allowance per update while healthy |
 | `smoothing` | float | `0.2` | 0.0..1.0, adoption rate of each new estimate |
 | `rtt_tolerance` | float | `1.5` | >= 1.0; baseline drift tolerated before shedding |
@@ -190,7 +190,7 @@ Pool metrics (`/metrics`): `vane_upstream_pool_hits_total`,
 `hits / (hits + misses)` is the health of the pool; see
 [docs/perf-arc-2026-10.md](perf-arc-2026-10.md) for the analysis.
 
-## `[access_log]` — request logging
+## `[access_log]`: request logging
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
@@ -202,7 +202,7 @@ Fields per line: `ts_ns`, `duration_us`, `worker`, `status`,
 `method`, `host`, `path`, `trace_id` (when W3C context propagated).
 A full ring drops records (counted) rather than blocking workers.
 
-## `[rate_limit]` — process-wide rate limiting
+## `[rate_limit]`: process-wide rate limiting
 
 One GCRA bucket shared by **all** workers: the configured rate is the
 true aggregate, not per-worker. Over-budget requests are rejected
@@ -210,12 +210,12 @@ true aggregate, not per-worker. Over-budget requests are rejected
 
 | field | type | default | notes |
 |---|---|---|---|
-| `rps` | int | — | sustained requests/second (aggregate) |
+| `rps` | int | - | sustained requests/second (aggregate) |
 | `burst` | int | `100` | instantaneous allowance |
 
 Absent section = unlimited.
 
-## `[jwt]` — bearer authentication
+## `[jwt]`: bearer authentication
 
 Requests to edge listeners must carry `Authorization: Bearer <jwt>`;
 failures are `401`. Checked before routing.
@@ -228,9 +228,9 @@ failures are `401`. Checked before routing.
 | `audience` | string | required `aud` claim (optional) |
 
 Either material file is required. The file is reloaded when its mtime
-changes — rotate keys without restart.
+changes; rotate keys without restart.
 
-## cluster `compression` — response gzip
+## cluster `compression`: response gzip
 
 ```toml
 [clusters.api]
@@ -245,7 +245,7 @@ existing encoding, the body is gzipped and relayed chunked
 responses pass through verbatim. HTTP/2 (engine path) responses are not
 compressed in 0.2.
 
-## cluster `outlier` — ejection
+## cluster `outlier`: ejection
 
 ```toml
 [clusters.api.outlier]
@@ -258,7 +258,7 @@ for `ejection_ms` (it remains the fallback of last resort when nothing
 else is live); any non-5xx completion resets its streak. Independent of
 the active health checker.
 
-## Listener `h2c` — cleartext HTTP/2
+## Listener `h2c`: cleartext HTTP/2
 
 ```toml
 [[listeners]]
@@ -271,7 +271,7 @@ Plain listeners with `h2c = true` speak prior-knowledge HTTP/2
 containers and service meshes that terminate TLS elsewhere. Requires
 no TLS material; coexists with plain HTTP/1.1 on other listeners.
 
-## Listener `proxy_protocol` — client IP behind an L4 load balancer
+## Listener `proxy_protocol`: client IP behind an L4 load balancer
 
 ```toml
 [[listeners]]
@@ -285,7 +285,7 @@ the address it carries: X-Forwarded-For, access records, and filter
 contexts all name the ORIGINAL client instead of the load balancer.
 The header precedes the TLS handshake on TLS listeners (this is how
 AWS NLB and HAProxy send it), and v1 and v2 may be mixed across
-connections — each is detected on its own connection.
+connections; each is detected on its own connection.
 
 Trust is the operator's declaration. Enable `proxy_protocol` ONLY on
 listeners where every sender is the trusted fronting proxy: anyone who
@@ -293,7 +293,7 @@ can open a connection can send a spoofed header claiming any address.
 Consequences of the flag, by design:
 
 - The header is REQUIRED. A connection whose first bytes are not a
-  valid header — a plain request, a garbage header — is closed with no
+  valid header; a plain request, a garbage header; is closed with no
   response ("do not mix modes").
 - A malformed header closes the connection. A v2 LOCAL header (health
   checks, unproxied internal connections) is accepted but claims no
@@ -303,7 +303,7 @@ Consequences of the flag, by design:
 
 Added in v0.10.0 (`vane-proto` 0.6.0 carries the wire parser).
 
-## Listener `tls.h3` — HTTP/3 over QUIC (experimental)
+## Listener `tls.h3`: HTTP/3 over QUIC (experimental)
 
 ```toml
 [[listeners]]
@@ -320,15 +320,15 @@ binds a UDP socket on the same port number as the TCP TLS listener
 and serves HTTP/3 (RFC 9114) over QUIC: the request shares the same
 route table, filter chain, and upstream clients as the TCP path.
 TCP responses advertise the endpoint via `alt-svc: h3=":port";
-ma=86400` (RFC 7838). Status: experimental — settings/flow-control
+ma=86400` (RFC 7838). Status: experimental; settings/flow-control
 parity with h2 is not yet exhaustive.
 
-## `vane gateway-operator` — Gateway API dynamic config
+## `vane gateway-operator`: Gateway API dynamic config
 
 Watches Kubernetes Gateway API resources (Gateways + HTTPRoutes,
 `gateway.networking.k8s.io/v1`) in one namespace, compiles them into
 xDS snapshots, and POSTs them to a vane admin plane
-(`POST /xds/snapshot` — atomic router swap, errors leave the live
+(`POST /xds/snapshot`; atomic router swap, errors leave the live
 table untouched).
 
 ```bash
@@ -346,7 +346,7 @@ mount convention paths (`/etc/vane/certs/{secret}`). v0.2 is
 poll-based (no watch API) and single-namespace; the Helm chart ships
 a `gatewayOperator.enabled=true` deployment + read-only RBAC.
 
-## `[http2]` — protocol tuning
+## `[http2]`: protocol tuning
 
 ```toml
 [http2]
@@ -357,10 +357,10 @@ strict_idle_window_update = false   # default: lenient
 streams the peer never opened (RFC 7540 §5.1 idle state →
 PROTOCOL_ERROR connection error), matching h2spec. The default is
 lenient because the h2 crate client legitimately grants stream credit
-before its HEADERS land — strict mode is for conformance runs
+before its HEADERS land; strict mode is for conformance runs
 (`scripts/h2spec_run.sh`, 145/145).
 
-## cluster `http3` — upstream over QUIC (bridge)
+## cluster `http3`: upstream over QUIC (bridge)
 
 ```toml
 [clusters.up]
@@ -387,7 +387,7 @@ docs/quickstart-h3.md.
 
 ## xDS secrets (SDS)
 
-`POST /xds/snapshot` snapshots may carry `secrets` — SDS-decoded TLS
+`POST /xds/snapshot` snapshots may carry `secrets`; SDS-decoded TLS
 material by name (PEM content, never file paths):
 
 ```json
@@ -415,7 +415,7 @@ handshake failure). The verified ID is forwarded upstream as
 `X-Vane-Spiffe-Id`; inbound values of that header are stripped, so
 only vane-verified identities flow. See docs/quickstart-h3.md.
 
-## cluster `mesh` — mTLS upstreams with SPIFFE identities
+## cluster `mesh`: mTLS upstreams with SPIFFE identities
 
 ```toml
 [clusters.mesh-up]
@@ -437,7 +437,7 @@ mutual TLS (ALPN `vane-mesh`): the
 proxy presents its SVID, requires the backend's certificate to chain
 to `ca`, and enforces the backend's SPIFFE URI SAN against
 `spiffe_prefix` after the handshake. Verification failure (or any TLS
-error) answers **502** while the response is still unsent — mesh is
+error) answers **502** while the response is still unsent; mesh is
 TLS-or-nothing, never a plaintext fallback. Identities are re-read
 from disk per dial, so rotation is: replace the files (atomically),
 next dial presents the new SVID.
@@ -458,10 +458,10 @@ With `svid_socket` set, the files become the local cache, not the
 source: at startup vane fetches the X.509 SVID from the agent
 (`FetchX509SVID` over the Unix socket) and writes `cert`/`key`/`ca`;
 a watcher re-materializes on every SVID push from the agent, so
-rotation happens with zero restarts. The first fetch is synchronous —
+rotation happens with zero restarts. The first fetch is synchronous -
 startup fails when the agent is unreachable (mesh is TLS-or-nothing).
 
-## `[[routes]] retry` — per-route retries
+## `[[routes]] retry`: per-route retries
 
 ```toml
 [[routes]]
@@ -475,11 +475,11 @@ retry_5xx = true        # also retry idempotent requests on 5xx
 
 Retry policy for this route's cluster. `max_attempts` caps the total
 dial attempts (default 3 = 2 retries). `retry_5xx = true` replays the
-request through the failover machinery when an upstream answers 5xx —
+request through the failover machinery when an upstream answers 5xx -
 idempotent bodyless requests only (GET/HEAD/PUT/DELETE), capped by
 `max_attempts`. Default (absent): connect failures only, 3 attempts.
 
-## `[[routes]] mirror` — request mirroring (shadow traffic)
+## `[[routes]] mirror`: request mirroring (shadow traffic)
 
 ```toml
 [[routes]]
@@ -496,7 +496,7 @@ responses are discarded. Mirroring is best-effort: it never delays or
 fails the real response, and a down shadow is invisible to callers.
 Use for canary validation and load previews.
 
-## `[[routes]] cors` — cross-origin policy
+## `[[routes]] cors`: cross-origin policy
 
 ```toml
 [[routes]]
@@ -514,7 +514,7 @@ max_age_secs       = 86400
 
 Enforces the Fetch/CORS spec per route. Two behaviors:
 
-**Preflight** — an `OPTIONS` carrying `Access-Control-Request-Method` is
+**Preflight**; an `OPTIONS` carrying `Access-Control-Request-Method` is
 answered at the edge with `204` and the policy's headers. The upstream is
 never dialed, so a preflight costs no backend capacity and does not show
 up in upstream metrics. A preflight is exempt from the route's `methods`
@@ -522,18 +522,18 @@ allowlist: browsers will not send the real request if the preflight
 fails, so an allowlist that omitted `OPTIONS` would break every
 cross-origin call.
 
-**Actual requests** — proxied normally, then the response headers are
+**Actual requests**; proxied normally, then the response headers are
 injected into the upstream's response head. vane's `Vary` is *merged*
 with the upstream's (`Vary: Accept-Encoding` becomes
 `Vary: Accept-Encoding, Origin`) rather than duplicated.
 
 A request with no `Origin`, or an origin outside `allow_origins`, is
-relayed **untouched** — the browser is the enforcement point, so vane
+relayed **untouched**; the browser is the enforcement point, so vane
 neither adds headers nor synthesizes a rejection. A preflight naming a
 method or header outside the policy is likewise relayed without
 `Access-Control-Allow-Origin`.
 
-`allow_origins = ["*"]` emits `Access-Control-Allow-Origin: *` — unless
+`allow_origins = ["*"]` emits `Access-Control-Allow-Origin: *`; unless
 `allow_credentials = true`, in which case the wildcard is invalid (the
 fetch spec requires a named origin for credentialed requests) and vane
 echoes the requesting origin instead.
@@ -550,6 +550,6 @@ body, so the stream cannot be resynchronized.
 
 `vane run -c vane.toml` watches the config file. A valid changed
 config re-applies routes, clusters, and health through the same
-reconciler path as xDS — no restart. Invalid configs keep the
+reconciler path as xDS; no restart. Invalid configs keep the
 previous generation (logged). Listener changes are startup-bound and
 logged as restart-required.

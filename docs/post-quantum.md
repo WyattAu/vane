@@ -20,7 +20,7 @@ exactly where that leg terminates.
 X25519MLKEM768 is a *hybrid*: an X25519 share AND an ML-KEM-768
 share. Against a CRQC attacker the ML-KEM half holds; against a
 "break ML-KEM today" attacker the X25519 half holds. It is a
-migration group, not a permanent one — see the parked trigger in
+migration group, not a permanent one; see the parked trigger in
 `crates/vane-tls/src/lib.rs` for when to revisit the ordering.
 
 ## Building and installing
@@ -41,7 +41,7 @@ platform without cmake are untouched. Feature-gated builds are also
 what CI's `--all-features` runs exercise, so the feature cannot rot
 unnoticed.
 
-No configuration change is needed — the provider install is
+No configuration change is needed; the provider install is
 process-wide and happens before `main` (a `ctor` in `vane-tls`), so
 every listener, every ACME renewal, every mesh handshake, and the
 QUIC endpoint all pick it up. Explicit `install_crypto_provider()`
@@ -81,7 +81,7 @@ crates.io, not a local build):
 
 | server build | client offers | negotiated |
 |---|---|---|
-| ring (default) | `X25519MLKEM768` only | no shared group — handshake fails |
+| ring (default) | `X25519MLKEM768` only | no shared group; handshake fails |
 | ring (default) | `x25519` | classical |
 | `post-quantum` | `X25519MLKEM768` | **X25519MLKEM768** |
 | `post-quantum` | `X25519MLKEM768:x25519:secp256r1` | **X25519MLKEM768** (hybrid leads) |
@@ -96,7 +96,7 @@ silently lost by a rustls upgrade that reorders the default list.
 
 * **Two vane instances can share one port.** Listeners use
   `SO_REUSEPORT` (`crates/vane-kernel/src/net.rs`), so the kernel
-  load-balances between processes — useful for zero-copy dispatch,
+  load-balances between processes; useful for zero-copy dispatch,
   surprising when you are A/B testing two builds on the same port.
   Use different ports when comparing builds.
 * **Clients that do not offer the hybrid still connect.** rustls's

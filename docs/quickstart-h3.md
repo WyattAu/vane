@@ -3,7 +3,7 @@
 vane speaks HTTP/3 in two places: as an **edge** (clients dial vane
 over QUIC, Alt-Svc advertised automatically) and as an **upstream**
 (vane re-originates requests to your backends over QUIC through an
-in-process bridge). Both are default features — no extra build flags.
+in-process bridge). Both are default features; no extra build flags.
 
 ## Serving h3 on a TLS listener
 
@@ -27,7 +27,7 @@ automatically on TLS responses when `h3 = true`.
 `client_ca` applies to the QUIC listener the same way it applies to
 TCP: the handshake requires a client certificate chaining to the CA.
 Routes with `allowed_spiffe_prefixes` enforce the caller's SPIFFE ID
-exactly as they do on h2 — wrong prefix → `403`, no certificate →
+exactly as they do on h2; wrong prefix → `403`, no certificate →
 handshake failure. See docs/mesh-mtls-design.md.
 
 ## Dialing backends over h3 (`clusters.*.http3`)
@@ -57,14 +57,14 @@ cluster. Your worker speaks plain HTTP/1.1 to it; the bridge
 re-originates each request over QUIC/HTTP-3 to the real backends and
 translates the response back. Behavior you get for free:
 
-- **Connection reuse** — one QUIC handshake per backend; requests
+- **Connection reuse**; one QUIC handshake per backend; requests
   multiplex as h3 streams.
-- **Health ownership** — the bridge actively probes
+- **Health ownership**; the bridge actively probes
   `cluster.health_path` over the pooled connections (every 5 s) and
   routes around dead backends, with one in-bridge retry on the next
   healthy backend. Failure to reach any backend closes the client
   socket abruptly, so the engine's existing failover rules apply.
-- **Material rotation** — the bridge fingerprints the `h3_tls` files
+- **Material rotation**; the bridge fingerprints the `h3_tls` files
   every second and hot-swaps them (re-handshaking the pool). Point
   `client_cert`/`client_key` at SPIFFE SVID files refreshed by the
   Workload API and rotation just works.
@@ -91,7 +91,7 @@ http3 = true
 With `mesh.http3 = true` the bridge presents the SVID as its client
 certificate, trusts the mesh CA, and speaks ALPN `vane-mesh`. The
 SVID watcher's rotations propagate to the bridge automatically.
-(`mesh.http3` and `h3_tls` are mutually exclusive — mesh owns the
+(`mesh.http3` and `h3_tls` are mutually exclusive; mesh owns the
 material.)
 
 ## Request limits and behavior notes
@@ -103,17 +103,17 @@ material.)
   the engine's p2c policy and outlier ejection apply to the bridge
   address, not to individual h3 backends.
 - Engine-side active health checks are skipped for http3 clusters
-  (they would probe the bridge, not the backends) — the bridge's own
+  (they would probe the bridge, not the backends); the bridge's own
   probes replace them.
 - Response bodies are fully buffered per request by the bridge
   (bounded by the engine's body limits).
 
 ## Conformance
 
-- h2: `scripts/h2spec_run.sh` — 145/145 pass, 0 failed (146 cases, 1
+- h2: `scripts/h2spec_run.sh`; 145/145 pass, 0 failed (146 cases, 1
   skipped: TLS-only). Runs vane in strict mode
   (`[http2] strict_idle_window_update = true`, which rejects
   idle-stream WINDOW_UPDATEs per RFC 7540 §5.1; the default build is
   lenient because the h2 crate client grants stream credit early).
-- h3: `scripts/h3spec_run.sh` — see docs/h3-design.md for the
+- h3: `scripts/h3spec_run.sh`; see docs/h3-design.md for the
   calibration against the h3 crate's reference server.

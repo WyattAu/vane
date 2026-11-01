@@ -22,7 +22,7 @@ QuinnEndpoint (worker-owned)
   engine's h2: Headers/Data/Trailers. The existing `H2Server` shim is
   reused nearly verbatim; only the transport plumbing differs.
 - **Flow control**: h3 flow control is per-stream + connection, same
-  shape as h2 — `release_capacity`/`consume_send_budget` carry over.
+  shape as h2; `release_capacity`/`consume_send_budget` carry over.
 - **Zero-copy**: quinn gives `Read`/chunks API; splice does not apply
   (userspace crypto), but our 16 KB slot model holds.
 - **Feature gate**: `h3` feature off by default; listener config `h3 =
@@ -34,7 +34,7 @@ QuinnEndpoint (worker-owned)
 
 - quinn pulls tokio; the engine integration must own the endpoint poll
   loop (quinn's `poll`-style API, not its async facade) or run a dedicated
-  runtime thread bridging CQEs into the worker — document the bridge.
+  runtime thread bridging CQEs into the worker; document the bridge.
 - 0-RTT replay semantics: reject 0-RTT on non-idempotent methods.
 
 ## Milestones
@@ -47,7 +47,7 @@ QuinnEndpoint (worker-owned)
    roundtrip e2e in `tests/h3_edge.rs` (quinn+h3 client → edge → h1
    upstream).
    **Conformance baseline (2026-09-25, h3spec v0.1.13)**: QUIC/TLS
-   handshake green (0-RTT CRYPTO case passes); 48 of 49 cases fail —
+   handshake green (0-RTT CRYPTO case passes); 48 of 49 cases fail -
    **calibrated against the h3 crate's own example server, which
    fails identically (48/49)**: the failures are h3spec's
    Haskell-QUIC client vs quinn interop quirks, not vane-specific.
@@ -69,7 +69,7 @@ QuinnEndpoint (worker-owned)
    advertised endpoint serves h3. h2spec-h3 parity remains open.
 4. Client-side h3 (H3Upstream) for mesh east-west.
 
-## Milestone 4: client-side H3Upstream — SHIPPED (2026-09-28, loopback-bridge form)
+## Milestone 4: client-side H3Upstream: SHIPPED (2026-09-28, loopback-bridge form)
 
 The upstream connector runs on the synchronous mio worker; quinn needs
 an async runtime. Three options were considered:
@@ -86,35 +86,35 @@ Option B's ring handoff, simplified to option **B′**: the bridge is an
 in-process mini-proxy. The server spawns `h3_bridge::spawn(backends,
 tls, timeout)` per `http3 = true` cluster; it binds an ephemeral
 loopback TCP port and the cluster's backend list is REWRITTEN to that
-address before the workers start — the synchronous mio worker dials a
+address before the workers start; the synchronous mio worker dials a
 normal h1 backend and the entire engine (pool, health, failover,
 timeouts) works unchanged.
 
 - h1 side: thread-per-connection accept loop; one httparse request
   per connection (CL-delimited or bodyless; chunked → 501).
 - h3 side: ONE shared `quinn::Endpoint` on a dedicated runtime thread
-  with a per-backend connection pool — one QUIC handshake per
+  with a per-backend connection pool; one QUIC handshake per
   backend, requests multiplex as h3 streams (`h3_client::exchange`
   on pooled `SendRequest` handles). Health-aware round-robin with a
   single in-bridge retry on the next healthy backend.
-- Health: the bridge owns backend health for the cluster — active
+- Health: the bridge owns backend health for the cluster; active
   probes (`cluster.health_path`) over the pooled connections every
   `probe_interval` (5 s), plus reactive marking on request/dial
   failure, plus probe-based recovery. Engine-side health probes,
   outlier ejection, and the breaker stay applied to the loopback
-  bridge address only (vacuous by construction — skipped for http3
+  bridge address only (vacuous by construction; skipped for http3
   clusters); the bridge is the owner of that logic in this shape.
 - Failure semantics: when no backend answers, the h1 socket closes
-  abruptly — the worker sees premature EOF and the existing failover
+  abruptly; the worker sees premature EOF and the existing failover
   rules apply (no synthetic 502 to mask a dead backend).
 - TLS: `h3_tls.ca` (server trust), optional `client_cert`/`client_key`
   (mesh SVID for mTLS backends), `alpn` (default `h3`).
 - The h3 client carries the authority in the URI (`:authority`); an
   explicit `host` header mismatching the URI host makes the h3 crate
-  fail the header build (H3_INTERNAL_ERROR) — that bug class is
+  fail the header build (H3_INTERNAL_ERROR); that bug class is
   designed out.
 
-Acceptance: `tests/h3_bridge.rs` — h1→bridge→QUIC→vane-h3-edge→h1
+Acceptance: `tests/h3_bridge.rs`; h1→bridge→QUIC→vane-h3-edge→h1
 roundtrip (200 + body), dead-backend abrupt close, the mTLS
 variant (bridge presents a CA-signed SVID against a client-cert-
 required h3 backend; anonymous dial rejected), health-aware routing
@@ -127,5 +127,5 @@ accept counter: 4 requests → exactly 1 QUIC handshake).
 The loopback hop costs one memcpy per direction. If profiled as hot,
 replace the TCP bridge with the original design: request/response
 SPSC rings + eventfd wakeup registered in the worker's poller (the
-SHM sidecar pattern). Semantics and config are unchanged — `h3_bridge`
+SHM sidecar pattern). Semantics and config are unchanged; `h3_bridge`
 swaps its transport under the same interface.

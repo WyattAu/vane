@@ -1,6 +1,6 @@
 # Contributing to vane
 
-## The gates (Tier A — latency/concurrency-critical)
+## The gates (Tier A: latency/concurrency-critical)
 
 Every PR runs the shared matrix plus vane-specific jobs:
 
@@ -28,7 +28,7 @@ python3 ../engineering-standards/scripts/resync-vet-exemptions.py --write
 cargo vet fmt
 ```
 
-`cargo vet fmt` owns `supply-chain/config.toml`'s formatting — do not
+`cargo vet fmt` owns `supply-chain/config.toml`'s formatting; do not
 hand-edit it. First-party crates are declared `audit-as-crates-io`
 because they publish under those names.
 
@@ -38,7 +38,7 @@ fixing or justifying it, not deleting the gate.
 
 ## Data-plane rules (`vane-core`, `vane-proto`, `vane-filters`)
 
-1. **No locks.** Atomics are limited to `Relaxed`/`Acquire`/`Release` — no
+1. **No locks.** Atomics are limited to `Relaxed`/`Acquire`/`Release`; no
    `SeqCst`. If you need a lock, redesign.
 2. **No allocation on the request path.** Sessions come from the slab, IO
    buffers from the fixed pool; new per-request state needs a pool story.

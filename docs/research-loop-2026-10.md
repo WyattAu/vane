@@ -1,4 +1,4 @@
-# Research loop — 2026-10 spec re-derivation (10 iterations)
+# Research loop: 2026-10 spec re-derivation (10 iterations)
 
 Driver: a re-examination of the whole spec from first principles. For
 each part of the repo: pull current papers/specs, analyze the best
@@ -9,11 +9,11 @@ proof artifacts match the spec.
 
 Verdict vocabulary:
 
-- **KEEP** — vane's approach is at or past the state of the art; the
+- **KEEP**; vane's approach is at or past the state of the art; the
   proof adjustment pins it.
-- **ADOPT** — a better mechanism exists elsewhere; the spec changes and
+- **ADOPT**; a better mechanism exists elsewhere; the spec changes and
   the code/test follows.
-- **OPEN** — genuinely unsolved (by us or by anyone); recorded as a
+- **OPEN**; genuinely unsolved (by us or by anyone); recorded as a
   parked research item with a trigger.
 
 | # | Part | Verdict | Lean proof adjusted |
@@ -30,13 +30,13 @@ Verdict vocabulary:
 | 10 | Correctness proof methods for parsers | KEEP + ADOPT | 2 paper-pinned chunk-size tests; ledger closed |
 
 
-## Iteration 1 — HTTP/1.1 framing & smuggling defense
+## Iteration 1: HTTP/1.1 framing & smuggling defense
 
 **Pulled (2025–2026 sources):** Pingora CVE-2026-2835 (HTTP/1.0
 close-delimited bodies + multi-TE forwarded); Tinyproxy CVE-2026-54387
 (conflicting CL + TE:chunked forwarded verbatim); Akamai CVE-2025-66373
 (invalid chunked size forwarded, tail bytes smuggled); Kettle, "The
-Desync Delusion" (Black Hat/DEF CON 2025 — leading-OWS TE obfuscation
+Desync Delusion" (Black Hat/DEF CON 2025; leading-OWS TE obfuscation
 as the desync-delusion class); OWASP WSTG 4.x modern vectors (h2→h1
 translation, h2c upgrade).
 
@@ -46,14 +46,14 @@ forwarding ambiguous framing verbatim and picking one interpretation,
 as a new message, (c) accepting obfuscated TE values. (a) is Pingora/
 Tinyproxy; (b) is Akamai; (c) is the 2025 research frontier.
 
-**Prior art:** Cloudflare's edge posture — reject non-HTTP/1.1,
-invalid CL, multiple TE, non-exact `chunked` — is the strict
+**Prior art:** Cloudflare's edge posture; reject non-HTTP/1.1,
+invalid CL, multiple TE, non-exact `chunked`; is the strict
 interpreter, and it is what kept their CDN unaffected while Pingora
 (standalone) was vulnerable. hyper/llhttp converge on the same
 strictness.
 
 **Verdict: KEEP + ADOPT.** vane's `framing_is_ambiguous` guard already
-rejected CL+TE, duplicate CL, multiple TE, and non-chunked codings —
+rejected CL+TE, duplicate CL, multiple TE, and non-chunked codings -
 strictly stronger than the vulnerable versions of Pingora/Tinyproxy.
 ADOPTED three hardenings the research showed we lacked:
 
@@ -64,7 +64,7 @@ ADOPTED three hardenings the research showed we lacked:
    the CVE-2026-2835 class).
 3. A malformed chunked body (invalid size line, over-long line) now
    sets a `malformed` flag on the scanner and the proxy CLOSES the
-   connection instead of parsing the tail as a new request — request
+   connection instead of parsing the tail as a new request; request
    side, inline-body side, and the response relay side (which also
    stops reusing the upstream connection).
 
@@ -75,7 +75,7 @@ one), scanner `is_malformed` covered by the existing malformed-size
 test plus the new proxy wiring.
 
 
-## Iteration 2 — HTTP/2 conformance & flood defense
+## Iteration 2: HTTP/2 conformance & flood defense
 
 **Pulled:** Envoy CVE-2024-30255 (CONTINUATION flood → CPU exhaustion,
 ~1 core per 300 Mbit/s), CVE-2024-27919 (the memory variant), Apache
@@ -102,7 +102,7 @@ CONTINUATION payloads accumulated without limit, the count was
 uncapped (zero-length frames free), and per-frame size was unvalidated
 on the CONTINUATION path (only on HEADERS). Now: fragments past
 `max_header_list_size` (our advertised setting) are a PROTOCOL_ERROR
-connection error — explicitly NOT a buffered informative response; a
+connection error; explicitly NOT a buffered informative response; a
 CONTINUATION larger than `max_frame_size` is FRAME_SIZE_ERROR; and
 more than 64 CONTINUATIONs per block is PROTOCOL_ERROR (legitimate
 maximum is ~8: 128 KiB list / 16 KiB frames).
@@ -114,7 +114,7 @@ PROTOCOL_ERROR), alongside the existing `continuation_assembles_block`
 test proving legitimate multi-frame blocks still work.
 
 
-## Iteration 3 — QUIC / HTTP/3 transport
+## Iteration 3: QUIC / HTTP/3 transport
 
 **Pulled:** RFC 9000 §8/§9 (address validation, migration, anti-
 amplification), RFC 9308 §3 (0-RTT applicability + replay), RFC 8740
@@ -125,7 +125,7 @@ to Security and Privacy Attacks?" (arXiv 2401.06657, 2025).
 **Analysis:** the QUIC server-side risk set is 0-RTT replay
 (non-idempotent requests can be silently duplicated), spoofed
 connection migration (CMRF), and amplification via replayed
-validation tokens. ALL THREE live in the transport layer — quinn —
+validation tokens. ALL THREE live in the transport layer; quinn -
 not in vane's application code. A proxy relaying POST bodies must
 treat 0-RTT with suspicion: RFC 8740 only blesses idempotent methods.
 
@@ -135,7 +135,7 @@ as an explicit server-side choice, defaulting to reject. quinn's
 `ValidationTokenConfig` (14-day tokens, bloom-filter log) implements
 the anti-amplification token validation.
 
-**Verdict: KEEP.** vane's h3 accept path never calls `into_0rtt()` —
+**Verdict: KEEP.** vane's h3 accept path never calls `into_0rtt()` -
 by construction quinn rejects 0-RTT early data, which eliminates the
 replay class entirely (the correct posture for a proxy relaying
 non-idempotent requests). Address validation, retry tokens, path
@@ -150,32 +150,32 @@ re-opening 0-RTT is an explicit, reviewed change (it would require the
 HTTP-REPLAY analysis for every upstream semantic vane relays).
 
 
-## Iteration 4 — Load balancing (P2C)
+## Iteration 4: Load balancing (P2C)
 
 **Pulled:** Mitzenmacher, "The Power of Two Choices in Randomized Load
-Balancing" (IEEE TPDS 2001; thesis 1996) — d=2 gives an exponential
+Balancing" (IEEE TPDS 2001; thesis 1996); d=2 gives an exponential
 max-load improvement over d=1, d=3 only a constant factor more; Envoy
 least-request (P2C over active requests, "the host with the highest
 active-request count never receives new requests and drains"); Envoy's
-Peak EWMA balancer (2025 — latency-aware P2C, the Finagle PeakEWMA
+Peak EWMA balancer (2025; latency-aware P2C, the Finagle PeakEWMA
 lineage); Envoy weighted least-request (bias=1: weight/(active+1)).
 
-**Analysis:** the load SIGNAL is the whole game — the classic model
+**Analysis:** the load SIGNAL is the whole game; the classic model
 uses queue length; Envoy uses active requests; the cutting edge adds
 per-host latency EWMA. vane's P2C compares `ConnGauges`, which ARE
-in-flight request counts — the Envoy least-request signal, correct.
+in-flight request counts; the Envoy least-request signal, correct.
 The genuine gap: **backend weights were ignored by P2C** (only
-LeastConn divided by weight) — a `policy = "p2c"` cluster with
+LeastConn divided by weight); a `policy = "p2c"` cluster with
 weighted backends silently served everything with equal probability.
 
 **Verdict: KEEP + ADOPT.** P2C stays (theory-backed, O(1)). ADOPTED
 weight-awareness via Envoy's bias=1 formulation: effective load =
 in-flight / weight, compared by cross-multiplication (no float,
-weight-0 clamps to 1, exact ties break toward the first pick —
+weight-0 clamps to 1, exact ties break toward the first pick -
 matching pre-change behavior for equal-weight clusters).
 
 **Open (parked):** latency-aware P2C (Peak EWMA) would need per-host
-RTT sampling wired through the relay hot path — a real feature with a
+RTT sampling wired through the relay hot path; a real feature with a
 measurable cost; trigger: measured tail-latency imbalance across
 homogeneous backends.
 
@@ -184,7 +184,7 @@ comparison (equal gauges favor higher weight; cross-multiplied
 tradeoffs; zero-weight clamp; tie-break).
 
 
-## Iteration 5 — Outlier detection & circuit breaking
+## Iteration 5: Outlier detection & circuit breaking
 
 **Pulled:** Envoy outlier detection spec (v1.7 → v1.40 evolution):
 consecutive-5xx (inline), success-rate (periodic sweep, mean −
@@ -195,11 +195,11 @@ backoff. Plus the breaker work already done in iteration 0 of this
 train (breaker 2.0, process-wide gate, anti-flap policy).
 
 **Analysis:** vane's outlier set had consecutive-failure ejection with
-a fixed duration — but NO ejection cap. A shared-cause transient (a
+a fixed duration; but NO ejection cap. A shared-cause transient (a
 network blip during a config push) could eject EVERY backend of a
 cluster into a guaranteed total outage, exactly when the capacity is
-most needed. Envoy's rule — cap ejections at a percent of the cluster,
-always allowing at least one — is the cluster-survival guard.
+most needed. Envoy's rule; cap ejections at a percent of the cluster,
+always allowing at least one; is the cluster-survival guard.
 
 **Prior art:** Envoy (consecutive + success-rate + percentage, capped,
 at-least-one), Finagle/resilience4j breakers (windowed, half-open).
@@ -212,14 +212,14 @@ keeps the last healthy backend in rotation. Success-rate sweeps and
 ejection-time backoff stay parked (trigger: measured flapping between
 two detection types).
 
-**Lean proof:** `ejection_cap_keeps_the_cluster_serving` — with a 50%
+**Lean proof:** `ejection_cap_keeps_the_cluster_serving`; with a 50%
 cap on a 2-backend cluster, the second backend past its threshold is
 NOT ejected; a 100% cap still allows a full ejection.
 
 
 ## Release-train note (2026-10-16 interim, 2026-10-17 closed)
 
-**Closed (2026-10-17):** the arc shipped as two trains —
+**Closed (2026-10-17):** the arc shipped as two trains -
 `vane-proto` 0.7.0 / `vane-router` 0.7.0 / `vane-control` 0.10.0 /
 `vane-proxy` 0.11.0 for iterations 1-5, then `vane-tls` 0.6.0 /
 `vane-control` 0.10.1 / `vane-proxy` 0.12.0 for iterations 6-10
@@ -236,13 +236,13 @@ across the vane-control config family, OutlierConfig.max_ejection_
 percent, weight-aware P2C in vane-router 0.7.0, the chunked smuggling
 fix in vane-proto 0.7.0). Versions bumped for the train:
 `vane-proto` 0.7.0, `vane-router` 0.7.0, `vane-control` 0.10.0,
-`vane-proxy` 0.11.0 — published when the arc completes. `Listener
+`vane-proxy` 0.11.0; published when the arc completes. `Listener
 Config`'s non_exhaustive pattern (Default + field assignment) is now
 the family-wide rule; `VaneConfig` stays exempt (parsed, never
 constructed, downstream).
 
 
-## Iteration 6 — TLS: post-quantum key exchange & cert lifecycle
+## Iteration 6: TLS: post-quantum key exchange & cert lifecycle
 
 **Pulled:** rustls defaults manual (X25519MLKEM768 via aws-lc-rs;
 `prefer-post-quantum` feature makes it top-priority), rustls-post-
@@ -252,16 +252,16 @@ the X25519MLKEM768 I-D, and the deployment picture (Chrome +
 Cloudflare default since 2024).
 
 **Analysis:** harvest-now-decrypt-later makes PQ hybrid KEX relevant
-to a proxy NOW — the frontend TLS leg carries exactly the traffic an
+to a proxy NOW; the frontend TLS leg carries exactly the traffic an
 adversary would capture. Chrome/Cloudflare negotiate X25519MLKEM768 by
 default; a rustls server on the ring provider (vane today) simply
 never offers it. ACME lifecycle is already current: expiry-gated
 hourly renewal (iteration 0 of this train), short-lived certificates
 viable; OCSP stapling deliberately NOT built (LE retired OCSP Aug
-2025 — researched and ruled out).
+2025; researched and ruled out).
 
 **Prior art:** Caddy (on-demand TLS, but no PQ), nginx (no PQ),
-Envoy (PQ via BoringSSL X25519MLKEM768, default since 2024) — Envoy
+Envoy (PQ via BoringSSL X25519MLKEM768, default since 2024); Envoy
 is ahead here; rustls-based proxies need the provider switch.
 
 **Verdict: ADOPT, feature-gated.** Three implementation routes exist:
@@ -271,7 +271,7 @@ cmake/NASM build requirements to every downstream build);
 (3) `mlkem-tls` (ring-compatible kx group, third-party).
 Route 1 is the defensible one (same vendor family as rustls, widely
 deployed), implemented as a `post-quantum` cargo feature so the
-default ring build is untouched — the switch changes the build matrix
+default ring build is untouched; the switch changes the build matrix
 (CI, docker, musl) and deserves its own gate cycle. Scheduled as its
 own unit; NOT a drive-by.
 
@@ -291,12 +291,12 @@ route 1 chosen over mlkem-tls (vendor family, deployment track
 record).
 
 
-## Iteration 7 — Memory & zero-copy data path
+## Iteration 7: Memory & zero-copy data path
 
-**Pulled:** io_uring zero-copy send (LWN 877167/879724 — 1.88-2.44x
+**Pulled:** io_uring zero-copy send (LWN 877167/879724; 1.88-2.44x
 over msg_zerocopy, best with fixed buffers, kernel 6.4+); io_uring
 zero-copy RECEIVE (kernel docs, kernel 6.14+, ifq per NIC queue with
-flow steering); Seastar's asymmetric_io_uring backend (July 2026 —
+flow steering); Seastar's asymmetric_io_uring backend (July 2026 -
 I/O offloaded to dedicated networking cores); Google's Snap / eRPC
 lineage for the shared-nothing thread-per-core model.
 
@@ -318,10 +318,10 @@ architecture is a different point in the design space (vane's
 thread-per-core handlers do minimal syscall work already).
 
 **Lean proof:** the parked triggers live as a doc assertion in
-`uring.rs` — the integration point where both features would land.
+`uring.rs`; the integration point where both features would land.
 
 
-## Iteration 8 — Control plane (xDS/ADS, hot reload)
+## Iteration 8: Control plane (xDS/ADS, hot reload)
 
 **Pulled:** the xDS protocol spec's four variants (SotW/Incremental ×
 per-type/Aggregated), Envoy's FAQ on incremental-xDS status ("all xDS
@@ -332,7 +332,7 @@ resource TTLs, reconnect-state hints).
 
 **Analysis:** delta xDS buys wire efficiency at large resource counts,
 lazy loading, and resource TTLs. A vane instance wildcard-subscribes
-to every type, loads everything eagerly, and its snapshot is bounded —
+to every type, loads everything eagerly, and its snapshot is bounded -
 the delta wins don't apply at vane's scale. vane's ADS client already
 implements the hard parts correctly: per-type state machine with
 nonces, ACK/NACK, RDS held back until CDS is ACKed, LDS-attached
@@ -352,7 +352,7 @@ trigger), plus the existing xDS decode-matrix and subcommand-loop
 tests from the earlier coverage work.
 
 
-## Iteration 9 — Observability (access logs, traces)
+## Iteration 9: Observability (access logs, traces)
 
 **Pulled:** Envoy access-log spec (command operators, format strings
 vs format dictionaries, the Envoy Gateway typed-JSON default set),
@@ -360,7 +360,7 @@ the OpenTelemetry logging data model (TraceId/SpanId fields linking a
 log entry to its trace), and OTel trace-log correlation guidance.
 
 **Analysis:** Envoy Gateway's default typed-JSON record set is the
-industry expectation — and vane's fixed structured record already
+industry expectation; and vane's fixed structured record already
 covers the load-bearing fields (ts, duration, status, bytes, client,
 upstream, method/host/path, trace_id) with one architectural
 difference: vane's record shape is FIXED (a bincode-ish struct over a
@@ -372,7 +372,7 @@ formatting work per request.
 **Verdict: KEEP + FIX.** The gap the research exposed was
 trace-log CORRELATION: the request span continued the client's
 inbound `traceparent`, but the ACCESS RECORD carried a freshly
-generated trace id — every log/trace join broke at vane's hop, and a
+generated trace id; every log/trace join broke at vane's hop, and a
 new correlation e2e caught it immediately. Fixed: the filter
 pipeline's trace is seeded from the parsed inbound `traceparent` when
 present.
@@ -380,27 +380,27 @@ present.
 **Parked:** response "why" flags in the record (Envoy's
 RESPONSE_FLAGS: breaker-open, upstream-reset...); outbound
 traceparent REWRITE (vane currently forwards the client's traceparent
-verbatim to the upstream — W3C wants a child span id per hop). Both
+verbatim to the upstream; W3C wants a child span id per hop). Both
 are additive record/header work with no correctness impact on
 request framing.
 
 
-## Iteration 10 — Correctness proof methods for parsers
+## Iteration 10: Correctness proof methods for parsers
 
 **Pulled:** "The HTTP Garden: Discovering Parsing Vulnerabilities in
 HTTP/1.1 Implementations by Differential Fuzzing of Request Streams"
-(arXiv 2405.17737, Kallus/Anantharaman/Locasto/Smith — 100+ parser
+(arXiv 2405.17737, Kallus/Anantharaman/Locasto/Smith; 100+ parser
 bugs, 68 fixed, 39 exploitable), T-Reqs and FRAMESHIFTER (related
 differential tools), libFuzzer's structural guidance (corpus as
 regression suite).
 
 **Analysis:** the state of the art is differential testing over
-INTERPRETATIONS (how a server parses a stream), not just outputs —
+INTERPRETATIONS (how a server parses a stream), not just outputs -
 and the highest-yield bug class is integer-parser quirks: Python's
 int() ignoring digit-separating underscores, strtol ignoring a 0x
 prefix under an explicit radix. vane's own chunked-scanner
 segmentation bug (fixed in the v0.11.0 train) was exactly a
-differential-invariant bug — the fuzz target's whole-vs-dripped
+differential-invariant bug; the fuzz target's whole-vs-dripped
 assertion is the technique the paper systematizes, applied
 self-differentially instead of across implementations.
 
@@ -414,7 +414,7 @@ exploited); whitespace-padded sizes pinned as deliberately tolerated.
 
 **Open:** a coverage-guided differential target pairing vane's h1
 parser with a second implementation (the HTTP Garden transducer
-model) — real value, real scope; parked, with the regression seeds
+model); real value, real scope; parked, with the regression seeds
 already in place.
 
 Entries are appended per iteration; the table is filled at the end of

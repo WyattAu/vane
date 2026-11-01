@@ -1,4 +1,4 @@
-# Dogfood deployment — vane in front of real services
+# Dogfood deployment: vane in front of real services
 
 This is not a test stub: it exercises vane against real services
 (Redis, a static file server) with production-shaped configs, so
@@ -36,7 +36,7 @@ docker compose -f dogfood/compose.yml up -d
 # http://localhost:8080 → the file server
 # redis-cli -p 6379     → Redis via TCP splice
 
-# Hot-reload: edit dogfood/vane.toml, save — routes apply live.
+# Hot-reload: edit dogfood/vane.toml, save: routes apply live.
 ```
 
 ## Stopping

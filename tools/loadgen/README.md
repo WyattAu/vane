@@ -25,7 +25,7 @@ proto conns duration total rps ok conn_err read_err non200 0 p50_us 0 p99_us
 ```
 
 `rps` counts *complete* responses; non-2xx responses are complete and are
-therefore both counted and reported separately — a proxy that answers 503
+therefore both counted and reported separately; a proxy that answers 503
 fast must never look like a throughput win. Latencies are microseconds.
 
 ## Usage
@@ -47,7 +47,7 @@ upload direction; a 64 KiB upstream body floods the download direction).
   protocols so h1/h2/h3 legs are comparable.
 - Per-connection latency pools, merged once at the end: no lock on the
   hot path.
-- Read/write timeouts so the generator always terminates — a server that
+- Read/write timeouts so the generator always terminates; a server that
   stops mid-response must not hang the benchmark.
 - h2 GETs pass `end_of_stream` on the request itself: the h2 crate queues
   an empty `send_data(Bytes::new(), true)` without emitting END_STREAM,

@@ -28,10 +28,10 @@ container, use a permissive seccomp profile or `--privileged`.
 
 The compose files also set two container knobs vane depends on:
 
-- `shm_size: "256mb"` — `/dev/shm` defaults to 64 MB, too small for
+- `shm_size: "256mb"`; `/dev/shm` defaults to 64 MB, too small for
   the default sidecar slot config; enlarge it whenever `[sidecar]` is
   enabled (see `[sidecar] slot_size × slots` in [config.md](config.md)).
-- `cap_add: [IPC_LOCK]` — io_uring fixed buffers are page-locked
+- `cap_add: [IPC_LOCK]`; io_uring fixed buffers are page-locked
   (`IORING_REGISTER_BUFFERS`); without it, buffer registration fails
   and the engine falls back to heap buffers.
 
@@ -62,14 +62,14 @@ is the published `ghcr.io/wyattau/vane:<version>` image.
 # static config from values
 helm install vane ./charts/vane
 # Gateway API variant (watches HTTPRoutes + Endpoints; needs the
-# gateway-api CRDs and RBAC — included in the chart)
+# gateway-api CRDs and RBAC: included in the chart)
 helm install vane ./charts/vane -f charts/vane/values-k8s-provider.yaml
 ```
 
 What the chart creates: Deployment (rolling, 0 unavailable, non-root),
 dual-port Service (data + admin), ConfigMap-generated `vane.toml`,
-`/healthz` + `/readyz` probes, Prometheus scrape annotations, and —
-with `k8sProvider.enabled` — ServiceAccount + ClusterRole/ClusterRoleBinding
+`/healthz` + `/readyz` probes, Prometheus scrape annotations, and -
+with `k8sProvider.enabled`; ServiceAccount + ClusterRole/ClusterRoleBinding
 for `httproutes`, `endpoints`, and `services` list/watch.
 
 Important values (`charts/vane/values.yaml`):
@@ -86,7 +86,7 @@ Important values (`charts/vane/values.yaml`):
 
 ### Notes on running vane in-cluster
 
-- **Providers**: the chart's static config and the K8s provider compose —
+- **Providers**: the chart's static config and the K8s provider compose -
   static routes seed the table, provider updates publish generations.
 - **TLS**: mount certs via a Secret into `/etc/vane/tls` and reference
   them from `[listeners.tls]` in `config` (or wire `[acme]`).

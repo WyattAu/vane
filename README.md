@@ -1,6 +1,6 @@
 # vane
 
-**A deterministic, zero-copy L4/L7 reverse proxy, edge gateway, and micro sidecar — in Rust.**
+**A deterministic, zero-copy L4/L7 reverse proxy, edge gateway, and micro sidecar; in Rust.**
 
 ```text
             ┌──────────────────────────────────────────────────┐
@@ -20,19 +20,19 @@
 └──────────────┘      └──────────────┘          └──────────────┘
 ```
 
-- **Thread-per-core, share-nothing** — pinned workers, zero locks on the data
+- **Thread-per-core, share-nothing**; pinned workers, zero locks on the data
   plane, cacheline-padded lock-free SPSC command paths.
 - **io_uring with fixed registered buffers** (zero per-op kernel mapping),
   automatic **mio/epoll fallback** on older kernels.
-- **Lock-free dynamic routing** — immutable radix trie, EBR generation swap
+- **Lock-free dynamic routing**; immutable radix trie, EBR generation swap
   across cores in well under 1 ms, ~220 ns lookups at 10k routes.
-- **Monomorphized filter pipelines** — no vtable dispatch; rate limiting
+- **Monomorphized filter pipelines**; no vtable dispatch; rate limiting
   (GCRA) and circuit breaking reuse the [`throttle-kit`] and [`breaker`] kits.
-- **POSIX SHM sidecar transport** — co-located services call the proxy over
+- **POSIX SHM sidecar transport**; co-located services call the proxy over
   shared-memory rings: **~2.8 µs round-trip** (10× under the 30 µs target).
-- **Zero-loss hot upgrade** — listeners hand over via `SCM_RIGHTS`; route
+- **Zero-loss hot upgrade**; listeners hand over via `SCM_RIGHTS`; route
   state archives to disk; connections never reset.
-- **Kernel splice passthrough** for L4 — request bytes never enter user space.
+- **Kernel splice passthrough** for L4; request bytes never enter user space.
 
 [`throttle-kit`]: https://crates.io/crates/throttle-kit
 [`breaker`]: https://crates.io/crates/breaker
@@ -114,7 +114,7 @@ cache; pair with the ACME manager for automated certificates.
   cert/key or `VANE_TLS_CERT`/`VANE_TLS_KEY`
 - **Failover**: a dead backend is skipped (up to 2 attempts) while the
   request is still unsent; breaker-recorded
-- **Enforced timeouts**: connect / first-byte / idle — 504 on expiry
+- **Enforced timeouts**: connect / first-byte / idle; 504 on expiry
 - **Opt-in rate limiting** (GCRA per client IP via `rate_limit_rps`)
 - **Env overrides** (container-friendly layering over TOML):
   `VANE_LISTEN`, `VANE_ADMIN_ADDR`, `VANE_CLUSTER_<NAME>`
@@ -127,7 +127,7 @@ cache; pair with the ACME manager for automated certificates.
 - **Sustained concurrent load** (`crates/vane/tests/load.rs`, always
   green): fixed in this cycle. The decisive defects were an io_uring
   `Connect` sockaddr use-after-free (bytes copied at submit, not at SQE
-  build — surfaced as EAFNOSUPPORT storms) and an IPv4 byte-order slip
+  build; surfaced as EAFNOSUPPORT storms) and an IPv4 byte-order slip
   (`1.0.0.127` SYN blackhole). Both carry regression coverage
   (`vane-core/tests/connect.rs`, `vane-core/tests/echo.rs` on both
   engines).
@@ -135,7 +135,7 @@ cache; pair with the ACME manager for automated certificates.
   backend per worker); `pool_per_backend = 0` for dial-fresh.
 - HTTP/2 is served by a **separate REUSEPORT acceptor** (see
   `h2_edge.rs`) whose bodies are buffered (32 MiB); no upstream h2 yet.
-- Upstream HTTP/2 and HTTP/3 (frontend h2/h3 terminate to HTTP/1.1) —
+- Upstream HTTP/2 and HTTP/3 (frontend h2/h3 terminate to HTTP/1.1) -
   tracked on the roadmap.
 
 ### Hot upgrade
@@ -148,7 +148,7 @@ cache; pair with the ACME manager for automated certificates.
 
 ## Performance
 
-Measured on the repository's criterion benches (dev profile — release builds
+Measured on the repository's criterion benches (dev profile; release builds
 are faster):
 
 | Bench | Result | Requirement |
@@ -156,7 +156,7 @@ are faster):
 | HTTP/1.1 head parse (5 headers) | ~266 ns incl. storage reset | `PR-01` |
 | Route lookup @ 10k routes | ~223 ns | `CP-01` |
 | SHM sidecar RTT (512 B) | ~2.8 µs | `IP-01` < 30 µs |
-| Keep-alive pool (opt-in) | 1 upstream conn across 5 sequential requests | — |
+| Keep-alive pool (opt-in) | 1 upstream conn across 5 sequential requests | - |
 | Config generation swap | one `Release` store + epoch retire | `CP-02` < 1 ms |
 
 ### Throughput (measured on the dev host, loadgen, keep-alive c=64)
@@ -175,7 +175,7 @@ and tuned nginx (upstream keepalive 64) 50–51k on this host
 (2026-10-07); nginx is no longer installable here, so that row stands
 as measured and cross-day comparisons carry a host-drift caveat
 (~3% day-of, larger across days). The honest reading stands: upstream
-connection reuse is the dominant lever — the same upstream serves
+connection reuse is the dominant lever; the same upstream serves
 9–10k rps without keep-alive and 50k+ with it.
 
 ## Admin plane & metrics
@@ -196,7 +196,7 @@ Core metric families (`vane_*`): `http_requests_total`,
 `request_duration_us` (histogram).
 
 Access logging (`[access_log]`, default off) emits one JSON object per
-completed request — see [docs/config.md](docs/config.md).
+completed request; see [docs/config.md](docs/config.md).
 
 ## Engineering gates (Tier A)
 
@@ -216,8 +216,8 @@ baseline regressions. CI mirrors [`WyattAu/engineering-standards`].
 | `wasm` | wasmtime plugin sandbox |
 | `k8s` | Gateway API provider |
 | `rkyv` | zero-copy route snapshots for handover |
-| `post-quantum` | aws-lc-rs provider with X25519MLKEM768 leading the key-exchange list — [docs/post-quantum.md](docs/post-quantum.md) |
-| adaptive concurrency | opt-in per cluster: latency-gradient load shedding (503 before queueing collapse) — [docs/perf-arc-2026-10.md](docs/perf-arc-2026-10.md) |
+| `post-quantum` | aws-lc-rs provider with X25519MLKEM768 leading the key-exchange list; [docs/post-quantum.md](docs/post-quantum.md) |
+| adaptive concurrency | opt-in per cluster: latency-gradient load shedding (503 before queueing collapse); [docs/perf-arc-2026-10.md](docs/perf-arc-2026-10.md) |
 
 ## Documentation
 
@@ -232,10 +232,10 @@ baseline regressions. CI mirrors [`WyattAu/engineering-standards`].
 
 ## Deploy
 
-- `Dockerfile` — distroless image
-- `deploy/docker-compose.yml` — local two-service demo
-- `deploy/helm/vane/` — chart with probes, SHM mount, scrape annotations
-- `deploy/vane.example.toml` — full configuration reference
+- `Dockerfile`; distroless image
+- `deploy/docker-compose.yml`; local two-service demo
+- `deploy/helm/vane/`; chart with probes, SHM mount, scrape annotations
+- `deploy/vane.example.toml`; full configuration reference
 
 ## License
 

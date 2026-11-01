@@ -1,22 +1,22 @@
 # Iteration plan (revised after research): fix the TLS-h2 upstream-read resume
 
-## Goal (revised — research completed the diagnosis)
+## Goal (revised: research completed the diagnosis)
 
 The desync is NOT a framing clobber between transactions: it is a
 **deadlock between vane's upstream-read throttle and the client's
 flow control** on the TLS-h2 path. Vane reads ~8 KB of a 64 KiB
 response, the shim holds the rest awaiting client credit, vane
-stops reading the upstream, the client grants WINDOW_UPDATE — and
+stops reading the upstream, the client grants WINDOW_UPDATE; and
 **the upstream read never re-arms**. The client stalls, h2load's
 wall deadline drops the connection, the poisoned upstream fd
 cascades (pre-park-guard) and the churn degrades the leg (TLS-h2
 ~370-4300 rps vs curl clean at every shape).
 
 The single unit for THIS iteration: **make the h2-session upstream
-read resume when the shim's held queue drains on client credit** —
+read resume when the shim's held queue drains on client credit** -
 mirroring the h1 path's pending_down-based re-arm.
 
-## Phase: research ✓ (complete — see .loop/research.md)
+## Phase: research ✓ (complete: see .loop/research.md)
 
 - The mechanism pinned: vane awaits client credit; the client
   waits for data; the upstream-read re-arm never fires for h2
@@ -54,7 +54,7 @@ mirroring the h1 path's pending_down-based re-arm.
 
 - Ledger updated (the arc's root cause + fix), pushed, CI green.
 - Commit+push of the working tree (the checkout gate + the probes
-  + this fix) — the mutating actions deferred from the research
+  + this fix); the mutating actions deferred from the research
   phase are included here.
 
 ## Done means

@@ -19,7 +19,7 @@
 > install-verified: `cargo install vane-proxy --version 0.15.0
 > --locked` → `vane 0.15.0`. The body-splice release: the HTTP fast
 > path is root-caused (the pump never decremented `remaining`, so
-> completion could never fire — an accounting bug that masqueraded
+> completion could never fire; an accounting bug that masqueraded
 > as kernel byte-loss for two sessions), proven at two test levels,
 > and **default-on**: get64k at 2.52× median (34.2k → 86.3k rps,
 > p50 178 → 77 µs) with the profile flat where the memmove pair
@@ -29,14 +29,14 @@
 > Default impl). Feature forward note: `response_splice` implies
 > `vane-kernel/body-splice`, which is why the kernel's minor bump
 > and the same-commit workspace requirement bump were load-bearing
-> — publishing the proxy against kernel 0.8.0 would not resolve.
+>; publishing the proxy against kernel 0.8.0 would not resolve.
 >
 > **v0.14.0 published 2026-10-18** (`vane-kernel` 0.8.0 →
 > `vane-proxy` 0.14.0). Kernel internals: `Op` is
 > `#[non_exhaustive]` with the exhaustive `Token::op` decode fix,
 > and generic readiness-watch primitives land with contract tests.
 > Cut because the semver gate caught the new `Op` variants breaking
-> downstream matches at the same minor — the gate doing its job.
+> downstream matches at the same minor; the gate doing its job.
 >
 > **v0.13.0 published 2026-10-17** (`vane-control` 0.11.0 →
 > `vane-proxy` 0.13.0), install-verified: `cargo install
@@ -53,7 +53,7 @@
 > X25519MLKEM768 leading the kx list (default build still ring), plus
 > the fuzz-found nameless-xDS-cluster rejection and the access-log /
 > trace correlation fix. `vane-tls` leaves the workspace train with an
-> explicit version — the rest of the train had no reason to move.
+> explicit version; the rest of the train had no reason to move.
 >
 > **v0.11.0 published 2026-10-16** (vane-proto 0.7.0 →
 > vane-router 0.7.0 → vane-control 0.10.0 → vane-proxy 0.11.0),
@@ -67,7 +67,7 @@
 > **v0.10.1 published 2026-10-14** (vane-control 0.9.1 →
 > vane-proxy 0.10.1), install-verified: `cargo install vane-proxy
 > --version 0.10.1 --locked` → `vane 0.10.1`. The ACME renewal fix:
-> the loop used to re-issue certificates daily with no expiry check —
+> the loop used to re-issue certificates daily with no expiry check -
 > breaking its own renewals against Let's Encrypt's 5/week duplicate
 > limit on day 5 of uptime. It now reads the stored leaf's validity
 > hourly and re-issues only past renew_at_fraction of the lifetime,
@@ -85,8 +85,8 @@
 > is not a breaking change. `quinn-proto` 0.11.19 for the QUIC
 > advisories.
 >
-> **v0.9.0 published 2026-10-11** (vane-filters 0.6.0 — first version
-> off the workspace train — → vane-control 0.8.0 → vane-kernel 0.7.0 →
+> **v0.9.0 published 2026-10-11** (vane-filters 0.6.0; first version
+> off the workspace train; → vane-control 0.8.0 → vane-kernel 0.7.0 →
 > vane-proxy 0.9.0), install-verified: `cargo install vane-proxy
 > --version 0.9.0 --locked` → `vane 0.9.0`. The relay-correctness
 > release: tunnel bytes coalesced with the 101 head are no longer
@@ -111,12 +111,12 @@
 
 crates.io forbids git dependencies, so the leaves must land in
 dependency order. The only external blocker was `slab-pool` (git dep
-of the engine crate) — already published at 0.1.0.
+of the engine crate); already published at 0.1.0.
 
 ## Publish order (dependency leaves first)
 
 Each: `cargo publish --dry-run -p <crate>` then `cargo publish -p
-<crate>` (crates.io rate-limits NEW crate creation — space publishes
+<crate>` (crates.io rate-limits NEW crate creation; space publishes
 ~90 s apart and back off on 429):
 
 1. `vane-observe` (no internal deps)
@@ -139,7 +139,7 @@ vane --version
 
 * **Most crates inherit `version.workspace = true`** (0.5.3). A crate
   that needs a different version must set it explicitly in its own
-  manifest — two publish failures came from forgetting.
+  manifest; two publish failures came from forgetting.
 * **Internal dependency requirements live in `[workspace.dependencies]`**
   and can lag the bumped crate versions. Bump them in the same commit as
   the manifest version, or the published crate resolves the *old*
@@ -156,14 +156,14 @@ vane --version
 Automated: pushing a `vX.Y.Z` tag triggers `.github/workflows/
 release.yml`, which builds the Dockerfile and pushes
 `ghcr.io/wyattau/vane:X.Y.Z` (+ `X.Y` + `latest`) with the
-workflow-scoped `GITHUB_TOKEN` — no PAT, no local credentials.
+workflow-scoped `GITHUB_TOKEN`; no PAT, no local credentials.
 Backfill an already-cut tag by deleting and re-pushing it (or run the
 workflow manually).
 
 `latest` is pushed on every release so it cannot drift. It did once: a
 manually-pushed `latest` outlived several releases because the workflow
 only ever pushed the semver tags, so anyone pulling `:latest` silently
-got an old build. **Pin an exact tag when you need reproducibility** —
+got an old build. **Pin an exact tag when you need reproducibility** -
 the charts and both compose files do.
 
 Local builds for testing: `docker build -t ghcr.io/wyattau/vane:X.Y.Z .`

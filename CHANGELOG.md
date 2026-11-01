@@ -4,12 +4,12 @@ All notable changes to vane are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 semver.
 
-## [0.15.0] — 2026-10-21
+## [0.15.0]: 2026-10-21
 
 Crate versions: `vane-kernel` 0.8.0 → **0.9.0**, `vane-control`
 0.11.0 → **0.12.0**, `vane-proxy` 0.14.0 → **0.15.0**. The
 body-splice release: the HTTP fast path is root-caused, proven, and
-default-on — get64k at 2.52× median with the profile flat where the
+default-on; get64k at 2.52× median with the profile flat where the
 memmove pair used to own 29.3% of on-CPU time.
 
 ### Added
@@ -28,13 +28,13 @@ memmove pair used to own 29.3% of on-CPU time.
   eligibility gates.
 - **`SessionIo::splice_response_body` + `Handler::on_body_spliced`**
   (`vane-kernel` 0.9.0, feature `body-splice`): the handler-side
-  seam for the fast path — request the splice, get the completion
+  seam for the fast path; request the splice, get the completion
   with the moved byte count.
 - **`Engine::watch`-based readiness plumbing** reused by the splice
   pump (the 0.8.0 primitives get their first production user).
 - **Worker-level body-splice unit tests** (`body_splice_worker_tests`):
   exact byte movement + completion handoff, truncation
-  kills-the-session, re-entry/parking rejections — compiled only
+  kills-the-session, re-entry/parking rejections; compiled only
   under the `body-splice` feature.
 
 ### Fixed
@@ -42,13 +42,13 @@ memmove pair used to own 29.3% of on-CPU time.
 - **The splice pump never completed** (`vane-kernel` 0.9.0): the
   egress loop incremented `moved` but never decremented `remaining`,
   so the completion condition could never fire and the session
-  leaked — the "client starves after the first chunk" symptom that
+  leaked; the "client starves after the first chunk" symptom that
   looked like a kernel byte-loss mystery for two sessions. Found by
   the worker-level unit tests the coverage gate demanded.
 - **Truncated-upstream client hang** (`vane-kernel` 0.9.0): an
   io_uring op still submitted on a socket holds a kernel reference
   to the struct file, so `close(2)` alone freed the fd NUMBER
-  without closing the socket — no FIN, client hangs forever.
+  without closing the socket; no FIN, client hangs forever.
   `close_session` now shutdowns both sockets before close, and the
   truncation path half-closes after flushing queued bytes
   (nginx-style partial relay). Gated repro
@@ -64,18 +64,18 @@ memmove pair used to own 29.3% of on-CPU time.
   be feature-gated), with a public `ProxyConfig::new` constructor
   for the four required wiring handles.
 - **`response_splice` config field** (`vane-control` 0.12.0):
-  default ON via an explicit serde default fn — `#[serde(default)]`
+  default ON via an explicit serde default fn; `#[serde(default)]`
   alone would call `bool::default()` (false) and silently keep the
   fast path off.
 - Supply-chain: wasmtime 48.0.7 (RUSTSEC-2026-0378/0379),
   rustls-webpki 0.103.16 + webpki-roots 1.0.10
   (RUSTSEC-2026-0381/0382/0383).
 
-## [0.14.0] — 2026-10-18
+## [0.14.0]: 2026-10-18
 
 Crate versions: `vane-kernel` 0.8.0, `vane-proxy` 0.14.0. A
 kernel-internals release that exists because the semver gate caught
-what a performance experiment did to the public API — exactly what
+what a performance experiment did to the public API; exactly what
 that gate is for.
 
 ### Changed
@@ -87,7 +87,7 @@ that gate is for.
   Shipping it with the exhaustive `Token::op` fix below.
 - **`Token::op()` decodes every operation** (`vane-kernel`): the
   match previously knew ops 1..=7 and silently mapped anything else
-  to `Op::Splice` — a latent trap where any new operation's
+  to `Op::Splice`; a latent trap where any new operation's
   completions would vanish into the wrong dispatcher. It is now
   exhaustive, and a standalone engine test
   (`watch_fires_on_readability`) proves a readiness watch fires
@@ -97,18 +97,18 @@ that gate is for.
   the two-firing contract test. Added for (and currently only used
   by) the kernel test suite; the body-splice fast path they were
   built for is recorded as rolled-back in
-  docs/perf-arc-2026-10.md, iteration 3 — the lean proofs refused
+  docs/perf-arc-2026-10.md, iteration 3; the lean proofs refused
   it (corrupted relay + truncated hang) and the honest state is
   dark until the offset interaction is understood.
 
 ### Breaking
 
 - `vane-kernel` 0.8.0: `Op` gained three variants and
-  `#[non_exhaustive]` — downstream `match`es over `Op` need a
+  `#[non_exhaustive]`; downstream `match`es over `Op` need a
   wildcard arm.
 - `vane-proxy` 0.14.0 tracks it.
 
-## [0.13.0] — 2026-10-17
+## [0.13.0]: 2026-10-17
 
 Crate versions: `vane-proxy` 0.13.0, `vane-control` 0.11.0.
 The performance-arc release (iterations 1-2 of
@@ -127,7 +127,7 @@ shedding.
   requests.
 - **`runtime.pool_idle_ms`** (default 30000): a pooled upstream
   connection is reusable for this long after it was parked, then
-  reaped — a connection the backend has already retired (nginx
+  reaped; a connection the backend has already retired (nginx
   `keepalive_timeout` 60 s, most LBs 60 s) used to be handed out
   anyway, costing the next request a failed attach plus a fresh
   dial. Park reaps expired entries BEFORE refusing room, so a burst
@@ -136,7 +136,7 @@ shedding.
   opt-in per cluster): `[clusters.<name>.adaptive]` installs a
   Netflix-Gradient2 controller (also Envoy's adaptive-concurrency
   family) that tracks the cluster's latency baseline and sheds with
-  503 `overloaded` when in-flight requests reach the current limit —
+  503 `overloaded` when in-flight requests reach the current limit -
   instead of queueing behind a collapsed backend. Worker-local
   (shared-nothing, no atomics on the request path); rejected requests
   never sample, so shedding cannot poison the baseline. Metrics:
@@ -144,12 +144,12 @@ shedding.
   `vane_cluster_<name>_concurrency_limit` (per worker). The lean
   proof caught a real algorithm bug before it shipped: sampling the
   in-flight count AFTER releasing the slot lets the app-limited rule
-  eat ~289 of 290 updates on a fast cluster — a limit that never
+  eat ~289 of 290 updates on a fast cluster; a limit that never
   grows never recovers; the pre-release count is what Netflix passes.
 
 ### Fixed
 
-- **A dropped worker no longer leaks pooled descriptors** — parked
+- **A dropped worker no longer leaks pooled descriptors**; parked
   upstream fds are detached from the engine, so `Drop` now closes
   every idle connection an embedder teardown or failed restart was
   holding.
@@ -159,11 +159,11 @@ shedding.
 - `RuntimeConfig` and `ClusterConfig` are `#[non_exhaustive]` (the
   config-struct family rule; both are parsed structs, serde builds
   them in-crate). `ProxyConfig` deliberately stays exhaustively
-  constructible — it is the programmatic embedder API — and gains a
+  constructible; it is the programmatic embedder API; and gains a
   `Default` so tests and embedders can write struct-update literals.
 - The development pool test suite caught a silent-total-failure bug
   during development: `get_mut` instead of `entry` disabled parking
-  for every backend's first connection — pooling would have done
+  for every backend's first connection; pooling would have done
   nothing while every test that only checked "it runs" stayed green.
 
 ### Benchmarks
@@ -174,7 +174,7 @@ windows; the pool changes are throughput-neutral within the ~3%
 host drift, stated rather than tuned around. Full table and the
 reuse evidence in docs/benchmarks.md.
 
-## [0.12.0] — 2026-10-17
+## [0.12.0]: 2026-10-17
 
 Crate versions: `vane-proxy` 0.12.0, `vane-tls` 0.6.0,
 `vane-control` 0.10.1. The research-loop release, part two
@@ -190,7 +190,7 @@ verdict ledger.
   highest-priority key-exchange group on every TLS listener AND the
   h3/QUIC endpoint. This is the harvest-now-decrypt-later defense
   Chrome and Cloudflare negotiate by default, applied to the leg that
-  actually carries attacker-visible plaintext. Off by default — the
+  actually carries attacker-visible plaintext. Off by default; the
   ring build is unchanged, and switching providers needs cmake to
   build, so the switch is a deliberate build choice.
   - With both provider features compiled, rustls refuses to auto-pick
@@ -207,13 +207,13 @@ verdict ledger.
 - **Nameless xDS clusters are rejected at decode** (`vane-control`,
   fuzz-found). A `Cluster` message with an empty `name` has no valid
   proto (field 1 is required) but previously produced a snapshot keyed
-  by `""` — two such clusters collapsed onto one key, and the
+  by `""`; two such clusters collapsed onto one key, and the
   resulting route pointed nowhere. `decode_cluster` now returns `None`
   for an empty name. Regression seed in
   `fuzz/corpus/regression/xds_nameless_cluster`.
 - **Access records now carry the client's inbound trace id**
   (`vane-proxy`). The request span continued an inbound
-  `traceparent`, but the access log emitted a freshly generated id —
+  `traceparent`, but the access log emitted a freshly generated id -
   so log records and spans could not be joined for any request that
   arrived with tracing. `ctx.trace` is now seeded from the parsed
   header. E2E proof: `access_log_correlates_inbound_traceparent`.
@@ -221,7 +221,7 @@ verdict ledger.
 ### Research ledger (docs/research-loop-2026-10.md)
 
 Iterations 6-10 closed the arc: post-quantum KEX (ADOPT, shipped
-above), the zero-copy path (KEEP — registered fixed buffers + splice
+above), the zero-copy path (KEEP; registered fixed buffers + splice
 stay; SEND_ZC and ZC-Rx parked with measured triggers), xDS
 subscriptions (KEEP SotW ADS; delta parked behind a 10k-resource or
 resource-TTL trigger), observability (KEEP + the trace fix above),
@@ -229,7 +229,7 @@ and proof methods (KEEP + the HTTP Garden integer-parser quirks
 pinned as regression tests). Every parked item names the measurement
 that would reopen it.
 
-## [0.11.0] — 2026-10-16
+## [0.11.0]: 2026-10-16
 
 Crate versions: `vane-proxy` 0.11.0, `vane-control` 0.10.0,
 `vane-router` 0.7.0, `vane-proto` 0.7.0. The research-loop release
@@ -240,7 +240,7 @@ Crate versions: `vane-proxy` 0.11.0, `vane-control` 0.10.0,
 - **Chunked-body segmentation could change where a body ends**
   (`vane-proto`). The nightly deep fuzz found an input where the
   scanner declared the body complete byte-by-byte but incomplete fed
-  whole — a segmentation-dependent verdict, i.e. a request-smuggling
+  whole; a segmentation-dependent verdict, i.e. a request-smuggling
   primitive. `take_line` now searches the virtual join of carry+data
   with exact consumed-accounting, and the LINE_CAP rule is a property
   of the line rather than of the segmentation. The 10149-byte crash
@@ -249,13 +249,13 @@ Crate versions: `vane-proxy` 0.11.0, `vane-control` 0.10.0,
 - **Malformed chunked bodies no longer parse their tails as new
   messages** (`vane-proxy`, `vane-proto`). An invalid chunk size line
   or an over-long line now marks the scan malformed and the
-  connection CLOSES — request side, inline-body side, and the
+  connection CLOSES; request side, inline-body side, and the
   response relay side (which also stops reusing either connection).
   This is the Akamai CVE-2025-66373 class.
 - **HTTP/2 CONTINUATION-flood triple bounds** (`vane-kernel`):
   fragments past the advertised SETTINGS_MAX_HEADER_LIST_SIZE are a
   PROTOCOL_ERROR connection error (not a buffered informative
-  response — the Apache CVE-2024-27316 lesson); a CONTINUATION larger
+  response; the Apache CVE-2024-27316 lesson); a CONTINUATION larger
   than max_frame_size is FRAME_SIZE_ERROR; more than 64
   CONTINUATIONs per block is PROTOCOL_ERROR (the zero-length-frame
   bypass, Netty CVE-2026-33871).
@@ -282,10 +282,10 @@ Crate versions: `vane-proxy` 0.11.0, `vane-control` 0.10.0,
 - **rustls 0.23.46 / wasmtime 48.0.6** advisory bumps.
 - **The nightly deep fuzz now completes**: event-scoped concurrency
   groups (a push no longer cancels the 2.5 h schedule run), a 200
-  minute ceiling, and workflow_dispatch — and its first completed run
+  minute ceiling, and workflow_dispatch; and its first completed run
   found the chunked bug above.
 
-## [0.10.1] — 2026-10-14
+## [0.10.1]: 2026-10-14
 
 Crate versions: `vane-proxy` 0.10.1, `vane-control` 0.9.1.
 
@@ -293,7 +293,7 @@ Crate versions: `vane-proxy` 0.10.1, `vane-control` 0.9.1.
 
 - **The ACME renewal loop re-issued certificates daily with no expiry
   check** (`vane-control`). `spawn_renewal` slept 24 hours and called
-  `obtain_certificate()` unconditionally — and `renew_at_fraction`,
+  `obtain_certificate()` unconditionally; and `renew_at_fraction`,
   the documented 2/3-lifetime threshold, was dead config: parsed,
   defaulted, never read. Against Let's Encrypt's duplicate-certificate
   limit (5 per week for the same names), a deployment broke its own
@@ -304,7 +304,7 @@ Crate versions: `vane-proxy` 0.10.1, `vane-control` 0.9.1.
   short-lived certificates viable: at the 2/3 point of a 6-day
   certificate the loop holds ~48 retry opportunities of margin.
 
-## [0.10.0] — 2026-10-13
+## [0.10.0]: 2026-10-13
 
 Crate versions: `vane-proxy` 0.10.0, `vane-control` 0.9.0,
 `vane-proto` 0.6.0. (`vane-kernel` 0.7.0 and `vane-filters` 0.6.0 are
@@ -316,7 +316,7 @@ unchanged from 0.9.0.)
   client-IP contract for vane deployed behind an L4 load balancer (AWS
   NLB, HAProxy, Cloudflare). Every connection on an enabled listener
   must open with a PROXY protocol header, and vane attributes the
-  connection to the address it carries — X-Forwarded-For, access
+  connection to the address it carries; X-Forwarded-For, access
   records, and filter contexts name the ORIGINAL client instead of the
   balancer. The header precedes the TLS handshake (the case that
   breaks naive implementations), which the e2e suite exercises with a
@@ -329,7 +329,7 @@ unchanged from 0.9.0.)
     no response.
   - Bounded by design: a v2 payload over 4 KiB is refused (a peer
     cannot pin memory dribbling a partial header), and a v2 LOCAL
-    header (health checks) claims no address — the real socket peer is
+    header (health checks) claims no address; the real socket peer is
     kept.
 - `quinn-proto` bumped to 0.11.19 (RustSec advisories against 0.11.17
   in the QUIC transport layer; vane's h3 suites re-run green on the
@@ -342,20 +342,20 @@ unchanged from 0.9.0.)
   `proxy_protocol` were each added after the first release), and this
   makes the NEXT field addition a non-event instead of a breaking
   change. Construct with `ListenerConfig::default()` plus field
-  assignment — struct expressions are refused cross-crate by design.
+  assignment; struct expressions are refused cross-crate by design.
   Version bumps in this train (`vane-proto` 0.6.0 for the new
   `proxy_protocol` wire module, `vane-control` 0.9.0,
   `vane-proxy` 0.10.0) are the semver cost of the feature.
 
-## [0.9.0] — 2026-10-11
+## [0.9.0]: 2026-10-11
 
 Crate versions: `vane-proxy` 0.9.0, `vane-control` 0.8.0,
 `vane-kernel` 0.7.0, `vane-filters` 0.6.0 (first version off the
-workspace train — it is the crate that changed).
+workspace train; it is the crate that changed).
 
 The coverage arc closed this release: quality/coverage reads 90.19%
 against the 90% Tier A bar, and every CI gate is green. What closed it
-was not coverage-chasing — the dark lines were hiding the defects
+was not coverage-chasing; the dark lines were hiding the defects
 below.
 
 ### Fixed
@@ -364,19 +364,19 @@ below.
   (`vane-proxy`). `relay_body` had no `Tunnel` arm, so its catch-all
   relayed nothing; bytes coalesced into the same read as the upgrade
   head vanished, and the stream ended short. On loopback with separate
-  writes the case never occurs — CI's slower runners coalesce segments,
+  writes the case never occurs; CI's slower runners coalesce segments,
   which is where the byte-exact tunnel test failed ("pattern mismatch
   at 0, got 3"). `relay_body` now relays tunnels like chunked, and
   `upgrade_with_coalesced_tunnel_bytes_loses_nothing` pins the case
   deterministically (head + first data bytes in one write).
 - **The h1 circuit breaker could not see the failures it exists for**
   (`vane-proxy`, `vane-filters`). A backend that accepted the request
-  and closed without answering — the most common "backend is gone"
-  signature — counted as nothing; resets, dial failures and timeouts
+  and closed without answering; the most common "backend is gone"
+  signature; counted as nothing; resets, dial failures and timeouts
   counted. `note_upstream_failure` now serves all of them.
 - **Debug stderr prints in hot paths**: `request_body` (every body
   through an h2up cluster) and `upstream_flush` printed unconditionally
-  to stderr — leftover instrumentation from the previous release's
+  to stderr; leftover instrumentation from the previous release's
   h2up investigation, invisible to tests because tests never assert on
   stderr.
 
@@ -390,26 +390,26 @@ below.
   and tests keep independent state).
 - **Breaker policy is explicit and anti-flap** (`vane-filters`,
   `breaker` 1.0 → 2.0). Trip on a 50% failure rate over a full 20-call
-  window; the 5-failure-streak rule is off — with the gate shared, a
+  window; the 5-failure-streak rule is off; with the gate shared, a
   sub-second backend blip used to trip it and hold the circuit open for
   30 s. Now: 5 s open window, at most 3 half-open probes, 2 successes
   to close. A handful of failures ejects nothing; a backend failing
   half its calls is ejected and re-probed within seconds. `chaos_breaker_flap`'s
   SLO was rewritten to what a breaker legitimately promises (traffic
-  flows, down windows yield gateway errors, recovery happens) — called
+  flows, down windows yield gateway errors, recovery happens); called
   out because weakening a test is never free.
 - **RFC 9218 SETTINGS_NO_RFC7540_PRIORITIES** (`vane-kernel`): values
   greater than 1 are now a PROTOCOL_ERROR connection error (RFC 9113
-  §6.5.2 — the setting is a bool); previously every value was silently
+  §6.5.2; the setting is a bool); previously every value was silently
   accepted. vane also declares the setting (value 1) once in its first
   SETTINGS frame, which is accurate: PRIORITY frames are validated but
   never acted on. The public `Setting` enum is unchanged (additive
-  accessors only) — an earlier variant addition was correctly rejected
+  accessors only); an earlier variant addition was correctly rejected
   by cargo-semver-checks as breaking.
 - **Config tables reject unknown fields** (`vane-control`): every
   user-authored table (19 of them; the top-level document stays
   permissive for forward compatibility) now carries
-  `deny_unknown_fields` — a typo like `challenge = "http-01"` (the
+  `deny_unknown_fields`; a typo like `challenge = "http-01"` (the
   RFC 8555 spelling the enum then lacked) is a load error naming the
   field, not a silently ignored line.
 
@@ -418,12 +418,12 @@ below.
 - In-process **mock ACME v2 server** harness: the full issuance flow
   (directory → newAccount → newOrder → http-01 → finalize → chain
   download) against a server that decodes and verifies our JWS
-  protected headers the way a real CA would. No docker, ~0.03 s — the
+  protected headers the way a real CA would. No docker, ~0.03 s; the
   pebble e2e stays for the full stack.
 - **h3 → h2 upstream relay** e2e: the only vane path where QUIC meets
   HTTP/2 had no coverage.
 - **xDS decode matrix through the real client loop**: LDS attachment,
-  EDS endpoint overrides, SDS secrets, and the NACK branch — the loop
+  EDS endpoint overrides, SDS secrets, and the NACK branch; the loop
   previously only ever decoded CLUSTER and ROUTE in tests. One
   asymmetry surfaced and is documented rather than changed: malformed
   EDS/SDS resources are skipped silently while malformed
@@ -441,7 +441,7 @@ below.
   SETTINGS validation edges above.
 - `scripts/h2spec_run.sh` fetches h2spec v2.6.0 on demand with a pinned
   SHA-256, and `bench_compare.sh` fetches Caddy 2.10.2 / Traefik 3.5.4
-  the same way — all spec/bench artifacts now live under
+  the same way; all spec/bench artifacts now live under
   `${VANE_ARTIFACTS:-/var/tmp/vane-artifacts}` instead of a `/tmp`
   path this host wipes on restart (a gate that degrades to "binary
   missing" is not a gate). The `Enforce Tier A threshold` CI step now
@@ -449,7 +449,7 @@ below.
   took instead of re-running the workspace with `--skip` filters that
   cargo-llvm-cov mangles into run-only filters.
 
-## [0.8.0] — 2026-10-07
+## [0.8.0]: 2026-10-07
 
 Crate versions: `vane-proxy` 0.8.0, `vane-control` 0.7.0,
 `vane-kernel` 0.6.0.
@@ -459,13 +459,13 @@ Crate versions: `vane-proxy` 0.8.0, `vane-control` 0.7.0,
 - **HPACK string-length arithmetic overflow** (`vane-kernel` h2). A
   12-byte crafted header block drove `decode_int` to `u64::MAX - 1`, so
   `len_pos + len` overflowed: a panic in any overflow-checked build, and
-  in release a wrap to a *valid but wrong* range — the decoder would
+  in release a wrap to a *valid but wrong* range; the decoder would
   copy bytes the declared length never described. Found by the 600 s
   nightly `hpack` fuzz run; fixed with checked arithmetic, and the
   minimized input is kept as three unit tests plus a tracked regression
   seed.
-- **DER SAN walk slice overrun** (`vane-tls`). `spiffe_id` — which
-  parses the peer-presented leaf certificate during the TLS handshake —
+- **DER SAN walk slice overrun** (`vane-tls`). `spiffe_id`; which
+  parses the peer-presented leaf certificate during the TLS handshake -
   indexed directly at the one step of the DER walk where every sibling
   used `get()`, so a GeneralName with an over-long length panicked.
   Found by a same-class sweep after the HPACK fix. `der_header` now
@@ -478,8 +478,8 @@ Crate versions: `vane-proxy` 0.8.0, `vane-control` 0.7.0,
 ### Fixed
 
 - **k8s provider ignored the chart's own `namespaces` default**
-  (`vane-control`). `namespaces = ["*"]` (or an empty list) — the
-  documented default in vane's Helm chart — was forwarded as a literal
+  (`vane-control`). `namespaces = ["*"]` (or an empty list); the
+  documented default in vane's Helm chart; was forwarded as a literal
   namespace name and matched nothing: zero routes, permanent 503s.
   `["*"]` and `[]` now watch all namespaces.
 - **CI repairs**: the fuzz regression-seed gate never actually ran
@@ -489,7 +489,7 @@ Crate versions: `vane-proxy` 0.8.0, `vane-control` 0.7.0,
   (`fuzz/` is its own workspace) and one did not compile; kind-smoke
   got its first green run (leftover-cluster cleanup, corrected upstream
   args, diagnosable cluster-creation failure).
-- `h3_client` was compiled even without the `h3` feature — the
+- `h3_client` was compiled even without the `h3` feature; the
   `--no-default-features` build was broken.
 
 ### Added
@@ -501,12 +501,12 @@ Crate versions: `vane-proxy` 0.8.0, `vane-control` 0.7.0,
   trade per-connection memory for syscalls-per-byte. Verified with the
   h1 boundary sweep at the 512-byte minimum and io_uring end-to-end at
   16 KiB. Measured on the one leg the default loses (64 KiB bodies: 16
-  slot round trips per response): +30% median throughput at 16384 —
+  slot round trips per response): +30% median throughput at 16384 -
   docs/benchmarks.md.
 - **Tunnel backpressure proof**: the 101-upgrade arm (WebSocket et al.)
-  now has the same stalled-reader proof the h1 relay has — 8 MiB
+  now has the same stalled-reader proof the h1 relay has; 8 MiB
   floods in both directions, byte-verified.
-- **`tools/loadgen`** — the benchmark load generator now lives in-repo
+- **`tools/loadgen`**; the benchmark load generator now lives in-repo
   (own workspace, `publish = false`) instead of an untracked scratch
   crate under `/tmp/opencode`: h1/h2/h3 clients with a shared 13-field
   output contract, `certgen`, and a configurable upstream. Other
@@ -514,7 +514,7 @@ Crate versions: `vane-proxy` 0.8.0, `vane-control` 0.7.0,
   and `scripts/bench_compare.sh` gained POST 4 KB / GET 64 KB breadth
   legs routed through every compared proxy.
 
-## [0.7.0] — 2026-10-06
+## [0.7.0]: 2026-10-06
 
 Crate versions: `vane-proxy` 0.7.0, `vane-proto` 0.5.5,
 `vane-router` 0.6.1, `vane-control` 0.6.1.
@@ -531,18 +531,18 @@ Crate versions: `vane-proxy` 0.7.0, `vane-proto` 0.5.5,
   duplicated. `allow_origins = ["*"]` emits the wildcard, except with
   `allow_credentials`, where the fetch spec requires a named origin. A
   request with no `Origin`, or one outside the policy, is relayed
-  untouched — the browser is the enforcement point, so the common
+  untouched; the browser is the enforcement point, so the common
   non-CORS path allocates nothing. Per-route, and hot-reload applies
   with the rest of the routes.
-- `vane_proto::chunked::ChunkedScanner` — incremental chunked-transfer
+- `vane_proto::chunked::ChunkedScanner`; incremental chunked-transfer
   decoder (new public module).
-- `vane_router::CorsPolicy` — a resolved CORS policy (new public type).
+- `vane_router::CorsPolicy`; a resolved CORS policy (new public type).
 
 ### Fixed
 
 - **A client that read slowly could deadlock the relay permanently.**
   Upstream reads are throttled while the client-bound write queue is
-  backed up, and nothing ever resumed them — the throttle was a one-way
+  backed up, and nothing ever resumed them; the throttle was a one-way
   door. Once the queue passed 8 KiB the response simply stopped arriving:
   the client waited for the rest of a body vane would never fetch, until
   its read timeout fired. Any pause long enough to cover 8 KiB of
@@ -555,7 +555,7 @@ Crate versions: `vane-proxy` 0.7.0, `vane-proto` 0.5.5,
   payload, text with a NUL) and can straddle two reads. On the response
   side that truncated bodies or hung the relay; on the request side it
   additionally left the remaining bytes to be parsed as the next request
-  head on the same connection — a desync, and a smuggling vector when
+  head on the same connection; a desync, and a smuggling vector when
   the backend frames the same bytes differently.
 - **An upstream response head split across TCP segments returned 502.**
   TCP carries no message boundaries, so a valid head prefix is now
@@ -572,10 +572,10 @@ Crate versions: `vane-proxy` 0.7.0, `vane-proto` 0.5.5,
 - **A gzipped response never terminated an h2 stream.** The head rewrite
   strips `Content-Length` (the compressed length is not known up front),
   so the shim had no way to derive END_STREAM and the response ended
-  with the connection close — a broken stream. The same path also never
+  with the connection close; a broken stream. The same path also never
   accounted for body bytes that arrived with the head, so the gzip
   trailer was dropped and the deflate stream left incomplete.
-- **An h2 upstream response never terminated the downstream stream** —
+- **An h2 upstream response never terminated the downstream stream** -
   the same missing-END_STREAM class, because an h2 response is framed by
   h2 rules and normally carries no `Content-Length` for the shim to count
   against.
@@ -597,46 +597,46 @@ Crate versions: `vane-proxy` 0.7.0, `vane-proto` 0.5.5,
   every boundary defect above passed the suite indistinguishably from a
   correct relay. Reverting each fix fails a distinct sweep.
 
-## [0.6.1] — 2026-10-05 (vane-proxy)
+## [0.6.1]: 2026-10-05 (vane-proxy)
 
 - Allocation tranche 2: reusable path/host buffers on the relay, so the
   per-request head scratch is allocated once per connection instead of
   once per request (RSS 225 MB → 205 MB on the plain benchmark shape).
-- Release hygiene: this release corrects the version ordering — a
+- Release hygiene: this release corrects the version ordering; a
   `v0.5.7` tag had been cut after `v0.6.0`, so the tranche above would
   otherwise have shipped under a patch number that postdated a minor.
 
-## [0.6.0] — 2026-10-04 (vane-control, vane-router, vane-proxy)
+## [0.6.0]: 2026-10-04 (vane-control, vane-router, vane-proxy)
 
 The adoption release.
 
 - **Config hot-reload.** `vane run` watches the config file (notify,
   with a 30 s poll and an mtime debounce). A valid changed config
   re-applies routes, clusters and health through the same reconciler
-  path as xDS — no restart. An invalid config keeps the previous
+  path as xDS; no restart. An invalid config keeps the previous
   generation and is logged. Listener changes remain startup-bound and
   are logged as restart-required.
-- `[[routes]] retry` — `max_attempts` and `retry_5xx`. A 5xx retry
+- `[[routes]] retry`; `max_attempts` and `retry_5xx`. A 5xx retry
   replays the stored request head through the existing failover
   machinery; idempotent bodyless requests only (GET/HEAD/PUT/DELETE),
   capped by `max_attempts`.
-- `mirror = "shadow-cluster"` — a fire-and-forget copy of each request
+- `mirror = "shadow-cluster"`; a fire-and-forget copy of each request
   to a named cluster, on a detached thread. Never delays or fails the
   real response; a down shadow is invisible to callers.
 
-## [0.5.7] — 2026-10-05, superseded
+## [0.5.7]: 2026-10-05, superseded
 
 The `v0.5.7` tag was cut on 2026-10-05, after `v0.6.0`, and re-issued
 as `v0.6.1`,
 which carries the same allocation-tranche work. Kept as a tag because
 it was pushed; crates.io only ever saw 0.6.1.
 
-## [0.5.6] — 2026-10-04 (vane-proxy)
+## [0.5.6]: 2026-10-04 (vane-proxy)
 
 - The circuit breaker `Arc` is cached per connection, keyed by cluster,
   instead of being resolved per request (~2.5% relay CPU).
 
-## [0.5.5] — 2026-10-04 (vane-proxy)
+## [0.5.5]: 2026-10-04 (vane-proxy)
 
 - Zero-copy relay dial: the request-head buffer is taken and restored
   rather than cloned per request (+2-4% h1, RSS -4% / -41% depending
@@ -644,7 +644,7 @@ it was pushed; crates.io only ever saw 0.6.1.
 - Rate limiting is opt-in. The per-request GCRA is not run unless
   `[rate_limit]` is configured (~2% relay CPU).
 
-## [0.5.4] — 2026-10-03 (vane-proto, vane-proxy)
+## [0.5.4]: 2026-10-03 (vane-proto, vane-proxy)
 
 - Security, from fuzzing: a length-varint overflow in the protobuf
   decoder and an unvalidated status range in the h1 pool response
@@ -653,7 +653,7 @@ it was pushed; crates.io only ever saw 0.6.1.
   `h1pool_response`.
 - `SECURITY.md` published with a reporting policy.
 
-## [0.5.3] — 2026-10-03
+## [0.5.3]: 2026-10-03
 
 - Three stacked h2 bugs refused or dropped every request after the
   first: the kernel counted closed streams without pruning them, the
@@ -661,41 +661,41 @@ it was pushed; crates.io only ever saw 0.6.1.
   reset. The h2 edge went from 1 to 32.7k req/s; h2spec 145/145 in
   strict mode is preserved.
 
-## [0.5.2] — 2026-10-03 (vane-proxy)
+## [0.5.2]: 2026-10-03 (vane-proxy)
 
 - Pooled h1 upstream client for the h3 edge, shared by the mesh path
   (+85% on the mesh benchmark).
 
-## [0.5.1] — 2026-10-03 (vane-control, vane-proxy)
+## [0.5.1]: 2026-10-03 (vane-control, vane-proxy)
 
 - Full LDS: listener decode plus the multi-RDS attachment merge.
 
-## [0.5.0] — 2026-10-02
+## [0.5.0]: 2026-10-02
 
 - Mesh operations: bridge metrics, identity chaining.
 - SDS: control-plane-delivered TLS secrets.
 
-## [0.4.1] — 2026-10-02
+## [0.4.1]: 2026-10-02
 
 - SPIFFE identity propagation for mesh callers, and a multi-listener h3
   fix.
 
-## [0.4.0] — 2026-10-02
+## [0.4.0]: 2026-10-02
 
 Mesh over QUIC, across all 11 crates: SVID rotation for the h3 bridge,
 `mesh.http3`, and SPIFFE enforcement on the h3 edge. h2spec 145/145 in
 strict mode.
 
-## [0.3.1] — 2026-09-29 (vane-proxy)
+## [0.3.1]: 2026-09-29 (vane-proxy)
 
 - HTTP/3 upstream bridge: h3 to backends, with a shared endpoint,
   connection reuse and health ownership.
 
-## [0.3.0] — 2026-09-28
+## [0.3.0]: 2026-09-28
 
 ### Changed
 
-- **HTTP/3 promoted out of experimental — the `h3` feature is now
+- **HTTP/3 promoted out of experimental; the `h3` feature is now
   default.** The published binary serves h3 (QUIC) listeners and the
   Alt-Svc advertisement out of the box, matching the h2 promotion in
   0.2.3. Compile it out with `default-features = false` or
@@ -706,7 +706,7 @@ strict mode.
 - **h2 stream-level WINDOW_UPDATE overflow is now a stream error**:
   the offending stream is reset with an in-band
   `RST_STREAM(FLOW_CONTROL_ERROR)` (RFC 7540 §6.9) and the connection
-  survives — previously it tore the whole connection down. h2spec
+  survives; previously it tore the whole connection down. h2spec
   137/138 (the one documented divergence: lenient idle-stream
   WINDOW_UPDATE, required by the h2 crate client's early credit
   grants).
@@ -724,15 +724,15 @@ strict mode.
 - **Snapshot-driven listener TLS rotation (LDS parity, TLS
   dimension).** `XdsSnapshot.listeners` carries
   `{ address, cert, key, client_ca }`; the admin plane swaps the
-  pre-bound listener's TLS slot live — certificate rotation via
+  pre-bound listener's TLS slot live; certificate rotation via
   control plane, same hot-swap the file watcher performs. An address
   that is not a pre-bound TLS listener is rejected with `400` (xDS
   never binds ports).
 - h3spec harness (`scripts/h3spec_run.sh`) + calibration against the
   h3 crate's own reference server (identical 48 error-case failures
-  upstream — documented in `docs/h3-design.md`).
+  upstream; documented in `docs/h3-design.md`).
 
-## [0.2.3] — 2026-09-26 (vane-proxy only)
+## [0.2.3]: 2026-09-26 (vane-proxy only)
 
 ### Fixed
 
@@ -745,9 +745,9 @@ strict mode.
 - h2spec v2.6.0 run against the h2c listener: 112/138 pass. The 25
   remaining failures are missing protocol validations (frame-size
   limits, idle/closed-stream rules, pseudo-header rules,
-  content-length mismatch) — worklist in `docs/h2-conformance.md`.
+  content-length mismatch); worklist in `docs/h2-conformance.md`.
 
-## [0.2.2] — 2026-09-25 (vane-proxy only)
+## [0.2.2]: 2026-09-25 (vane-proxy only)
 
 ### Added
 
@@ -758,9 +758,9 @@ strict mode.
   (vane-proxy 0.2.1 carried only the RDS-after-CDS ordering fix.)
 - Stray xds-client debug prints removed.
 
-## [0.2.1] — 2026-09-21
+## [0.2.1]: 2026-09-21
 
-### Fixed — xDS interop (found by the go-control-plane interop test)
+### Fixed: xDS interop (found by the go-control-plane interop test)
 
 - `DiscoveryRequest` wire fields were swapped: `version_info` is field
   1 and `node` is field 2 (envoy/service/discovery/v3/discovery.proto).
@@ -772,7 +772,7 @@ strict mode.
   `ClusterLoadAssignment.endpoints` = 2,
   `LocalityLbEndpoints.lb_endpoints` = 2, `Address.socket_address` = 1,
   and `SocketAddress.port_value` = 3. The decoder previously only
-  worked against self-encoded fixtures with invented field numbers —
+  worked against self-encoded fixtures with invented field numbers -
   backends decoded as empty against go-control-plane.
 - `vane xds-client` now subscribes RDS only after the CDS ACK: real
   management planes answer watches independently, and an RDS response
@@ -796,7 +796,7 @@ strict mode.
 ### Security
 
 - Request-smuggling hardening: ambiguous request framing is rejected
-  with `400` — `Content-Length` + `Transfer-Encoding` together,
+  with `400`; `Content-Length` + `Transfer-Encoding` together,
   duplicate `Content-Length` (even self-consistent), multiple
   `Transfer-Encoding` headers, and transfer codings that do not end in
   `chunked` (vane-proto `ParseError::ConflictingFraming`).
@@ -819,13 +819,13 @@ strict mode.
 ### Added
 
 - **Mesh mTLS (docs/mesh-mtls-design.md)**: cluster `mesh` upstream
-  identities — the proxy presents a SVID, requires the backend to
+  identities; the proxy presents a SVID, requires the backend to
   chain to the mesh CA (ALPN `vane-mesh`), and enforces the backend's
   SPIFFE URI SAN prefix after the handshake; verification failure
   answers `502` while the response is unsent (TLS-or-nothing).
 - **SPIFFE Workload API source**: cluster `mesh.svid_socket` fetches
   the X.509 SVID from the agent at startup and a watcher
-  re-materializes the PEM cache on every agent push — rotation with
+  re-materializes the PEM cache on every agent push; rotation with
   no restarts. First fetch is fail-closed.
 - **Per-route caller authorization**: routes gain
   `allowed_spiffe_prefixes`; with `listeners.tls.client_ca` set the
@@ -856,7 +856,7 @@ strict mode.
   sessions mid-stream; upstream-bound bytes now defer and flush in
   512 KiB chunks gated on queue-drain (16 MiB runaway guard).
 - h2 upstream: bodyless requests (no/zero `Content-Length`) set
-  END_STREAM on HEADERS — gRPC trailer relays complete again.
+  END_STREAM on HEADERS; gRPC trailer relays complete again.
 - TLS listeners: handshake failures now flush rustls' queued alert
   before close (a cert-less mTLS client sees `certificate_required`
   instead of hanging), and early-exit replies (405) close the session
@@ -872,7 +872,7 @@ strict mode.
 - `docs/config.md`: `mesh` (incl. `svid_socket`), `compression`,
   `outlier`, `h2c`, and route `allowed_spiffe_prefixes` reference.
 
-## [0.1.0] — 2026-09-09
+## [0.1.0]: 2026-09-09
 
 First tagged release of the full implementation.
 

@@ -4,7 +4,7 @@
 
 Report vulnerabilities privately via GitHub Security Advisories
 ("Report a vulnerability" on the repository's Security tab). Please
-include a reproducing input where possible — the fuzzing corpora make
+include a reproducing input where possible; the fuzzing corpora make
 most parser issues trivially reproducible.
 
 ## Parser assurance (fuzzing)
